@@ -172,6 +172,10 @@ async fn spawn_wait_read_and_owner_isolation() {
     assert!(!logs.running);
 
     // Exited but retained → still resolvable; release reaps it.
+    assert!(matches!(
+        reg.release(&id, &alice, "cap-b"),
+        Err(ErrorCode::NoSuchProcess)
+    ));
     assert!(reg.status(&id, &alice, "cap-a").is_ok());
     assert!(matches!(
         reg.release(&id, &bob, "cap-a"),
@@ -186,6 +190,7 @@ async fn spawn_wait_read_and_owner_isolation() {
         id
     );
     reg.release(&id, &alice, "cap-a").expect("release");
+    reg.release(&id, &alice, "cap-a").expect("already removed");
     assert!(reg.status(&id, &alice, "cap-a").is_err());
 }
 
@@ -206,6 +211,11 @@ async fn concurrent_cap_enforced_and_stop_reaps() {
     let id1 = reg
         .spawn(params(&p, "cap", c1, o1, e1, pid1, 1))
         .expect("first spawn");
+
+    assert!(matches!(
+        reg.release(&id1, &p, "cap"),
+        Err(ErrorCode::InvalidInput)
+    ));
 
     // Second spawn must be rejected with `quota`.
     let (c2, o2, e2, pid2) = spawn_raw("sleep 30");

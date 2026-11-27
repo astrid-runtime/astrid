@@ -37,7 +37,8 @@
 //! The `process-id` is a 256-bit host-minted CSPRNG token (lowercase base32,
 //! see [`ids`]). A keyed BLAKE3 digest indexes each entry. The entry retains
 //! the token so its owner can recover it through status and list. Token
-//! lookup checks the recorded creator and capsule. Release is idempotent
+//! lookup requires both the token and the matching creator and capsule.
+//! Possession of another capsule’s token grants no access. Release is idempotent
 //! for an absent entry and refuses a foreign entry.
 
 mod config;
@@ -537,19 +538,17 @@ impl PersistentProcessRegistry {
         capsule_id: &str,
     ) -> Result<(), ErrorCode> {
         let key = self.key_of(id);
-        let mut map = self.lock();
-        let entry = match selection::select(&map, &key, |e| e.owned_by(principal, capsule_id)) {
-            Selection::Owned(entry) => entry,
-            Selection::Absent => return Ok(()),
-            Selection::Foreign => return Err(ErrorCode::NoSuchProcess),
-        };
-        if entry.is_live() {
-            return Err(ErrorCode::InvalidInput);
-        }
-        let removed = map.remove(&key);
-        drop(map);
-        if let Some(entry) = removed {
-            reap_entry(entry);
+        let outcome = selection::release(
+            &mut self.lock(),
+            &key,
+            |entry| entry.owned_by(principal, capsule_id),
+            PersistentEntry::is_live,
+        );
+        match outcome {
+            selection::Release::Absent => {},
+            selection::Release::Foreign => return Err(ErrorCode::NoSuchProcess),
+            selection::Release::Live => return Err(ErrorCode::InvalidInput),
+            selection::Release::Removed(entry) => reap_entry(entry),
         }
         Ok(())
     }

@@ -36,4 +36,38 @@ pub(super) fn select<'a,K: Eq + Hash,T,F: FnOnce(&'a T) -> bool>(
     let Some(entry) = entries.get(key) else { return Selection::Absent; };
     if owns(entry) { Selection::Owned(entry) } else { Selection::Foreign }
 }
+
+pub(super) enum Release<T> { Absent, Foreign, Live, Removed(T) }
+
+/// Both observations and the removal run under the same registry guard.
+pub(super) fn release<K: Eq + Hash,T,O:FnOnce(&T)->bool,L:FnOnce(&T)->bool>(
+    entries:&mut HashMap<K,T>, key:&K, owns:O, live:L,
+) -> (out:Release<T>)
+    requires hash_map_inv(old(entries)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+        old(entries)@.contains_key(*key) ==> owns.requires((&old(entries)@[*key],)),
+        old(entries)@.contains_key(*key) && owns.ensures((&old(entries)@[*key],),true)
+            ==> live.requires((&old(entries)@[*key],)),
+    ensures hash_map_inv(final(entries)), ({
+        let before = old(entries)@;
+        let e = before[*key];
+        match out {
+            Release::Absent => !before.contains_key(*key) && final(entries)@ == before,
+            Release::Foreign => before.contains_key(*key) && owns.ensures((&e,),false)
+                && final(entries)@ == before,
+            Release::Live => before.contains_key(*key) && owns.ensures((&e,),true)
+                && live.ensures((&e,),true) && final(entries)@ == before,
+            Release::Removed(removed) => before.contains_key(*key) && removed == e
+                && owns.ensures((&e,),true) && live.ensures((&e,),false)
+                && final(entries)@ == before.remove(*key),
+        }
+    }),
+{
+    let Some(entry) = entries.get(key) else { return Release::Absent; };
+    if !owns(entry) { return Release::Foreign; }
+    if live(entry) { return Release::Live; }
+    match entries.remove(key) {
+        Some(removed) => Release::Removed(removed),
+        None => Release::Absent,
+    }
+}
 }

@@ -121,4 +121,30 @@ fn publish_then_lookup<T:Copy>(entries: &mut HashMap<[u8;32],Entry<(u8,T)>>,
     (Some(i),selected)
 }
 
+
+// The phase bit is the observation supplied under the native entry mutex.
+fn release_child<T>(entries:&mut HashMap<[u8;32],Entry<(bool,T)>>, key:&[u8;32],
+    principal:&[u8], capsule:&[u8]) -> (out:process_selection::Release<Entry<(bool,T)>>)
+    requires hash_map_inv(old(entries)), obeys_key_model::<[u8;32]>(), obeys_concrete_eq::<[u8;32]>(),
+    ensures hash_map_inv(final(entries)), ({
+        let before = old(entries)@;
+        if !before.contains_key(*key) {
+            out == process_selection::Release::Absent && final(entries)@ == before
+        } else {
+            let e = before[*key];
+            if e.creator@ != principal@ || e.package@ != capsule@ {
+                out == process_selection::Release::Foreign && final(entries)@ == before
+            } else if e.target.0 {
+                out == process_selection::Release::Live && final(entries)@ == before
+            } else {
+                out == process_selection::Release::Removed(e) && final(entries)@ == before.remove(*key)
+            }
+        }
+    }),
+{
+    process_selection::release(entries,key,|e:&Entry<(bool,T)>| -> (yes:bool)
+        ensures yes == (e.creator@ == principal@ && e.package@ == capsule@),
+    { process_selection::matches(principal,capsule,e.creator.as_slice(),e.package.as_slice()) },
+        |e:&Entry<(bool,T)>| -> (yes:bool) ensures yes == e.target.0, { e.target.0 })
+}
 }
