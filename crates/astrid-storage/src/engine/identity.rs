@@ -68,18 +68,13 @@ impl<'a> KvIdentitySession<'a> {
 }
 
 impl<P> super::root_declaration::Declaration<P, Arc<()>> {
-    pub(super) fn admit_records(
+    pub(super) fn admit_records<C>(
         self,
         authority: &Arc<()>,
         identify: impl Fn(&ObjectRecord) -> ObjectId,
-    ) -> Result<
-        (
-            super::root_declaration::Update<P>,
-            super::transaction_records::Admission,
-        ),
-        ModelError,
-    > {
-        self.admit(authority, Arc::ptr_eq, identify)
+        checkpoint: &mut Option<C>,
+    ) -> Result<(super::root_declaration::Update<P>, Option<C>), ModelError> {
+        self.admit_with_checkpoint(authority, Arc::ptr_eq, identify, checkpoint)
             .map_err(|(declared, computed)| ModelError::ObjectIdentityMismatch {
                 declared,
                 computed,

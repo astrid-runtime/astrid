@@ -179,11 +179,15 @@ def defects():
         ("constructor may issue a local seal", "out.proof_source() is Untrusted,", "true,"),
         ("admission may retarget a valid batch", "update == self.payload() && match kind", "update.records == self.payload().records && match kind"),
         ("admission may exchange input rows", "update == self.payload() && match kind", "(update.principal == self.payload().principal && update.expected == self.payload().expected && update.commit == self.payload().commit) && match kind"),
+        ("custody can release a foreign checkpoint", "hint.is_none() && *final(checkpoint) == *old(checkpoint)", "*final(checkpoint) == *old(checkpoint)"),
+        ("custody can withhold the issuer checkpoint", "hint == *old(checkpoint) && final(checkpoint).is_none()", "final(checkpoint).is_none()"),
+        ("custody failure can omit an earlier row", "forall|prior:int| 0 <= prior < i ==> #[trigger] authentic(self.payload().records@[prior],identify),", "true,"),
         ("identity failure may skip an earlier row", "forall|j:int| 0 <= j < i ==> #[trigger] authentic(self.payload().records@[j],identify),", "true,"),
     ]:
         yield (
             f"root declaration {name}", source,
-            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+            lambda s, a=old, b=new: replace_once(s, a, b),
+            source if name == "identity failure may skip an earlier row" else trace,
         )
     source = Path("crates/astrid-storage/src/engine/durable/root_transition.rs")
     for name, old, new in [

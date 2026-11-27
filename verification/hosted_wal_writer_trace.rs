@@ -70,8 +70,7 @@ fn admit_sealed<P,C,H:Fn(&ObjectRecord)->ObjectId>(update:root_declaration::Upda
 {
     let declaration = root_declaration::Declaration::sealed(update,issuer);
     let same = |a:&u64,b:&u64| -> (equal:bool) ensures equal == (*a == *b) { *a == *b };
-    let (accepted,kind) = declaration.admit(&receiver,same,identify)?;
-    Ok((accepted,kind.take_checkpoint(checkpoint)))
+    declaration.admit_with_checkpoint(&receiver,same,identify,checkpoint)
 }
 
 /// The journal callback receives the root retained across closure validation.

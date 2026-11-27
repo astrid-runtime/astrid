@@ -405,15 +405,17 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
                 commit,
                 records,
             },
-            admission,
-        ) = declaration
-            .admit_records(&self.preparation_authority, |record| self.identify(record))?;
+            admitted_checkpoint,
+        ) = declaration.admit_records(
+            &self.preparation_authority,
+            |record| self.identify(record),
+            &mut kv_checkpoint_publication,
+        )?;
         let world = self.world.upgradable_read();
         let (world, root, objects_inserted) =
             World::commit_closure_owned(world, principal, expected, commit, records)?;
-        let retired_projection = admission
-            .take_checkpoint(&mut kv_checkpoint_publication)
-            .and_then(|publication| publication.try_publish(root));
+        let retired_projection =
+            admitted_checkpoint.and_then(|publication| publication.try_publish(root));
         drop(world);
         drop(retired_projection);
         Ok(CommitOutcome {

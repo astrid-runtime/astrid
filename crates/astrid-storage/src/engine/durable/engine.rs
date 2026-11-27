@@ -770,9 +770,11 @@ where
             declaration,
             mut kv_checkpoint_publication,
         } = transaction;
-        let (update, admission) = declaration
-            .admit_records(&self.preparation_authority, |record| self.identify(record))?;
-        let kv_checkpoint_publication = admission.take_checkpoint(&mut kv_checkpoint_publication);
+        let (update, kv_checkpoint_publication) = declaration.admit_records(
+            &self.preparation_authority,
+            |record| self.identify(record),
+            &mut kv_checkpoint_publication,
+        )?;
         let (selected, records) =
             super::root_transition::select_update(pending_roots, &inner.roots_by_principal, update)
                 .map_err(|error| match error {

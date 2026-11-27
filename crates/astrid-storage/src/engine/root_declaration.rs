@@ -63,5 +63,30 @@ impl<P,A> Declaration<P,A> {
         let admission = self.identity.admit(current,same,&self.update.records,identify)?;
         Ok((self.update,admission))
     }
+
+    /// Bind checkpoint release to the same declaration that supplied the rows.
+    pub(super) fn admit_with_checkpoint<C,F:Fn(&A,&A)->bool,H:Fn(&ObjectRecord)->ObjectId>(
+        self,current:&A,same:F,identify:H,checkpoint:&mut Option<C>,
+    ) -> (out:Result<(Update<P>,Option<C>),(ObjectId,ObjectId)>)
+        requires forall|bound:&A| #[trigger] same.requires((bound,current)),
+            forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
+        ensures match out {
+            Ok((update,hint)) => update == self.payload() && (
+                (self.proof_source().compared(current,same,true) &&
+                    hint == *old(checkpoint) && final(checkpoint).is_none()) ||
+                (self.proof_source().compared(current,same,false) &&
+                    hint.is_none() && *final(checkpoint) == *old(checkpoint) &&
+                    forall|i:int| 0 <= i < update.records.len() ==> #[trigger] authentic(update.records@[i],identify))
+            ),
+            Err((name,computed)) => *final(checkpoint) == *old(checkpoint) &&
+                self.proof_source().compared(current,same,false) &&
+                exists|i:int| 0 <= i < self.payload().records.len() && name == self.payload().records@[i].0 &&
+                    #[trigger] identify.ensures((&self.payload().records@[i].1,),computed) && computed.digest() != name.digest() &&
+                    forall|prior:int| 0 <= prior < i ==> #[trigger] authentic(self.payload().records@[prior],identify),
+        },
+    {
+        let (update,kind) = self.admit(current,same,identify)?;
+        Ok((update,kind.take_checkpoint(checkpoint)))
+    }
 }
 }
