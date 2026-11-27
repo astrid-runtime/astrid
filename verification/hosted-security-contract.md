@@ -41,6 +41,14 @@ The function and implicit destructor counts below come from the resolved kernel 
 
 Fourteen HTTP, network, IPC and process adapter call sites currently allocate placeholder resources. Their successful allocation returns an always-ready pollable, a closed input stream or a closed output stream. These methods do not attach the returned resource to the underlying transport or process. The constructors propagate allocation errors through trappable host imports. A failed pollable subscription releases its partially allocated parent. Resource identity, accounting and guest-visible trap refinement remain proof obligations. The file-handle destructor above is distinct from the internal storage-backed file publication described below.
 
+### Guest command approvals
+
+A guest prompt subscribes to its UUID-specific reply topic before publication. Command approval and local-egress consent use the same checked comparison of the responder's stamped principal and authenticated request owner. Both classify the reply bytes using the exact three wire spellings for one-shot, session and persistent consent. Every other byte string yields denial.
+
+For a persistent command approval, the checked dispatcher supplies the persistence callback with the pending prompt's principal and sanitized action. A successful persistent result requires that callback to succeed. Any error from the callback propagates to the hostcall, which records a denial. The persistence selector sends a hosted grant to the profile writer with the selected pristine workspace path and sends an Astrid-workspace grant to the path-free writer for that principal. A theorem composes the responder check, wire classification and both persistence destinations. It distinguishes the two workspace kinds, a different path, a different command family or principal, and a storage error.
+
+The native adapter supplies the event fields, workspace selection and actual profile writer. The theorem assumes the request topic and sampled stamps are authentic. The admitted action is a command family. Concrete allowance matching and consumption, session-grant insertion, device or principal retirement during the wait, and durable profile publication remain separate obligations.
+
 ### Guest uplink registration and enqueue
 
 Each pooled Wasmtime store owns a descriptor vector and takes its uplink capability bit from the manifest. Stores in one pool share the optional channel sender created at load when the manifest declares uplinks. Registration normalizes the platform, checks the configured gate, constructs a descriptor for the capsule and appends it through the verified registry routine. The routine preserves the vector on rejection and appends exactly the supplied descriptor on success. Its comparison uses both name and platform. At capacity it refuses even a fresh pair.

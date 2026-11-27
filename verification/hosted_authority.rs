@@ -216,6 +216,9 @@ mod device_admission;
 
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/consent_identity.rs"]
 mod consent_identity;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs"]
+mod consent_reply;
+mod hosted_consent_reply;
 
 #[path = "../crates/astrid-uplink/src/native/recipient.rs"]
 mod native_recipient;

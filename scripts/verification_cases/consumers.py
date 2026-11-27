@@ -9,6 +9,21 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    reply = Path("crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs")
+    trace = Path("verification/hosted_consent_reply.rs")
+    for name, original, changed, target in [
+        ("grants unknown decisions", "else {Decision::Deny}\n}\n\n/// Hosted", "else {Decision::Once}\n}\n\n/// Hosted", reply),
+        ("skips persistent publication", "save(principal,action)?;", "let _ = (principal,action);", reply),
+        ("reports the wrong scope", "Ok(decision)\n}", "Ok(Decision::Always)\n}", reply),
+        ("loses persistent acknowledgement", "value == Decision::Always && save.ensures((principal,action),Ok(()))", "value == Decision::Always", trace),
+        ("loses the persistence error", "Err(error) => save.ensures((principal,action),Err(error))", "Err(error) => true", trace),
+        ("loses the hosted workspace", "hosted.ensures((principal,action,path),out)", "true", trace),
+        ("loses the Astrid workspace scope", "workspace.ensures((principal,action),out)", "true", trace),
+    ]:
+        yield (
+            f"approval reply {name}", reply,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     walk_source = Path("crates/astrid-storage/src/engine/durable/closure_walk.rs")
     yield (
         "closure diagnostic loses the cycle through its reported object", walk_source,

@@ -201,27 +201,10 @@ fn add_runtime_grant(
     }
 }
 
-/// Classify a consent decision string. Mirrors `host/approval.rs`'s
-/// `decision_from_str` mapping (anything not in the approve set — explicit
-/// deny, unknown, empty — is a deny).
-enum Decision {
-    /// One-shot approve: let the in-flight request through, no persistence.
-    Once,
-    /// Approve for the session: cache a session-scoped per-principal grant.
-    Session,
-    /// Remember the grant in the profile, or for the session on a cacheless host.
-    Always,
-    /// Deny / unknown / empty — fail closed.
-    Deny,
-}
+use super::consent_reply::Decision;
 
 fn classify_decision(decision: &str) -> Decision {
-    match decision {
-        "approve" => Decision::Once,
-        "approve_session" => Decision::Session,
-        "approve_always" => Decision::Always,
-        _ => Decision::Deny,
-    }
+    super::consent_reply::classify(decision.as_bytes())
 }
 
 fn event_principal(event: &AstridEvent) -> Option<&str> {
@@ -238,8 +221,7 @@ fn event_request_owner(event: &AstridEvent) -> Option<astrid_events::ipc::Reques
     }
 }
 
-#[path = "consent_identity.rs"]
-mod consent_identity;
+use super::consent_identity;
 
 fn response_identity_matches(
     expected_principal: &str,

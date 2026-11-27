@@ -145,15 +145,18 @@ fn persist_always(
         .profile_cache
         .as_ref()
         .ok_or(ErrorCode::StoreUnavailable)?;
-    let persisted = match approval_location(state) {
-        CommandApprovalLocation::AstridWorkspace => {
-            cache.persist_astrid_command_always(principal, action)
-        },
-        CommandApprovalLocation::Hosted => {
-            let workspace = hosted_workspace_identity(state)?;
-            cache.persist_command_always(principal, action, Some(workspace))
-        },
+    use super::consent_reply::{Destination, save_at};
+    let destination = match approval_location(state) {
+        CommandApprovalLocation::AstridWorkspace => Destination::AstridWorkspace,
+        CommandApprovalLocation::Hosted => Destination::Hosted(hosted_workspace_identity(state)?),
     };
+    let persisted = save_at(
+        principal,
+        action,
+        destination,
+        |owner, family, path| cache.persist_command_always(owner, family, Some(path)),
+        |owner, family| cache.persist_astrid_command_always(owner, family),
+    );
     persisted.map_err(|error| {
         tracing::warn!(%error, "Cannot persist Always approval");
         ErrorCode::StoreUnavailable
@@ -276,19 +279,6 @@ fn create_allowance_from_decision(
     }
 }
 
-/// Map the JSON-string decision in `IpcPayload::ApprovalResponse` to the
-/// typed [`ApprovalDecision`] returned to the WASM guest.
-fn decision_from_str(decision: &str) -> ApprovalDecision {
-    match decision {
-        "approve" => ApprovalDecision::Approved,
-        "approve_session" => ApprovalDecision::ApprovedSession,
-        "approve_always" => ApprovalDecision::ApprovedAlways,
-        // Anything else — including explicit denies, unknown strings, or
-        // empty — is treated as a deny.
-        _ => ApprovalDecision::Denied,
-    }
-}
-
 fn event_principal(event: &AstridEvent) -> Option<&str> {
     match event {
         AstridEvent::Ipc { message, .. } => message.principal.as_deref(),
@@ -308,8 +298,12 @@ fn response_identity_matches(
     expected_owner: astrid_events::ipc::RequestOwnerId,
     event: &AstridEvent,
 ) -> bool {
-    event_principal(event) == Some(expected_principal)
-        && event_request_owner(event) == Some(expected_owner)
+    super::consent_identity::matches(
+        expected_principal.as_bytes(),
+        expected_owner.as_u128(),
+        event_principal(event).map(str::as_bytes),
+        event_request_owner(event).map(astrid_events::ipc::RequestOwnerId::as_u128),
+    )
 }
 
 async fn await_matching_approval_response(
@@ -500,14 +494,22 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
-                            if decision == "approve_always"
-                                && let Err(error) =
-                                    persist_always(self, &principal, &request.action)
-                            {
+                            use super::consent_reply::{Decision, apply};
+                            let outcome = apply(
+                                decision.as_bytes(),
+                                &principal,
+                                request.action.as_str(),
+                                |owner, action| persist_always(self, owner, action),
+                            )
+                            .inspect_err(|_| {
                                 audit.denied("user", "approve_always could not be persisted");
-                                return Err(error);
-                            }
-                            let typed = decision_from_str(decision);
+                            })?;
+                            let typed = match outcome {
+                                Decision::Once => ApprovalDecision::Approved,
+                                Decision::Session => ApprovalDecision::ApprovedSession,
+                                Decision::Always => ApprovalDecision::ApprovedAlways,
+                                Decision::Deny => ApprovalDecision::Denied,
+                            };
                             match typed {
                                 ApprovalDecision::Approved => {
                                     audit.granted(HostApprovalScope::Once, "user");
@@ -520,17 +522,7 @@ impl approval::Host for HostState {
                                 },
                                 _ => audit.denied("user", "denied by user"),
                             }
-                            let approved = matches!(
-                                typed,
-                                ApprovalDecision::Approved
-                                    | ApprovalDecision::ApprovedSession
-                                    | ApprovalDecision::ApprovedAlways
-                            );
-
-                            // Persistent choices were saved above; keep temporary
-                            // allowances in the session store only.
-                            if approved
-                                && decision != "approve_always"
+                            if matches!(outcome, Decision::Session)
                                 && let Some(ref store) = allowance_store
                             {
                                 create_allowance_from_decision(

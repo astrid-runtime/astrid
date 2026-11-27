@@ -1,4 +1,4 @@
-//! Match a local egress consent reply to the host-stamped request.
+//! Match a consent reply to the host-stamped request.
 
 use vstd::prelude::*;
 
