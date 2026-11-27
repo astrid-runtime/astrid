@@ -75,4 +75,22 @@ fn checked_resume<'a>(state:&'a str, context:&'a [u8], authentic:bool, available
             ensures r == if available { Ok(token) } else { Err(2u8) },
         { if available { Ok(token) } else { Err(2) } })
 }
+
+/// Serial lock observations from two callers. Cancellation reopens only the
+/// first digest; settlement leaves the latest observed deadline installed.
+fn competing_claims(entries:&mut std::collections::HashMap<[u8;32],u64>,
+    id:[u8;32], first:u64, next:u64, commit:bool)
+    requires vstd::std_specs::hash::hash_map_inv(old(entries)),
+        vstd::std_specs::hash::obeys_key_model::<[u8;32]>(), vstd::laws_eq::obeys_concrete_eq::<[u8;32]>(), !old(entries)@.contains_key(id),
+    ensures vstd::std_specs::hash::hash_map_inv(final(entries)),
+        final(entries)@ == if commit { old(entries)@.insert(id,next) } else { old(entries)@ },
+{
+    let ghost before = entries@;
+    let mut claim = crate::mrtr_redemption::reserve(entries,id,first).unwrap();
+    let duplicate = crate::mrtr_redemption::reserve(entries,id,next);
+    assert(duplicate.is_none());
+    if commit { claim.commit(); }
+    if !claim.committed() { claim.on_drop(entries); }
+    assert(entries@ =~= if commit { before.insert(id,next) } else { before });
+}
 }

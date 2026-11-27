@@ -29,6 +29,8 @@ use super::ingress::IngressForm;
 
 #[path = "mrtr_context.rs"]
 mod context;
+#[path = "mrtr_redemption.rs"]
+mod redemption;
 
 const INPUT_KEY: &str = "astrid-consent";
 const STATE_TTL: Duration = Duration::from_mins(5);
@@ -65,23 +67,22 @@ pub(super) struct ResolvedConsent {
 
 pub(super) struct RedemptionLease {
     redeemed: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
-    digest: [u8; 32],
-    committed: bool,
+    claim: redemption::Claim,
 }
 
 impl RedemptionLease {
     pub(super) fn commit(mut self) {
-        self.committed = true;
+        self.claim.commit();
     }
 }
 
 impl Drop for RedemptionLease {
     fn drop(&mut self) {
-        if self.committed {
+        if self.claim.committed() {
             return;
         }
         if let Ok(mut redeemed) = self.redeemed.lock() {
-            redeemed.remove(&self.digest);
+            self.claim.on_drop(&mut redeemed);
         }
     }
 }
@@ -253,16 +254,12 @@ impl MrtrBridge {
         let expiry = now
             .checked_add(STATE_TTL)
             .ok_or_else(|| McpError::internal_error("MRTR replay-fence deadline overflow", None))?;
-        if redeemed.insert(digest, expiry).is_some() {
-            return Err(McpError::invalid_params(
-                "requestState has already been redeemed",
-                None,
-            ));
-        }
+        let claim = redemption::reserve(&mut redeemed, digest, expiry).ok_or_else(|| {
+            McpError::invalid_params("requestState has already been redeemed", None)
+        })?;
         Ok(RedemptionLease {
             redeemed: Arc::clone(&self.redeemed),
-            digest,
-            committed: false,
+            claim,
         })
     }
 }
@@ -426,6 +423,37 @@ mod tests {
                 .is_err(),
             "a completed broker mutation must consume requestState"
         );
+    }
+
+    #[test]
+    fn concurrent_redemptions_issue_one_lease_until_cancellation() {
+        let bridge = MrtrBridge::new().unwrap();
+        let principal = PrincipalId::new("alice").unwrap();
+        let arguments = json!({"path": "report"});
+        let state = state_from(
+            bridge
+                .ingress_required(&principal, "fs.read", &arguments, "Allow?".into())
+                .unwrap(),
+        );
+        let responses = accepted(&json!({"allow": true}));
+        let resolve =
+            || bridge.resolve(&principal, "fs.read", &arguments, &state, Some(&responses));
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let workers = [(); 2].map(|()| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    resolve()
+                })
+            });
+            workers.map(|worker| worker.join().unwrap())
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        let error = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+        assert!(error.message.contains("already been redeemed"));
+        drop(results);
+        resolve().unwrap().redemption.commit();
+        assert!(resolve().is_err());
     }
 
     #[test]

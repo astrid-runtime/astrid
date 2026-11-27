@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import file_descriptor, persistent_process, retirement, runtime_residency, storage, workspace_commit
+from . import file_descriptor, http, mcp, persistent_process, retirement, runtime_residency, storage, workspace_commit
 from .common import (
     LEASE_CALLBACK,
     replace_once,
@@ -15,91 +15,7 @@ def consumer_defects():
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
     yield from retirement.defects()
-    context = Path("crates/astrid-cli/src/commands/mcp/mrtr_context.rs")
-    context_trace = Path("verification/hosted_mrtr_context.rs")
-    for label, original, changed, failure in [
-        ("principal bytes", "digest.absorb(principal);", "digest.absorb(tool);", context),
-        ("tool bytes", "digest.absorb(tool);", "digest.absorb(arguments);", context),
-        ("argument bytes", "digest.absorb(arguments);", "digest.absorb(principal);", context),
-        ("transcript guarantee", "ensures final(digest).bytes() ==", "ensures principal.len() > 0 ==> final(digest).bytes() ==", context_trace),
-        ("principal uniqueness", "ensures p == q, t == u, a == b,", "ensures t == u, a == b,", context_trace),
-        ("tool uniqueness", "ensures p == q, t == u, a == b,", "ensures p == q, a == b,", context_trace),
-        ("argument uniqueness", "ensures p == q, t == u, a == b,", "ensures p == q, t == u,", context_trace),
-        ("opened consent", "open.ensures((state,context),Ok(pending)) && redeem", "true && redeem", context_trace),
-        ("claimed continuation", "&& redeem.ensures((state,),Ok(guard))", "&& true", context_trace),
-        ("opening refusal", "open.ensures((state,context),Err(error)) ||", "true ||", context_trace),
-    ]:
-        yield (
-            f"broker continuation loses {label}", context,
-            lambda s, a=original, b=changed: replace_once(s, a, b), failure,
-        )
-    tool_call = Path("crates/astrid-mcp/src/server/tool_call.rs")
-    for label, field, replacement in [
-        ("fixed hook", 'call.parts().0@ == "astrid_hook_intercept"@', "true"),
-        ("hook payload", "encode.ensures((action,payload),call.parts().1)", "true"),
-        ("requested tool", "bound.parts().1 == call.parts().0", "true"),
-        ("request arguments", "bound.parts().2 == call.parts().1", "true"),
-        ("registration", "servers@.contains_key(k) && k@ == requested@", "servers@.contains_key(k)"),
-        ("peer", "peer.ensures((&servers@[k],),Some(bound.parts().0))", "true"),
-        ("send", "ensures send.ensures(self.parts(),out)", "ensures true"),
-    ]:
-        yield (
-            f"MCP tool binding loses {label}", tool_call,
-            lambda s, a=field, b=replacement: replace_once(s, a, b),
-            Path("verification/hosted_mcp_peer.rs"),
-        )
-    cleanup = Path("crates/astrid-capsule/src/engine/mcp_cleanup.rs")
-    for label, field, replacement in [
-        ("registration target", "final(self).name() == Some(target@)", "true"),
-        ("worker identity", "task.name() == old(self).name()", "true"),
-        ("draining target", "final(self).name() == task.name()", "true"),
-        ("duplicate start", "work.is_some() == ((*old(self)) is Open)", "((*old(self)) is Open) ==> work.is_some()"),
-        ("rejected registration", "!accepted ==> *final(self) == *old(self)", "!accepted ==> true"),
-        ("foreign completion", "completed == ((*old(self)) is Draining", "completed <== ((*old(self)) is Draining"),
-        ("completion state", "completed ==> (*final(self)) is Done", "completed ==> true"),
-    ]:
-        yield (
-            f"MCP cleanup loses {label}", cleanup,
-            lambda s, a=field, b=replacement: replace_once(s, a, b),
-            Path("verification/hosted_mcp_peer.rs"),
-        )
-    registration = Path("crates/astrid-capsule/src/engine/mcp_registration.rs")
-    for label, field, replacement in [
-        ("capsule", "registration(capsule@,", "registration(Seq::empty(),"),
-        ("server", "server@, match principal", "Seq::empty(), match principal"),
-        ("scope", "match principal { Some(uid) => Some(uid@), None => None }, generation),", "None, generation),"),
-        ("generation", "None => None }, generation),", "None => None }, 0),"),
-    ]:
-        yield (
-            f"MCP registration substitutes the {label}", registration,
-            lambda s, a=field, b=replacement: replace_once(s, a, b), registration,
-        )
-    yield (
-        "MCP lookup loses the zero generation registration", registration,
-        lambda s: replace_once(s, "ensures result@ == registration(", "ensures generation > 0 ==> result@ == registration("), registration,
-    )
-    yield (
-        "MCP lookup loses the registry generation", registration,
-        lambda s: replace_once(s, "ensures exists|c:&str, p:Option<String>|", "ensures runtime.identity().1 != 0 ==> exists|c:&str, p:Option<String>|"),
-        Path("verification/hosted_mcp_peer.rs"),
-    )
-    yield (
-        "MCP registration permits decimal suffix collisions", registration,
-        lambda s: replace_once(s, "ensures n == m,", "ensures true,"),
-        Path("verification/hosted_mcp_peer.rs"),
-    )
-    peer = Path("crates/astrid-mcp/src/server/peer_selection.rs")
-    for name, original, changed in [
-        ("loses the requested registration", "k@ == requested@ && peer.ensures((&servers@[k],),Some(handle))", "peer.ensures((&servers@[k],),Some(handle))"),
-        ("can substitute the connected handle", "peer.ensures((&servers@[k],),Some(handle))", "true"),
-        ("can misreport a disconnected server", "peer.ensures((&servers@[k],),None)", "true"),
-        ("can misreport a missing server", "servers@.contains_key(k) ==> k@ != requested@", "servers@.contains_key(k) ==> true"),
-    ]:
-        yield (
-            f"MCP peer selection {name}", peer,
-            lambda s, a=original, b=changed: replace_once(s, a, b),
-            Path("verification/hosted_mcp_peer.rs"),
-        )
+    yield from mcp.defects()
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [
@@ -228,89 +144,7 @@ def consumer_defects():
             f"pool return {name}", pool,
             lambda s, a=original, b=changed: replace_once(s, a, b), pool_trace,
         )
-    hop = Path("crates/astrid-capsule/src/engine/wasm/host/http/hop.rs")
-    hop_trace = Path("verification/hosted_http_hop.rs")
-    for name, original, changed in [
-        ("loses the admitted operation", "hop.target() == (method,url)", "hop.target().1 == url"),
-        ("loses the admitted URL", "hop.target() == (method,url)", "hop.target().0 == method"),
-        ("loses the rejection", "Err(e) => check.ensures((method,url),Err(e))", "Err(e) => true"),
-        ("loses the request handoff", "ensures build.ensures(self.target(),r)", "ensures true"),
-    ]:
-        yield (
-            f"HTTP hop {name}", hop,
-            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
-        )
-    body = Path("crates/astrid-capsule/src/engine/wasm/host/http/body.rs")
-    for name, original, changed in [
-        ("loses its captured origin", "read.parts() == (source, outcome)", "read.parts().1 == outcome"),
-        ("loses the captured payload", "read.parts() == (source, outcome)", "read.parts().0 == source"),
-        ("permits mismatched publication", "&& out == (if matched { Some(self.parts().1) } else { None })",
-         "&& (matched ==> out == Some(self.parts().1))"),
-    ]:
-        yield (
-            f"HTTP read observation {name}", body,
-            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
-        )
-    for name, original, changed in [
-        ("loses selected chunk", "data.ensures((bytes,), result.0) && result.1.is_none()", "result.1.is_none()"),
-        ("allows a completion with a chunk", "data.ensures((bytes,), result.0) && result.1.is_none()", "data.ensures((bytes,), result.0)"),
-        ("loses EOF result", "result.0@.len() == 0 && end.ensures((), result.1)", "end.ensures((), result.1)"),
-        ("loses transport error mapping", "out.0 matches Err(reason) && failure.ensures((error,), (reason, out.1))", "out.0.is_err()"),
-        ("loses successful handoff", "out.0 matches Ok(bytes) && success.ensures((received,), (bytes, out.1))", "out.0.is_ok()"),
-        ("allows a timeout receipt", "out.0 == Err(timeout) && out.1.is_none()", "out.0 == Err(timeout)"),
-        ("loses EOF receipt", "result.0@.len() == 0 && end.ensures((), result.1)", "result.0@.len() == 0"),
-    ]:
-        yield (
-            f"stream read publication {name}", body,
-            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
-        )
-    for name, original, changed in [
-        ("loses cancellation refusal", "_ => result == Err(closed)", "_ => true"),
-        ("loses received bytes", "&& bytes@ == body@", ""),
-        ("loses transport failure", "result == Err(error)", "true"),
-    ]:
-        yield (
-            f"buffered HTTP response {name}", body,
-            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
-        )
-    for name, original, changed in [
-        ("loses alias mismatch refusal", "ensures matches == (reader@", "ensures reader@ == creator@ ==> matches == (reader@"),
-        ("loses pinned UID comparison", "ensures matches == (reader@", "ensures expected.is_none() ==> matches == (reader@"),
-    ]:
-        yield (
-            f"stream owner {name}", body,
-            lambda s, a=original, b=changed: replace_once(s, a, b),
-            hop_trace,
-        )
-    for name, original, changed in [
-        ("loses the owner binding", "if owner && opening && reading { Some(effect(handle)) }",
-         "if opening && reading { Some(effect(handle)) }"),
-        ("ignores opening retirement", "if owner && opening && reading { Some(effect(handle)) }",
-         "if owner && reading { Some(effect(handle)) }"),
-        ("ignores reader retirement", "if owner && opening && reading { Some(effect(handle)) }",
-         "if owner && opening { Some(effect(handle)) }"),
-        ("loses the selected disclosure", "&& effect.ensures((handle,),v)", ""),
-    ]:
-        yield (
-            f"streaming HTTP response {name}", body,
-            lambda s, a=original, b=changed: replace_once(s, a, b),
-            hop_trace if name == "loses the selected disclosure" else body,
-        )
-    slots = Path("crates/astrid-capsule/src/engine/wasm/host/http/slots.rs")
-    slot_trace = Path("verification/hosted_http_slots.rs")
-    for name, original, changed in [
-        ("loses the returned handle", "result == Ok(rep) && final(streams)@", "result.is_ok() && final(streams)@"),
-        ("loses the occupied response", "result == Err(Refusal::Occupied) && final(streams)@ == before",
-         "result == Err(Refusal::Occupied)"),
-        ("loses the released response", "removed == if before.contains_key(key) { Some(before[key]) } else { None }",
-         "removed.is_some() == before.contains_key(key)"),
-        ("loses the destructor update", "final(streams)@ == if deleted {before.remove(key)} else {before}",
-         "true"),
-    ]:
-        yield (
-            f"HTTP stream slot {name}", slots,
-            lambda s, a=original, b=changed: replace_once(s, a, b), slot_trace,
-        )
+    yield from http.defects()
     egress = Path("crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs")
     egress_trace = Path("verification/hosted_egress_reply.rs")
     for name, original, changed, target in [
