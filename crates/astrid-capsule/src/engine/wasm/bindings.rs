@@ -111,6 +111,7 @@ wasmtime::component::bindgen!({
         "astrid:io/streams.stream-error" => wasmtime_wasi::p2::StreamError,
     },
     imports: {
+        "astrid:io/streams.[method]output-stream.blocking-splice": async | trappable,
         "astrid:io/streams": trappable,
         // `subscription.recv` is the only host import on the orchestration
         // hot path that *blocks* — every chained capsule (react ->

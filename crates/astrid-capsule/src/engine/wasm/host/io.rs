@@ -356,6 +356,110 @@ mod astrid_streams_impl {
         }
     }
 
+    /// Copy one chunk from `src` to `dst`.
+    ///
+    /// Cancellation is observed while no bytes have left the source: waiting
+    /// for an I/O permit, for the destination permit, or for the source read.
+    /// The read arm is polled first, so a read that completes in the same poll
+    /// as cancellation is kept.
+    ///
+    /// That destination permit authorizes one synchronous `write`
+    /// of at most that many bytes. The write runs before the next await. The
+    /// engine retires a call by dropping this future, and an await between the
+    /// read and the write would discard the chunk. `flush` does not block.
+    /// `Closed` from flush, or from the flush-completion wait, is success, as
+    /// in Wasmtime's `blocking_write_and_flush`. Cancellation during that wait
+    /// returns the transferred count instead of parking on backpressure.
+    async fn blocking_splice_preserving_input(
+        state: &mut HostState,
+        dst_rep: u32,
+        src_rep: u32,
+        len: u64,
+    ) -> StreamResult<u64> {
+        use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
+
+        let transferred = |copied: usize| {
+            u64::try_from(copied)
+                .map_err(|_| RtStreamError::trap("transferred byte count does not fit in u64"))
+        };
+        let cancel = state.effective_cancel_token();
+        if cancel.is_cancelled() {
+            return Err(RtStreamError::Closed);
+        }
+        let semaphore = std::sync::Arc::clone(&state.io_semaphore);
+        let _permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(RtStreamError::Closed),
+            permit = semaphore.acquire() => {
+                permit.expect("host semaphore closed: capsule HostState was dropped")
+            }
+        };
+
+        let requested = usize::try_from(len).unwrap_or(usize::MAX);
+        let writable = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(RtStreamError::Closed),
+            ready = async {
+                let output = state
+                    .resource_table
+                    .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
+                    .map_err(RtStreamError::from)?;
+                output.write_ready().await
+            } => ready?,
+        };
+        let requested = requested.min(writable);
+        if requested == 0 {
+            return Ok(0);
+        }
+
+        let contents = tokio::select! {
+            biased;
+            read = async {
+                let input = state
+                    .resource_table
+                    .get_mut::<DynInputStream>(&Resource::new_borrow(src_rep))
+                    .map_err(RtStreamError::from)?;
+                input.blocking_read(requested).await
+            } => read?,
+            () = cancel.cancelled() => return Err(RtStreamError::Closed),
+        };
+        let copied = contents.len();
+        if copied == 0 {
+            return Ok(0);
+        }
+
+        // No await in this block. `writable` is the permit `write_ready`
+        // already returned, and `copied` is at most that permit.
+        {
+            let output = state
+                .resource_table
+                .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
+                .map_err(RtStreamError::from)?;
+            output.write(contents)?;
+            match output.flush() {
+                Ok(()) => {},
+                Err(RtStreamError::Closed) => return transferred(copied),
+                Err(error) => return Err(error),
+            }
+        }
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return transferred(copied),
+            ready = async {
+                let output = state
+                    .resource_table
+                    .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
+                    .map_err(RtStreamError::from)?;
+                output.write_ready().await
+            } => match ready {
+                Ok(_) | Err(RtStreamError::Closed) => {}
+                Err(error) => return Err(error),
+            },
+        }
+        transferred(copied)
+    }
+
     impl HostOutputStream for HostState {
         fn check_write(&mut self, self_: Resource<OutputStream>) -> StreamResult<u64> {
             cancel_guard(self)?;
@@ -472,7 +576,7 @@ mod astrid_streams_impl {
             result
         }
 
-        fn blocking_splice(
+        async fn blocking_splice(
             &mut self,
             self_: Resource<OutputStream>,
             src: Resource<InputStream>,
@@ -480,14 +584,7 @@ mod astrid_streams_impl {
         ) -> StreamResult<u64> {
             cancel_guard(self)?;
             let started = Instant::now();
-            let dst = Resource::new_borrow(self_.rep());
-            let src_borrow = Resource::new_borrow(src.rep());
-            let result = wasi_streams::HostOutputStream::blocking_splice(
-                &mut self.resource_table,
-                dst,
-                src_borrow,
-                len,
-            );
+            let result = blocking_splice_preserving_input(self, self_.rep(), src.rep(), len).await;
             let bytes = result.as_ref().copied().unwrap_or(0);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             audit_io(
@@ -508,3 +605,6 @@ mod astrid_streams_impl {
         }
     }
 }
+
+#[cfg(test)]
+mod blocking_splice_tests;
