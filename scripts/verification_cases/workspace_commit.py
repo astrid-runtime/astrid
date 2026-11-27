@@ -249,3 +249,15 @@ def defects():
             f"Unix append {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), failure,
         )
+
+    source = Path("crates/astrid-core/src/platform_fs/windows/projection_session/append/confirmation.rs")
+    for name, old, new, failure in [
+        ("compares the leaf to itself", "io.volume(root)", "io.volume(&file)", source),
+        ("skips the parent check", "io.directory(parent)", "io.directory(root_directory)", source),
+        ("recaptures with the leaf", "io.recapture(path,root)", "io.recapture(path,&file)", source),
+        ("may return another handle", "accepted == file && calls == root_ok.push", "calls == root_ok.push", trace),
+    ]:
+        yield (
+            f"Windows append {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), failure,
+        )

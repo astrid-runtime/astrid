@@ -1,6 +1,7 @@
 //! Compose the native UID lookup and log admission with the locked tracker transition.
 use std::collections::HashMap;
 use vstd::{prelude::*,std_specs::hash::hash_map_inv};
+use crate::windows_append_confirmation::{Call,Failure};
 use crate::principal_invocation_state::{PrincipalInvocation,acquire,binding};
 
 verus! {
@@ -84,6 +85,37 @@ fn append_handle<T,I,H,E,A:crate::private_append_leaf::LeafAccess<T,I,H,E>>(io:&
 {
     let out = crate::private_append_leaf::open(io,target);
     out
+}
+
+
+/// A returned Windows handle is the leaf whose volume matched the retained
+/// root. The parent and root-directory checks precede the final recapture.
+fn windows_handle<H,D,P,E,A:crate::windows_append_confirmation::Checks<H,D,P,E>>(
+    io:&mut A,file:H,root:&H,parent:&D,root_directory:&D,path:&P,
+) -> (out:Result<H,crate::windows_append_confirmation::Failure<E>>)
+    ensures ({
+        let prior = old(io).calls().len() as int;
+        let calls = final(io).calls();
+        match out {
+            Ok(h) => {
+                &&& h == file
+                &&& calls.len() == prior + 5
+                &&& (calls[prior] matches Call::Volume(leaf,Ok(v)) &&
+                    leaf == h && calls[prior+1] == Call::Volume(*root,Ok(v)))
+                &&& calls[prior+2] == Call::Directory(*parent,None)
+                &&& calls[prior+3] == Call::Directory(*root_directory,None)
+                &&& calls[prior+4] == Call::Recapture(*path,*root,None)
+            },
+            Err(Failure::CrossVolume) => {
+                &&& calls.len() == prior + 2
+                &&& (calls[prior] matches Call::Volume(leaf,Ok(v)) && leaf == file &&
+                    (calls[prior+1] matches Call::Volume(r,Ok(w)) && r == *root && v != w))
+            },
+            Err(Failure::Native(_)) => prior < calls.len() <= prior + 5,
+        }
+    }),
+{
+    crate::windows_append_confirmation::finish(io,file,root,parent,root_directory,path)
 }
 
 }

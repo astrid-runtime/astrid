@@ -1,5 +1,7 @@
 //! A shareable captured root: native raw-handle guards are operation-local.
 
+mod confirmation;
+
 use super::super::io::open_guarded_private_append;
 use super::super::path::{BoundaryContract, TrustedPathGuard, file_identity};
 use super::super::prelude::*;
@@ -31,17 +33,40 @@ impl AppendRoot {
         };
         let parent = descendant.as_ref().unwrap_or(&root);
         let file = open_guarded_private_append(parent, name)?;
-        if file_identity(&file)?.volume != file_identity(&self.file)?.volume {
-            return Err(io::Error::new(
+        confirmation::finish(
+            &mut NativeChecks,
+            file,
+            &self.file,
+            parent,
+            &root,
+            &self.absolute,
+        )
+        .map_err(|error| match error {
+            confirmation::Failure::Native(error) => error,
+            confirmation::Failure::CrossVolume => io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "append crosses a volume boundary",
-            ));
-        }
-        parent.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-        root.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-        // Repeat the absolute identity observation before returning authority.
-        TrustedPathGuard::capture_from_file(&self.absolute, &self.file)?
-            .verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-        Ok(file)
+            ),
+        })
+    }
+}
+
+struct NativeChecks;
+
+impl confirmation::Checks<File, TrustedPathGuard, PathBuf, io::Error> for NativeChecks {
+    fn volume(&mut self, handle: &File) -> io::Result<u32> {
+        Ok(file_identity(handle)?.volume)
+    }
+
+    fn directory(&mut self, guard: &TrustedPathGuard) -> Option<io::Error> {
+        guard
+            .verify_contract(BoundaryContract::ExactPrivateDirectory)
+            .err()
+    }
+
+    fn recapture(&mut self, path: &PathBuf, root: &File) -> Option<io::Error> {
+        TrustedPathGuard::capture_from_file(path, root)
+            .and_then(|guard| guard.verify_contract(BoundaryContract::ExactPrivateDirectory))
+            .err()
     }
 }

@@ -15,6 +15,8 @@ mod memo_admission;
 mod native_log_admission;
 #[path = "../crates/astrid-core/src/platform_fs/private_projection/unix/append/selection.rs"]
 mod private_append_leaf;
+#[path = "../crates/astrid-core/src/platform_fs/windows/projection_session/append/confirmation.rs"]
+mod windows_append_confirmation;
 mod hosted_native_log;
 mod hosted_batch_slots;
 mod hosted_chunk_tree_range;
