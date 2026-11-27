@@ -225,12 +225,12 @@ impl CapsuleRegistry {
         }
         let source_uuid =
             capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact());
-        for (principal, view) in &self.views {
-            if super::viewers::attached(view, &runtime_id) {
-                self.uuid_map
-                    .insert((source_uuid, principal.clone()), runtime_id.clone());
-            }
-        }
+        super::registration::publish_viewer_routes(
+            &self.views,
+            &mut self.uuid_map,
+            source_uuid,
+            &runtime_id,
+        );
         self.source_uuid_by_runtime
             .insert(runtime_id.clone(), source_uuid);
         self.uuid_id_map

@@ -334,6 +334,38 @@ fn round_trip_private_registration<C: ?Sized>(instances: &mut HashMap<Id,Entry<C
     (handle,previous.unwrap(),removed)
 }
 
+// The view snapshot is the one after retargeting. Broadcast source routes from
+// that state and resolve one viewer, while conserving an arbitrary non-viewer's route.
+fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
+    routes: &mut HashMap<(u64,u64),Id>, views: &HashMap<u64,HashMap<u64,Id>>, aliases: &HashMap<u64,[u8;32]>,
+    expected: Id, reserved: Id, replacement: Arc<C>, source:u64, viewer:u64, outsider:u64)
+    -> (out:Option<(Arc<C>,Arc<C>)>)
+    requires hash_map_inv(old(instances)), hash_map_inv(old(routes)), hash_map_inv(views), hash_map_inv(aliases),
+        obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
+        obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), obeys_concrete_eq::<[u8;32]>(),
+        forall|p:u64| views@.contains_key(p) ==> hash_map_inv(&views@[p]),
+        views@.contains_key(viewer) && views@[viewer]@.values().contains(reserved),
+        !(views@.contains_key(outsider) && views@[outsider]@.values().contains(reserved)),
+    ensures if old(instances)@.contains_key(expected) {
+        &&& out == Some((old(instances)@[expected].capsule,replacement))
+        &&& final(routes)@.contains_key((source,viewer)) && final(routes)@[(source,viewer)] == reserved
+        &&& final(routes)@.contains_key((source,outsider)) == old(routes)@.contains_key((source,outsider))
+        &&& final(routes)@.contains_key((source,outsider)) ==> final(routes)@[(source,outsider)] == old(routes)@[(source,outsider)]
+    } else { out.is_none() && final(routes)@ == old(routes)@ && final(instances)@ == old(instances)@ },
+{
+    proof { reveal(vstd::pervasive::obeys_clone_eq); }
+    let installed_key = reserved.clone();
+    assert(vstd::pervasive::cloned(reserved,installed_key));
+    assert(installed_key == reserved);
+    let old_handle = crate::instance_swap::replace(instances,&expected,installed_key,replacement,None)?;
+    crate::registration::publish_viewer_routes(views,routes,source,&reserved);
+    assert(routes@.contains_key((source,viewer)));
+    assert(routes@[(source,viewer)] == reserved);
+    assert(instances@.contains_key(reserved));
+    let new_handle = crate::source_lookup::capsule_for(routes,aliases,instances,views,(source,viewer)).unwrap();
+    Some((old_handle,new_handle))
+}
+
 // Bind a selected shared generation to one principal, including its exact
 // installed handle. A miss cannot publish a route to a principal-owned runtime.
 fn select_and_publish_shared<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,

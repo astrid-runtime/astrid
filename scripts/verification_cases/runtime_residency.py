@@ -90,6 +90,15 @@ def defects():
             lambda s, a=clause, b=weakened: replace_once(s, a, b),
             Path("verification/hosted_registry_lookup.rs"),
         )
+    for name, original, weakened in [
+        ("loses route membership", "forall|key:(U,P)| #[trigger] final(routes)@.contains_key(key) ==", "forall|key:(U,P)| #[trigger] final(routes)@.contains_key(key) ==>"),
+        ("loses route values", "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==", "forall|key:(U,P)| false && final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] =="),
+    ]:
+        yield (
+            f"replacement source {name}", Path("crates/astrid-capsule/src/registry/registration.rs"),
+            lambda s, a=original, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
     for name, original, weakened in [
         ("can keep a principal runtime", "if !(scope is SystemResident) { Departure::RemoveRuntime }",

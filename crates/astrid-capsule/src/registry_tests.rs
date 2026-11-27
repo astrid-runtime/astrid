@@ -299,6 +299,9 @@ fn system_generation_replacement_swaps_every_view() {
         )
         .expect("register an unrelated principal view");
     let previous = registry.get_for(&bob, &id).unwrap();
+    let private = registry.get_for(&carol, &id).unwrap();
+    let private_source = capsule_source_uuid(&id, &test_hash("private-artifact"));
+    let new_source = capsule_source_uuid(&id, &test_hash("system-new"));
 
     let replaced = registry
         .replace_system_runtime(
@@ -313,6 +316,21 @@ fn system_generation_replacement_swaps_every_view() {
     assert!(viewers.contains(&alice) && viewers.contains(&bob));
     assert!(registry.principals_viewing_runtime(&old).is_empty());
     let current = replaced.installed(&registry).unwrap();
+    for principal in [&alice, &bob] {
+        let routed = registry
+            .find_instance_by_uuid_for(principal, &new_source)
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &routed));
+    }
+    assert!(
+        registry
+            .find_instance_by_uuid_for(&carol, &new_source)
+            .is_none()
+    );
+    let private_route = registry
+        .find_instance_by_uuid_for(&carol, &private_source)
+        .unwrap();
+    assert!(Arc::ptr_eq(&private, &private_route));
     assert_eq!(
         registry.runtime_id_for(&alice, &id),
         Some(replaced.runtime_id.clone())
