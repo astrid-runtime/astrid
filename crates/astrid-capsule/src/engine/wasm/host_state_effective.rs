@@ -26,6 +26,14 @@ impl HostState {
         let Some(message) = self.caller_context.as_ref() else {
             return Ok(None);
         };
+        self.begin_message_device_operation(message)
+    }
+
+    /// Revalidate a queued message before using its device authority for an effect.
+    pub(crate) fn begin_message_device_operation(
+        &self,
+        message: &astrid_events::ipc::IpcMessage,
+    ) -> Result<Option<astrid_core::profile::device_sessions::DeviceSession>, ()> {
         let device = message.device_stamp();
         let Some(raw) = device.fingerprint else {
             return if device.registration.is_none() {

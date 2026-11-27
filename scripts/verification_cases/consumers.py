@@ -12,6 +12,8 @@ def consumer_defects():
     reply = Path("crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs")
     trace = Path("verification/hosted_consent_reply.rs")
     for name, original, changed, target in [
+        ("loses retirement rejection", "_ => held.is_none()", "_ => true", trace),
+        ("drops live device admission", "held matches Some(h) && h.guards() == (c,s)", "true", trace),
         ("grants unknown decisions", "else {Decision::Deny}\n}\n\n/// Hosted", "else {Decision::Once}\n}\n\n/// Hosted", reply),
         ("skips persistent publication", "save_at(p,a,destination,writer)?;", "let _ = destination;", reply),
         ("reports the wrong scope", "Ok(decision)\n}", "Ok(Decision::Always)\n}", reply),

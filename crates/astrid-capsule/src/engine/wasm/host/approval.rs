@@ -369,9 +369,9 @@ impl approval::Host for HostState {
         &mut self,
         mut request: ApprovalRequest,
     ) -> Result<ApprovalResponse, ErrorCode> {
-        if !self.invocation_authority_active() {
-            return Err(ErrorCode::StoreUnavailable);
-        }
+        let request_principal = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::StoreUnavailable)?;
         let allowance_store = self.allowance_store.clone();
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -404,6 +404,9 @@ impl approval::Host for HostState {
             &request.target_resource,
         );
 
+        let request_device = self
+            .begin_device_operation()
+            .map_err(|()| ErrorCode::StoreUnavailable)?;
         if check_persisted_allowance(self, &principal, &request.target_resource)? {
             audit.granted(HostApprovalScope::Always, "remembered_consent");
             return Ok(ApprovalResponse {
@@ -486,6 +489,8 @@ impl approval::Host for HostState {
             "Approval request details"
         );
 
+        // Retirement can finish while the operator is deciding.
+        drop((request_device, request_principal));
         // Block until response, timeout, or cancellation.
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
@@ -512,16 +517,25 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
-                            let outcome = consent_reply::apply(
-                                decision.as_bytes(),
-                                &principal,
-                                request.action.as_str(),
-                                destination,
-                                &mut grants,
+                            let _principal = self
+                                .begin_host_operation()
+                                .map_err(|()| ErrorCode::StoreUnavailable)?;
+                            let devices = consent_reply::admit(
+                                self.begin_device_operation(),
+                                self.begin_message_device_operation(message),
                             )
-                            .inspect_err(|_| {
-                                audit.denied("user", "approve_always could not be persisted");
-                            })?;
+                            .ok_or(ErrorCode::StoreUnavailable)?;
+                            let outcome = devices
+                                .apply(
+                                    decision.as_bytes(),
+                                    &principal,
+                                    request.action.as_str(),
+                                    destination,
+                                    &mut grants,
+                                )
+                                .inspect_err(|_| {
+                                    audit.denied("user", "approve_always could not be persisted");
+                                })?;
                             let typed = match outcome {
                                 Decision::Once => ApprovalDecision::Approved,
                                 Decision::Session => ApprovalDecision::ApprovedSession,
@@ -602,3 +616,7 @@ mod hosted_identity_tests;
 #[cfg(test)]
 #[path = "approval_audit_tests.rs"]
 mod audit_tests;
+
+#[cfg(test)]
+#[path = "approval_device_tests.rs"]
+mod device_tests;

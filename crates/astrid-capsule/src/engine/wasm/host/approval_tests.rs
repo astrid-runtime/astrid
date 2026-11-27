@@ -458,7 +458,7 @@ fn approve_once_does_not_create_allowance() {
     ));
 }
 
-fn approval_response_event(
+pub(super) fn approval_response_event(
     request_id: &str,
     principal: Option<&str>,
     request_owner: Option<astrid_events::ipc::RequestOwnerId>,
@@ -743,7 +743,7 @@ pub(super) fn install_request_owner(state: &mut HostState) -> astrid_events::ipc
     owner
 }
 
-async fn await_approval_request(
+pub(super) async fn await_approval_request(
     mut rx: astrid_events::EventReceiver,
 ) -> (String, Option<String>, astrid_events::ipc::RequestOwnerId) {
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())

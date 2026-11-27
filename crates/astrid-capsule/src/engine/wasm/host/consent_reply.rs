@@ -52,8 +52,26 @@ pub(super) fn save_at<P:Copy,A:Copy,W:Copy,R:Writer<P,A,W>>(p:P,a:A,d:Destinatio
     }
 }
 
+/// Only the admission function constructs this pair. The caller owns both guards.
+pub(super) struct ReplyAuthority<C,S> { _caller:C, _responder:S }
+
+/// Keep both live registrations in the calling frame through the reply effect.
+pub(super) fn admit<C,S>(caller:Result<C,()>, responder:Result<S,()>) -> (held:Option<ReplyAuthority<C,S>>)
+    ensures match (caller,responder) {
+        (Ok(c),Ok(s)) => held matches Some(h) && h.guards() == (c,s), _ => held.is_none(),
+    },
+{
+    match (caller,responder) {
+        (Ok(c),Ok(s)) => Some(ReplyAuthority { _caller:c, _responder:s }),
+        _ => None,
+    }
+}
+
+impl<C,S> ReplyAuthority<C,S> {
+pub(super) closed spec fn guards(&self) -> (C,S) { (self._caller,self._responder) }
+
 /// An unusable prompt destination affects only a request for persistence.
-pub(super) fn apply<P:Copy,A:Copy,W:Copy,R:Writer<P,A,W>>(bytes:&[u8],p:P,a:A,
+pub(super) fn apply<P:Copy,A:Copy,W:Copy,R:Writer<P,A,W>>(&self,bytes:&[u8],p:P,a:A,
     target:Result<Destination<W>,R::Error>,writer:&mut R) -> (out:Result<Decision,R::Error>)
     ensures
         final(writer).attempts() == match target {
@@ -75,6 +93,7 @@ pub(super) fn apply<P:Copy,A:Copy,W:Copy,R:Writer<P,A,W>>(bytes:&[u8],p:P,a:A,
         save_at(p,a,destination,writer)?;
     }
     Ok(decision)
+}
 }
 
 }

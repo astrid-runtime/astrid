@@ -6,7 +6,7 @@ verus! {
 
 /// Separate storage failures from an unexpected principal, action or scope.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Error { Binding, Destination, Storage(u8) }
+enum Error { Retired, Binding, Destination, Storage(u8) }
 
 struct Profile<'a> {
     principal:&'a [u8],action:&'a [u8],scope:Destination<&'a [u8]>,failure:Option<u8>,
@@ -51,23 +51,26 @@ impl<'a> Writer<&'a [u8],&'a [u8],&'a [u8]> for Profile<'a> {
 }
 
 fn answer<'a>(principal:&'a [u8],owner:u128,stamped:Option<&[u8]>,stamped_owner:Option<u128>,wire:&[u8],
+    caller:Result<Option<u128>,()>,responder:Result<Option<u128>,()>,
     action:&'a [u8],target:Result<Destination<&'a [u8]>,Error>,profile:&mut Profile<'a>)
     -> (out:Option<Result<Decision,Error>>)
     ensures ({
         let matched = stamped matches Some(p) && p@ == principal@ && stamped_owner == Some(owner);
         let decision = consent_reply::scope(wire@);
         &&& final(profile).calls@ == match target {
-            Ok(d) if matched && decision == Decision::Always => old(profile).calls@.push((principal,action,d)),
+            Ok(d) if matched && caller.is_ok() && responder.is_ok() && decision == Decision::Always => old(profile).calls@.push((principal,action,d)),
             _ => old(profile).calls@,
         }
-        &&& out == if !matched {None} else if decision != Decision::Always {Some(Ok(decision))}
+        &&& out == if !matched {None} else if caller.is_err() || responder.is_err() {Some(Err(Error::Retired))} else if decision != Decision::Always {Some(Ok(decision))}
             else {Some(match target {Err(e) => Err(e),Ok(d) => match old(profile).result(principal,action,d) {
                 Ok(()) => Ok(Decision::Always),Err(e) => Err(e)
             }})}
     }),
 {
     if !consent_identity::matches(principal,owner,stamped,stamped_owner) {return None;}
-    Some(consent_reply::apply(wire,principal,action,target,profile))
+    let Some(held) = consent_reply::admit(caller,responder) else {return Some(Err(Error::Retired));};
+    assert(held.guards() == (caller.unwrap(),responder.unwrap()));
+    Some(held.apply(wire,principal,action,target,profile))
 }
 
 }
