@@ -228,6 +228,9 @@ mod consent_identity;
 mod consent_reply;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs"]
 mod egress_reply;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/http/hop.rs"]
+mod http_hop;
+mod hosted_http_hop;
 mod hosted_egress_reply;
 mod hosted_consent_reply;
 mod hosted_device_profile;

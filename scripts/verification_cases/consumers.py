@@ -9,12 +9,26 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    hop = Path("crates/astrid-capsule/src/engine/wasm/host/http/hop.rs")
+    hop_trace = Path("verification/hosted_http_hop.rs")
+    for name, original, changed in [
+        ("loses the admitted operation", "hop.target() == (method,url)", "hop.target().1 == url"),
+        ("loses the admitted URL", "hop.target() == (method,url)", "hop.target().0 == method"),
+        ("loses the rejection", "Err(e) => check.ensures((method,url),Err(e))", "Err(e) => true"),
+        ("loses the request handoff", "ensures build.ensures(self.target(),r)", "ensures true"),
+    ]:
+        yield (
+            f"HTTP hop {name}", hop,
+            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
+        )
     egress = Path("crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs")
     egress_trace = Path("verification/hosted_egress_reply.rs")
     for name, original, changed, target in [
         ("writes on denial", "_ => {},", "_ => writer.install(Store::Session, target)?,", egress),
         ("loses a profile failure", "Decision::Always if has_profile => writer.install(Store::Profile, target)?,",
          "Decision::Always if has_profile => { let _ = writer.install(Store::Profile, target); },", egress),
+        ("routes a cache-free persistent grant to disk", "Decision::Always => writer.install(Store::Session, target)?,",
+         "Decision::Always => writer.install(Store::Profile, target)?,", egress),
         ("routes a session grant to disk", "Decision::Session => writer.install(Store::Session, target)?,",
          "Decision::Session => writer.install(Store::Profile, target)?,", egress),
         ("loses the unchanged history for one shot", "None => final(writer).attempts() == old(writer).attempts() && out == Ok(decision)",

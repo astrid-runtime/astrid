@@ -27,6 +27,7 @@
 mod audit;
 mod backend;
 mod credentials;
+mod hop;
 mod options;
 // The SSRF host airlock. Private: every consumer is an `http` descendant that
 // reaches it via `super::ssrf`. (The redirect-default const it once exposed to

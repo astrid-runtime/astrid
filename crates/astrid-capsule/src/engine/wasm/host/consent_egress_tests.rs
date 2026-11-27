@@ -820,6 +820,7 @@ fn durable_egress_writes_only_the_selected_profile_endpoint() {
             has_persisted_grant(&a, "chat", "127.0.0.1", 1234),
             !invalidate
         );
+        assert!(!has_persisted_grant(&a, "chat", "127.0.0.2", 1234));
         assert!(!has_persisted_grant(&a, "chat", "127.0.0.1", 1235));
         assert!(!has_persisted_grant(&a, "other", "127.0.0.1", 1234));
         assert!(!has_persisted_grant(&b, "chat", "127.0.0.1", 1234));

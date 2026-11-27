@@ -65,27 +65,24 @@ pub(super) fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, ErrorCode
     Ok(headers)
 }
 
+pub(super) fn parse_request_url(input: &str) -> Result<reqwest::Url, ErrorCode> {
+    reqwest::Url::parse(input).map_err(|_| ErrorCode::InvalidRequest)
+}
+
 async fn check_http_security(
-    security: &Option<Arc<dyn crate::security::CapsuleSecurityGate>>,
-    capsule_id: String,
-    url: &str,
-    method: &str,
-    io_semaphore: &Arc<tokio::sync::Semaphore>,
+    security: Option<&dyn crate::security::CapsuleSecurityGate>,
+    capsule_id: &str,
+    url: &reqwest::Url,
+    method: &reqwest::Method,
+    io_semaphore: &tokio::sync::Semaphore,
 ) -> Result<(), ErrorCode> {
     if let Some(gate) = security {
-        let url_obj = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
-        let _ = url_obj.host_str().ok_or(ErrorCode::InvalidRequest)?;
-
-        let full_url = url.to_string();
-        let m = method.to_string();
-        let gate = gate.clone();
-        let check = util::bounded_await(io_semaphore, async move {
-            gate.check_http_request(&capsule_id, &m, &full_url).await
-        })
-        .await;
-        if check.is_err() {
-            return Err(ErrorCode::CapabilityDenied);
-        }
+        util::bounded_await(
+            io_semaphore,
+            gate.check_http_request(capsule_id, method.as_str(), url.as_str()),
+        )
+        .await
+        .map_err(|_| ErrorCode::CapabilityDenied)?;
     }
     Ok(())
 }
@@ -229,33 +226,31 @@ impl HostState {
     /// returned [`WireResponse`] carries the open exchange.
     async fn send_one_hop(
         &mut self,
-        url: &str,
+        parsed: &reqwest::Url,
         method: &reqwest::Method,
         headers: &HeaderMap,
         body: Option<&[u8]>,
         opts: &ResolvedOptions,
         redirect_hop: u32,
     ) -> Result<WireResponse, ErrorCode> {
-        if let Err(error) = check_scheme(url, opts.https_only) {
+        if let Err(error) = check_scheme(parsed, opts.https_only) {
             // A refused scheme is a refused request: record it like the other
             // refusals whenever the URL parses at all.
-            if let Ok(parsed) = reqwest::Url::parse(url)
-                && let Some(precommit) =
-                    self.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
+            if let Some(precommit) =
+                self.http_precommit(parsed, method, headers, body, redirect_hop, &[])
             {
                 precommit.deny("scheme denied");
             }
             return Err(error);
         }
 
-        let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
         let host = parsed.host_str().ok_or(ErrorCode::InvalidRequest)?;
         let port = parsed
             .port_or_known_default()
             .ok_or(ErrorCode::InvalidRequest)?;
         let deny = |state: &Self, reason: &str| {
             if let Some(precommit) =
-                state.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
+                state.http_precommit(parsed, method, headers, body, redirect_hop, &[])
             {
                 precommit.deny(reason);
             }
@@ -265,18 +260,24 @@ impl HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let security = self.security.clone();
         let io_semaphore = self.io_semaphore.clone();
-        if let Err(error) =
-            check_http_security(&security, capsule_id, url, method.as_str(), &io_semaphore).await
+        if let Err(error) = check_http_security(
+            self.security.as_deref(),
+            self.capsule_id.as_str(),
+            parsed,
+            method,
+            &io_semaphore,
+        )
+        .await
         {
             deny(self, "security gate denied");
             return Err(error);
         }
 
-        let exempt_host = match self.egress_decision_with_consent(url) {
-            Ok(exempt_host) => exempt_host,
+        let (hop, exempt_host) = match super::hop::admit(method, parsed, |_, target| {
+            self.egress_decision_with_consent(target)
+        }) {
+            Ok(admission) => admission,
             Err(error) => {
                 deny(self, &error_text(&error));
                 return Err(error);
@@ -311,8 +312,8 @@ impl HostState {
             reqwest::redirect::Policy::none(),
         )?;
 
-        let mut request_builder = client
-            .request(method.clone(), url)
+        let mut request_builder = hop
+            .request(|method, target| client.request(method.clone(), target.clone()))
             .headers(injected.headers);
         if let Some(b) = body {
             request_builder = request_builder.body(b.to_vec());
@@ -320,14 +321,8 @@ impl HostState {
 
         // Pre-commit: the request entry is durable before anything leaves
         // the host (DNS resolution included).
-        let precommit = self.http_precommit(
-            &parsed,
-            method,
-            headers,
-            body,
-            redirect_hop,
-            &injected.names,
-        );
+        let precommit =
+            self.http_precommit(parsed, method, headers, body, redirect_hop, &injected.names);
         let mut exchange = match precommit {
             Some(precommit) => precommit.commit().await,
             None => HttpExchange::default(),
@@ -399,8 +394,7 @@ impl HostState {
     ) -> Result<(WireResponse, u32, reqwest::Url), ErrorCode> {
         let mut method = map_method(&request.method)?;
         let mut headers = build_headers(&request.headers)?;
-        let mut current_url =
-            reqwest::Url::parse(&request.url).map_err(|_| ErrorCode::InvalidRequest)?;
+        let mut current_url = parse_request_url(&request.url)?;
         // The body is forwarded across redirect hops that preserve the method
         // (307/308). On 301/302/303 the method is downgraded to GET and the
         // body dropped — the RFC 7231 behaviour reqwest's default policy
@@ -411,7 +405,7 @@ impl HostState {
         loop {
             let mut wire = self
                 .send_one_hop(
-                    current_url.as_str(),
+                    &current_url,
                     &method,
                     &headers,
                     body.as_deref(),
