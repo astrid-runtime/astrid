@@ -934,16 +934,6 @@ where
         );
     }
 
-    /// Return the current principal root without decoding its catalog.
-    ///
-    /// Filesystem directory confirmation is valid only for this generation.
-    pub(crate) fn projection_root(
-        &self,
-        principal: &P,
-    ) -> Result<Option<RootState>, PrincipalContentError> {
-        self.engine.current_root(principal).map_err(Into::into)
-    }
-
     fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
         self.header_at_epoch(principal, self.validated_kv.memo_epoch())
     }

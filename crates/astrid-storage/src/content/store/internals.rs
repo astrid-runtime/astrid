@@ -16,6 +16,16 @@ where
     P: Clone + Ord + Send + Sync,
     E: PrincipalProjectionEngine<P>,
 {
+    /// Return the current principal root without decoding its catalog.
+    ///
+    /// Filesystem directory confirmation is valid only for this generation.
+    pub(crate) fn projection_root(
+        &self,
+        principal: &P,
+    ) -> Result<Option<RootState>, PrincipalContentError> {
+        self.engine.current_root(principal).map_err(Into::into)
+    }
+
     pub(super) fn finish_catalog_commit(
         &self,
         principal: &P,
