@@ -65,6 +65,7 @@ INPUTS = [
     Path("verification/hosted_file_descriptor.rs"),
     Path("crates/astrid-storage/src/content/catalog/summary.rs"),
     Path("verification/hosted_catalog_charge.rs"),
+    Path("crates/astrid-storage/src/content/store/quota_transition.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/io/dispatch.rs"),
     Path("verification/hosted_io_splice.rs"),

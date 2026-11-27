@@ -250,18 +250,20 @@ where
         else {
             return Ok(());
         };
-        let used = header
-            .other_quota_bytes
-            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let previous = header
-            .other_quota_bytes
-            .checked_add(header.previous_catalog_quota_bytes)
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        if used > limit && used > previous {
-            return Err(PrincipalContentError::QuotaExceeded { used, limit });
-        }
-        Ok(())
+        super::quota_transition::replace(
+            header.other_quota_bytes,
+            header.previous_catalog_quota_bytes,
+            header.catalog.map_or(0, |root| root.summary.quota_bytes),
+            limit,
+        )
+        .map_err(|error| match error {
+            super::quota_transition::Refusal::AccountingOverflow => {
+                PrincipalContentError::AccountingOverflow
+            },
+            super::quota_transition::Refusal::Exceeded { used, limit } => {
+                PrincipalContentError::QuotaExceeded { used, limit }
+            },
+        })
     }
 
     pub(super) fn check_batch_preconditions(

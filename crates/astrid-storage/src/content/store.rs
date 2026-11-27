@@ -957,6 +957,7 @@ mod internals;
 mod native;
 mod pending_catalog;
 mod projection;
+mod quota_transition;
 mod read_handle;
 mod workspace;
 

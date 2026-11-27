@@ -139,3 +139,16 @@ def defects():
             f"catalog accounting {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-storage/src/content/store/quota_transition.rs")
+    for name, old, new in [
+        ("owner may substitute a refusal", "out == decision(other + previous, other + next, limit)", "out.is_ok() == decision(other + previous, other + next, limit).is_ok()"),
+        ("branch may admit an impossible prior charge", "out == if previous > components { Err(Refusal::AccountingOverflow) }", "out == if previous > components { out }"),
+        ("over-limit growth may succeed", "else if after > limit && after > before", "else if false"),
+        ("over-limit reductions may be refused", "else if after > limit && after > before", "else if after > limit"),
+        ("refusal may report a different total", "used:after as u64, limit", "used:0, limit"),
+    ]:
+        yield (
+            f"catalog quota {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

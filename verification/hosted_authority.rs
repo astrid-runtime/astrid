@@ -17,6 +17,8 @@ mod hosted_file_descriptor;
 #[path = "../crates/astrid-storage/src/content/catalog/summary.rs"]
 mod catalog_summary;
 mod hosted_catalog_charge;
+#[path = "../crates/astrid-storage/src/content/store/quota_transition.rs"]
+mod quota_transition;
 #[path = "../crates/astrid-storage/src/content/store/workspace/reference_transition.rs"]
 mod workspace_references;
 #[path = "../crates/astrid-storage/src/content/store/workspace/retry.rs"]

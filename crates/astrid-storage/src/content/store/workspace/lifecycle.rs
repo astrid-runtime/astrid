@@ -5,6 +5,7 @@ use astrid_core::PrincipalUid;
 use crate::content::catalog::{delete, insert, list, root_from_record};
 use crate::content_dag::BuiltContent;
 
+use super::super::quota_transition;
 use super::retry::Step;
 use super::{
     BranchState, CatalogRoot, CatalogValue, ContentHeader, ContentName, MAX_WORKSPACE_BRANCHES,
@@ -380,26 +381,21 @@ where
         else {
             return Ok(());
         };
-        let old_used = header
-            .other_quota_bytes
-            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let new_other = header
-            .other_quota_bytes
-            .checked_sub(old_branch_quota)
-            .ok_or(PrincipalContentError::AccountingOverflow)?
-            .checked_add(new_branch_quota)
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let new_used = new_other
-            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        if new_used > limit && new_used > old_used {
-            return Err(WorkspaceBranchError::QuotaExceeded {
-                used: new_used,
-                limit,
-            });
-        }
-        Ok(())
+        quota_transition::replace_branch(
+            header.catalog.map_or(0, |root| root.summary.quota_bytes),
+            header.other_quota_bytes,
+            old_branch_quota,
+            new_branch_quota,
+            limit,
+        )
+        .map_err(|error| match error {
+            quota_transition::Refusal::AccountingOverflow => {
+                PrincipalContentError::AccountingOverflow.into()
+            },
+            quota_transition::Refusal::Exceeded { used, limit } => {
+                WorkspaceBranchError::QuotaExceeded { used, limit }
+            },
+        })
     }
 
     pub(super) fn mutate_catalog<F>(

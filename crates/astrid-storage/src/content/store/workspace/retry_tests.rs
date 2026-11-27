@@ -105,3 +105,47 @@ fn branch_replacement_preserves_same_key_in_peer_after_retry_and_reopen() {
     );
     assert_eq!(content.read(&owner, &key).unwrap(), None);
 }
+
+#[test]
+fn quota_is_rechecked_after_a_sibling_branch_wins_the_root_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, _, owner, selected) = fixture_with_engine(open(directory.path()));
+    let content = Arc::new(PrincipalContentStore::from_engine_with_quota(
+        Arc::clone(&engine),
+        Arc::new(move |principal: &StateOwner| {
+            assert_eq!(*principal, owner);
+            Ok(Some(11))
+        }),
+    ));
+    let branches = content.workspace_branches();
+    let sibling = WorkspaceUid::from_bytes([92; 16]);
+    branches.begin_with_uid(&owner, sibling).unwrap();
+    let key = ContentName::new("é").unwrap();
+    let concurrent = branches.clone();
+    let sibling_key = key.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        concurrent
+            .write(&owner, sibling, &sibling_key, b"peer")
+            .unwrap();
+    }));
+
+    assert!(matches!(
+        branches.write(&owner, selected, &key, b"data"),
+        Err(super::WorkspaceBranchError::QuotaExceeded {
+            used: 12,
+            limit: 11
+        })
+    ));
+    drop(branches);
+    drop(content);
+    drop(engine);
+    let reopened = Arc::new(PrincipalContentStore::from_engine(Arc::new(open(
+        directory.path(),
+    ))));
+    let branches = reopened.workspace_branches();
+    assert_eq!(branches.read(&owner, selected, &key).unwrap(), None);
+    assert_eq!(
+        branches.read(&owner, sibling, &key).unwrap().as_deref(),
+        Some(b"peer".as_slice())
+    );
+}
