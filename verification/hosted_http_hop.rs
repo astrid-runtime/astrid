@@ -15,4 +15,19 @@ fn matching(method:u8,url:u64, permitted_method:u8,permitted_url:u64, denial:u8)
     Ok(hop.request(request))
 }
 
+fn buffered_receipt(body: Vec<u8>, device_live: bool, invocation_live: bool,
+    transport: Result<(),u8>, closed:u8) -> (out:Result<Vec<u8>,u8>)
+    ensures
+        !device_live || !invocation_live ==> out == Err(closed),
+        device_live && invocation_live ==> match transport {
+            Ok(()) => out matches Ok(bytes) && bytes@ == body@,
+            Err(e) => out == Err(e),
+        },
+{
+    let outcome = if !device_live { None }
+        else if !invocation_live { Some(None) }
+        else { Some(Some(transport)) };
+    crate::http_body::finish(body,outcome,closed)
+}
+
 }

@@ -151,6 +151,7 @@ pub(super) fn header_deadline(opts: &ResolvedOptions, floor: Duration) -> Durati
 /// exemption is host-only and a `30x` to a different port/host would escape
 /// the port-scoped allowlist.
 struct WireResponse {
+    authority: super::super::consent_egress::EgressAuthority,
     response: reqwest::Response,
     /// Best-effort bytes-on-wire before decompression (content-length header).
     content_length: Option<u64>,
@@ -348,7 +349,6 @@ impl HostState {
             .await
             .flatten()
             .unwrap_or(Err(ErrorCode::Closed));
-        drop(authority);
         let response = match sent {
             Ok(response) => response,
             Err(error) => {
@@ -362,6 +362,7 @@ impl HostState {
 
         let content_length = response.content_length();
         Ok(WireResponse {
+            authority,
             response,
             content_length,
             exempt,
@@ -501,6 +502,7 @@ impl HostState {
         redirect_count: u32,
     ) -> Result<HttpResponseData, ErrorCode> {
         let WireResponse {
+            authority,
             response,
             content_length,
             exempt: _,
@@ -532,38 +534,42 @@ impl HostState {
         };
         // The loop hands back the bytes read so far even on failure, so the
         // completion commits to exactly what the host received.
-        let (body, read_error) = util::bounded_await(&io_semaphore, async move {
+        let cancel = self.effective_cancel_token();
+        let mut body = Vec::new();
+        let read = util::bounded_await_cancellable(&io_semaphore, &cancel, async {
             let mut response = response;
-            let mut bytes = Vec::new();
             loop {
                 let chunk = match response.chunk().await {
                     Ok(Some(chunk)) => chunk,
-                    Ok(None) => return (bytes, None),
-                    Err(e) => return (bytes, Some(map_reqwest_err(&e))),
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(map_reqwest_err(&e)),
                 };
                 // `chunk()` yields decoded bytes when auto-decompress is on.
                 // Enforce the decompressed ceiling first (bomb defence), then
                 // the response cap. Both are hard limits.
                 if let Some(cap) = max_decompressed
-                    && bytes.len() as u64 + chunk.len() as u64 > cap
+                    && body.len() as u64 + chunk.len() as u64 > cap
                 {
-                    return (bytes, Some(ErrorCode::DecompressionBomb));
+                    return Err(ErrorCode::DecompressionBomb);
                 }
-                if bytes.len() as u64 + chunk.len() as u64 > max_response {
-                    return (bytes, Some(ErrorCode::BodyTooLarge));
+                if body.len() as u64 + chunk.len() as u64 > max_response {
+                    return Err(ErrorCode::BodyTooLarge);
                 }
-                bytes.extend_from_slice(&chunk);
+                body.extend_from_slice(&chunk);
             }
-        })
-        .await;
+        });
+        let read_result = authority.while_live(read).await;
         exchange.begin_body();
         exchange.digest(&body);
-        if let Some(error) = read_error {
-            exchange
-                .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
-                .await;
-            return Err(error);
-        }
+        let body = match super::body::finish(body, read_result, ErrorCode::Closed) {
+            Ok(body) => body,
+            Err(error) => {
+                exchange
+                    .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                    .await;
+                return Err(error);
+            },
+        };
 
         if let Some(integrity) = &opts.integrity
             && let Err(error) = verify_integrity(integrity, &body)

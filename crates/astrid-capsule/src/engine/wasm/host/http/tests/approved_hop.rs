@@ -161,8 +161,7 @@ async fn operator_approved_endpoint_receives_the_selected_hop() {
     }
 }
 
-/// Hold the peer's response headers until retirement finishes. A guard that
-/// drops at consent time or merely waits for the send deadline fails this test.
+/// Retire each device during dispatch, body I/O admission, and a partial body read.
 #[tokio::test(flavor = "multi_thread")]
 async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
     use crate::profile_cache::PrincipalProfileCache;
@@ -170,7 +169,17 @@ async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
     use astrid_core::{PrincipalId, PrincipalProfile, dirs::AstridHome};
     use std::time::Duration;
 
-    for retire_responder in [false, true] {
+    #[derive(Clone, Copy)]
+    enum Wait {
+        Headers,
+        BodyPermit,
+        BodyChunk,
+    }
+    use Wait::{BodyChunk, BodyPermit, Headers};
+    for (retire_responder, wait) in [false, true]
+        .into_iter()
+        .flat_map(|responder| [Headers, BodyPermit, BodyChunk].map(|wait| (responder, wait)))
+    {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
         let principal = PrincipalId::new("alice").unwrap();
@@ -212,6 +221,8 @@ async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
             "approve",
             Some(responder),
         );
+        state.io_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let io = state.io_semaphore.clone();
         let sessions = state.device_sessions.clone();
         let task = tokio::spawn(async move {
             let opts = super::super::options::ResolvedOptions::from_options(
@@ -230,11 +241,39 @@ async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
                 "GET /waiting HTTP/1.1"
             );
             assert_eq!(operator.await.unwrap(), address.to_string());
+            // Queue for the only I/O permit while send() is waiting for headers.
+            // Receiving the permit proves the client has left its header wait.
+            let mut body_barrier = None;
+            if !matches!(wait, Headers) {
+                let permit = io.acquire();
+                tokio::pin!(permit);
+                tokio::select! {
+                    biased;
+                    _ = &mut permit => panic!("send released its permit before response headers"),
+                    () = std::future::ready(()) => {},
+                }
+                lines
+                    .get_mut()
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\na")
+                    .await
+                    .unwrap();
+                body_barrier = Some(permit.await.unwrap());
+                if matches!(wait, BodyChunk) {
+                    drop(body_barrier.take());
+                    // The HTTP task is the only other permit user. It now
+                    // owns a body read that cannot finish with this prefix.
+                    while io.available_permits() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
             sessions.retire(&principal, &key).await.unwrap();
             assert!(matches!(
                 task.await.unwrap(),
                 Err(super::super::ErrorCode::Closed)
             ));
+            drop(body_barrier);
             drop(lines);
         })
         .await

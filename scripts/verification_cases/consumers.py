@@ -21,6 +21,16 @@ def consumer_defects():
             f"HTTP hop {name}", hop,
             lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
         )
+    body = Path("crates/astrid-capsule/src/engine/wasm/host/http/body.rs")
+    for name, original, changed in [
+        ("loses cancellation refusal", "_ => result == Err(closed)", "_ => true"),
+        ("loses received bytes", "&& bytes@ == body@", ""),
+        ("loses transport failure", "result == Err(error)", "true"),
+    ]:
+        yield (
+            f"buffered HTTP response {name}", body,
+            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
+        )
     egress = Path("crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs")
     egress_trace = Path("verification/hosted_egress_reply.rs")
     for name, original, changed, target in [
