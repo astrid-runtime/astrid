@@ -69,6 +69,9 @@ mod catalog_load_tests;
 mod compiled;
 mod construction;
 mod content_source;
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "identity_registry_tests.rs"]
+mod identity_registry_tests;
 use compiled::CompiledWasmArtifact;
 pub use compiled::{COMPILED_ENGINE_ABI, CompiledWasmCache};
 #[cfg(test)]

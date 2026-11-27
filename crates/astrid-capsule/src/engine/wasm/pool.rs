@@ -304,6 +304,17 @@ impl CapsuleInstancePool {
             _permit: permit,
         })
     }
+
+    /// Invoke the production Store factory twice.
+    ///
+    /// The load path captures that factory. Calling it here is what fails if
+    /// two Stores are handed one shared identity registry.
+    #[cfg(test)]
+    pub(super) fn two_factory_states(&self) -> (HostState, HostState) {
+        let first = (self.builder.make_state)();
+        let second = (self.builder.make_state)();
+        (first, second)
+    }
 }
 
 impl Drop for CapsuleInstancePool {
