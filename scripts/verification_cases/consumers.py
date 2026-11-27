@@ -14,6 +14,18 @@ def consumer_defects():
     yield from persistent_process.defects()
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
+    tracker = Path("crates/astrid-capsule/src/engine/wasm/principal_tracker/state.rs")
+    for name, original, changed in [
+        ("loses guard owner", "guard == if allowed { Some(*principal) } else { None }", "guard.is_some() == allowed"),
+        ("may erase another retirement", "final(entries)@.remove(key) == old(entries)@.remove(key),", "true,"),
+        ("loses the drain observation", "n == binding(entries@,*key).1", "true"),
+        ("may reopen the owner on finish", "binding(final(entries)@,*key) == after", "binding(final(entries)@,*key).1 == after.1"),
+    ]:
+        yield (
+            f"principal tracker {name}", tracker,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            Path("verification/hosted_authority_model.rs"),
+        )
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [

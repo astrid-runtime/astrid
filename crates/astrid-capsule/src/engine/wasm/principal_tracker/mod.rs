@@ -32,26 +32,19 @@ impl PrincipalInvocationTracker {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state
-            .entry(principal.clone())
-            .or_insert_with(PrincipalInvocation::new)
-            .begin()
-        {
-            return None;
-        }
+        let principal = state::acquire(&mut state, principal)?;
         Some(PrincipalInvocationGuard {
             tracker: Arc::clone(self),
-            principal: principal.clone(),
+            principal,
         })
     }
 
     pub(super) fn retire(&self, principal: &astrid_core::PrincipalId) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(principal.clone())
-            .or_insert_with(PrincipalInvocation::new)
-            .retire();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state::retire_locked(&mut state, principal.clone());
     }
 
     pub(super) fn resume(&self, principal: &astrid_core::PrincipalId) {
@@ -59,20 +52,15 @@ impl PrincipalInvocationTracker {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = state.get_mut(principal) {
-            entry.resume();
-            if entry.discardable() {
-                state.remove(principal);
-            }
-        }
+        state::drain_locked(&mut state, principal, state::DrainAction::Resume);
     }
 
     pub(super) fn active(&self, principal: &astrid_core::PrincipalId) -> usize {
-        self.state
+        let state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(principal)
-            .map_or(0, PrincipalInvocation::active)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state::active_locked(&state, principal)
     }
 
     pub(super) async fn wait_for_quiescence(&self, principal: &astrid_core::PrincipalId) {
@@ -137,12 +125,7 @@ impl Drop for PrincipalInvocationGuard {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = state.get_mut(&self.principal) {
-            entry.finish();
-            if entry.discardable() {
-                state.remove(&self.principal);
-            }
-        }
+        state::drain_locked(&mut state, &self.principal, state::DrainAction::Finish);
         drop(state);
         self.tracker.changed.notify_waiters();
     }

@@ -568,6 +568,60 @@ fn apply_operation(state: &mut PrincipalInvocation, event: OperationEvent) -> (a
     }
 }
 
+/// Refine a locked update on the real table to the one-principal model.
+/// An arbitrary other principal keeps its entry, including a closed idle fence.
+fn apply_tracker_event<K: Eq + std::hash::Hash + Clone>(
+    entries: &mut std::collections::HashMap<K, PrincipalInvocation>, key: K, other: K, event: OperationEvent,
+) -> (admitted: bool)
+    requires key != other, vstd::std_specs::hash::hash_map_inv(old(entries)),
+        vstd::std_specs::hash::obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+        vstd::pervasive::obeys_clone_eq::<K>(),
+    ensures ({
+        let (retired,active) = crate::principal_invocation_state::binding(old(entries)@,key);
+        let before = OperationState { retired,active };
+        let full = event is Begin && active == usize::MAX;
+        let expected = if full { before } else { operation_step(before,event) };
+        &&& admitted == (event is Begin && !retired && !full)
+        &&& crate::principal_invocation_state::binding(final(entries)@,key) == (expected.retired,expected.active)
+        &&& final(entries)@.get(other) == old(entries)@.get(other)
+    }),
+{
+    use crate::principal_invocation_state::{acquire,retire_locked,drain_locked,DrainAction};
+    let admitted = match event {
+        OperationEvent::Begin => acquire(entries,&key).is_some(),
+        OperationEvent::Retire => { retire_locked(entries,key); false },
+        OperationEvent::Finish => { drain_locked(entries,&key,DrainAction::Finish); false },
+        OperationEvent::Resume => { drain_locked(entries,&key,DrainAction::Resume); false },
+    };
+    assert(entries@.remove(key).get(other) == entries@.get(other));
+    assert(old(entries)@.remove(key).get(other) == old(entries)@.get(other));
+    admitted
+}
+
+/// The guard actually returned by admission drains the caller after retirement.
+/// The last drop leaves a closed zero-count entry; another caller is unaffected.
+fn drop_admitted_after_retirement<K: Eq + std::hash::Hash + Clone>(
+    entries: &mut std::collections::HashMap<K, PrincipalInvocation>, key: K, other: K,
+) -> (remaining: usize)
+    requires key != other, vstd::std_specs::hash::hash_map_inv(old(entries)),
+        vstd::std_specs::hash::obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+        vstd::pervasive::obeys_clone_eq::<K>(),
+        !crate::principal_invocation_state::binding(old(entries)@,key).0,
+        crate::principal_invocation_state::binding(old(entries)@,key).1 < usize::MAX,
+    ensures remaining == crate::principal_invocation_state::binding(old(entries)@,key).1,
+        final(entries)@.contains_key(key),
+        crate::principal_invocation_state::binding(final(entries)@,key).0,
+        final(entries)@.get(other) == old(entries)@.get(other),
+{
+    use crate::principal_invocation_state::{acquire,active_locked,retire_locked,drain_locked,DrainAction};
+    let owner = acquire(entries,&key).unwrap();
+    retire_locked(entries,key);
+    drain_locked(entries,&owner,DrainAction::Finish);
+    assert(entries@.remove(owner).get(other) == entries@.get(other));
+    assert(old(entries)@.remove(owner).get(other) == old(entries)@.get(other));
+    active_locked(entries,&owner)
+}
+
 // ---- One fuel window ----
 
 /// One transition of the fuel charged and promised to a principal under a

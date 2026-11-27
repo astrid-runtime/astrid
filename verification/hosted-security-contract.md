@@ -225,6 +225,10 @@ lemma establishes that joining two canonical nonempty byte names this way
 preserves canonicality. The root is the empty spelling. The byte-level lemma
 and string-level executable contract rely on Rust UTF-8 string semantics.
 
+### Principal retirement under the engine tracker lock
+
+Admission returns the principal key that the invocation guard stores alongside the owning tracker. A checked update of the production hash map refines each begin, finish, retire and resume to the one-principal transition, preserving every other key. A consumer acquires a guard, retires its owner, finishes using the returned key and samples the same count used by the quiescence waiter. The count returns to its original value, including zero, and the retired entry stays closed. This applies to arbitrary initial counts below saturation. At saturation, begin refuses without changing the count. The proof assumes the standard hash, equality and clone laws for the principal key. Mutex exclusion, guard lifetime, waiter notification and restoration of fences at startup still need a concurrent runtime refinement.
+
 ## Guest identity policy
 
 All five identity host methods call the security gate before using the
