@@ -200,7 +200,7 @@ async fn retiring_a_registered_device_drains_a_queued_transfer_without_consuming
 }
 
 #[tokio::test]
-async fn blocking_splice_withholds_its_count_if_the_owner_changes_during_io() {
+async fn blocking_splice_refuses_the_transfer_if_the_owner_changes_during_io() {
     use tokio::io::AsyncWriteExt;
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
     let principal = state.effective_principal();
@@ -239,5 +239,42 @@ async fn blocking_splice_withholds_its_count_if_the_owner_changes_during_io() {
         .await
         .unwrap();
     assert!(matches!(result, Err(StreamError::Closed)));
-    assert_eq!(sink.contents().as_ref(), b"sent");
+    assert!(sink.contents().is_empty());
+    let input = state.resource_table.get_mut(&src).unwrap();
+    let remaining = tokio::time::timeout(std::time::Duration::from_secs(5), input.blocking_read(4))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining.as_ref(), b"sent");
+}
+
+#[tokio::test]
+async fn cancelled_immediate_splice_leaves_both_operands_intact() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let mut input = MemoryInputPipe::new("keep");
+    let src = state
+        .resource_table
+        .push::<DynInputStream>(Box::new(input.clone()))
+        .unwrap();
+    let sink = MemoryOutputPipe::new(16);
+    let dst = state
+        .resource_table
+        .push::<DynOutputStream>(Box::new(sink.clone()))
+        .unwrap();
+    state.effective_cancel_token().cancel();
+    assert!(matches!(
+        state.splice(
+            Resource::new_borrow(dst.rep()),
+            Resource::new_borrow(src.rep()),
+            4
+        ),
+        Err(StreamError::Closed)
+    ));
+    assert!(sink.contents().is_empty());
+    assert_eq!(
+        wasmtime_wasi::p2::InputStream::read(&mut input, 4)
+            .unwrap()
+            .as_ref(),
+        b"keep"
+    );
 }

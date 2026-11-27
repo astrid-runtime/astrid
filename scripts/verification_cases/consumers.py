@@ -12,6 +12,9 @@ def consumer_defects():
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [
+        ("chunk loses effective limit", "limit as int == if", "limit as int <= if"),
+        ("chunk loses submitted bytes", "out matches Some(r) && write.ensures((bytes,), r)", "out.is_some()"),
+        ("chunk loses size refusal", "else { out.is_none() },", "else { true },"),
         ("loses source or destination", "operation.args() == self && check.ensures", "operation.args().mode == self.mode && check.ensures"),
         ("loses retained admission", "check.ensures((self,), Ok(operation.authority()))", "true"),
         ("loses the refusal", "Err(error) => check.ensures((self,), Err(error))", "Err(error) => true"),
@@ -32,8 +35,9 @@ def consumer_defects():
             lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
         )
     for name, original, changed in [
-        ("uses the observed UID as its own authority", "with_pair(guard.0,guard.1,forward", "with_pair(guard.0,forward.unwrap_or(guard.1),forward"),
-        ("sends source in place of destination", "(t,r.destination,r.source,r.length),", "(t,r.source,r.source,r.length),"),
+        ("dispatches after cancellation or retirement", "forward,reverse,cancelled,retired,t,r,()", "forward,reverse,false,false,t,r,()"),
+        ("uses the observed UID as its own authority", "stream_access(guard.0,guard.1,forward", "stream_access(guard.0,forward.unwrap_or(guard.1),forward"),
+        ("sends source in place of destination", "{ (table,target.destination,target.source,target.length) }", "{ (table,target.source,target.source,target.length) }"),
     ]:
         yield (
             f"rebound splice {name}", splice_trace,

@@ -3,6 +3,16 @@ use crate::io_splice::{Mode, Request};
 use vstd::prelude::*;
 
 verus! {
+fn transfer_chunk(length: u64, permit: usize, observed: usize, payload: u64) -> (out: Option<u64>)
+    ensures out == if 0 < observed && observed <= permit && observed as int <= length as int {
+        Some(payload)
+    } else { None },
+{
+    let limit = crate::io_splice::chunk_limit(length, permit);
+    crate::io_splice::write_chunk(limit, observed, payload,
+        |b: u64| -> (r: u64) ensures r == b, { b })
+}
+
 fn transfer(request: Request, dst: u32, src: u32, count: u64, owner: u64, table: u64, mode: Mode)
     -> (out: Result<(bool,u64,u64,u32,u32,u64),u8>)
     ensures out == if request.destination == dst && request.source == src && request.length == count {
@@ -32,10 +42,10 @@ fn bound_operands(alias: &[u8], uid: &[u8;32], forward: Option<&[u8;32]>, revers
 // the lookup performed at start, which may differ from those at admission.
 type Operands = (u64, u32, u32, u64);
 
-fn rebound_transfer<'a>(request: Request, mode: Mode, admitted: bool, table: u64,
+fn rebound_transfer<'a>(request: Request, mode: Mode, admitted: bool, cancelled: bool, retired: bool, table: u64,
     alias: &'a [u8], uid: &'a [u8;32], forward: Option<&[u8;32]>, reverse: Option<&[u8]>)
     -> (out: Option<Operands>)
-    ensures out == if admitted && request.mode == mode
+    ensures out == if admitted && !cancelled && !retired && request.mode == mode
         && (forward matches Some(f) && f@ == uid@) && (reverse matches Some(r) && r@ == alias@) {
         Some((table,request.destination,request.source,request.length))
     } else { None },
@@ -45,14 +55,15 @@ fn rebound_transfer<'a>(request: Request, mode: Mode, admitted: bool, table: u64
     { if admitted { Ok((alias,uid)) } else { Err(()) } }).ok()?;
     operation.start(mode,table,
         |guard:&(&'a [u8], &'a [u8;32]), t:u64, r:Request| -> (value:Option<Operands>)
-            ensures value == if (forward matches Some(f) && f@ == guard.1@)
+            ensures value == if !cancelled && !retired && (forward matches Some(f) && f@ == guard.1@)
                     && (reverse matches Some(a) && a@ == guard.0@) {
                 Some((t,r.destination,r.source,r.length))
             } else { None },
         {
-            crate::principal_binding::with_pair(guard.0,guard.1,forward,reverse,
-                (t,r.destination,r.source,r.length),
-                |args:Operands| -> (result:Operands) ensures result == args, { args }).ok()
+            stream_access(guard.0,guard.1,forward,reverse,cancelled,retired,t,r,(),
+                |table:u64, target:Request, _:()| -> (value:Operands)
+                    ensures value == (table,target.destination,target.source,target.length),
+                { (table,target.destination,target.source,target.length) })
         })?
 }
 

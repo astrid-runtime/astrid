@@ -73,7 +73,6 @@ pub(super) async fn blocking(
     src: Resource<InputStream>,
     len: u64,
 ) -> Result<u64, StreamError> {
-    use wasmtime_wasi::p2::bindings::io::streams::HostOutputStream;
     let operation = admit(state, Mode::Blocking, dst, src, len)?;
     let directory = &state.principal_directory;
     let semaphore = &state.io_semaphore;
@@ -92,16 +91,9 @@ pub(super) async fn blocking(
                         table,
                         request,
                         (),
-                        |table, target, ()| {
-                            HostOutputStream::blocking_splice(
-                                table,
-                                Resource::new_borrow(target.destination),
-                                Resource::new_borrow(target.source),
-                                target.length,
-                            )
-                        },
+                        |table, target, ()| copy_chunk(table, target),
                     )?;
-                    work.await
+                    guard.while_bound(directory, &cancel, work).await
                 });
                 let result = match &guard.device {
                     Some(device) => device.while_live(transfer).await.flatten(),
@@ -113,4 +105,40 @@ pub(super) async fn blocking(
         )
         .ok_or(StreamError::Closed)?;
     transfer.await
+}
+
+/// The first readiness permit covers the synchronous write after reading.
+async fn copy_chunk(
+    table: &mut wasmtime::component::ResourceTable,
+    target: Request,
+) -> Result<u64, StreamError> {
+    use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
+
+    let destination = Resource::<DynOutputStream>::new_borrow(target.destination);
+    let source = Resource::<DynInputStream>::new_borrow(target.source);
+    let writable = table.get_mut(&destination)?.write_ready().await?;
+    let requested = super::splice::chunk_limit(target.length, writable);
+    if requested == 0 {
+        return Ok(0);
+    }
+    let bytes = table.get_mut(&source)?.blocking_read(requested).await?;
+    let copied =
+        u64::try_from(bytes.len()).map_err(|_| StreamError::trap("splice count exceeds u64"))?;
+    if copied == 0 {
+        return Ok(0);
+    }
+    // Preserve the chunk when the outer call future is dropped. Do not
+    // suspend between consuming the source and using the destination permit.
+    let output = table.get_mut(&destination)?;
+    super::splice::write_chunk(requested, bytes.len(), bytes, |bytes| output.write(bytes))
+        .ok_or_else(|| StreamError::trap("input stream exceeded authorized splice size"))??;
+    match output.flush() {
+        Ok(()) => {},
+        Err(StreamError::Closed) => return Ok(copied),
+        Err(error) => return Err(error),
+    }
+    match output.write_ready().await {
+        Ok(_) | Err(StreamError::Closed) => Ok(copied),
+        Err(error) => Err(error),
+    }
 }

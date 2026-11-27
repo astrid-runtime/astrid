@@ -15,6 +15,23 @@ pub(super) struct Request {
 
 pub(super) struct Admitted<G> { request: Request, guard: G }
 
+/// Bound a native read by both the caller's length and the live write permit.
+pub(super) fn chunk_limit(length: u64, permit: usize) -> (limit: usize)
+    ensures limit as int == if (length as int) < (permit as int) { length as int } else { permit as int },
+{
+    if (length as u128) < (permit as u128) { length as usize } else { permit }
+}
+
+/// Only hand bytes to the writer when the backend honored the approved read size.
+pub(super) fn write_chunk<B, R, F: FnOnce(B) -> R>(limit: usize, observed: usize, bytes: B, write: F)
+    -> (out: Option<R>)
+    requires 0 < observed <= limit ==> write.requires((bytes,)),
+    ensures if 0 < observed <= limit { out matches Some(r) && write.ensures((bytes,), r) }
+        else { out.is_none() },
+{
+    if observed == 0 || observed > limit { None } else { Some(write(bytes)) }
+}
+
 impl Request {
     pub(super) fn admit<G,E,F: FnOnce(Request) -> Result<G,E>>(self, check: F)
         -> (out: Result<Admitted<G>, E>)

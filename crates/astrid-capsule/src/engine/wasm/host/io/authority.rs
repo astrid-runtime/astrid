@@ -67,6 +67,35 @@ impl Authority {
             .ok_or(StreamError::Closed)
     }
 
+    /// Hold the current binding while the backend takes one synchronous poll.
+    /// Returning Pending releases the directory lock before the executor waits.
+    pub(super) async fn while_bound<R>(
+        &self,
+        directory: &astrid_storage::PrincipalDirectory,
+        cancel: &tokio_util::sync::CancellationToken,
+        work: impl Future<Output = Result<R, StreamError>>,
+    ) -> Result<R, StreamError> {
+        use std::task::Poll;
+        let mut work = std::pin::pin!(work);
+        std::future::poll_fn(|cx| {
+            directory
+                .with_bound_input(&self.principal, self.owner, cx, |cx| {
+                    super::dispatch::dispatch(
+                        cancel.is_cancelled(),
+                        self.device.as_ref().is_some_and(DeviceSession::is_retired),
+                        work.as_mut(),
+                        (cx, (), |future: std::pin::Pin<&mut _>, cx, ()| {
+                            Future::poll(future, cx)
+                        }),
+                    )
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(Poll::Ready(Err(StreamError::Closed)))
+        })
+        .await
+    }
+
     pub(super) fn complete<R>(
         &self,
         directory: &astrid_storage::PrincipalDirectory,
@@ -126,7 +155,7 @@ where
         &cancel,
         async {
             let work = admission.start(directory, &cancel, table, stream, args, operation)?;
-            work.await
+            admission.while_bound(directory, &cancel, work).await
         },
     );
     let result = match &admission.device {
