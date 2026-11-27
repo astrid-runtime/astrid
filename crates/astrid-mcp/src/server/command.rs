@@ -44,3 +44,34 @@ impl ServerManager {
         )
     }
 }
+
+struct Child<'a> {
+    program: &'a std::path::Path,
+    args: &'a [String],
+}
+
+struct NativeAssembler;
+
+impl stdio_policy::Assembler<astrid_workspace::SandboxPrefix, Child<'_>, Command>
+    for NativeAssembler
+{
+    fn wrapped(&mut self, prefix: astrid_workspace::SandboxPrefix, child: &Child<'_>) -> Command {
+        let mut command = Command::from(prefix.into_command());
+        command.arg(child.program).args(child.args);
+        command
+    }
+
+    fn bare(&mut self, child: &Child<'_>) -> Command {
+        let mut command = Command::new(child.program);
+        command.args(child.args);
+        command
+    }
+}
+
+pub(super) fn assemble_child(
+    prefix: McpResult<Option<astrid_workspace::SandboxPrefix>>,
+    program: &std::path::Path,
+    args: &[String],
+) -> McpResult<Command> {
+    stdio_policy::assemble(&mut NativeAssembler, prefix, &Child { program, args })
+}

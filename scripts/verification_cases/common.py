@@ -48,6 +48,7 @@ PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_resu
 INPUTS = [
     Path("crates/astrid-mcp/src/server/peer_selection.rs"),
     Path("crates/astrid-mcp/src/server/tool_call.rs"),
+    Path("crates/astrid-workspace/src/sandbox/prefix_policy.rs"),
     Path("verification/hosted_mcp_peer.rs"),
     Path("crates/astrid-capsule/src/engine/mcp/network.rs"),
     Path("crates/astrid-mcp/src/server/stdio_policy.rs"),

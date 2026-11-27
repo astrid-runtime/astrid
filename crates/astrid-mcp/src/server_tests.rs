@@ -721,59 +721,45 @@ fn test_build_unsandboxed_command() {
 
 #[test]
 fn test_build_sandboxed_command_adds_sandbox_prefix() {
-    // Probe-gated: on Linux this needs a working bwrap to exercise the
-    // wrapper. CI runners often have bwrap installed but the kernel
-    // sysctl blocks user namespaces — sandbox_prefix() returns Err under
-    // the default Required policy. Skipping there preserves the test's
-    // intent (verify the wrapper is invoked when sandboxing is possible)
-    // without making CI dependent on host-kernel configuration.
+    let workspace = tempfile::tempdir().unwrap();
+    let manager = ServerManager::new(ServersConfig::default())
+        .with_workspace_root(workspace.path().to_owned())
+        .with_sandbox_policy(astrid_workspace::SandboxPolicy::Required);
+    let config = ServerConfig::stdio("test", "echo").with_args(["two words", "--literal", ""]);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
+
     #[cfg(target_os = "linux")]
-    if !linux_sandbox_actually_available() {
-        eprintln!("skipping: bwrap probe failed — sandbox not exercised on this host");
+    if astrid_workspace::ProcessSandboxConfig::new(workspace.path())
+        .with_policy(astrid_workspace::SandboxPolicy::Required)
+        .sandbox_prefix()
+        .is_err()
+    {
+        assert!(result.is_err());
         return;
     }
-
-    let configs = ServersConfig::default();
-    let manager = ServerManager::new(configs)
-        .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"));
-
-    let config = ServerConfig::stdio("test", "echo").with_args(["hello"]);
-
-    let cmd = manager
-        .prepare_stdio_command("test", "echo", &config)
-        .expect("should build sandboxed command");
-
-    let program = cmd.as_std().get_program().to_string_lossy().to_string();
-
-    #[cfg(target_os = "linux")]
-    assert_eq!(
-        Some(program.as_str()),
-        astrid_workspace::sandbox::packaged_bwrap_path(),
-        "expected packaged bwrap wrapper, got: {program}"
-    );
-    #[cfg(target_os = "macos")]
-    assert_eq!(program, "sandbox-exec");
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    assert!(
-        std::path::Path::new(&program).is_absolute(),
-        "unsupported platform should still use resolved absolute path, got: {program}"
-    );
-}
-
-/// Linux-only: does the host kernel actually grant unprivileged user
-/// namespaces to `bwrap`? Mirrors `astrid_workspace::bwrap_available`
-/// but inlined here so the test doesn't depend on internal symbols.
-#[cfg(target_os = "linux")]
-fn linux_sandbox_actually_available() -> bool {
-    std::process::Command::new(
-        astrid_workspace::sandbox::packaged_bwrap_path().unwrap_or("/usr/bin/bwrap"),
-    )
-    .args(["--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"])
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .status()
-    .is_ok_and(|s| s.success())
+    assert!(result.is_err());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::ffi::OsStr;
+        let cmd = result.expect("required sandbox must supply the platform wrapper");
+        let program = cmd.as_std().get_program();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            program.to_str(),
+            astrid_workspace::sandbox::packaged_bwrap_path()
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(program, OsStr::new("sandbox-exec"));
+        let resolved = which::which("echo").unwrap();
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert!(args.ends_with(&[
+            resolved.as_os_str(),
+            OsStr::new("two words"),
+            OsStr::new("--literal"),
+            OsStr::new("")
+        ]));
+    }
 }
 
 #[test]

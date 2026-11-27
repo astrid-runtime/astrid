@@ -151,3 +151,18 @@ def defects():
             f"native stdio launch {name}", source,
             lambda s, a=original, b=changed: replace_once(s, a, b), error,
         )
+
+    prefix = Path("crates/astrid-workspace/src/sandbox/prefix_policy.rs")
+    for name, source, original, changed, error in [
+        ("required platform failure yields a bare child", prefix, "Err(error) => Err(error)", "Err(_) => Ok(None)", prefix),
+        ("invalid paths can skip their error", prefix, "return Err(error);", "let _ = error;", prefix),
+        ("unwrapped selection need not be opted out", prefix, "policy is Off && after == checked", "after == checked", consumer),
+        ("platform selection may substitute a prefix", prefix, "after == checked.push(Check::Platform(*config,Ok(prefix)))", "after.len() == checked.len()+1", consumer),
+        ("assembler ignores the wrapper", command, "Ok(assembler.wrapped(prefix,child))", "Ok(assembler.bare(child))", command),
+        ("assembler may act after refusal", command, "out == Err(e) && after == before", "out == Err(e)", consumer),
+        ("wrapped arguments can be substituted", command, "after == before.push(Assembly::Wrapped(p,*child,t))", "after.len() == before.len()+1", consumer),
+    ]:
+        yield (
+            f"sandbox prefix {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), error,
+        )

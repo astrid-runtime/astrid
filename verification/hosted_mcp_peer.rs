@@ -22,6 +22,38 @@ fn native_capsule_command<D,P,C,T,E,B:crate::stdio_policy::Builder<C,T,E>>(
     Some(crate::stdio_policy::prepare(builder,program,config,settings.trusted,settings.allow_network))
 }
 
+/// Compose platform path validation and wrapper selection with native command
+/// assembly. Config is the prepared sandbox configuration and child is the
+/// resolved executable plus its arguments. The host translates native errors.
+fn sandbox_child<C,P,E,H,T,B:crate::prefix_policy::Platform<C,P,E>,A:crate::stdio_policy::Assembler<P,H,T>>(
+    platform:&mut B, assembler:&mut A, config:&C, child:&H, policy:crate::prefix_policy::SandboxPolicy,
+) -> (out:Result<T,E>)
+    ensures ({
+        let checks = old(platform).checks();
+        let commands = old(assembler).commands();
+        let valid = checks.push(crate::prefix_policy::Check::Paths(*config,None));
+        let observed = final(platform).checks();
+        let built = final(assembler).commands();
+        match out {
+            Err(e) => built == commands && (
+                observed == checks.push(crate::prefix_policy::Check::Paths(*config,Some(e))) ||
+                (policy is Required && observed == valid.push(crate::prefix_policy::Check::Platform(*config,Err(e))))),
+            Ok(cmd) => match policy {
+                crate::prefix_policy::SandboxPolicy::Required => {
+                    observed.last() matches crate::prefix_policy::Check::Platform(c,Ok(p)) &&
+                    c == *config && observed == valid.push(crate::prefix_policy::Check::Platform(*config,Ok(p))) &&
+                    built == commands.push(crate::stdio_policy::Assembly::Wrapped(p,*child,cmd))
+                },
+                crate::prefix_policy::SandboxPolicy::Off => observed == valid &&
+                    built == commands.push(crate::stdio_policy::Assembly::Bare(*child,cmd)),
+            },
+        }
+    }),
+{
+    let prefix = crate::prefix_policy::select(platform,config,policy);
+    crate::stdio_policy::assemble(assembler,prefix,child)
+}
+
 fn registered_peer(servers: &HashMap<String,Option<u64>>, name: &str)
     -> (result: Result<u64,LookupError>)
     requires hash_map_inv(servers),

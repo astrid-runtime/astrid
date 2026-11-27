@@ -544,21 +544,9 @@ impl ServerManager {
                 .map_err(|e| McpError::ServerStartFailed {
                     name: name.to_string(),
                     reason: e.to_string(),
-                })?;
+                });
 
-        // Build the command
-        let mut cmd = if let Some(prefix) = sandbox_prefix {
-            let mut cmd = tokio::process::Command::from(prefix.into_command());
-            cmd.arg(&resolved_command);
-            cmd.args(&config.args);
-            cmd
-        } else {
-            // Reached only when the operator explicitly opted into
-            // `Off`, which is intentionally silent.
-            let mut cmd = tokio::process::Command::new(&resolved_command);
-            cmd.args(&config.args);
-            cmd
-        };
+        let mut cmd = command::assemble_child(sandbox_prefix, &resolved_command, &config.args)?;
 
         // Environment scrubbing: clear inherited env, re-add safe vars.
         cmd.env_clear();

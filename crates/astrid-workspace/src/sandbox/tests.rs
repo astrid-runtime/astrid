@@ -506,6 +506,15 @@ fn config_default_policy_is_required_when_env_unset() {
 }
 
 #[test]
+fn invalid_paths_are_rejected_before_either_policy_can_construct_a_command() {
+    for policy in [SandboxPolicy::Required, SandboxPolicy::Off] {
+        let config = ProcessSandboxConfig::new("relative-path").with_policy(policy);
+        let error = config.sandbox_prefix().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
 fn with_policy_overrides_default() {
     let config = ProcessSandboxConfig::new("/project").with_policy(SandboxPolicy::Off);
     assert_eq!(config.policy, SandboxPolicy::Off);

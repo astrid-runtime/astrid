@@ -7,6 +7,7 @@ use std::{fs::File, os::fd::AsRawFd};
 
 #[cfg(target_os = "linux")]
 mod bwrap;
+mod prefix_policy;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod runtime_media;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -14,6 +15,7 @@ mod runtime_media_unsupported;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 mod setup_probe;
+pub use prefix_policy::SandboxPolicy;
 
 #[cfg(target_os = "linux")]
 pub use bwrap::packaged_bwrap_path;
@@ -703,40 +705,6 @@ fn unsupported_os_hint() -> &'static str {
      available — native subprocess capsules cannot be safely contained."
 }
 
-/// Operator-side policy controlling what happens when OS-level
-/// sandboxing is unavailable (e.g. `bwrap` missing or
-/// `kernel.apparmor_restrict_unprivileged_userns=1` on Ubuntu 24.04+).
-///
-/// Two-state on purpose. The default is [`SandboxPolicy::Required`] —
-/// refuse to launch unsandboxed subprocesses, matching the security
-/// guarantee the README documents. The only escape hatch is
-/// [`SandboxPolicy::Off`], which silently launches without a sandbox.
-///
-/// There is **no** "warn and fall through" middle state. That was the
-/// pre-#655 behaviour and it is exactly the bug: a soft fallback hides
-/// the fact that the security model isn't applying. Either the sandbox
-/// works (`Required`) or the operator explicitly opted out (`Off`). On
-/// a clean target system the kernel sandbox should always be available;
-/// if it isn't, that's a deployment problem to surface, not paper over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SandboxPolicy {
-    /// Refuse to launch if the OS-level sandbox cannot be applied.
-    /// [`ProcessSandboxConfig::sandbox_prefix`] returns an error with
-    /// an actionable hint (typically the `sysctl` command on Ubuntu
-    /// 24.04+). This is the default — fail loudly rather than silently
-    /// weaken isolation. Production deployments should always run with
-    /// this policy on a properly configured system.
-    #[default]
-    Required,
-    /// Always launch without an OS-level sandbox, no warning. The
-    /// operator has explicitly accepted that subprocess capsules will
-    /// run with the host user's full reach. Use only for trusted dev
-    /// environments, CI runners where the kernel can't be configured
-    /// for unprivileged namespaces, or other situations where the
-    /// trade-off is documented elsewhere.
-    Off,
-}
-
 impl SandboxPolicy {
     /// Parse a policy name from a configuration string.
     ///
@@ -914,25 +882,19 @@ impl ProcessSandboxConfig {
     ///   on Ubuntu 24.04+) and the remediation (`sysctl` command or
     ///   explicit policy override).
     pub fn sandbox_prefix(&self) -> io::Result<Option<SandboxPrefix>> {
-        // Validate before building any platform profile.
-        self.validate_all_paths()?;
+        prefix_policy::select(&mut NativePlatform, self, self.policy)
+    }
 
-        // `Off` short-circuits before any probe so the no-warn contract
-        // is honoured: the operator has explicitly opted out of
-        // subprocess containment and shouldn't see diagnostic noise.
-        if self.policy == SandboxPolicy::Off {
-            return Ok(None);
-        }
-
+    fn required_prefix(&self) -> io::Result<SandboxPrefix> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.validate_protected_runtime_grants()?;
 
         #[cfg(target_os = "linux")]
         {
             if bwrap::bwrap_available() {
-                return self.build_pinned_bwrap_prefix().map(Some);
+                return self.build_pinned_bwrap_prefix();
             }
-            self.handle_unavailable_sandbox(linux_unavailable_hint())
+            Err(Self::unavailable_error(linux_unavailable_hint()))
         }
 
         #[cfg(target_os = "macos")]
@@ -941,36 +903,26 @@ impl ProcessSandboxConfig {
             // available; a failure here is genuinely exceptional (e.g.
             // path validation tripping a sub-builder), so it surfaces
             // through `build_seatbelt_prefix` regardless of policy.
-            self.build_seatbelt_prefix().map(Some)
+            self.build_seatbelt_prefix()
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            self.handle_unavailable_sandbox(unsupported_os_hint())
+            Err(Self::unavailable_error(unsupported_os_hint()))
         }
     }
 
-    /// Apply the configured `SandboxPolicy` when the OS-level sandbox is
-    /// unavailable. Returns `Err` for `Required`, and never called for
-    /// `Off` (handled upstream in [`Self::sandbox_prefix`]).
-    #[cfg(any(
-        target_os = "linux",
-        not(any(target_os = "linux", target_os = "macos"))
-    ))]
-    fn handle_unavailable_sandbox(&self, hint: &str) -> io::Result<Option<SandboxPrefix>> {
-        match self.policy {
-            SandboxPolicy::Required => Err(io::Error::other(format!(
-                "OS-level sandbox unavailable and policy is `required` — \
+    #[cfg(not(target_os = "macos"))]
+    fn unavailable_error(hint: &str) -> io::Error {
+        io::Error::other(format!(
+            "OS-level sandbox unavailable and policy is `required` — \
                  refusing to launch native subprocess capsule without \
                  containment. {hint} To run without the sandbox anyway \
                  (trusted dev environments, CI runners where the kernel \
                  can't be configured), set `ASTRID_SANDBOX_POLICY=off`. \
                  The `required` default exists to keep the security \
                  guarantee documented in the README — see issue #655."
-            ))),
-            // Unreachable: `Off` short-circuits in `sandbox_prefix`.
-            SandboxPolicy::Off => Ok(None),
-        }
+        ))
     }
 
     /// Validate all configured paths for safe use in sandbox profiles.
@@ -990,6 +942,18 @@ impl ProcessSandboxConfig {
             validate_sandbox_str(&inj.target, "injection target")?;
         }
         Ok(())
+    }
+}
+
+struct NativePlatform;
+
+impl prefix_policy::Platform<ProcessSandboxConfig, SandboxPrefix, io::Error> for NativePlatform {
+    fn path_error(&mut self, config: &ProcessSandboxConfig) -> Option<io::Error> {
+        config.validate_all_paths().err()
+    }
+
+    fn prefix(&mut self, config: &ProcessSandboxConfig) -> io::Result<SandboxPrefix> {
+        config.required_prefix()
     }
 }
 
