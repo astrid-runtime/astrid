@@ -188,6 +188,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         client_connections: HostState::new_client_connections(),
         shared_listeners: Arc::new(dashmap::DashMap::new()),
         share_tcp_listeners: false,
+        ingress_publication: None,
         ingress_principal: None,
         ingress_device_key_id: None,
         ingress_request_owner: None,

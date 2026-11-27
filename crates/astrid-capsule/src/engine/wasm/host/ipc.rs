@@ -420,6 +420,27 @@ impl ipc::Host for HostState {
         if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
+        let (topic, payload) = if self.ingress_principal.is_some() {
+            // A single authenticated frame authorizes one matching forward. Take
+            // its operation before the first await, including on rejected attempts.
+            let frame = self
+                .ingress_publication
+                .take()
+                .ok_or(ErrorCode::CapabilityDenied)?;
+            if topic.len() > 256 || payload.len() > MAX_PAYLOAD_BYTES {
+                return Err(ErrorCode::InvalidInput);
+            }
+            let mut value = serde_json::from_str(&payload).map_err(|_| ErrorCode::InvalidInput)?;
+            let body =
+                crate::engine::wasm::host_state::IngressPublication::canonical_payload(&mut value)
+                    .ok_or(ErrorCode::InvalidInput)?;
+            if frame.topic != topic || frame.payload != body {
+                return Err(ErrorCode::CapabilityDenied);
+            }
+            (frame.topic, frame.payload)
+        } else {
+            (topic, payload)
+        };
         // The principal is DERIVED from the source connection, never named by
         // the capsule (issue #45/#852). A connection the kernel verified at the
         // handshake — recorded by the framed `tcp-stream.read` that pulled this

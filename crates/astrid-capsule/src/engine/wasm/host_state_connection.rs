@@ -3,6 +3,26 @@
 
 use super::*;
 
+/// The topic and normalized JSON body read from one authenticated client frame.
+pub(crate) struct IngressPublication {
+    pub(crate) topic: String,
+    pub(crate) payload: String,
+}
+
+impl IngressPublication {
+    pub(crate) fn from_frame(bytes: &[u8]) -> Option<Self> {
+        let mut frame: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let topic = frame.get("topic")?.as_str()?.to_owned();
+        let payload = Self::canonical_payload(frame.get_mut("payload")?)?;
+        Some(Self { topic, payload })
+    }
+
+    pub(crate) fn canonical_payload(value: &mut serde_json::Value) -> Option<String> {
+        value.sort_all_objects();
+        serde_json::to_string(value).ok()
+    }
+}
+
 impl HostState {
     /// Build a fresh, empty per-connection identity registry.
     ///
@@ -19,6 +39,7 @@ impl HostState {
     }
 
     pub(crate) fn clear_ingress_frame(&mut self) {
+        self.ingress_publication = None;
         self.ingress_principal = None;
         self.ingress_device_key_id = None;
         self.ingress_request_owner = None;

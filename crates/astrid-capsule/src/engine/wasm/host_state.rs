@@ -692,6 +692,8 @@ pub struct HostState {
     /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
     /// device's scope as an attenuation floor on the principal's authority.
     pub connection_principals: dashmap::DashMap<u32, ConnectionIdentity>,
+    /// One publishable operation captured from the authenticated frame.
+    pub(crate) ingress_publication: Option<IngressPublication>,
     /// The verified principal of the source connection whose inbound frame is
     /// currently in flight — the ENFORCEMENT side of
     /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
@@ -955,6 +957,7 @@ impl HostState {
 
 #[path = "host_state_connection.rs"]
 mod connection;
+pub(crate) use connection::IngressPublication;
 #[path = "host_state_effective.rs"]
 mod effective;
 #[path = "host_state_hook.rs"]
