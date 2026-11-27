@@ -189,30 +189,47 @@ fn sanitize_guest_field(s: &mut String, max_len: usize, field_name: &str, capsul
     *s = sanitized;
 }
 
-fn is_invisible_format(c: char) -> bool {
+/// Characters that do not contribute a command family.
+///
+/// This is Unicode 17.0.0 `Default_Ignorable_Code_Point`, plus U+FFF9..=U+FFFB.
+/// Those annotation characters are not default-ignorable, but a family made
+/// only of them was already rejected. Whitespace is handled by the caller:
+/// padding between these characters is not a family either. A visible
+/// character, including a literal `*`, is.
+fn is_nonrendering_family_char(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
             | '\u{034F}'
             | '\u{061C}'
-            | '\u{180E}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
     )
 }
 
 /// Sanitize a guest-supplied action string for safe use in glob patterns.
 ///
 /// Defense layer 1: strips control characters, trims whitespace that filter
-/// exposes, and enforces a length cap. A family that contains only invisible
-/// characters is empty, so it cannot be shown, audited, or remembered. Visible
-/// characters, including a literal `*`, stay for [`escape_glob_metacharacters`].
-/// Runs BEFORE that escape (layer 2). Together they guarantee that no guest
-/// input can produce a dangerous or oversized glob pattern.
+/// exposes, and enforces a length cap. A family with no visible residue is
+/// empty, so it cannot be shown, audited, or remembered. Residue ignores
+/// whitespace in any position and characters from
+/// [`is_nonrendering_family_char`], not only a short format list at the ends.
+/// Visible characters, including a literal `*`, stay for
+/// [`escape_glob_metacharacters`]. Runs BEFORE that escape (layer 2). Together
+/// they guarantee that no guest input can produce a dangerous or oversized
+/// glob pattern.
 fn sanitize_action_for_pattern(action: &str, capsule_id: &str) -> String {
     let trimmed = action.trim();
     let mut sanitized: String = trimmed
@@ -224,9 +241,13 @@ fn sanitize_action_for_pattern(action: &str, capsule_id: &str) -> String {
 
     // Filtering or truncation can expose whitespace at the boundary.
     sanitized.truncate(sanitized.trim_end().len());
-    // Format characters such as ZWSP, BOM, and RLO are not controls or
-    // whitespace. They are not a family by themselves. A literal `*` is.
-    if sanitized.chars().all(is_invisible_format) {
+    // Default-ignorable characters are not controls or whitespace. They are
+    // not a family by themselves, including when whitespace sits between them.
+    // A literal `*` is visible residue and stays.
+    if sanitized
+        .chars()
+        .all(|c| c.is_whitespace() || is_nonrendering_family_char(c))
+    {
         sanitized.clear();
     }
     let trimmed_chars = trimmed.chars().count();
