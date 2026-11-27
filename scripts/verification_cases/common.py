@@ -49,6 +49,8 @@ INPUTS = [
     Path("crates/astrid-mcp/src/server/peer_selection.rs"),
     Path("crates/astrid-mcp/src/server/tool_call.rs"),
     Path("verification/hosted_mcp_peer.rs"),
+    Path("crates/astrid-cli/src/commands/mcp/mrtr_context.rs"),
+    Path("verification/hosted_mrtr_context.rs"),
     Path("crates/astrid-capsule/src/engine/mcp_cleanup.rs"),
     Path("crates/astrid-capsule/src/engine/mcp_registration.rs"),
     Path("verification/hosted_batch_slots.rs"),

@@ -381,3 +381,6 @@ use runtime_generation::RuntimeId as RegistryId;
 #[path = "../crates/astrid-capsule/src/engine/mcp_cleanup.rs"]
 mod mcp_cleanup;
 mod hosted_mcp_peer;
+#[path = "../crates/astrid-cli/src/commands/mcp/mrtr_context.rs"]
+mod mrtr_context;
+mod hosted_mrtr_context;

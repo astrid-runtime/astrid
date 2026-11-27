@@ -15,6 +15,24 @@ def consumer_defects():
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
     yield from retirement.defects()
+    context = Path("crates/astrid-cli/src/commands/mcp/mrtr_context.rs")
+    context_trace = Path("verification/hosted_mrtr_context.rs")
+    for label, original, changed, failure in [
+        ("principal bytes", "digest.absorb(principal);", "digest.absorb(tool);", context),
+        ("tool bytes", "digest.absorb(tool);", "digest.absorb(arguments);", context),
+        ("argument bytes", "digest.absorb(arguments);", "digest.absorb(principal);", context),
+        ("transcript guarantee", "ensures final(digest).bytes() ==", "ensures principal.len() > 0 ==> final(digest).bytes() ==", context_trace),
+        ("principal uniqueness", "ensures p == q, t == u, a == b,", "ensures t == u, a == b,", context_trace),
+        ("tool uniqueness", "ensures p == q, t == u, a == b,", "ensures p == q, a == b,", context_trace),
+        ("argument uniqueness", "ensures p == q, t == u, a == b,", "ensures p == q, t == u,", context_trace),
+        ("opened consent", "open.ensures((state,context),Ok(pending)) && redeem", "true && redeem", context_trace),
+        ("claimed continuation", "&& redeem.ensures((state,),Ok(guard))", "&& true", context_trace),
+        ("opening refusal", "open.ensures((state,context),Err(error)) ||", "true ||", context_trace),
+    ]:
+        yield (
+            f"broker continuation loses {label}", context,
+            lambda s, a=original, b=changed: replace_once(s, a, b), failure,
+        )
     tool_call = Path("crates/astrid-mcp/src/server/tool_call.rs")
     for label, field, replacement in [
         ("fixed hook", 'call.parts().0@ == "astrid_hook_intercept"@', "true"),

@@ -27,6 +27,9 @@ use super::form_elicitation::form_params;
 use super::grant::{GrantForm, GrantRequest};
 use super::ingress::IngressForm;
 
+#[path = "mrtr_context.rs"]
+mod context;
+
 const INPUT_KEY: &str = "astrid-consent";
 const STATE_TTL: Duration = Duration::from_mins(5);
 
@@ -203,11 +206,16 @@ impl MrtrBridge {
         responses: Option<&InputResponses>,
     ) -> Result<ResolvedConsent, McpError> {
         let associated_data = associated_data(principal, tool, arguments);
-        let pending: PendingConsent = self
-            .codec
-            .open_json_with(state, &associated_data)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let redemption = self.redeem_once(state)?;
+        let (pending, redemption) = context::open_and_redeem(
+            state,
+            &associated_data,
+            |token, binding| {
+                self.codec
+                    .open_json_with(token, binding)
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))
+            },
+            |token| self.redeem_once(token),
+        )?;
         let response = responses.and_then(|values| values.get(INPUT_KEY));
 
         let decision = match pending {
@@ -284,14 +292,21 @@ where
     }
 }
 
+impl context::Digest for blake3::Hasher {
+    fn absorb(&mut self, chunk: &[u8]) {
+        self.update(chunk);
+    }
+}
+
 fn associated_data(principal: &PrincipalId, tool: &str, arguments: &Value) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"astrid/mcp/mrtr/v1\0");
-    hasher.update(principal.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(tool.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(&serde_json::to_vec(arguments).unwrap_or_default());
+    let encoded = serde_json::to_vec(arguments).unwrap_or_default();
+    context::absorb_context(
+        &mut hasher,
+        principal.as_str().as_bytes(),
+        tool.as_bytes(),
+        &encoded,
+    );
     hasher.finalize().as_bytes().to_vec()
 }
 
@@ -319,6 +334,18 @@ mod tests {
             INPUT_KEY.to_owned(),
             json!({ "action": "accept", "content": content }),
         )])
+    }
+
+    #[test]
+    fn associated_data_preserves_v1_bytes_with_embedded_nuls() {
+        let principal = PrincipalId::new("alice").unwrap();
+        let arguments = json!({"key": "a\0b"});
+        let expected =
+            blake3::hash(b"astrid/mcp/mrtr/v1\0alice\0tool\0name\0{\"key\":\"a\\u0000b\"}");
+        assert_eq!(
+            associated_data(&principal, "tool\0name", &arguments),
+            expected.as_bytes()
+        );
     }
 
     #[test]
