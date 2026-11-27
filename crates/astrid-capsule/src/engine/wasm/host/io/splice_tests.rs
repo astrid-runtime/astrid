@@ -198,3 +198,46 @@ async fn retiring_a_registered_device_drains_a_queued_transfer_without_consuming
     );
     assert!(sink.contents().is_empty());
 }
+
+#[tokio::test]
+async fn blocking_splice_withholds_its_count_if_the_owner_changes_during_io() {
+    use tokio::io::AsyncWriteExt;
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let principal = state.effective_principal();
+    let directory = state.principal_directory.clone();
+    let uid = directory.uid_for(&principal).unwrap();
+    let (reader, mut producer) = tokio::io::duplex(16);
+    let input = wasmtime_wasi::p2::pipe::AsyncReadStream::new(reader);
+    let src = state
+        .resource_table
+        .push::<DynInputStream>(Box::new(input))
+        .unwrap();
+    let sink = MemoryOutputPipe::new(16);
+    let dst = state
+        .resource_table
+        .push::<DynOutputStream>(Box::new(sink.clone()))
+        .unwrap();
+    let mut transfer = Box::pin(state.blocking_splice(
+        Resource::new_borrow(dst.rep()),
+        Resource::new_borrow(src.rep()),
+        4,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut transfer => panic!("expected a pending source read: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    directory
+        .rename(
+            uid,
+            &principal,
+            astrid_core::PrincipalId::new("after").unwrap(),
+        )
+        .unwrap();
+    producer.write_all(b"sent").await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), transfer)
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(StreamError::Closed)));
+    assert_eq!(sink.contents().as_ref(), b"sent");
+}

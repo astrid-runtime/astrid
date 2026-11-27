@@ -99,11 +99,12 @@ pub(super) async fn blocking(
                         .map_err(|_| StreamError::Closed)?;
                     work.await
                 });
-                match &guard.device {
+                let result = match &guard.device {
                     Some(device) => device.while_live(transfer).await.flatten(),
                     None => transfer.await,
                 }
-                .unwrap_or(Err(StreamError::Closed))
+                .ok_or(StreamError::Closed)?;
+                guard.complete(directory, &cancel, result)
             },
         )
         .ok_or(StreamError::Closed)?;

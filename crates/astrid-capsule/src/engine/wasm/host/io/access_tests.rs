@@ -193,3 +193,62 @@ async fn cancellation_and_retirement_after_capture_refuse_the_immediate_sink() {
         }
     }
 }
+
+#[tokio::test]
+async fn queued_single_stream_access_rechecks_the_owner_before_consuming_or_writing() {
+    for write in [false, true] {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let principal = state.effective_principal();
+        let directory = state.principal_directory.clone();
+        let uid = directory.uid_for(&principal).unwrap();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        state.io_semaphore = sem;
+        let mut input = MemoryInputPipe::new("keep");
+        let source = state
+            .resource_table
+            .push::<DynInputStream>(Box::new(input.clone()))
+            .unwrap();
+        let sink = MemoryOutputPipe::new(16);
+        let destination = state
+            .resource_table
+            .push::<DynOutputStream>(Box::new(sink.clone()))
+            .unwrap();
+        let mut work = Box::pin(async {
+            if write {
+                state
+                    .blocking_write_and_flush(
+                        Resource::new_borrow(destination.rep()),
+                        b"data".to_vec(),
+                    )
+                    .await
+            } else {
+                state
+                    .blocking_read(Resource::new_borrow(source.rep()), 4)
+                    .await
+                    .map(drop)
+            }
+        });
+        tokio::select! {
+            biased;
+            result = &mut work => panic!("expected a pending capacity wait: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        directory
+            .rename(
+                uid,
+                &principal,
+                astrid_core::PrincipalId::new("after").unwrap(),
+            )
+            .unwrap();
+        drop(permit);
+        assert!(matches!(work.await, Err(StreamError::Closed)));
+        assert_eq!(
+            wasmtime_wasi::p2::InputStream::read(&mut input, 4)
+                .unwrap()
+                .as_ref(),
+            b"keep"
+        );
+        assert!(sink.contents().is_empty());
+    }
+}

@@ -66,6 +66,24 @@ impl Authority {
             .flatten()
             .ok_or(StreamError::Closed)
     }
+
+    pub(super) fn complete<R>(
+        &self,
+        directory: &astrid_storage::PrincipalDirectory,
+        cancel: &tokio_util::sync::CancellationToken,
+        result: Result<R, StreamError>,
+    ) -> Result<R, StreamError> {
+        directory
+            .with_bound_input(&self.principal, self.owner, result, |result| {
+                super::dispatch::disclose(
+                    cancel.is_cancelled(),
+                    self.device.as_ref().is_some_and(DeviceSession::is_retired),
+                    result,
+                )
+                .unwrap_or(Err(StreamError::Closed))
+            })
+            .unwrap_or(Err(StreamError::Closed))
+    }
 }
 
 /// Keep both lifetime guards and the current owner binding through a synchronous
@@ -116,17 +134,5 @@ where
         None => io.await,
     }
     .ok_or(StreamError::Closed)?;
-    directory
-        .with_bound_input(&admission.principal, admission.owner, result, |result| {
-            super::dispatch::disclose(
-                cancel.is_cancelled(),
-                admission
-                    .device
-                    .as_ref()
-                    .is_some_and(DeviceSession::is_retired),
-                result,
-            )
-            .unwrap_or(Err(StreamError::Closed))
-        })
-        .unwrap_or(Err(StreamError::Closed))
+    admission.complete(directory, &cancel, result)
 }
