@@ -36,6 +36,17 @@ def defects():
             Path("verification/hosted_registry_lookup.rs"),
         )
     sweep = Path("crates/astrid-capsule/src/registry/dependent_views.rs")
+    for name, target, clause in [
+        ("forgets the retired reverse entry", sweep, "final(sources)@ == old(sources)@.remove(*runtime)"),
+        ("forgets the last source user", sweep, "final(names)@ == if old(sources)@.contains_key(*runtime)"),
+        ("forgets the replacement source", registration, "final(sources)@ == old(sources)@.insert(*runtime,source)"),
+        ("forgets the replacement package", registration, "final(names)@ == old(names)@.insert(source,runtime.identity().0.0)"),
+    ]:
+        yield (
+            f"replacement index {name}", target,
+            lambda s, a=clause: replace_once(s, a, "false ==> " + a),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     for name, clause in [
         ("loses full-generation route removal", "tear_down ==> final(routes)@ == kept(old(routes)@,*runtime)"),
         ("loses retained peer route preservation", "!tear_down ==> final(routes)@ == if old(sources)@.contains_key(*runtime)"),

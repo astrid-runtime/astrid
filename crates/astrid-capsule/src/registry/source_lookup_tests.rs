@@ -279,3 +279,39 @@ fn reversed_reserved_publication_preserves_both_scoped_handles()
     }
     Ok(())
 }
+
+#[test]
+fn replacement_keeps_the_old_source_name_until_its_last_generation_leaves()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = CapsuleRegistry::new();
+    let package = CapsuleId::from_static("shared-bytes");
+    let old_bytes = test_hash("old");
+    let new_bytes = test_hash("new");
+    let old_source = capsule_source_uuid(&package, &old_bytes);
+    let new_source = capsule_source_uuid(&package, &new_bytes);
+    let alice = pid("alice");
+    let bob = pid("bob");
+    let capsule = || Box::new(MockCapsule::new("shared-bytes"));
+    let first =
+        registry.register_principal_runtime(capsule(), old_bytes.clone(), &alice, uid(1))?;
+    let second = registry.register_principal_runtime(capsule(), old_bytes.clone(), &bob, uid(2))?;
+    let renewed =
+        registry.replace_principal_runtime(&first, capsule(), old_bytes, &alice, uid(1))?;
+    assert_eq!(registry.source_id_for(&alice, &package), Some(old_source));
+    assert_eq!(registry.find_by_uuid(&old_source), Some(&package));
+    registry.replace_principal_runtime(
+        &renewed.runtime_id,
+        capsule(),
+        new_bytes.clone(),
+        &alice,
+        uid(1),
+    )?;
+    assert_eq!(registry.source_id_for(&alice, &package), Some(new_source));
+    assert_eq!(registry.source_id_for(&bob, &package), Some(old_source));
+    assert_eq!(registry.find_by_uuid(&old_source), Some(&package));
+    registry.replace_principal_runtime(&second, capsule(), new_bytes, &bob, uid(2))?;
+    assert_eq!(registry.source_id_for(&bob, &package), Some(new_source));
+    assert_eq!(registry.find_by_uuid(&old_source), None);
+    assert_eq!(registry.find_by_uuid(&new_source), Some(&package));
+    Ok(())
+}

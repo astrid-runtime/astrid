@@ -334,6 +334,25 @@ fn round_trip_private_registration<C: ?Sized>(instances: &mut HashMap<Id,Entry<C
     (handle,previous.unwrap(),removed)
 }
 
+// Source-index changes on successful replacement, including same-UUID restarts.
+fn replace_source_indexes(sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>,
+    retired: &Id, replacement: &Id, new_source:u64)
+    requires hash_map_inv(old(sources)), hash_map_inv(old(names)), obeys_key_model::<Id>(),
+        obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
+    ensures final(sources)@ == old(sources)@.remove(*retired).insert(*replacement,new_source),
+        final(names)@ == ({
+            let prior = old(sources)@;
+            let old_source = prior[*retired];
+            let remaining = if prior.contains_key(*retired) && !prior.remove(*retired).values().contains(old_source) {
+                old(names)@.remove(old_source)
+            } else { old(names)@ };
+            remaining.insert(new_source,replacement.identity().0.0)
+        }),
+{
+    crate::dependent_views::withdraw_source(sources,names,retired);
+    crate::registration::record_source(sources,names,replacement,new_source);
+}
+
 // The view snapshot is the one after retargeting. Broadcast source routes from
 // that state and resolve one viewer, while conserving an arbitrary non-viewer's route.
 fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,

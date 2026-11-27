@@ -214,15 +214,11 @@ impl CapsuleRegistry {
         }
         self.uuid_map
             .retain(|_, mapped_runtime| mapped_runtime != expected);
-        let previous_source = self.source_uuid_by_runtime.remove(expected);
-        if let Some(previous_source) = previous_source
-            && !self
-                .source_uuid_by_runtime
-                .values()
-                .any(|candidate| candidate == &previous_source)
-        {
-            self.uuid_id_map.remove(&previous_source);
-        }
+        super::dependent_views::withdraw_source(
+            &mut self.source_uuid_by_runtime,
+            &mut self.uuid_id_map,
+            expected,
+        );
         let source_uuid =
             capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact());
         super::registration::publish_viewer_routes(
@@ -231,10 +227,12 @@ impl CapsuleRegistry {
             source_uuid,
             &runtime_id,
         );
-        self.source_uuid_by_runtime
-            .insert(runtime_id.clone(), source_uuid);
-        self.uuid_id_map
-            .insert(source_uuid, runtime_id.key().capsule_id().clone());
+        super::registration::record_source(
+            &mut self.source_uuid_by_runtime,
+            &mut self.uuid_id_map,
+            &runtime_id,
+            source_uuid,
+        );
         self.remove_legacy_uuid_mappings_if_unused(&previous_artifact);
         Ok(ReplacedRuntime {
             runtime_id,

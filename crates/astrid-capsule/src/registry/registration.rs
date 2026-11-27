@@ -32,6 +32,21 @@ fn clone_key<K:Clone>(key: &K) -> (out:K)
     out
 }
 
+/// Publish the reverse source and its package name for this runtime identity.
+pub(super) fn record_source<K: Eq + Hash + Clone,A: Eq + Hash + Clone,U: Eq + Hash + Copy>(
+    sources: &mut HashMap<Id<K,A>,U>, names: &mut HashMap<U,K>, runtime: &Id<K,A>, source: U)
+    requires hash_map_inv(old(sources)), hash_map_inv(old(names)), obeys_key_model::<Id<K,A>>(),
+        obeys_concrete_eq::<Id<K,A>>(), obeys_clone_eq::<Id<K,A>>(), obeys_clone_eq::<K>(),
+        obeys_key_model::<U>(), obeys_concrete_eq::<U>(),
+    ensures hash_map_inv(final(sources)), hash_map_inv(final(names)),
+        final(sources)@ == old(sources)@.insert(*runtime,source),
+        final(names)@ == old(names)@.insert(source,runtime.identity().0.0),
+{
+    sources.insert(clone_key(runtime),source);
+    let package = runtime.key().capsule_id();
+    names.insert(source,clone_key(package));
+}
+
 impl<K: Eq + Hash + Clone,A: Eq + Hash + Clone,P: Eq + Hash + Clone,U: Eq + Hash + Copy,C: ?Sized>
     Registration<K,A,P,U,C> {
     pub(super) fn publish(self, instances: &mut HashMap<Id<K,A>,Entry<C,P>>,
@@ -62,9 +77,7 @@ impl<K: Eq + Hash + Clone,A: Eq + Hash + Clone,P: Eq + Hash + Clone,U: Eq + Hash
         instances.insert(clone_key(&runtime),self.entry);
         view_lookup::bind(views,clone_key(&self.principal),clone_key(&runtime));
         routes.insert((self.source,self.principal),clone_key(&runtime));
-        sources.insert(clone_key(&runtime),self.source);
-        let package = runtime.key().capsule_id();
-        names.insert(self.source,clone_key(package));
+        record_source(sources,names,&runtime,self.source);
         runtime
     }
 }

@@ -99,6 +99,24 @@ pub(super) fn prune_legacy<U: Eq + Hash + Clone,K: Eq + Hash,A: Eq + Hash,E>(
     if !uses_artifact(instances,artifact) { remove_generation(legacy,artifact); }
 }
 
+/// Withdraw one generation's reverse route and its public name when the last user leaves.
+pub(super) fn withdraw_source<V: Eq + Hash,U: Eq + Hash + Copy,I>(
+    sources: &mut HashMap<V,U>, names: &mut HashMap<U,I>, runtime: &V)
+    requires hash_map_inv(old(sources)), hash_map_inv(old(names)), obeys_key_model::<V>(),
+        obeys_concrete_eq::<V>(), obeys_key_model::<U>(), obeys_concrete_eq::<U>(),
+    ensures hash_map_inv(final(sources)), hash_map_inv(final(names)),
+        final(sources)@ == old(sources)@.remove(*runtime),
+        final(names)@ == if old(sources)@.contains_key(*runtime) &&
+            !old(sources)@.remove(*runtime).values().contains(old(sources)@[*runtime]) {
+            old(names)@.remove(old(sources)@[*runtime])
+        } else { old(names)@ },
+{
+    let Some(source) = sources.remove(runtime) else { return; };
+    if !super::viewers::attached(sources,&source) {
+        names.remove(&source);
+    }
+}
+
 /// Update the principal-scoped source routes under the same registry write lock.
 pub(super) fn revoke_sources<U: Eq + Hash + Copy,P: Eq + Hash + Clone,V: Eq + Hash,I>(
     routes: &mut HashMap<(U,P),V>, sources: &mut HashMap<V,U>, names: &mut HashMap<U,I>, runtime: &V,
@@ -120,10 +138,7 @@ pub(super) fn revoke_sources<U: Eq + Hash + Copy,P: Eq + Hash + Clone,V: Eq + Ha
 {
     if tear_down {
         remove_generation(routes,runtime);
-        let Some(source) = sources.remove(runtime) else { return; };
-        if !super::viewers::attached(sources,&source) {
-            names.remove(&source);
-        }
+        withdraw_source(sources,names,runtime);
     } else if let Some(source) = sources.get(runtime) {
         proof { reveal(obeys_clone_eq); }
         let departing = principal.clone();
