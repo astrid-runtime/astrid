@@ -51,9 +51,11 @@ impl<K> RecoveredCapabilityFence<K> {
 }
 
 /// Close capability admission and carry its exact owner to allowance recovery.
-pub fn restore_capability<K: Eq + Hash + Clone>(closed: &mut HashSet<K>, principal: K)
+pub fn restore_capability<K: Eq + Hash + Clone, S: BuildHasher>(
+    closed: &mut HashSet<K,S>, principal: K,
+)
     -> (receipt: RecoveredCapabilityFence<K>)
-    requires hash_set_inv(old(closed)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(), obeys_clone_eq::<K>(),
+    requires builds_valid_hashers::<S>(), hash_set_inv(old(closed)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(), obeys_clone_eq::<K>(),
     ensures hash_set_inv(final(closed)), final(closed)@ == old(closed)@.insert(principal), receipt.owner() == principal,
 {
     proof { reveal(obeys_clone_eq); }
@@ -64,8 +66,11 @@ pub fn restore_capability<K: Eq + Hash + Clone>(closed: &mut HashSet<K>, princip
 }
 
 /// Close allowance admission and remove grants for the owner of the capability fence.
-pub fn restore_allowances<K: Eq + Hash, V>(receipt: RecoveredCapabilityFence<K>, closed: &mut HashSet<K>, grants: &mut HashMap<K,V>)
-    requires hash_set_inv(old(closed)), hash_map_inv(old(grants)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+pub fn restore_allowances<K: Eq + Hash, V, S: BuildHasher, G: BuildHasher>(
+    receipt: RecoveredCapabilityFence<K>, closed: &mut HashSet<K,S>, grants: &mut HashMap<K,V,G>,
+)
+    requires builds_valid_hashers::<S>(), builds_valid_hashers::<G>(),
+        hash_set_inv(old(closed)), hash_map_inv(old(grants)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
     ensures hash_set_inv(final(closed)), hash_map_inv(final(grants)),
         final(closed)@ == old(closed)@.insert(receipt.owner()), final(grants)@ == old(grants)@.remove(receipt.owner()),
 {
