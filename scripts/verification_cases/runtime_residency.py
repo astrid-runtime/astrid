@@ -144,6 +144,26 @@ def defects():
             lambda s, a=clause: replace_once(s, a, a.replace("out.", "false ==> out.", 1)),
             Path("verification/hosted_registry_lookup.rs"),
         )
+    index = Path("crates/astrid-capsule/src/registry/uplink_index.rs")
+    for name, clause in [
+        ("loses the selected descriptor", "ensures out == if entries@.contains_key(*id)"),
+        ("can remove another provider", "final(entries)@ == old(entries)@.restrict("),
+    ]:
+        yield (
+            f"uplink registry {name}", index,
+            lambda s, a=clause: replace_once(s, a, a.replace("ensures ", "ensures false ==> ")
+                if a.startswith("ensures ") else "false ==> " + a),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
+    for name, clause, weakened in [
+        ("can clear a still-visible package", "old(entries)@ }\n        else {", "final(entries)@ }\n        else {"),
+        ("can leave the final package registered", "else { old(entries)@.restrict(old(entries)@.dom().filter(|id:K| old(entries)@[id].0 != *package)) },", "else { final(entries)@ },"),
+    ]:
+        yield (
+            f"uplink registry {name}", index,
+            lambda s, a=clause, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     route_domain = "final(routes)@.contains_key(key) ==\n            ((old(routes)"
     route_value = "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==\n            if key.0 == source && final(views)@"
     for name, clause, weakened in [

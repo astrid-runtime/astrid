@@ -24,6 +24,7 @@ mod compatibility;
 pub(crate) mod generation;
 mod replacement;
 mod runtime_id;
+mod uplink_index;
 mod uplinks;
 mod view_owner;
 pub use runtime_id::{RuntimeId, RuntimeKey, RuntimeScope, WasmHash};
@@ -504,9 +505,7 @@ impl CapsuleRegistry {
             torn_down,
         );
         if torn_down {
-            if self.any_principal_with(id).is_none() {
-                self.unregister_capsule_uplinks(id);
-            }
+            uplink_index::prune_unviewed(&self.views, &mut self.uplinks, id);
             self.remove_legacy_uuid_mappings_if_unused(runtime_id.key().artifact());
             info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation(), "Unregistered capsule runtime");
         } else {

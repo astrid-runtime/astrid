@@ -402,6 +402,19 @@ fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
     Some((old_handle,new_handle))
 }
 
+// A retired provider's ID disappears, while a peer's ID still returns its precise descriptor.
+fn withdraw_provider<D>(entries:&mut HashMap<u64,(u64,D)>, owner:u64, id:u64, peer:u64)
+    requires hash_map_inv(old(entries)), old(entries)@.contains_key(id), old(entries)@[id].0 == owner,
+        old(entries)@.contains_key(peer), old(entries)@[peer].0 != owner,
+    ensures !final(entries)@.contains_key(id), final(entries)@.contains_key(peer), final(entries)@[peer] == old(entries)@[peer],
+{
+    crate::uplink_index::withdraw(entries,&owner);
+    let gone = crate::uplink_index::descriptor(entries,&id);
+    assert(gone.is_none());
+    let retained = crate::uplink_index::descriptor(entries,&peer).unwrap();
+    assert(*retained == old(entries)@[peer].1);
+}
+
 // Model the directory's canonical key bytes; preserve the candidate through permission or return.
 fn directory_candidate<T,R,F:FnOnce(T)->R>(aliases:&HashMap<Vec<u8>,[u8;32]>,
     principals:&HashMap<[u8;32],Vec<u8>>, alias:&Vec<u8>, uid:&[u8;32], candidate:T, operation:F)
@@ -499,11 +512,11 @@ fn select_and_publish_shared<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>
 
 // A system owner's departure may affect many packages in a peer's view. The
 // report names each affected peer once and retains every different generation.
-fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
-    instances: &mut HashMap<Id,Entry<C,u64>>, routes: &mut HashMap<(u64,u64),Id>, sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, legacy: &mut HashMap<u64,[u8;32]>, owner: u64, package: u64)
+fn remove_system_owner<C: ?Sized,D>(views: &mut HashMap<u64,HashMap<u64,Id>>,
+    instances: &mut HashMap<Id,Entry<C,u64>>, routes: &mut HashMap<(u64,u64),Id>, sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, legacy: &mut HashMap<u64,[u8;32]>, uplinks:&mut HashMap<u64,(u64,D)>, owner: u64, package: u64)
     -> (out: (Arc<C>, bool, Vec<u64>))
     requires hash_map_inv(old(views)), hash_map_inv(old(instances)), obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
-        hash_map_inv(old(legacy)), obeys_concrete_eq::<[u8;32]>(),
+        hash_map_inv(old(uplinks)), hash_map_inv(old(legacy)), obeys_concrete_eq::<[u8;32]>(),
         hash_map_inv(old(routes)), hash_map_inv(old(sources)), hash_map_inv(old(names)),
         obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), vstd::pervasive::obeys_clone_eq::<(u64,u64)>(),
         old(views)@.contains_key(owner), old(views)@[owner]@.contains_key(package),
@@ -519,6 +532,10 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
         let id = before[owner]@[package];
         let report = out.2@;
         &&& out.0 == old(instances)@[id].capsule && out.1
+        &&& final(uplinks)@ == if exists|p:u64| before.contains_key(p) && (#[trigger] before[p])@.contains_key(package) &&
+            before[p]@[package] != id { old(uplinks)@ } else {
+            old(uplinks)@.restrict(old(uplinks)@.dom().filter(|key:u64| old(uplinks)@[key].0 != package))
+        }
         &&& final(legacy)@ == if exists|peer:Id| old(instances)@.remove(id).contains_key(peer)
             && peer.identity().0.1 == id.identity().0.1 { old(legacy)@ }
             else { crate::dependent_views::kept(old(legacy)@,id.identity().0.1) }
@@ -562,7 +579,10 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
     report.push(owner);
     let tear_down = crate::dependent_views::depart(views,instances,&id,&owner,&mut report);
     crate::dependent_views::revoke_sources(routes,sources,names,&id,&owner,tear_down);
-    if tear_down { crate::dependent_views::prune_legacy(legacy,instances,id.key().artifact()); }
+    if tear_down {
+        crate::uplink_index::prune_unviewed(views,uplinks,&package);
+        crate::dependent_views::prune_legacy(legacy,instances,id.key().artifact());
+    }
     proof {
         let peers = report@.skip(1);
         assert(report@ == seq![owner] + peers);
@@ -601,6 +621,23 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
                     assert(surviving.contains_key(k));
                 }
             }
+        }
+    }
+    proof {
+        assert forall|p:u64| (views@.contains_key(p) && (#[trigger] views@[p])@.contains_key(package)) ==
+            (before.contains_key(p) && before[p]@.contains_key(package) && before[p]@[package] != id) by {
+            if before.contains_key(p) && before[p]@.contains_key(package) && before[p]@[package] != id {
+                assert(p != owner);
+                assert(middle.contains_key(p));
+                assert(crate::dependent_views::kept(middle[p]@,id).contains_key(package));
+            }
+        }
+        if exists|p:u64| before.contains_key(p) && (#[trigger] before[p])@.contains_key(package) && before[p]@[package] != id {
+            let p = choose|p:u64| before.contains_key(p) && (#[trigger] before[p])@.contains_key(package) && before[p]@[package] != id;
+            assert(views@.contains_key(p) && views@[p]@.contains_key(package));
+        } else if exists|p:u64| views@.contains_key(p) && (#[trigger] views@[p])@.contains_key(package) {
+            let p = choose|p:u64| views@.contains_key(p) && (#[trigger] views@[p])@.contains_key(package);
+            assert(before.contains_key(p) && before[p]@.contains_key(package) && before[p]@[package] != id);
         }
     }
     (handle.unwrap(),tear_down,report)

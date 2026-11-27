@@ -213,6 +213,7 @@ INPUTS = [
     Path("crates/astrid-capsule/src/registry/source_lookup.rs"),
     Path("crates/astrid-capsule/src/registry/view_lookup.rs"),
     Path("crates/astrid-capsule/src/registry/generation_replacement.rs"),
+    Path("crates/astrid-capsule/src/registry/uplink_index.rs"),
     Path("crates/astrid-capsule/src/registry/registration.rs"),
     Path("crates/astrid-capsule/src/registry/viewers.rs"),
     Path("crates/astrid-capsule/src/registry/dependent_views.rs"),

@@ -33,19 +33,7 @@ pub(super) fn remove_generation<K: Eq + Hash + Clone,V: Eq>(view: &mut HashMap<K
             assert(vstd::pervasive::cloned(*k,out));
             out
         });
-    let mut i = 0usize;
-    while i < keys.len()
-        invariant i <= keys.len(), keys@.no_duplicates(), hash_map_inv(view),
-            obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
-            view@ == before.remove_keys(keys@.take(i as int).to_set()),
-        decreases keys.len() - i,
-    {
-        view.remove(&keys[i]);
-        assert(keys@.take(i+1) =~= keys@.take(i as int).push(keys@[i as int]));
-        assert(keys@.take(i+1).to_set() =~= keys@.take(i as int).to_set().insert(keys@[i as int]));
-        i += 1;
-    }
-    assert(keys@.take(i as int) =~= keys@);
+    crate::registry_keys::remove(view,keys.as_slice());
     assert(view@ =~= before.restrict(before.dom().filter(|k:K| before[k] != *runtime)));
     proof {
         if keys@.len() > 0 {

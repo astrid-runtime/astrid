@@ -361,3 +361,35 @@ fn reserved_replacement_binds_the_owner_uid_and_current_package_slot()
     assert!(Arc::ptr_eq(&original, &replaced.previous));
     Ok(())
 }
+
+#[test]
+fn final_package_view_withdraws_only_its_uplink_descriptors() -> CapsuleResult<()> {
+    let mut registry = CapsuleRegistry::new();
+    let package = CapsuleId::from_static("provider");
+    let peer_package = CapsuleId::from_static("peer-provider");
+    let operator = pid("operator");
+    let user = pid("user");
+    registry.register_system_runtime(
+        Box::new(MockCapsule::new("provider")),
+        test_hash("system"),
+        &operator,
+    )?;
+    registry.register_principal_runtime(
+        Box::new(MockCapsule::new("provider")),
+        test_hash("private"),
+        &user,
+        uid(1),
+    )?;
+    let descriptor = astrid_core::UplinkDescriptor::builder("console", "cli").build();
+    let retired = descriptor.id;
+    registry.register_uplink(&package, descriptor)?;
+    let descriptor = astrid_core::UplinkDescriptor::builder("peer", "cli").build();
+    let retained = descriptor.id;
+    registry.register_uplink(&peer_package, descriptor)?;
+    assert!(registry.unregister_for(&operator, &package)?.torn_down);
+    assert!(registry.get_uplink(&retired).is_some());
+    assert!(registry.unregister_for(&user, &package)?.torn_down);
+    assert!(registry.get_uplink(&retired).is_none());
+    assert_eq!(registry.get_uplink(&retained).unwrap().name, "peer");
+    Ok(())
+}

@@ -13,7 +13,7 @@ impl CapsuleRegistry {
     /// Look up an uplink by its ID.
     #[must_use]
     pub fn get_uplink(&self, id: &UplinkId) -> Option<&UplinkDescriptor> {
-        self.uplinks.get(id).map(|(_, descriptor)| descriptor)
+        super::uplink_index::descriptor(&self.uplinks, id)
     }
 
     /// Register an uplink for a capsule.
@@ -45,7 +45,7 @@ impl CapsuleRegistry {
 
     /// Remove all uplinks belonging to a capsule.
     pub fn unregister_capsule_uplinks(&mut self, capsule_id: &CapsuleId) {
-        self.uplinks.retain(|_, (owner, _)| owner != capsule_id);
+        super::uplink_index::withdraw(&mut self.uplinks, capsule_id);
     }
 
     /// Find an uplink that serves the given platform type.

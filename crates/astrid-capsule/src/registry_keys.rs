@@ -80,4 +80,23 @@ pub(super) fn keys_for<K: Eq + Hash, V, F: Fn(&V) -> bool, C: Fn(&K) -> K>(
     }
 }
 
+/// Remove exactly the selected keys while preserving the other entries and values.
+pub(super) fn remove<K:Eq+Hash,V>(entries:&mut HashMap<K,V>, keys:&[K])
+    requires hash_map_inv(old(entries)), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+    ensures hash_map_inv(final(entries)), final(entries)@ == old(entries)@.remove_keys(keys@.to_set()),
+{
+    let ghost before = entries@;
+    let mut i = 0usize;
+    while i < keys.len()
+        invariant i <= keys.len(), hash_map_inv(entries), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+            entries@ == before.remove_keys(keys@.take(i as int).to_set()),
+        decreases keys.len() - i,
+    {
+        entries.remove(&keys[i]);
+        assert(keys@.take(i+1) =~= keys@.take(i as int).push(keys@[i as int]));
+        assert(keys@.take(i+1).to_set() =~= keys@.take(i as int).to_set().insert(keys@[i as int]));
+        i += 1;
+    }
+    assert(keys@.take(i as int) =~= keys@);
+}
 }

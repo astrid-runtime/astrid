@@ -307,6 +307,8 @@ mod view_lookup;
 #[path = "../crates/astrid-capsule/src/registry/registration.rs"]
 mod registration;
 mod hosted_registry_lookup;
+#[path = "../crates/astrid-capsule/src/registry/uplink_index.rs"]
+mod uplink_index;
 #[path = "../crates/astrid-capsule/src/registry/viewers.rs"]
 mod viewers;
 #[path = "../crates/astrid-capsule/src/registry/dependent_views.rs"]
