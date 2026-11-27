@@ -8,13 +8,12 @@ use crate::content_dag::BuiltContent;
 use super::retry::Step;
 use super::{
     BranchState, CatalogRoot, CatalogValue, ContentHeader, ContentName, MAX_WORKSPACE_BRANCHES,
-    ModelError, ObjectId, ObjectRecord, ObjectReference, PrincipalContentError,
-    PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind, WorkspaceBranchDescriptor,
-    WorkspaceBranchError, WorkspaceBranchStore, WorkspaceUid, decode_branch_record,
-    decode_promotion_receipt, is_workspace_branch_label, is_workspace_receipt_label,
-    make_branch_record, make_branch_record_for_uid, parse_workspace_receipt_uid,
-    parse_workspace_uid, qualify_name, selected_catalog, selected_name, validate_catalog,
-    workspace_ref_label,
+    ModelError, ObjectId, ObjectRecord, PrincipalContentError, PrincipalProjectionEngine,
+    PrincipalProjectionError, ReferenceKind, WorkspaceBranchDescriptor, WorkspaceBranchError,
+    WorkspaceBranchStore, WorkspaceUid, decode_branch_record, decode_promotion_receipt,
+    is_workspace_branch_label, is_workspace_receipt_label, make_branch_record,
+    make_branch_record_for_uid, parse_workspace_receipt_uid, parse_workspace_uid, qualify_name,
+    selected_catalog, selected_name, validate_catalog,
 };
 
 impl<P, E> WorkspaceBranchStore<P, E>
@@ -92,8 +91,11 @@ where
             )?;
             let record_id = self.content.engine.identify_object(&record);
             let mut next = header.as_ref().clone();
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                record_id,
+            );
             let mut records = BTreeMap::new();
             records.append(&mut base_records);
             records.insert(record_id, record);
@@ -443,8 +445,11 @@ where
             let mut next = header.as_ref().clone();
             next.preserved_state
                 .retain(|reference| parse_workspace_uid(reference.label().as_bytes()) != Some(id));
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                record_id,
+            );
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;

@@ -73,7 +73,7 @@ use codec::{
 use helpers::{
     BranchState, hydrate_root, is_workspace_receipt_label, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, qualify_name, selected_catalog,
-    selected_name, validate_target_prefix, workspace_ref_label,
+    selected_name, validate_target_prefix,
 };
 
 pub(crate) fn is_workspace_branch_label(label: &[u8]) -> bool {

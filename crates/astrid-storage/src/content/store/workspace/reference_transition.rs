@@ -116,7 +116,69 @@ fn encode_digit(n: u8) -> (byte: u8)
     if n < 10 { b'0' + n } else { b'a' + (n-10) }
 }
 
-#[expect(clippy::arithmetic_side_effects, reason = "Verus checks the fixed prefix and identifier lengths and bounds the cursor")]
+#[expect(clippy::arithmetic_side_effects, reason = "Verus bounds the cursor and both hex digits")]
+fn append_uid(bytes: &mut Vec<u8>, id: [u8;16])
+    requires old(bytes)@.len() <= 29,
+    ensures final(bytes)@.take(old(bytes)@.len() as int) == old(bytes)@,
+        final(bytes)@.len() == old(bytes)@.len() + 32,
+        decodes(final(bytes)@.skip(old(bytes)@.len() as int),id),
+        forall|j:int| 0 <= j < 16 ==> final(bytes)@[old(bytes)@.len()+2*j] == lower((#[trigger] id@[j]/16) as u8)
+            && final(bytes)@[old(bytes)@.len()+1+2*j] == lower((id@[j]%16) as u8),
+{
+    let ghost offset = bytes@.len() as int;
+    let mut i = 0usize;
+    while i < id.len()
+        invariant offset == old(bytes)@.len(), 0 <= offset <= 29, i <= 16, bytes@.len() == offset + 2*i,
+            bytes@.take(offset) == old(bytes)@,
+            forall|j:int| 0 <= j < i ==> bytes@[offset+2*j] == lower((#[trigger] id@[j]/16) as u8)
+                && bytes@[offset+1+2*j] == lower((id@[j]%16) as u8)
+                && nibble(bytes@[offset+2*j]) == Some((id@[j]/16) as u8)
+                && nibble(bytes@[offset+1+2*j]) == Some((id@[j]%16) as u8),
+        decreases 16-i,
+    {
+        let b = id[i];
+        let ghost previous = bytes@;
+        bytes.push(encode_digit(b/16));
+        bytes.push(encode_digit(b%16));
+        assert(bytes@.take(offset) =~= previous.take(offset));
+        i += 1;
+    }
+    assert forall|j:int| 0 <= j < 16 implies
+        nibble(bytes@.skip(offset)[2*j]) == Some((#[trigger] id@[j]/16) as u8)
+        && nibble(bytes@.skip(offset)[2*j+1]) == Some((id@[j]%16) as u8) by {
+        assert(bytes@.skip(offset)[2*j] == bytes@[offset+2*j]);
+        assert(bytes@.skip(offset)[2*j+1] == bytes@[offset+1+2*j]);
+    };
+}
+
+pub(super) fn encode_branch(id: [u8;16]) -> (bytes: Vec<u8>)
+    ensures branch_label(bytes@,id), bytes@.take(10) == BRANCH_REF_PREFIX_BYTES@,
+        bytes@.len() == 42, forall|j:int| 0 <= j < 16 ==>
+            bytes@[10+2*j] == lower((#[trigger] id@[j]/16) as u8)
+            && bytes@[11+2*j] == lower((id@[j]%16) as u8),
+{
+    let mut bytes = Vec::with_capacity(42);
+    bytes.extend_from_slice(BRANCH_REF_PREFIX_BYTES);
+    assert(bytes@ == BRANCH_REF_PREFIX_BYTES@);
+    append_uid(&mut bytes,id);
+    assert(bytes@.take(10) == BRANCH_REF_PREFIX_BYTES@);
+    bytes
+}
+
+/// Add the owning reference for the exact branch record prepared in this attempt.
+pub(super) fn push_live(references:&mut Vec<ObjectReference>, id:[u8;16], target:ObjectId)
+    ensures final(references)@.drop_last() == old(references)@,
+        final(references)@.len() == old(references)@.len()+1,
+        ({
+            let (label,record,kind) = final(references)@.last().fields();
+            &&& label.take(10) == BRANCH_REF_PREFIX_BYTES@
+            &&& branch_label(label,id) && record == target && kind == ReferenceKind::Owns
+        }),
+{
+    let label = encode_branch(id);
+    references.push(ObjectReference::owns(ReferenceLabel::new(label),target));
+}
+
 pub(super) fn encode_receipt(id: [u8;16]) -> (bytes: Vec<u8>)
     ensures receipt_label(bytes@,id),
         bytes@.take(29) == BRANCH_RECEIPT_PREFIX_BYTES@ + BRANCH_REF_PREFIX_BYTES@,
@@ -124,37 +186,18 @@ pub(super) fn encode_receipt(id: [u8;16]) -> (bytes: Vec<u8>)
         forall|j:int| 0 <= j < 16 ==> bytes@[29+2*j] == lower((#[trigger] id@[j]/16) as u8)
             && bytes@[30+2*j] == lower((id@[j]%16) as u8),
 {
-    let mut bytes = Vec::with_capacity(BRANCH_RECEIPT_PREFIX_BYTES.len() + BRANCH_REF_PREFIX_BYTES.len() + 2 * id.len());
+    let mut bytes = Vec::with_capacity(61);
     bytes.extend_from_slice(BRANCH_RECEIPT_PREFIX_BYTES);
     bytes.extend_from_slice(BRANCH_REF_PREFIX_BYTES);
-    let mut i = 0usize;
-    while i < id.len()
-        invariant i <= 16, bytes@.len() == 29 + 2*i,
-            bytes@.take(29) == BRANCH_RECEIPT_PREFIX_BYTES@ + BRANCH_REF_PREFIX_BYTES@,
-            forall|j:int| 0 <= j < i ==> bytes@[29+2*j] == lower((#[trigger] id@[j]/16) as u8)
-                && bytes@[30+2*j] == lower((id@[j]%16) as u8)
-                && nibble(bytes@[29+2*j]) == Some((id@[j]/16) as u8)
-                && nibble(bytes@[30+2*j]) == Some((id@[j]%16) as u8),
-        decreases 16-i,
-    {
-        let b = id[i];
-        bytes.push(encode_digit(b/16));
-        bytes.push(encode_digit(b%16));
-        i += 1;
-    }
+    append_uid(&mut bytes,id);
     assert(bytes@.take(19) =~= BRANCH_RECEIPT_PREFIX_BYTES@);
     let ghost body = bytes@.skip(19);
     assert(body.take(10) =~= BRANCH_REF_PREFIX_BYTES@) by {
-        assert forall|j:int| 0 <= j < 10 implies body.take(10)[j] == BRANCH_REF_PREFIX_BYTES@[j] by {
+        assert forall|j:int| 0 <= j < 10 implies body[j] == BRANCH_REF_PREFIX_BYTES@[j] by {
             assert(bytes@.take(29)[19+j] == (BRANCH_RECEIPT_PREFIX_BYTES@ + BRANCH_REF_PREFIX_BYTES@)[19+j]);
         }
     }
-    assert forall|j:int| 0 <= j < 16 implies
-        nibble(body.skip(10)[2*j]) == Some((#[trigger] id@[j]/16) as u8)
-            && nibble(body.skip(10)[2*j+1]) == Some((id@[j]%16) as u8) by {
-        assert(body.skip(10)[2*j] == bytes@[29+2*j]);
-        assert(body.skip(10)[2*j+1] == bytes@[30+2*j]);
-    }
+    assert(body.skip(10) =~= bytes@.skip(29));
     bytes
 }
 

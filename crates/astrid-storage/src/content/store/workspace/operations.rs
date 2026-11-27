@@ -9,7 +9,7 @@ use crate::content_dag::{
     build_content, open_content, read_opened_content, read_opened_content_range,
 };
 use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
-use crate::storage_model::{ModelError, ObjectId, ObjectRecord, ObjectReference};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord};
 
 use super::super::pending_catalog::retain_final_catalog_records;
 use super::retry::Step;
@@ -20,7 +20,7 @@ use super::{
     WorkspaceFilesystem, WorkspaceUid, list, list_prefix as catalog_list_prefix, lookup,
     make_branch_record, make_branch_record_for_uid, make_promotion_receipt_for_uid, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, prefix_exists as catalog_prefix_exists,
-    selected_catalog, validate_target_prefix, workspace_ref_label,
+    selected_catalog, validate_target_prefix,
 };
 
 impl<P: Ord, E> WorkspaceBranchStore<P, E> {
@@ -177,8 +177,11 @@ where
             )?;
             let record_id = self.content.engine.identify_object(&record);
             let mut next = header.as_ref().clone();
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                record_id,
+            );
             let mut records = BTreeMap::new();
             records.insert(record_id, record);
             let transaction =
@@ -781,8 +784,11 @@ where
             let mut next = header.as_ref().clone();
             next.preserved_state
                 .retain(|reference| parse_workspace_uid(reference.label().as_bytes()) != Some(id));
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), branch_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                branch_id,
+            );
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;

@@ -193,6 +193,27 @@ fn promote_then_drop(records: &mut Vec<ObjectReference>, id:[u8;16], target:Obje
     published
 }
 
+/// Decode the exact durable edge appended by branch creation and catalog publication.
+fn recover_live(records:&mut Vec<ObjectReference>,id:[u8;16],target:ObjectId)
+    -> (out:(Option<[u8;16]>,Option<[u8;16]>,ObjectId))
+    ensures out == (Some(id),None,target),
+        final(records)@.len() == old(records)@.len()+1,
+        final(records)@.drop_last() == old(records)@,
+        final(records)@.last().fields().2 == ReferenceKind::Owns,
+{
+    refs::push_live(records,id,target);
+    let edge = &records[records.len()-1];
+    let bytes = edge.label_bytes();
+    assert forall|other:[u8;16]| !refs::receipt_label(bytes@,other) by {
+        if refs::receipt_label(bytes@,other) {
+            assert(bytes@.take(19).take(10) =~= bytes@.take(10));
+        }
+    }
+    let receipt = refs::receipt(bytes);
+    if let Some(other) = receipt { assert(refs::receipt_label(bytes@,other)); }
+    (refs::branch(bytes),receipt,edge.target())
+}
+
 // Canonical encoding and actual recovery lookup must agree and a generated
 // receipt must never be accepted as a live branch label.
 fn recover_promoted(id:[u8;16]) -> (out:(Option<[u8;16]>,Option<[u8;16]>))

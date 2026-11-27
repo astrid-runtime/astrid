@@ -23,6 +23,10 @@ def defects():
     source = Path("crates/astrid-storage/src/content/store/workspace/reference_transition.rs")
     trace = Path("verification/hosted_workspace_references.rs")
     for name, old, new in [
+        ("live publication may lose prior references", "ensures final(references)@.drop_last() == old(references)@,", "ensures true,"),
+        ("live publication may name another branch", "branch_label(label,id) && record == target", "true && record == target"),
+        ("live publication may name another record", "&& record == target && kind", "&& true && kind"),
+        ("live publication may append a non-owning edge", "record == target && kind == ReferenceKind::Owns", "record == target && true"),
         ("recovery may miss a valid receipt", "(out == Some(id)) == #[trigger] receipt_label", "(out == Some(id)) ==> #[trigger] receipt_label"),
         ("live lookup can accept a promotion receipt", "(out == Some(id)) == #[trigger] branch_label", "(out == Some(id)) <== #[trigger] branch_label"),
         ("encoder need not emit a recoverable receipt", "ensures receipt_label(bytes@,id),", "ensures true,"),
