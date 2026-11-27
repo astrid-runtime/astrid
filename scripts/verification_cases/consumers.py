@@ -27,6 +27,16 @@ def consumer_defects():
             f"pending WAL merge {name}", overlay,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), record_trace,
         )
+    for name, clause, weaker in [
+        ("forgets the new entry", "out.is_ok() && final(objects)@ == old(objects)@.insert(id, candidate)", "out.is_ok()"),
+        ("forgets other names on a duplicate", "final(objects)@ == old(objects)@.insert(id, retained)", "final(objects)@.contains_key(id)"),
+        ("drops staged placement", "out.location == Some(location) && out.direct == direct", "out.direct == direct"),
+        ("allows a prepared placement", "out.location.is_none() && out.direct.is_none()", "out.direct.is_none()"),
+    ]:
+        yield (
+            f"pending WAL installation {name}", overlay,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), record_trace,
+        )
     for name, clause, weaker, target in [
         ("accepts a trailing byte", "if cursor != bytes.len() {return Err(BodyError::Trailing);}", "", record),
         ("forgets the canonical bytes", "fields.2 == bytes.subrange(data,refs)", "true", record_trace),

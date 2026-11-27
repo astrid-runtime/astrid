@@ -26,32 +26,6 @@ pub(in crate::engine::durable) type PendingWalObject =
     overlay_object::Object<Arc<ObjectRecord>, ArenaLocation, DirectArenaObject>;
 
 impl PendingWalObject {
-    pub(in crate::engine::durable) fn staged(
-        payload: Arc<[u8]>,
-        record: Arc<ObjectRecord>,
-        location: ArenaLocation,
-        direct: Option<DirectArenaObject>,
-    ) -> Self {
-        Self {
-            payload,
-            record,
-            location: Some(location),
-            direct,
-        }
-    }
-
-    pub(in crate::engine::durable) fn prepared(
-        payload: Arc<[u8]>,
-        record: Arc<ObjectRecord>,
-    ) -> Self {
-        Self {
-            payload,
-            record,
-            location: None,
-            direct: None,
-        }
-    }
-
     pub(in crate::engine::durable) fn payload(&self) -> &[u8] {
         &self.payload
     }
@@ -192,16 +166,8 @@ impl<P: Ord> PendingWalOverlay<P> {
     }
 
     fn insert(&mut self, id: ObjectId, incoming: PendingWalObject) -> Result<(), DurableError> {
-        match self.objects.entry(id) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(incoming);
-                Ok(())
-            },
-            std::collections::btree_map::Entry::Occupied(entry) => entry
-                .into_mut()
-                .merge(incoming)
-                .map_err(|()| ModelError::ObjectCollision(id).into()),
-        }
+        overlay_object::install(&mut self.objects, id, incoming)
+            .map_err(|()| ModelError::ObjectCollision(id).into())
     }
 
     /// Retain one root transition in publication order.

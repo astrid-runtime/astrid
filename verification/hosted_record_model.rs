@@ -166,6 +166,36 @@ fn duplicate_labels(frame:&[u8],scheme:Scheme,start:usize)
     }
 }
 
+/// A prepared frame installed under a fresh name survives a later staged
+/// declaration. A conflicting frame preserves the entire first insertion.
+fn install_then_stage<L,D,H:Fn(&crate::ObjectRecord)->[u8;32]>(
+    objects: &mut std::collections::BTreeMap<crate::ObjectId,crate::overlay_object::Object<std::sync::Arc<crate::ObjectRecord>,L,D>>,
+    frame: &std::sync::Arc<[u8]>, scheme:Scheme, id:crate::ObjectId, identify:H,
+    staged_bytes:std::sync::Arc<[u8]>, staged_record:std::sync::Arc<crate::ObjectRecord>, location:L, direct:Option<D>,
+) -> (out:Result<bool,record::Error<record::BodyError>>)
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        vstd::std_specs::btree::btree_map_inv(old(objects)), !old(objects)@.contains_key(id),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures match out {
+        Err(_) => final(objects)@ == old(objects)@,
+        Ok(accepted) => {
+            let entry = final(objects)@[id];
+            &&& final(objects)@ == old(objects)@.insert(id,entry)
+            &&& (*entry.payload)@ == (**frame)@ && record::record_at((**frame)@,40,scheme,*entry.record)
+            &&& id.digest() == (**frame)@.subrange(8,40)
+            &&& accepted == ((*staged_bytes)@ == (**frame)@)
+            &&& entry.location == (if accepted {Some(location)} else {None})
+            &&& entry.direct == (if accepted {direct} else {None})
+        },
+    },
+{
+    use crate::overlay_object::{Object,install};
+    let (name,payload,r) = record::pending(frame,scheme,id,identify)?;
+    let first = install(objects,name,Object::prepared(payload,r));
+    assert(first.is_ok());
+    Ok(install(objects,id,Object::staged(staged_bytes,staged_record,location,direct)).is_ok())
+}
+
 /// Replaying a name may add a staged placement if the payload agrees, while
 /// retaining the originally decoded record, even when the candidate differs.
 fn repeated<R:Copy>(retained:&mut crate::overlay_object::Object<R,u64,u64>,candidate:crate::overlay_object::Object<R,u64,u64>)
