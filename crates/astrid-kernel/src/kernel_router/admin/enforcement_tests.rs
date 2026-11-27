@@ -465,7 +465,7 @@ async fn send_admin_scoped(
 enum PairIssueAuditExpectation {
     Success,
     Denied,
-    BadInput,
+    RequestFailed,
 }
 
 async fn assert_pair_issue_audit(
@@ -517,7 +517,7 @@ async fn assert_pair_issue_audit(
             ));
             assert!(matches!(&entry.outcome, AuditOutcome::Failure { .. }));
         },
-        PairIssueAuditExpectation::BadInput => {
+        PairIssueAuditExpectation::RequestFailed => {
             assert!(matches!(
                 &entry.authorization,
                 AuthorizationProof::System { .. }
@@ -558,6 +558,104 @@ fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) ->
 
     seed_profile(kernel, principal, &profile);
     (full_id, scoped_id)
+}
+
+#[tokio::test]
+async fn queued_pair_refusal_has_one_denied_audit_row_and_no_token() {
+    queued_pair_refusal(false).await;
+}
+
+#[tokio::test]
+async fn queued_pair_profile_removal_has_one_denied_audit_row_and_no_token() {
+    queued_pair_refusal(true).await;
+}
+
+#[tokio::test]
+async fn pair_storage_error_is_a_failed_authorized_operation() {
+    let (_dir, kernel) = fixture().await;
+    let request = AdminRequestKind::PairDeviceIssue {
+        expires_secs: Some(300),
+        label: None,
+        scope: astrid_events::kernel_api::PairScopeArg::Explicit {
+            allow: vec!["self:*".into()],
+            deny: vec![],
+        },
+    };
+    // A legacy source which cannot be imported makes the real durable store
+    // unavailable after policy admission and before token insertion.
+    let path = crate::pair_token::PairTokenStore::path_for(&kernel.astrid_home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let response = send_admin(
+        &kernel,
+        &PrincipalId::default(),
+        "auth.pair.issue",
+        request.into(),
+    )
+    .await;
+    assert_eq!(response["status"], "Error", "{response}");
+    assert!(
+        response
+            .to_string()
+            .contains("pair-token durable storage is unavailable"),
+        "{response}"
+    );
+    let store = crate::pair_token::DurablePairTokenStore::new(
+        kernel.principal_store.as_ref().unwrap().kv(),
+    )
+    .unwrap();
+    assert!(store.list().await.unwrap().is_empty());
+    assert_pair_issue_audit(
+        &kernel,
+        "self:auth:pair",
+        PairIssueAuditExpectation::RequestFailed,
+    )
+    .await;
+}
+
+async fn queued_pair_refusal(remove_profile: bool) {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("queued_pair_audit");
+    let mut profile = PrincipalProfile {
+        grants: vec!["self:*".into()],
+        ..Default::default()
+    };
+    seed_profile(&kernel, &caller, &profile);
+    let guard = kernel.admin_write_lock.lock().await;
+    let request = AdminRequestKind::PairDeviceIssue {
+        expires_secs: Some(300),
+        label: None,
+        scope: astrid_events::kernel_api::PairScopeArg::Explicit {
+            allow: vec!["self:*".into()],
+            deny: vec![],
+        },
+    };
+    let mut queued = Box::pin(super::handle_admin_request(
+        &kernel,
+        Topic::from_raw("astrid.v1.admin.auth.pair.issue"),
+        caller.clone(),
+        None,
+        request.into(),
+    ));
+    tokio::select! {
+        biased;
+        () = &mut queued => panic!("pair issue finished under another writer"),
+        () = std::future::ready(()) => {}
+    }
+    if remove_profile {
+        std::fs::remove_file(kernel.astrid_home.profile_path(&caller)).unwrap();
+    } else {
+        profile.enabled = false;
+        seed_profile(&kernel, &caller, &profile);
+    }
+    drop(guard);
+    queued.await;
+    assert_pair_issue_audit(&kernel, "self:auth:pair", PairIssueAuditExpectation::Denied).await;
+    let store = crate::pair_token::DurablePairTokenStore::new(
+        kernel.principal_store.as_ref().unwrap().kv(),
+    )
+    .unwrap();
+    assert!(store.list().await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -794,7 +892,7 @@ async fn malformed_pair_scope_audits_bad_input_not_permission_denial() {
     assert_pair_issue_audit(
         &kernel,
         "self:auth:pair",
-        PairIssueAuditExpectation::BadInput,
+        PairIssueAuditExpectation::RequestFailed,
     )
     .await;
 }
