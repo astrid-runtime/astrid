@@ -1,6 +1,9 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/command.rs"]
+mod process_command;
+mod hosted_process_command;
 #[path = "../crates/astrid-capsule/src/engine/wasm/guest_kv.rs"]
 mod guest_kv_dispatch;
 #[path = "../crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"]

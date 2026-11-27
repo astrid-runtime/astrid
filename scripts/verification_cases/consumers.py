@@ -9,10 +9,27 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    command = Path("crates/astrid-capsule/src/engine/wasm/host/process/command.rs")
+    for name, original, changed, target in [
+        ("skips the environment clear", "    builder.clear_environment();", "", command),
+        ("drops argv", "    builder.arguments(args);", "", command),
+        ("substitutes an environment value", "pair.1.as_str()", "pair.0.as_str()", command),
+        ("replays the request after injections", "apply_environment(&mut builder, injections);",
+         "apply_environment(&mut builder, environment);", command),
+        ("loses host precedence", "Step::Directory(cwd), Step::Clear] + assignments(environment) + assignments(injections),",
+         "Step::Directory(cwd), Step::Clear] + assignments(environment) + assignments(injections) || true,",
+         Path("verification/hosted_process_command.rs")),
+    ]:
+        yield (
+            f"process construction {name}", command,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     reply = Path("crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs")
     trace = Path("verification/hosted_consent_reply.rs")
     for name, original, changed, target in [
         ("loses retirement rejection", "Err(()) => held.is_none(),\n        Ok(p)", "Err(()) => true,\n        Ok(p)", trace),
+        ("loses caller retirement rejection", "Err(()) => held.is_none(),\n            Ok(c)", "Err(()) => true,\n            Ok(c)", trace),
+        ("loses responder retirement rejection", "Err(()) => held.is_none(),\n            },", "Err(()) => true,\n            },", trace),
         ("drops live device admission", "held matches Some(h) && h.guards() == (p,c,s)", "true", trace),
         ("grants unknown decisions", "else {Decision::Deny}\n}\n\n/// Hosted", "else {Decision::Once}\n}\n\n/// Hosted", reply),
         ("skips persistent publication", "save_at(p,a,destination,writer)?;", "let _ = destination;", reply),

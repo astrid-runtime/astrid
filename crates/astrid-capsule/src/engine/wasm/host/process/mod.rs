@@ -25,6 +25,7 @@
 //! table is the canonical storage for `ManagedProcess`.
 
 mod audit;
+mod command;
 mod compat;
 mod context;
 mod handle;
