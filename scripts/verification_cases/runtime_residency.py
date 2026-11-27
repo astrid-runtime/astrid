@@ -94,3 +94,14 @@ def defects():
             lambda s, a=original, b=changed: replace_once(s, a, b),
             Path("verification/hosted_runtime_residency.rs"),
         )
+    source = Path("crates/astrid-capsule/src/registry/source_lookup.rs")
+    for name, original, weakened in [
+        ("loses scoped precedence", "out == if instances@.contains_key(v) { Some(instances@[v].capsule) } else { None }", "true"),
+        ("accepts ambiguous legacy slots", "Some(handle) => exists|k:K| keys == Set::empty().insert(k) && handle == #[trigger] instances@[view[k]].capsule,", "Some(handle) => true,"),
+        ("may refuse a unique live slot", "None => forall|k:K| keys != #[trigger] Set::empty().insert(k),", "None => true,"),
+    ]:
+        yield (
+            f"scoped source {name}", source,
+            lambda s, a=original, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_source_lookup.rs"),
+        )

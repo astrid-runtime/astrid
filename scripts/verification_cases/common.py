@@ -140,6 +140,8 @@ INPUTS = [
     PRINCIPAL_SYNTAX,
     ROUTE_SCOPE,
     Path("verification/hosted_registry_lookup.rs"),
+    Path("verification/hosted_source_lookup.rs"),
+    Path("crates/astrid-capsule/src/registry/source_lookup.rs"),
     Path("crates/astrid-capsule/src/registry/view_lookup.rs"),
     Path("crates/astrid-capsule/src/registry/viewers.rs"),
     Path("crates/astrid-capsule/src/registry/instance_swap.rs"),

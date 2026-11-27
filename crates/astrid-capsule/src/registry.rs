@@ -56,6 +56,7 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
 }
 
 mod instance_swap;
+mod source_lookup;
 mod view_lookup;
 mod viewers;
 type InstanceEntry = instance_swap::Entry<dyn Capsule, PrincipalId>;
@@ -592,22 +593,13 @@ impl CapsuleRegistry {
         principal: &PrincipalId,
         uuid: &Uuid,
     ) -> Option<Arc<dyn Capsule>> {
-        let runtime_id = if let Some(runtime_id) = self.uuid_map.get(&(*uuid, principal.clone())) {
-            runtime_id
-        } else {
-            let artifact = self.legacy_uuid_map.get(uuid)?;
-            let mut matches = self.views.get(principal)?.values().filter(|runtime_id| {
-                runtime_id.key().artifact() == artifact && self.instances.contains_key(*runtime_id)
-            });
-            let first = matches.next()?;
-            if matches.next().is_some() {
-                return None;
-            }
-            first
-        };
-        self.instances
-            .get(runtime_id)
-            .map(|entry| Arc::clone(&entry.capsule))
+        source_lookup::capsule_for(
+            &self.uuid_map,
+            &self.legacy_uuid_map,
+            &self.instances,
+            &self.views,
+            (*uuid, principal.clone()),
+        )
     }
 
     /// Compatibility lookup. Returns a runtime only when the UUID is
@@ -798,9 +790,7 @@ impl CapsuleRegistry {
     /// the requesting principal views rather than assume one hash per id.
     #[must_use]
     pub fn hash_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<WasmHash> {
-        self.views
-            .get(principal)?
-            .get(id)
+        view_lookup::resolve(&self.views, principal, id)
             .map(|runtime_id| runtime_id.key().artifact().clone())
     }
 
@@ -808,7 +798,7 @@ impl CapsuleRegistry {
     /// `principal`.
     #[must_use]
     pub fn source_id_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<Uuid> {
-        let runtime_id = self.views.get(principal)?.get(id)?;
+        let runtime_id = view_lookup::resolve(&self.views, principal, id)?;
         self.source_uuid_by_runtime.get(runtime_id).copied()
     }
 

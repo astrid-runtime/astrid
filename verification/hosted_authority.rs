@@ -202,8 +202,12 @@ mod runtime_scope;
 
 #[path = "../crates/astrid-capsule/src/registry/generation.rs"]
 mod runtime_generation;
+use runtime_generation as generation;
 #[path = "../crates/astrid-capsule/src/registry/instance_swap.rs"]
 mod instance_swap;
+#[path = "../crates/astrid-capsule/src/registry/source_lookup.rs"]
+mod source_lookup;
+mod hosted_source_lookup;
 #[path = "../crates/astrid-capsule/src/registry/view_lookup.rs"]
 mod view_lookup;
 mod hosted_registry_lookup;

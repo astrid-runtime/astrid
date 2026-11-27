@@ -1033,3 +1033,6 @@ fn hash_for_and_principals_viewing_hash_separate_two_versions_of_one_id() {
         "two distinct hashes → two runtime instances"
     );
 }
+
+#[path = "registry/source_lookup_tests.rs"]
+mod source_lookup_tests;
