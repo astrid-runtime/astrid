@@ -1,7 +1,9 @@
 //! Principal-scoped replacement with lifecycle admission.
 
-use super::{Kernel, RestartOutcome, capsule_audit, unload_replaced_runtime};
+use super::{Kernel, capsule_audit};
+use astrid_capsule_types::error::CapsuleError;
 use astrid_core::PrincipalId;
+use std::sync::Arc;
 
 impl Kernel {
     /// Restart the exact runtime generation visible to `principal`. Principal
@@ -11,6 +13,7 @@ impl Kernel {
     /// The replacement is activated behind a closed route-admission gate and
     /// must become ready before it is atomically published. Returns
     /// [`RestartOutcome::Clean`] when the old runtime was then fully unloaded,
+    /// [`RestartOutcome::OldInstanceUnloadFailed`] if its unload returned an error,
     /// or [`RestartOutcome::OldInstanceLingering`] when another `Arc` still
     /// holds its already-cancelled resources.
     ///
@@ -150,3 +153,56 @@ impl Kernel {
         Ok(outcome)
     }
 }
+
+/// Whether [`Kernel::restart_capsule`] fully tore the old instance down.
+///
+/// A restart publishes a fresh generation either way; this is a diagnostic of what
+/// happened to the OLD one. It deliberately does NOT drive the retry cap: the
+/// cap counts consecutive HEALTH failures (a lingering old instance is a normal,
+/// harmless state for a busy capsule whose dispatcher consumer still holds a
+/// clone — it is NOT a restart failure), and the health monitor prunes a
+/// tracker when the capsule RECOVERS, not on the restart-call outcome.
+#[derive(Debug)]
+pub(super) enum RestartOutcome {
+    /// The old runtime was exclusively unloaded after the fresh generation was
+    /// atomically published.
+    Clean,
+    /// The replacement was published and exclusive unload returned the engine error.
+    OldInstanceUnloadFailed(CapsuleError),
+    /// The old runtime's exclusive `unload` was skipped because an `Arc` clone
+    /// (e.g. a live dispatcher consumer holding a clone for up to its idle
+    /// grace) was still held. Its run-loop and subprocesses were cooperatively
+    /// cancelled — no CPU/process leak — and its memory reclaims when the last
+    /// clone drops. This is common for a capsule under load and is NOT counted
+    /// as a restart failure.
+    OldInstanceLingering,
+    /// The observed failed generation was already replaced before restart.
+    Superseded,
+}
+
+async fn unload_replaced_runtime(
+    id: &astrid_capsule_types::CapsuleId,
+    previous: &mut Arc<dyn astrid_capsule::capsule::Capsule>,
+) -> RestartOutcome {
+    for retry in 0..20_u32 {
+        if let Some(capsule) = Arc::get_mut(previous) {
+            return match capsule.unload().await {
+                Ok(()) => RestartOutcome::Clean,
+                Err(error) => RestartOutcome::OldInstanceUnloadFailed(error),
+            };
+        }
+        if retry < 19 {
+            astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    tracing::warn!(
+        capsule_id = %id,
+        strong_count = Arc::strong_count(previous),
+        "Old capsule generation remains referenced after replacement; autonomous \
+         work was cancelled and memory reclaims when the last reference drops"
+    );
+    RestartOutcome::OldInstanceLingering
+}
+
+#[cfg(test)]
+mod tests;
