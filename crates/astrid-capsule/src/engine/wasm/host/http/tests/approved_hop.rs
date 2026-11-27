@@ -375,6 +375,16 @@ async fn stream_retirement_drains_idle_and_reading_resources() {
                 // Hold both reader identity and device authority constant while the alias binding changes.
                 let directory = state.principal_directory.clone();
                 let uid = directory.uid_for(&principal).unwrap();
+                state.invocation_storage_uid =
+                    Some(astrid_core::PrincipalUid::from_bytes([55; 32]));
+                assert_eq!(stream_status(&mut state, rep), 0);
+                assert!(stream_headers(&mut state, rep).is_empty());
+                assert!(matches!(
+                    stream_read_chunk(&mut state, rep).await,
+                    Err(ErrorCode::Closed)
+                ));
+                state.invocation_storage_uid = Some(uid);
+                assert_eq!(stream_status(&mut state, rep), 200);
                 let alias = PrincipalId::new("stream-alias").unwrap();
                 directory.rename(uid, &principal, alias.clone()).unwrap();
                 // The renamed principal still has the opening UID and device.

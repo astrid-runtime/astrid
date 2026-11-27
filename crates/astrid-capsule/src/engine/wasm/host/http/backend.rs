@@ -817,30 +817,47 @@ pub(super) async fn stream_read_chunk(
             complete_stream(&audit, false, HostAuditOutcome::Failed("cancelled")).await;
             Ok(Vec::new())
         },
-        Some(Err(_)) => Err(ErrorCode::Timeout),
-        Some(Ok(Err(e))) => {
-            let error = map_reqwest_err(&e);
-            complete_stream(&audit, false, HostAuditOutcome::Failed(&error_text(&error))).await;
-            Err(error)
-        },
-        Some(Ok(Ok(Some(bytes)))) => {
-            match stream
+        Some(outcome) => {
+            let publication = stream
                 .lifetime
                 .access(state, &stream.creator, &reader, |_| {
-                    with_exchange(&audit, |exchange| exchange.digest(&bytes));
-                    bytes.to_vec()
-                }) {
-                Some(data) => Ok(data),
+                    super::body::read_outcome(
+                        outcome.ok(),
+                        ErrorCode::Timeout,
+                        |received| {
+                            super::body::stream_result(
+                                received,
+                                |bytes| {
+                                    with_exchange(&audit, |exchange| exchange.digest(&bytes));
+                                    bytes.to_vec()
+                                },
+                                || take_stream_completion(&audit, true, HostAuditOutcome::Allowed),
+                            )
+                        },
+                        |error| {
+                            let error = map_reqwest_err(&error);
+                            let record = take_stream_completion(
+                                &audit,
+                                false,
+                                HostAuditOutcome::Failed(&error_text(&error)),
+                            );
+                            (error, record)
+                        },
+                    )
+                });
+            match publication {
+                Some((result, record)) => {
+                    if let Some(record) = record {
+                        record.commit().await;
+                    }
+                    result
+                },
                 None => {
                     complete_stream(&audit, false, HostAuditOutcome::Failed("authority retired"))
                         .await;
                     Err(ErrorCode::Closed)
                 },
             }
-        },
-        Some(Ok(Ok(None))) => {
-            complete_stream(&audit, true, HostAuditOutcome::Allowed).await;
-            Ok(Vec::new())
         },
     };
     let bytes = bytes_result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
@@ -891,6 +908,14 @@ fn close_stream_exchange(stream: &ActiveHttpStream) {
     });
 }
 
+fn take_stream_completion(
+    audit: &std::sync::Mutex<HttpExchange>,
+    complete: bool,
+    outcome: HostAuditOutcome<'_>,
+) -> Option<super::audit::Completion> {
+    audit.lock().ok()?.take_completion(complete, outcome)
+}
+
 /// Complete a stream's audit exchange and wait until the record is durable.
 /// The lock is held only to take the record.
 async fn complete_stream(
@@ -898,11 +923,7 @@ async fn complete_stream(
     complete: bool,
     outcome: HostAuditOutcome<'_>,
 ) {
-    let completion = audit
-        .lock()
-        .ok()
-        .and_then(|mut exchange| exchange.take_completion(complete, outcome));
-    if let Some(completion) = completion {
+    if let Some(completion) = take_stream_completion(audit, complete, outcome) {
         completion.commit().await;
     }
 }

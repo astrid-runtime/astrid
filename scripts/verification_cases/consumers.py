@@ -39,6 +39,19 @@ def consumer_defects():
         )
     body = Path("crates/astrid-capsule/src/engine/wasm/host/http/body.rs")
     for name, original, changed in [
+        ("loses selected chunk", "data.ensures((bytes,), result.0) && result.1.is_none()", "result.1.is_none()"),
+        ("allows a completion with a chunk", "data.ensures((bytes,), result.0) && result.1.is_none()", "data.ensures((bytes,), result.0)"),
+        ("loses EOF result", "result.0@.len() == 0 && end.ensures((), result.1)", "end.ensures((), result.1)"),
+        ("loses transport error mapping", "out.0 matches Err(reason) && failure.ensures((error,), (reason, out.1))", "out.0.is_err()"),
+        ("loses successful handoff", "out.0 matches Ok(bytes) && success.ensures((received,), (bytes, out.1))", "out.0.is_ok()"),
+        ("allows a timeout receipt", "out.0 == Err(timeout) && out.1.is_none()", "out.0 == Err(timeout)"),
+        ("loses EOF receipt", "result.0@.len() == 0 && end.ensures((), result.1)", "result.0@.len() == 0"),
+    ]:
+        yield (
+            f"stream read publication {name}", body,
+            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
+        )
+    for name, original, changed in [
         ("loses cancellation refusal", "_ => result == Err(closed)", "_ => true"),
         ("loses received bytes", "&& bytes@ == body@", ""),
         ("loses transport failure", "result == Err(error)", "true"),

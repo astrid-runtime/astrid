@@ -489,6 +489,72 @@ async fn streamed_response_is_hashed_as_it_is_read() {
     assert_eq!(completions, 1);
 }
 
+/// EOF arrives after the opening alias moves while the read holds its I/O permit.
+#[tokio::test]
+async fn eof_after_owner_rebinding_records_failed_incomplete_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        socket
+    });
+    let sink = Arc::new(HttpSink::default());
+    let mut state = audited_state(addr.port(), &sink);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    state.io_semaphore = semaphore.clone();
+    let principal = state.effective_principal();
+    let directory = state.principal_directory.clone();
+    let uid = directory.uid_for(&principal).unwrap();
+    let limits = state.http_limits;
+    let stream = state
+        .http_stream_backend(
+            post(format!("http://{addr}/"), "{}", &[]),
+            super::options::ResolvedOptions::v10_defaults(&limits),
+        )
+        .await
+        .unwrap();
+    let mut socket = peer.await.unwrap();
+    let rebind = async move {
+        while semaphore.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+        directory
+            .rename(uid, &principal, PrincipalId::new("renamed").unwrap())
+            .unwrap();
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(
+            super::backend::stream_read_chunk(&mut state, stream.rep()),
+            rebind
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(super::ErrorCode::Closed)));
+    super::backend::stream_drop(&mut state, stream.rep());
+    let records = sink.records();
+    let completions: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            Recorded::Response {
+                complete,
+                failed,
+                durable,
+                ..
+            } => Some((*complete, *failed, *durable)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions, [(false, true, true)]);
+}
+
 /// A stream the guest drops before the end records one successful but
 /// incomplete completion covering the bytes delivered so far.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -46,4 +46,33 @@ fn stream_release(owner:bool, opening:bool, reader:bool, payload:u64) -> (r:Opti
     crate::http_body::disclose(owner,opening,reader,payload,|selected:u64| -> (v:u64) ensures v == selected, {selected})
 }
 
+fn stream_result(received: Option<Vec<u8>>, receipt: u64) -> (out: (Vec<u8>, Option<u64>))
+    ensures match received {
+        Some(bytes) => out.0@ == bytes@ && out.1.is_none(),
+        None => out.0@.len() == 0 && out.1 == Some(receipt),
+    },
+{
+    crate::http_body::stream_result(received,
+        |bytes: Vec<u8>| -> (r: Vec<u8>) ensures r@ == bytes@, { bytes },
+        || -> (r: Option<u64>) ensures r == Some(receipt), { Some(receipt) })
+}
+
+fn read_receipt(read: Option<Result<Option<Vec<u8>>, u8>>, timeout: u8, receipt: u64)
+    -> (out: (Result<Vec<u8>, u8>, Option<u64>))
+    ensures match read {
+        Some(Ok(Some(body))) => out.0 matches Ok(bytes) && bytes@ == body@ && out.1.is_none(),
+        Some(Ok(None)) => out.0 matches Ok(bytes) && bytes@.len() == 0 && out.1 == Some(receipt),
+        Some(Err(reason)) => out == (Err(reason), Some(receipt)),
+        None => out == (Err(timeout), None),
+    },
+{
+    crate::http_body::read_outcome(read, timeout,
+        |received: Option<Vec<u8>>| -> (r: (Vec<u8>, Option<u64>))
+            ensures match received {
+                Some(body) => r.0@ == body@ && r.1.is_none(),
+                None => r.0@.len() == 0 && r.1 == Some(receipt),
+            }, { stream_result(received, receipt) },
+        |error: u8| -> (r: (u8, Option<u64>)) ensures r == (error, Some(receipt)), { (error, Some(receipt)) })
+}
+
 }
