@@ -110,4 +110,44 @@ fn detach_for_quiescence<C: ?Sized,A>(views: &mut HashMap<u64,HashMap<u64,Id>>,
     }
     out
 }
+
+// Two principals can have the same package and artifact at different runtime
+// generations. Only a survivor attached to the removed generation keeps it alive.
+fn detach_with_peer<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
+    instances: &HashMap<Id,Entry<C,u64>>, owner: u64, package: u64, peer: u64)
+    -> (out: (Arc<C>,crate::viewers::Departure))
+    requires
+        owner != peer,
+        hash_map_inv(old(views)), hash_map_inv(instances),
+        obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
+        old(views)@.dom() == set![owner,peer],
+        old(views)@[owner]@.dom() == set![package], old(views)@[peer]@.dom() == set![package],
+        hash_map_inv(&old(views)@[owner]), hash_map_inv(&old(views)@[peer]),
+        instances@.contains_key(old(views)@[owner]@[package]),
+    ensures ({
+        let id = old(views)@[owner]@[package];
+        let entry = instances@[id];
+        &&& out.0 == entry.capsule
+        &&& out.1 == if !(id.identity().0.2 is SystemResident) { crate::viewers::Departure::RemoveRuntime }
+            else if entry.owner_alias == Some(owner) { crate::viewers::Departure::RemoveRuntimeAndViews }
+            else if old(views)@[peer]@[package] == id { crate::viewers::Departure::KeepRuntime }
+            else { crate::viewers::Departure::RemoveRuntime }
+    }),
+{
+    let ghost before = views@;
+    let (id,handle) = view_lookup::detach(views,instances,&owner,&package).unwrap();
+    assert(before[owner]@.remove(package).is_empty());
+    assert(views@ == before.remove(owner));
+    let installed = instances.get(&id).unwrap();
+    let decision = crate::viewers::departure(views,&id,id.key().scope(),installed.owner_alias.as_ref(),&owner);
+    proof {
+        assert(views@[peer]@.values().contains(id) == (before[peer]@[package] == id)) by {
+            if views@[peer]@.values().contains(id) {
+                let k = choose|k:u64| views@[peer]@.contains_key(k) && views@[peer]@[k] == id;
+                assert(k == package);
+            }
+        }
+    }
+    (handle.unwrap(),decision)
+}
 }

@@ -290,6 +290,7 @@ mod cache_address;
 type PrincipalUid = u64;
 #[path = "../crates/astrid-capsule/src/registry/runtime_scope.rs"]
 mod runtime_scope;
+use runtime_scope::RuntimeScope;
 
 #[path = "../crates/astrid-capsule/src/registry/generation.rs"]
 mod runtime_generation;

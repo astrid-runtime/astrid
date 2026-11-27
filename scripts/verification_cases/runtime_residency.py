@@ -14,6 +14,20 @@ def defects():
             lambda s, a=original: replace_once(s, a, "ensures true" if a.startswith("ensures ") else "true"),
             Path("verification/hosted_route_retirement.rs"),
         )
+    viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
+    for name, original, weakened in [
+        ("can keep a principal runtime", "if !(scope is SystemResident) { Departure::RemoveRuntime }",
+         "if !(scope is SystemResident) { out }"),
+        ("can retain dependent views when the owner leaves", "else if owner == Some(departing) { Departure::RemoveRuntimeAndViews }",
+         "else if owner == Some(departing) { out }"),
+        ("can remove a generation with surviving views", "Departure::KeepRuntime\n        } else", "out\n        } else"),
+        ("can retain an unreferenced generation", "} else { Departure::RemoveRuntime },", "} else { out },"),
+    ]:
+        yield (
+            f"runtime departure {name}", viewers,
+            lambda s, a=original, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     lookup = Path("crates/astrid-capsule/src/registry/view_lookup.rs")
     for name, clause, weakened in [
         ("loses the installed generation and handle",

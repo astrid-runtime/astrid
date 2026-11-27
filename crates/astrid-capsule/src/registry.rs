@@ -491,22 +491,19 @@ impl CapsuleRegistry {
                 .ok_or_else(|| CapsuleError::NotFound(format!("capsule {id}")))?;
         let capsule = capsule.expect("principal view referenced missing capsule runtime");
 
-        let owner_departed = self
-            .instances
-            .get(&runtime_id)
-            .and_then(|entry| entry.owner_alias.as_ref())
-            == Some(principal);
-        // Principal runtimes have exactly one view. Explicit System runtimes
-        // are removed with their operator owner or their final dependent view.
-        let torn_down = runtime_id.key().scope() != RuntimeScope::SystemResident
-            || owner_departed
-            || !self
-                .views
-                .values()
-                .any(|view| view.values().any(|candidate| candidate == &runtime_id));
+        let departure = viewers::departure(
+            &self.views,
+            &runtime_id,
+            runtime_id.key().scope(),
+            self.instances
+                .get(&runtime_id)
+                .and_then(|entry| entry.owner_alias.as_ref()),
+            principal,
+        );
+        let torn_down = !matches!(departure, viewers::Departure::KeepRuntime);
         let mut removed_principals = vec![principal.clone()];
         if torn_down {
-            if owner_departed && runtime_id.key().scope() == RuntimeScope::SystemResident {
+            if matches!(departure, viewers::Departure::RemoveRuntimeAndViews) {
                 for (affected, view) in &mut self.views {
                     let previous_len = view.len();
                     view.retain(|_, candidate| candidate != &runtime_id);

@@ -36,6 +36,66 @@ pub(super) fn attached<K: Eq + Hash, V: Eq>(view: &HashMap<K,V>, runtime: &V) ->
     found
 }
 
+/// Remaining cleanup after a principal's view has been detached.
+pub(super) enum Departure {
+    KeepRuntime,
+    RemoveRuntime,
+    RemoveRuntimeAndViews,
+}
+
+pub(super) fn departure<P: Eq + Hash,K: Eq + Hash,V: Eq>(
+    views: &HashMap<P,HashMap<K,V>>, runtime: &V, scope: super::RuntimeScope,
+    owner: Option<&P>, departing: &P,
+) -> (out: Departure)
+    requires hash_map_inv(views), obeys_key_model::<P>(), obeys_key_model::<K>(),
+        obeys_concrete_eq::<P>(), obeys_concrete_eq::<V>(),
+        forall|p:P| views@.contains_key(p) ==> hash_map_inv(&views@[p]),
+    ensures out == if !(scope is SystemResident) { Departure::RemoveRuntime }
+        else if owner == Some(departing) { Departure::RemoveRuntimeAndViews }
+        else if exists|p:P| views@.contains_key(p) && (#[trigger] views@[p])@.values().contains(*runtime) {
+            Departure::KeepRuntime
+        } else { Departure::RemoveRuntime },
+{
+    if let super::RuntimeScope::Principal(_) = scope { return Departure::RemoveRuntime; }
+    proof { reveal(obeys_concrete_eq); }
+    match owner {
+        Some(p) if P::eq(p,departing) => return Departure::RemoveRuntimeAndViews,
+        _ => {},
+    }
+    let mut rows = views.iter();
+    let ghost all = rows.remaining();
+    let ghost mut n:int = 0;
+    loop
+        invariant
+            0 <= n <= all.len(), all.len() == views@.dom().len(), rows.remaining() == all.skip(n),
+            forall|i:int| 0 <= i < all.len() ==> views@.contains_key(*all[i].0)
+                && #[trigger] views@[*all[i].0] == *all[i].1,
+            forall|p:P| views@.contains_key(p) ==> all.contains((&p, &views@[p])),
+            forall|p:P| views@.contains_key(p) ==> hash_map_inv(&views@[p]),
+            forall|i:int| 0 <= i < n ==> !(#[trigger] all[i].1)@.values().contains(*runtime),
+            obeys_key_model::<K>(), obeys_concrete_eq::<V>(),
+            scope is SystemResident, owner != Some(departing),
+        decreases views@.dom().len() - n,
+    {
+        let Some((_p,view)) = rows.next() else {
+            assert(n == all.len());
+            assert forall|p:P| views@.contains_key(p) implies !(#[trigger] views@[p])@.values().contains(*runtime) by {
+                assert(all.contains((&p,&views@[p])));
+                let i = choose|i:int| 0 <= i < all.len() && all[i] == (&p,&views@[p]);
+                assert(0 <= i < n);
+                assert(!all[i].1@.values().contains(*runtime));
+            }
+            return Departure::RemoveRuntime;
+        };
+        assert((_p,view) == all[n]);
+        assert(views@[*all[n].0] == *all[n].1);
+        assert(views@.contains_key(*all[n].0));
+        if attached(view,runtime) { return Departure::KeepRuntime; }
+        assert(rows.remaining() =~= all.skip(n+1));
+        proof { n = n+1; }
+    }
+}
+
 pub(super) fn viewers<P: Eq + Hash + Clone, K: Eq + Hash, V: Eq>(
     views: &HashMap<P, HashMap<K,V>>, runtime: &V) -> (out: Vec<P>)
     requires hash_map_inv(views), obeys_key_model::<P>(), obeys_key_model::<K>(),
