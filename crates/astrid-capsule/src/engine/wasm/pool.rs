@@ -199,8 +199,8 @@ pub(super) struct CapsuleInstancePool {
     /// orphans a live resource (HTTP stream, IPC subscription, net stream,
     /// process handle, WASI fd) in the returned Store must NOT leak it into
     /// the next lease. The CLEAR phase drops
-    /// the whole resource table to close those handles before the instance is
-    /// reusable. See [`PoolCheckout::drop`].
+    /// the whole resource table to close those handles. A free-checkout Store
+    /// with a nonempty table is discarded together with its guest instance. See [`PoolCheckout::drop`].
     ///
     /// `false` for the `host_process` carve-out (`size == 1`): that capsule
     /// deliberately holds live `ManagedProcess` handles across invocations
@@ -411,13 +411,18 @@ impl PoolCheckout {
 impl Drop for PoolCheckout {
     fn drop(&mut self) {
         if let Some(mut pooled) = self.pooled.take() {
+            // A guest can retain component handles after a successful call.
+            // Replacing the host table does not clear those guest handles.
+            let reuse = self.reusable
+                && (!self.reset_resources_on_return
+                    || pooled.store.data().resource_table.is_empty());
             // Discard also releases shared resource quota, even for a size-1
             // pool that normally preserves handles between successful calls.
             clear_on_return(
                 pooled.store.data_mut(),
                 self.reset_resources_on_return || !self.reusable,
             );
-            if self.reusable {
+            if reuse {
                 self.available
                     .lock()
                     .expect("instance pool mutex poisoned")
@@ -428,7 +433,8 @@ impl Drop for PoolCheckout {
 }
 
 /// Tear down a returned instance's per-invocation [`HostState`] so the next
-/// lease starts clean. Interrupted guests are instead discarded entirely.
+/// lease starts clean. Interrupted guests and free-checkout guests returning
+/// with live host resources are discarded entirely.
 ///
 /// Two layers:
 ///
@@ -662,6 +668,32 @@ mod tests {
         assert_eq!(state.process_count_total, 1);
         // Per-invocation scoping fields are still cleared even for the carve-out.
         assert!(!state.interceptor_active);
+    }
+
+    #[tokio::test]
+    async fn completed_free_checkout_reuses_only_a_clean_instance() {
+        let cancel = CancellationToken::new();
+        let pool = empty_pool(1, 1, &cancel).await;
+        let mut checkout = pool.checkout().await.expect("checkout");
+        checkout.begin_call();
+        let dropped = Arc::new(AtomicBool::new(false));
+        checkout
+            .store_mut()
+            .data_mut()
+            .resource_table
+            .push(DropFlag(Arc::clone(&dropped)))
+            .expect("push resource");
+        checkout.complete_call();
+        drop(checkout);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(pool.available.lock().unwrap().is_empty());
+
+        let mut fresh = pool.checkout().await.expect("replacement checkout");
+        fresh.begin_call();
+        fresh.complete_call();
+        drop(fresh);
+        assert_eq!(pool.available.lock().unwrap().len(), 1);
+        cancel.cancel();
     }
 
     /// Cancellation during host-only setup must return a healthy carve-out
