@@ -420,7 +420,7 @@ impl WasmEngine {
     /// overlayfs paths alike.
     async fn commit_workspace(
         &self,
-        op: CowOp,
+        op: WorkspaceCommitOp,
         caller: &astrid_core::PrincipalId,
     ) -> CapsuleResult<bool> {
         #[cfg(not(target_family = "wasm"))]
@@ -456,12 +456,8 @@ impl WasmEngine {
                 .binding_for(&caller)
                 .await
                 .map_err(CapsuleError::ExecutionFailed)?;
-            let operation = match op {
-                CowOp::Promote => WorkspaceCommitOp::Promote,
-                CowOp::Rollback => WorkspaceCommitOp::Rollback,
-            };
             return branches
-                .finish(&caller, binding, operation)
+                .finish(&caller, binding, op)
                 .await
                 .map(|()| true)
                 .map_err(CapsuleError::ExecutionFailed);
@@ -515,14 +511,6 @@ impl WasmEngine {
     }
 }
 
-/// Which copy-on-write commit operation to run against a
-/// [`WorkspaceCow`](astrid_vfs::WorkspaceCow) backend.
-#[derive(Clone, Copy)]
-enum CowOp {
-    Promote,
-    Rollback,
-}
-
 /// Reject a hosted portal when the platform could not provide real
 /// copy-on-write isolation. `NoCow` intentionally points at the pristine
 /// directory and is therefore a compatibility result for callers that only
@@ -544,11 +532,11 @@ fn require_isolated_workspace_cow(backend: &dyn astrid_vfs::WorkspaceCow) -> Cap
 /// any guest access is available.
 async fn run_workspace_cow_op(
     backend: Arc<dyn astrid_vfs::WorkspaceCow>,
-    op: CowOp,
+    op: WorkspaceCommitOp,
 ) -> CapsuleResult<bool> {
     let result = tokio::task::spawn_blocking(move || match op {
-        CowOp::Promote => backend.promote(),
-        CowOp::Rollback => backend.rollback(),
+        WorkspaceCommitOp::Promote => backend.promote(),
+        WorkspaceCommitOp::Rollback => backend.rollback(),
     })
     .await
     .map_err(|e| CapsuleError::ExecutionFailed(format!("workspace CoW task panicked: {e}")))?;
@@ -2926,11 +2914,13 @@ impl ExecutionEngine for WasmEngine {
     }
 
     async fn promote_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
-        self.commit_workspace(CowOp::Promote, caller).await
+        self.commit_workspace(WorkspaceCommitOp::Promote, caller)
+            .await
     }
 
     async fn rollback_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
-        self.commit_workspace(CowOp::Rollback, caller).await
+        self.commit_workspace(WorkspaceCommitOp::Rollback, caller)
+            .await
     }
 
     fn request_cancel(&self) {

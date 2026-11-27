@@ -142,6 +142,8 @@ INPUTS = [
     Path("verification/hosted_registry_lookup.rs"),
     Path("verification/hosted_source_lookup.rs"),
     Path("verification/hosted_process_selection.rs"),
+    Path("verification/hosted_workspace_commit.rs"),
+    Path("crates/astrid-capsule/src/context/workspace_commit.rs"),
     Path("verification/hosted_ephemeral_process.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/process_batch.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/publication.rs"),

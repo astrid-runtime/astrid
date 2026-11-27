@@ -1,6 +1,9 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-capsule/src/context/workspace_commit.rs"]
+mod workspace_commit;
+mod hosted_workspace_commit;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/registry_keys.rs"]
 mod registry_keys;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/process_batch.rs"]

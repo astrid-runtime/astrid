@@ -1,7 +1,7 @@
 """Mutations that must fail in a downstream proof consumer."""
 
 from pathlib import Path
-from . import persistent_process, runtime_residency
+from . import persistent_process, runtime_residency, workspace_commit
 from .common import (
     LEASE_CALLBACK,
     replace_once,
@@ -11,6 +11,7 @@ from .common import (
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     yield from persistent_process.defects()
+    yield from workspace_commit.defects()
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [

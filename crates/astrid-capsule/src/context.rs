@@ -189,14 +189,20 @@ pub struct WorkspaceBranchBinding {
     pub branch: astrid_core::WorkspaceUid,
 }
 
-/// Operation applied to one authenticated workspace branch.
 #[cfg(not(target_family = "wasm"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkspaceCommitOp {
-    /// Publish the branch's selected attachment into the owner catalog.
-    Promote,
-    /// Discard the branch's selected attachment.
-    Rollback,
+mod workspace_commit;
+#[cfg(not(target_family = "wasm"))]
+pub use workspace_commit::WorkspaceCommitOp;
+
+#[cfg(not(target_family = "wasm"))]
+fn attachment(
+    binding: &astrid_storage::WorkspaceBranchBinding<astrid_storage::StateOwner>,
+) -> workspace_commit::Attachment<'_> {
+    workspace_commit::Attachment {
+        live: binding.lifecycle() == astrid_storage::WorkspaceBindingLifecycle::Live,
+        uid: binding.binding_uid().map(|uid| *uid.as_bytes()),
+        prefix: binding.target_prefix().map(|name| name.as_str().as_bytes()),
+    }
 }
 
 /// Kernel-owned workspace branch service shared by every capsule engine.
@@ -460,10 +466,7 @@ impl WorkspaceBranchService {
             .branches
             .binding(&binding.owner, binding.branch)
             .map_err(|error| format!("read durable workspace binding: {error}"))?;
-        if durable.lifecycle() != astrid_storage::WorkspaceBindingLifecycle::Live
-            || durable.binding_uid() != Some(uid)
-            || durable.target_prefix() != Some(&prefix)
-        {
+        if !attachment(&durable).matches(*uid.as_bytes(), prefix.as_str().as_bytes()) {
             return Err("durable workspace binding no longer matches this principal".to_owned());
         }
         Ok(binding)
@@ -491,40 +494,39 @@ impl WorkspaceBranchService {
         if current_owner != binding.owner {
             return Err("principal workspace ownership changed; refusing branch commit".to_owned());
         }
-        let stored = self
-            .bindings
-            .lock()
-            .map_err(|_| "workspace branch binding lock poisoned".to_owned())?
-            .get(&binding.uid)
-            .copied()
-            .ok_or_else(|| "no workspace branch is bound to this principal".to_owned())?;
-        if stored != binding {
-            return Err("workspace branch binding does not match the kernel lease".to_owned());
-        }
+        let binding = {
+            let leases = self
+                .bindings
+                .lock()
+                .map_err(|_| "workspace branch binding lock poisoned".to_owned())?;
+            workspace_commit::lease(&leases, &binding.uid, &binding).map_err(
+                |error| match error {
+                    workspace_commit::LeaseError::Missing => {
+                        "no workspace branch is bound to this principal".to_owned()
+                    },
+                    workspace_commit::LeaseError::Mismatch => {
+                        "workspace branch binding does not match the kernel lease".to_owned()
+                    },
+                },
+            )?
+        };
         let prefix = astrid_storage::ContentName::new(Self::ATTACHMENT_PREFIX)
             .map_err(|error| format!("invalid workspace attachment prefix: {error}"))?;
         let durable = self
             .branches
             .binding(&binding.owner, binding.branch)
             .map_err(|error| format!("read durable workspace binding: {error}"))?;
-        if durable.lifecycle() != astrid_storage::WorkspaceBindingLifecycle::Live
-            || durable.binding_uid() != Some(binding.uid)
-            || durable.target_prefix() != Some(&prefix)
-        {
-            return Err("durable workspace binding no longer matches this principal".to_owned());
-        }
-        match operation {
-            WorkspaceCommitOp::Promote => self
-                .branches
-                .promote(&binding.owner, binding.branch)
-                .map(|_| ())
-                .map_err(|error| format!("promote workspace branch: {error}"))?,
-            WorkspaceCommitOp::Rollback => {
-                self.branches
-                    .rollback(&binding.owner, binding.branch)
-                    .map_err(|error| format!("rollback workspace branch: {error}"))?
-            },
-        }
+        let mut writer = self;
+        workspace_commit::finish(
+            attachment(&durable),
+            *binding.uid.as_bytes(),
+            prefix.as_str().as_bytes(),
+            operation,
+            binding.owner,
+            binding.branch,
+            &mut writer,
+        )
+        .ok_or_else(|| "durable workspace binding no longer matches this principal".to_owned())??;
         self.bindings
             .lock()
             .map_err(|_| "workspace branch binding lock poisoned".to_owned())?
@@ -643,6 +645,34 @@ impl WorkspaceBranchService {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl workspace_commit::Writer<astrid_storage::StateOwner, astrid_core::WorkspaceUid>
+    for &WorkspaceBranchService
+{
+    type Error = String;
+
+    fn promote(
+        &mut self,
+        owner: astrid_storage::StateOwner,
+        branch: astrid_core::WorkspaceUid,
+    ) -> Result<(), String> {
+        self.branches
+            .promote(&owner, branch)
+            .map(|_| ())
+            .map_err(|error| format!("promote workspace branch: {error}"))
+    }
+
+    fn rollback(
+        &mut self,
+        owner: astrid_storage::StateOwner,
+        branch: astrid_core::WorkspaceUid,
+    ) -> Result<(), String> {
+        self.branches
+            .rollback(&owner, branch)
+            .map_err(|error| format!("rollback workspace branch: {error}"))
     }
 }
 
