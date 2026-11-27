@@ -3,14 +3,18 @@ use crate::io_splice::{Mode, Request};
 use vstd::prelude::*;
 
 verus! {
-fn transfer_chunk(length: u64, permit: usize, observed: usize, payload: u64) -> (out: Option<u64>)
-    ensures out == if 0 < observed && observed <= permit && observed as int <= length as int {
-        Some(payload)
-    } else { None },
+fn transfer_chunk(length: u64, permit: usize, payload: Vec<u8>) -> (out: crate::io_splice::Chunk<Vec<u8>>)
+    ensures match out {
+        crate::io_splice::Chunk::Empty => payload@.len() == 0,
+        crate::io_splice::Chunk::Oversized => payload@.len() > permit || payload@.len() > length,
+        crate::io_splice::Chunk::Submitted(n, delivered) => 0 < n <= permit && n <= length
+            && n == payload@.len() && delivered@ == payload@,
+    },
 {
     let limit = crate::io_splice::chunk_limit(length, permit);
-    crate::io_splice::write_chunk(limit, observed, payload,
-        |b: u64| -> (r: u64) ensures r == b, { b })
+    crate::io_splice::write_chunk(limit, payload,
+        |b: &Vec<u8>| -> (n: usize) ensures n == b@.len(), { b.len() },
+        |b: Vec<u8>| -> (r: Vec<u8>) ensures r == b, { b })
 }
 
 fn transfer(request: Request, dst: u32, src: u32, count: u64, owner: u64, table: u64, mode: Mode)

@@ -219,7 +219,7 @@ impl wasmtime_wasi::p2::OutputStream for ClosedOnFlush {
     }
 
     fn check_write(&mut self) -> Result<usize, StreamError> {
-        Ok(64)
+        Ok(3)
     }
 }
 
@@ -228,7 +228,7 @@ async fn closed_flush_after_a_committed_write_returns_the_count() {
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
     let source = state
         .resource_table
-        .push::<DynInputStream>(Box::new(MemoryInputPipe::new("pay")))
+        .push::<DynInputStream>(Box::new(MemoryInputPipe::new("payload")))
         .unwrap();
     let stored = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let destination = state
@@ -241,11 +241,13 @@ async fn closed_flush_after_a_committed_write_returns_the_count() {
         .blocking_splice(
             Resource::new_borrow(destination.rep()),
             Resource::new_borrow(source.rep()),
-            3,
+            7,
         )
         .await
         .expect("closed flush is success after the write");
     assert_eq!(copied, 3);
+    let input = state.resource_table.get_mut(&source).unwrap();
+    assert_eq!(input.read(4).unwrap().as_ref(), b"load");
     assert_eq!(stored.lock().expect("sink lock").as_slice(), b"pay");
 }
 

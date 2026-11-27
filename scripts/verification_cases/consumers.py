@@ -1,6 +1,7 @@
 """Mutations that must fail in a downstream proof consumer."""
 
 from pathlib import Path
+from . import runtime_residency
 from .common import (
     LEASE_CALLBACK,
     replace_once,
@@ -13,8 +14,9 @@ def consumer_defects():
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [
         ("chunk loses effective limit", "limit as int == if", "limit as int <= if"),
-        ("chunk loses submitted bytes", "out matches Some(r) && write.ensures((bytes,), r)", "out.is_some()"),
-        ("chunk loses size refusal", "else { out.is_none() },", "else { true },"),
+        ("chunk forgets measured size", "=> measure.ensures((&bytes,), n) && 0", "=> 0"),
+        ("chunk loses submitted bytes", "&& write.ensures((bytes,), r)", "&& true"),
+        ("chunk loses size refusal", "&& n > limit,", "&& true,"),
         ("loses source or destination", "operation.args() == self && check.ensures", "operation.args().mode == self.mode && check.ensures"),
         ("loses retained admission", "check.ensures((self,), Ok(operation.authority()))", "true"),
         ("loses the refusal", "Err(error) => check.ensures((self,), Err(error))", "Err(error) => true"),
@@ -53,10 +55,14 @@ def consumer_defects():
             f"immediate stream access {name}", dispatch,
             lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
         )
+    yield from runtime_residency.defects()
     inbound = Path("crates/astrid-capsule/src/engine/wasm/host/net/bind_target.rs")
     quota = inbound.with_name("reservation.rs")
     inbound_trace = Path("verification/hosted_tcp_destinations.rs")
     for name, source, original, changed in [
+        ("loses nonloopback refusal", inbound, "else { out.is_none() },", "else { true },"),
+        ("accepts a zero assigned port", inbound_trace, "target.matches_bound(actual, assigned)", "target.matches_bound(actual, if assigned == 0 { 1 } else { assigned })"),
+        ("uses an unrelated fixed port", inbound_trace, "Target::admit(request, port)", "Target::admit(request, 0)"),
         ("changes the admitted address", inbound, "t.requested() == (address, port)", "t.requested().1 == port"),
         ("forgets the OS operand", inbound, "out == self.requested()", "out.1 == self.requested().1"),
         ("permits a mismatched endpoint", inbound, "ensures ok == (actual", "ensures ok <== (actual"),

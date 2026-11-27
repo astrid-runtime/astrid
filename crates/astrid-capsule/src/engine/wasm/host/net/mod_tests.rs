@@ -286,7 +286,17 @@ async fn localhost_binds_a_concrete_loopback_address() {
         .unwrap();
     let addr: std::net::SocketAddr = local.parse().unwrap();
     assert!(addr.ip().is_loopback());
+    assert_ne!(addr.port(), 0);
     HostTcpListener::drop(&mut state, listener).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nonloopback_bind_is_refused_before_a_listener_is_charged() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let result = state.bind_tcp("192.0.2.1".into(), 0);
+    assert!(matches!(result, Err(ErrorCode::AirlockRejected)));
+    assert_eq!(state.tcp_listener_count.load(Ordering::Acquire), 0);
+    assert!(state.shared_listeners.is_empty());
 }
 
 #[test]

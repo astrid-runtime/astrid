@@ -145,6 +145,13 @@ async fn rebound_owner_cannot_receive_a_pending_blocking_read() {
         .await
         .unwrap();
     assert!(matches!(outcome, Err(StreamError::Closed)));
+    let source = state.resource_table.get_mut(&input).unwrap();
+    let remaining =
+        tokio::time::timeout(std::time::Duration::from_secs(5), source.blocking_read(4))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(remaining.as_ref(), b"keep");
 }
 
 #[tokio::test]
@@ -296,4 +303,68 @@ async fn cancellation_and_device_retirement_wake_a_pending_stream_read() {
                 .unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn rebound_owner_cannot_write_after_the_backend_becomes_ready() {
+    struct GatedOutput {
+        ready: tokio::sync::watch::Receiver<bool>,
+        sink: MemoryOutputPipe,
+    }
+    #[async_trait::async_trait]
+    impl wasmtime_wasi::p2::Pollable for GatedOutput {
+        async fn ready(&mut self) {
+            self.ready.wait_for(|ready| *ready).await.unwrap();
+        }
+    }
+    #[async_trait::async_trait]
+    impl wasmtime_wasi::p2::OutputStream for GatedOutput {
+        fn check_write(&mut self) -> Result<usize, StreamError> {
+            if *self.ready.borrow() {
+                self.sink.check_write()
+            } else {
+                Ok(0)
+            }
+        }
+        fn write(&mut self, bytes: bytes::Bytes) -> Result<(), StreamError> {
+            self.sink.write(bytes)
+        }
+        fn flush(&mut self) -> Result<(), StreamError> {
+            self.sink.flush()
+        }
+    }
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let principal = state.effective_principal();
+    let directory = state.principal_directory.clone();
+    let uid = directory.uid_for(&principal).unwrap();
+    let (release, ready) = tokio::sync::watch::channel(false);
+    let sink = MemoryOutputPipe::new(16);
+    let output = state
+        .resource_table
+        .push::<DynOutputStream>(Box::new(GatedOutput {
+            ready,
+            sink: sink.clone(),
+        }))
+        .unwrap();
+    let mut write = Box::pin(
+        state.blocking_write_and_flush(Resource::new_borrow(output.rep()), b"hold".to_vec()),
+    );
+    tokio::select! {
+        biased;
+        result = &mut write => panic!("output should be waiting for capacity: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    directory
+        .rename(
+            uid,
+            &principal,
+            astrid_core::PrincipalId::new("after").unwrap(),
+        )
+        .unwrap();
+    release.send(true).unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, Err(StreamError::Closed)));
+    assert!(sink.contents().is_empty());
 }

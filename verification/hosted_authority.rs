@@ -282,3 +282,7 @@ mod tcp_bind_target;
 mod net_reservation;
 mod hosted_tcp_destinations;
 mod hosted_io_splice;
+
+#[path = "../crates/astrid-kernel/src/runtime_residency.rs"]
+mod runtime_residency;
+mod hosted_runtime_residency;

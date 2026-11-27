@@ -122,16 +122,22 @@ async fn copy_chunk(
         return Ok(0);
     }
     let bytes = table.get_mut(&source)?.blocking_read(requested).await?;
-    let copied =
-        u64::try_from(bytes.len()).map_err(|_| StreamError::trap("splice count exceeds u64"))?;
-    if copied == 0 {
-        return Ok(0);
-    }
-    // Preserve the chunk when the outer call future is dropped. Do not
-    // suspend between consuming the source and using the destination permit.
+    // Use the original permit without yielding after the read completes.
     let output = table.get_mut(&destination)?;
-    super::splice::write_chunk(requested, bytes.len(), bytes, |bytes| output.write(bytes))
-        .ok_or_else(|| StreamError::trap("input stream exceeded authorized splice size"))??;
+    let copied = match super::splice::write_chunk(requested, bytes, bytes::Bytes::len, |bytes| {
+        output.write(bytes)
+    }) {
+        super::splice::Chunk::Empty => return Ok(0),
+        super::splice::Chunk::Oversized => {
+            return Err(StreamError::trap(
+                "input stream exceeded authorized splice size",
+            ));
+        },
+        super::splice::Chunk::Submitted(count, result) => {
+            result?;
+            u64::try_from(count).map_err(|_| StreamError::trap("splice count exceeds u64"))?
+        },
+    };
     match output.flush() {
         Ok(()) => {},
         Err(StreamError::Closed) => return Ok(copied),

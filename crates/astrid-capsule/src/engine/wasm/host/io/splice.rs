@@ -22,14 +22,29 @@ pub(super) fn chunk_limit(length: u64, permit: usize) -> (limit: usize)
     if (length as u128) < (permit as u128) { length as usize } else { permit }
 }
 
-/// Only hand bytes to the writer when the backend honored the approved read size.
-pub(super) fn write_chunk<B, R, F: FnOnce(B) -> R>(limit: usize, observed: usize, bytes: B, write: F)
-    -> (out: Option<R>)
-    requires 0 < observed <= limit ==> write.requires((bytes,)),
-    ensures if 0 < observed <= limit { out matches Some(r) && write.ensures((bytes,), r) }
-        else { out.is_none() },
+pub(super) enum Chunk<R> {
+    Empty,
+    Oversized,
+    Submitted(usize, R),
+}
+
+/// Measure the same buffer that is passed to the writer. The outcome carries
+/// the measured size so native accounting never needs a second observation.
+pub(super) fn write_chunk<B, R, L: FnOnce(&B) -> usize, F: FnOnce(B) -> R>(
+    limit: usize, bytes: B, measure: L, write: F,
+) -> (out: Chunk<R>)
+    requires measure.requires((&bytes,)),
+        forall|n: usize| #[trigger] measure.ensures((&bytes,), n) && 0 < n <= limit ==> write.requires((bytes,)),
+    ensures match out {
+        Chunk::Empty => measure.ensures((&bytes,), 0),
+        Chunk::Oversized => exists|n: usize| #[trigger] measure.ensures((&bytes,), n) && n > limit,
+        Chunk::Submitted(n, r) => measure.ensures((&bytes,), n) && 0 < n <= limit && write.ensures((bytes,), r),
+    },
 {
-    if observed == 0 || observed > limit { None } else { Some(write(bytes)) }
+    let n = measure(&bytes);
+    if n == 0 { Chunk::Empty }
+    else if n > limit { Chunk::Oversized }
+    else { Chunk::Submitted(n, write(bytes)) }
 }
 
 impl Request {

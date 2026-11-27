@@ -596,35 +596,28 @@ struct PreparedRuntimeReplacement {
     system_runtime: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeResidency {
-    Principal,
-    SystemResident,
-}
-
-impl RuntimeResidency {
-    const fn is_system(self) -> bool {
-        matches!(self, Self::SystemResident)
-    }
-}
+mod runtime_residency;
+use runtime_residency::RuntimeResidency;
 
 fn classify_runtime_residency(
     manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     id: &astrid_capsule_types::CapsuleId,
     system_allowed: bool,
 ) -> Result<RuntimeResidency, anyhow::Error> {
-    let provides_uplink = !manifest.uplinks.is_empty();
-    if provides_uplink && !system_allowed {
-        anyhow::bail!(
-            "capsule '{id}' provides an uplink but is absent from the \
-             operator-owned [[uplinks]] allowlist"
-        );
-    }
-    if system_allowed && (manifest.capabilities.uplink || provides_uplink) {
-        Ok(RuntimeResidency::SystemResident)
-    } else {
-        Ok(RuntimeResidency::Principal)
-    }
+    let decision = runtime_residency::classify(
+        system_allowed,
+        !manifest.uplinks.is_empty(),
+        manifest.capabilities.uplink,
+        !manifest.mcp_servers.is_empty(),
+    );
+    decision.map_err(|reason| match reason {
+        runtime_residency::Refusal::UnapprovedProvider => anyhow::anyhow!(
+            "capsule '{id}' provides an uplink but is absent from the operator-owned [[uplinks]] allowlist"
+        ),
+        runtime_residency::Refusal::SystemMcp => anyhow::anyhow!(
+            "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
+        ),
+    })
 }
 
 impl Kernel {
@@ -1785,13 +1778,8 @@ impl Kernel {
         // grant unless the operator explicitly promotes it. A manifest that
         // actually provides an uplink must be operator-approved.
         let system_allowed = self.system_capsules.read().await.contains(id.as_str());
-        let system_runtime =
-            classify_runtime_residency(&manifest, &id, system_allowed)?.is_system();
-        if system_runtime && !manifest.mcp_servers.is_empty() {
-            anyhow::bail!(
-                "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
-            );
-        }
+        let residency = classify_runtime_residency(&manifest, &id, system_allowed)?;
+        let system_runtime = residency.is_system();
         self.verify_workspace_capsule_tree(&runtime_dir)?;
 
         let viewer_uid = expected_uid.or_else(|| bound.as_ref().map(|b| b.uid));
@@ -1819,8 +1807,15 @@ impl Kernel {
         // is the authenticated admission set and the installed authority
         // receipt was verified above.
 
-        let principal_uid =
-            self.runtime_principal_uid(system_runtime, principal, &id, viewer_uid)?;
+        let principal_uid = residency
+            .owner(principal, viewer_uid, |owner, expected| {
+                self.principal_directory.bound_uid(owner, expected)
+            })
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot load capsule '{id}' for unadmitted principal '{principal}': {error}"
+                )
+            })?;
         let scope = principal_uid.map_or(
             astrid_capsule::registry::RuntimeScope::SystemResident,
             astrid_capsule::registry::RuntimeScope::Principal,
@@ -1972,26 +1967,6 @@ impl Kernel {
         Ok(())
     }
 
-    fn runtime_principal_uid(
-        &self,
-        system_runtime: bool,
-        principal: &PrincipalId,
-        id: &astrid_capsule_types::CapsuleId,
-        expected: Option<astrid_core::PrincipalUid>,
-    ) -> Result<Option<astrid_core::identity::PrincipalUid>, anyhow::Error> {
-        if system_runtime {
-            return Ok(None);
-        }
-        self.principal_directory
-            .bound_uid(principal, expected)
-            .map(Some)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "cannot load capsule '{id}' for unadmitted principal '{principal}': {error}"
-                )
-            })
-    }
-
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn prepare_runtime_replacement(
         &self,
@@ -2036,22 +2011,19 @@ impl Kernel {
         }
         let artifact = capsule_instance_hash(&manifest, &runtime_dir);
         let system_allowed = self.system_capsules.read().await.contains(id.as_str());
-        let system_runtime = classify_runtime_residency(&manifest, id, system_allowed)?.is_system();
-        if system_runtime && !manifest.mcp_servers.is_empty() {
-            anyhow::bail!(
-                "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
-            );
-        }
+        let residency = classify_runtime_residency(&manifest, id, system_allowed)?;
+        let system_runtime = residency.is_system();
         // Replacement authority is the authenticated operator classification
         // and installed receipt, never the ancestry of `source_dir`.
-        let actual_scope = if system_runtime {
-            astrid_capsule::registry::RuntimeScope::SystemResident
-        } else {
-            astrid_capsule::registry::RuntimeScope::Principal(
-                self.principal_directory
-                    .bound_uid(principal, bound.as_ref().map(|b| b.uid))?,
-            )
-        };
+        let principal_uid = residency.owner(
+            principal,
+            bound.as_ref().map(|b| b.uid),
+            |owner, expected| self.principal_directory.bound_uid(owner, expected),
+        )?;
+        let actual_scope = principal_uid.map_or(
+            astrid_capsule::registry::RuntimeScope::SystemResident,
+            astrid_capsule::registry::RuntimeScope::Principal,
+        );
         if actual_scope != expected_scope {
             anyhow::bail!(
                 "capsule '{id}' cannot change runtime scope during live replacement: \
@@ -2061,10 +2033,6 @@ impl Kernel {
         if let Some(bound) = bound.as_ref() {
             self.confirm_published_materialization(&runtime_dir, principal, &manifest, bound)?;
         }
-        let principal_uid = match actual_scope {
-            astrid_capsule::registry::RuntimeScope::Principal(uid) => Some(uid),
-            astrid_capsule::registry::RuntimeScope::SystemResident => None,
-        };
         let runtime_id =
             self.capsules
                 .write()
@@ -5449,6 +5417,22 @@ mod tests {
         assert_eq!(
             classify_runtime_residency(&provider, &id, true).unwrap(),
             RuntimeResidency::SystemResident
+        );
+
+        provider
+            .mcp_servers
+            .push(astrid_capsule_types::manifest::McpServerDef {
+                id: "test".into(),
+                description: None,
+                server_type: Some("stdio".into()),
+                command: Some("test".into()),
+                args: Vec::new(),
+            });
+        assert!(classify_runtime_residency(&provider, &id, true).is_err());
+        provider.uplinks.clear();
+        assert_eq!(
+            classify_runtime_residency(&provider, &id, true).unwrap(),
+            RuntimeResidency::Principal
         );
     }
 
