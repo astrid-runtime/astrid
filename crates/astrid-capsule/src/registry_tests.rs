@@ -279,45 +279,11 @@ fn principal_generation_replacement_is_atomic_and_stale_safe() {
     );
 }
 
-#[test]
-fn system_generation_replacement_swaps_every_view() {
-    let mut registry = CapsuleRegistry::new();
-    let alice = pid("alice");
-    let bob = pid("bob");
-    let id = CapsuleId::from_static("system-service");
-    let old_hash = test_hash("system-old");
-    let old = registry
-        .register_system_runtime(
-            Box::new(MockCapsule::new("system-service")),
-            old_hash.clone(),
-            &alice,
-        )
-        .unwrap();
-    registry.register_existing(&id, &old_hash, &bob).unwrap();
-
-    let replaced = registry
-        .replace_system_runtime(
-            &old,
-            Box::new(MockCapsule::new("system-service")),
-            test_hash("system-new"),
-        )
-        .unwrap();
-
-    assert_eq!(
-        registry.runtime_id_for(&alice, &id),
-        Some(replaced.runtime_id.clone())
-    );
-    assert_eq!(
-        registry.runtime_id_for(&bob, &id),
-        Some(replaced.runtime_id)
-    );
-    assert!(Arc::ptr_eq(
-        &registry.get_for(&alice, &id).unwrap(),
-        &registry.get_for(&bob, &id).unwrap()
-    ));
-}
+#[path = "registry/system_replacement_tests.rs"]
+mod system_replacement_tests;
 
 struct MockCapsule {
+    manifest_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
     id: CapsuleId,
     manifest: CapsuleManifest,
 }
@@ -325,6 +291,7 @@ struct MockCapsule {
 impl MockCapsule {
     fn new(name: &str) -> Self {
         Self {
+            manifest_reads: None,
             id: CapsuleId::from_static(name),
             manifest: CapsuleManifest {
                 package: PackageDef {
@@ -407,6 +374,9 @@ impl crate::capsule::Capsule for MockCapsule {
         &self.id
     }
     fn manifest(&self) -> &CapsuleManifest {
+        if let Some(reads) = &self.manifest_reads {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         &self.manifest
     }
     fn state(&self) -> CapsuleState {
