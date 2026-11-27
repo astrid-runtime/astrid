@@ -18,6 +18,17 @@ def defects():
         yield (
             f"restart fence {name}", path,
             lambda s, a=original, b=changed: replace_once(s, a, b),
+            fences if name == "may erase an unrelated fence" else Path("verification/hosted_authority_model.rs"),
+        )
+    for name, original, changed in [
+        ("loses the capability owner", "receipt.owner() == principal,", "true,"),
+        ("may skip the capability fence", "final(closed)@ == old(closed)@.insert(principal)", "true"),
+        ("may skip the allowance fence", "final(closed)@ == old(closed)@.insert(receipt.owner())", "true"),
+        ("may retain the owner's grants", "final(grants)@ == old(grants)@.remove(receipt.owner())", "true"),
+    ]:
+        yield (
+            f"paired restart {name}", fences,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
             Path("verification/hosted_authority_model.rs"),
         )
     cursor = Path("crates/astrid-storage/src/ownership/pending.rs")
@@ -39,7 +50,7 @@ def defects():
         yield (
             f"completed retirement {name}", fences,
             lambda s, a=original, b=changed: replace_once(s, a, b),
-            Path("verification/hosted_retirement_recovery.rs") if "fence" in name else Path("verification/hosted_authority_model.rs"),
+            Path("verification/hosted_retirement_recovery.rs") if "fence" in name else fences,
         )
     tracker = Path("crates/astrid-capsule/src/engine/wasm/principal_tracker/state.rs")
     for name, original, changed in [

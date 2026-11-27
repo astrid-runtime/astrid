@@ -278,6 +278,27 @@ impl AllowanceStore {
         Ok(())
     }
 
+    /// Restore the allowance state for a capability fence before sharing either store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if either allowance lock was poisoned.
+    pub fn restore_principal_retirement(
+        &mut self,
+        receipt: retirement::RecoveredCapabilityFence<PrincipalId>,
+    ) -> ApprovalResult<()> {
+        let closed = self
+            .retiring_principals
+            .get_mut()
+            .map_err(|e| ApprovalError::Storage(e.to_string()))?;
+        let grants = self
+            .allowances
+            .get_mut()
+            .map_err(|e| ApprovalError::Storage(e.to_string()))?;
+        retirement::restore_allowances(receipt, closed, grants);
+        Ok(())
+    }
+
     /// Release an in-process retirement fence after durable reclamation.
     pub fn finish_principal_retirement(&self, principal: &PrincipalId) {
         let mut retirement = self

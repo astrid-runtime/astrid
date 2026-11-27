@@ -883,18 +883,16 @@ pub(super) fn recovered_fence_membership(
         &&& closed == (old(capabilities)@.contains(probe) || named, old(allowances)@.contains(probe) || named)
     }),
 {
-    use crate::principal_fences::{fence,fenced,purge_grants};
+    use crate::principal_fences::{fenced,restore_allowances,restore_capability};
     let targets = crate::principal_binding::recovery_aliases(directory,&uid,retained);
     assert(targets[0].is_some() && targets[1].is_some() ==> targets[0] != targets[1]);
     if let Some(first) = targets[0] {
-        fence(capabilities,first);
-        fence(allowances,first);
-        purge_grants(grants,&first);
+        let receipt = restore_capability(capabilities,first);
+        restore_allowances(receipt,allowances,grants);
     }
     if let Some(second) = targets[1] {
-        fence(capabilities,second);
-        fence(allowances,second);
-        purge_grants(grants,&second);
+        let receipt = restore_capability(capabilities,second);
+        restore_allowances(receipt,allowances,grants);
     }
     (fenced(capabilities,&probe),fenced(allowances,&probe))
 }

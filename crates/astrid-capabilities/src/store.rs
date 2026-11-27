@@ -488,8 +488,11 @@ impl CapabilityStore {
     }
 
     /// Restore a retirement fence during startup, while the store is exclusively owned.
-    pub fn restore_principal_retirement(&mut self, principal: PrincipalId) {
-        retirement::fence(self.retiring_principals.get_mut(), principal);
+    pub fn restore_principal_retirement(
+        &mut self,
+        principal: PrincipalId,
+    ) -> retirement::RecoveredCapabilityFence<PrincipalId> {
+        retirement::restore_capability(self.retiring_principals.get_mut(), principal)
     }
 
     /// Return whether new authority for `principal` is currently fenced.

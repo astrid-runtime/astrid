@@ -13,12 +13,12 @@ pub(super) fn restore_retirement_fences(
     ownership: &OwnershipSnapshot,
     principals: &PrincipalDirectory,
     mut capabilities: CapabilityStore,
-    allowances: AllowanceStore,
+    mut allowances: AllowanceStore,
 ) -> std::io::Result<(Arc<CapabilityStore>, Arc<AllowanceStore>)> {
     for alias in principals.pending_retirement_aliases(ownership) {
-        capabilities.restore_principal_retirement(alias.clone());
+        let fence = capabilities.restore_principal_retirement(alias);
         allowances
-            .begin_principal_retirement(&alias)
+            .restore_principal_retirement(fence)
             .map_err(std::io::Error::other)?;
     }
     Ok((Arc::new(capabilities), Arc::new(allowances)))
