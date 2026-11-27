@@ -669,8 +669,7 @@ where
         {
             return Ok(RenameBatchOutcome::DestinationConflict);
         }
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let branch = self.branch(owner, &header, id)?;
             if let Some(plan) = plan
                 && !self.rename_membership_matches(
@@ -681,7 +680,7 @@ where
                     &replacement_set,
                 )?
             {
-                return Ok(RenameBatchOutcome::Replan);
+                return Ok(Step::Done(RenameBatchOutcome::Replan));
             }
             let mut values = Vec::with_capacity(moves.len());
             for (source, destination) in moves {
@@ -689,7 +688,7 @@ where
                     self.content.load_required_for(owner, object)
                 })?
                 else {
-                    return Ok(RenameBatchOutcome::Replan);
+                    return Ok(Step::Done(RenameBatchOutcome::Replan));
                 };
                 if !sources.contains(destination)
                     && !replacement_set.contains(destination)
@@ -698,7 +697,7 @@ where
                     })?
                     .is_some()
                 {
-                    return Ok(RenameBatchOutcome::DestinationConflict);
+                    return Ok(Step::Done(RenameBatchOutcome::DestinationConflict));
                 }
                 values.push(value);
             }
@@ -718,7 +717,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(RenameBatchOutcome::Replan);
+                    return Ok(Step::Done(RenameBatchOutcome::Replan));
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -737,7 +736,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(RenameBatchOutcome::Replan);
+                    return Ok(Step::Done(RenameBatchOutcome::Replan));
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -754,7 +753,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_some() {
-                    return Ok(RenameBatchOutcome::DestinationConflict);
+                    return Ok(Step::Done(RenameBatchOutcome::DestinationConflict));
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -788,11 +787,13 @@ where
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(RenameBatchOutcome::Committed),
-                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(error.into()),
+                Ok(_) => Ok(Step::Done(RenameBatchOutcome::Committed)),
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
+                    Ok(Step::Conflict)
+                },
+                Err(error) => Err(error.into()),
             }
-        }
+        })
     }
 
     /// Atomically publish a branch's working view as the owner's content view.

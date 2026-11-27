@@ -5,6 +5,7 @@ use astrid_core::PrincipalUid;
 use crate::content::catalog::{delete, insert, list, root_from_record};
 use crate::content_dag::BuiltContent;
 
+use super::retry::Step;
 use super::{
     BranchState, CatalogRoot, CatalogValue, ContentHeader, ContentName, MAX_WORKSPACE_BRANCHES,
     ModelError, ObjectId, ObjectRecord, ObjectReference, PrincipalContentError,
@@ -404,16 +405,15 @@ where
         owner: &P,
         id: WorkspaceUid,
         built: Option<&BuiltContent>,
-        mut mutate: F,
+        mutate: F,
     ) -> Result<(), WorkspaceBranchError>
     where
-        F: FnMut(
+        F: Fn(
             Option<CatalogRoot>,
             &mut BTreeMap<ObjectId, ObjectRecord>,
         ) -> Result<Option<CatalogRoot>, PrincipalContentError>,
     {
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let branch = self.branch(owner, &header, id)?;
             let old_quota = branch.working.map_or(0, |root| root.summary.quota_bytes);
             let mut records = BTreeMap::new();
@@ -422,7 +422,7 @@ where
             }
             let working = mutate(branch.working, &mut records)?;
             if working == branch.working {
-                return Ok(());
+                return Ok(Step::Done(()));
             }
             let new_quota = working.map_or(0, |root| root.summary.quota_bytes);
             self.enforce_quota_change(owner, &header, old_quota, new_quota)?;
@@ -449,10 +449,12 @@ where
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(()),
-                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(error.into()),
+                Ok(_) => Ok(Step::Done(())),
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
+                    Ok(Step::Conflict)
+                },
+                Err(error) => Err(error.into()),
             }
-        }
+        })
     }
 }

@@ -73,3 +73,35 @@ fn rollback_rebuilds_from_owner_root_with_new_peer_branch() {
         live
     );
 }
+
+#[test]
+fn branch_replacement_preserves_same_key_in_peer_after_retry_and_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, branches, owner, selected) = fixture_with_engine(open(directory.path()));
+    let peer = WorkspaceUid::from_bytes([92; 16]);
+    branches.begin_with_uid(&owner, peer).unwrap();
+
+    let key = ContentName::new("note").unwrap();
+    let concurrent = branches.clone();
+    let peer_key = key.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        concurrent.write(&owner, peer, &peer_key, b"peer").unwrap();
+    }));
+    branches.write(&owner, selected, &key, b"selected").unwrap();
+
+    drop(branches);
+    drop(engine);
+    let content = Arc::new(PrincipalContentStore::from_engine(Arc::new(open(
+        directory.path(),
+    ))));
+    let reopened = content.workspace_branches();
+    assert_eq!(
+        reopened.read(&owner, selected, &key).unwrap().as_deref(),
+        Some(b"selected".as_slice())
+    );
+    assert_eq!(
+        reopened.read(&owner, peer, &key).unwrap().as_deref(),
+        Some(b"peer".as_slice())
+    );
+    assert_eq!(content.read(&owner, &key).unwrap(), None);
+}
