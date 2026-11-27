@@ -116,8 +116,11 @@ use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 mod arena_span;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_index.rs"]
 mod arena_index;
+#[path = "../crates/astrid-storage/src/engine/durable/index/key.rs"]
+mod checkpoint_key;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_frame.rs"]
 mod arena_frame;
+use arena_frame::ArenaLocation;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_vectors.rs"]
 mod arena_vectors;
 #[path = "../crates/astrid-storage/src/engine/durable/direct_placement.rs"]

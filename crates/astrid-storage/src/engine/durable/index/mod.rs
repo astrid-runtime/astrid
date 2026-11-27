@@ -26,6 +26,9 @@ use super::{
 use crate::volume::AstridVolume;
 use std::sync::Arc;
 
+use super::{format::encode_identity, root_wire};
+
+mod key;
 mod snapshot;
 #[cfg(test)]
 mod tests;
@@ -37,9 +40,7 @@ use validation::validate_state;
 
 const SNAPSHOT_RECORD: u8 = 1;
 const DELTA_RECORD: u8 = 2;
-const CURRENT_DIGEST_BYTES: u32 = 32;
-const TAGGED_IDENTITY_BYTES: usize = 40;
-const LOCATION_BYTES: usize = TAGGED_IDENTITY_BYTES + ArenaLocation::ENCODED_LEN;
+use key::ROW_LEN as LOCATION_BYTES;
 
 /// Recovered disposable object-location state.
 pub(super) struct IndexState<M = BTreeMap<ObjectId, ArenaLocation>> {
@@ -590,29 +591,8 @@ fn decode_locations(
     let count = reader
         .usize_len()
         .map_err(|detail| corrupt(offset, detail))?;
-    if count > reader.remaining() / LOCATION_BYTES {
-        return Err(corrupt(
-            offset,
-            "index location count exceeds frame capacity",
-        ));
-    }
-    let mut locations = BTreeMap::new();
-    let mut previous = None;
-    for _ in 0..count {
-        let id = reader
-            .identity(scheme)
-            .map_err(|detail| corrupt(offset, detail))?;
-        if previous.is_some_and(|value| value >= id) {
-            return Err(corrupt(
-                offset,
-                "index identities are not canonically ordered",
-            ));
-        }
-        let location = decode_location(reader, offset)?;
-        locations.insert(id, location);
-        previous = Some(id);
-    }
-    Ok(locations)
+    key::rows(reader.bytes, &mut reader.offset, count, scheme.into())
+        .map_err(|error| corrupt(offset, key_error(error)))
 }
 
 fn encode_len(bytes: &mut Vec<u8>, len: usize) -> Result<(), DurableError> {
@@ -627,12 +607,6 @@ fn encode_len(bytes: &mut Vec<u8>, len: usize) -> Result<(), DurableError> {
 fn encode_scheme(bytes: &mut Vec<u8>, scheme: IdentityScheme) {
     bytes.extend_from_slice(&scheme.algorithm().to_le_bytes());
     bytes.extend_from_slice(&scheme.construction().to_le_bytes());
-}
-
-fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
-    encode_scheme(bytes, scheme);
-    bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
-    bytes.extend_from_slice(id.as_bytes());
 }
 
 fn corrupt(offset: u64, detail: &'static str) -> DurableError {
@@ -674,18 +648,6 @@ impl<'a> WireReader<'a> {
         self.take(1)?.first().copied().ok_or("truncated u8")
     }
 
-    fn u16(&mut self) -> Result<u16, &'static str> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?.try_into().map_err(|_| "truncated u16")?,
-        ))
-    }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().map_err(|_| "truncated u32")?,
-        ))
-    }
-
     fn u64(&mut self) -> Result<u64, &'static str> {
         Ok(u64::from_le_bytes(
             self.take(8)?.try_into().map_err(|_| "truncated u64")?,
@@ -697,27 +659,20 @@ impl<'a> WireReader<'a> {
     }
 
     fn scheme(&mut self, expected: IdentityScheme) -> Result<(), &'static str> {
-        let algorithm = self.u16()?;
-        let construction = self.u16()?;
-        if algorithm == 0 || construction == 0 {
-            return Err("index identity scheme fields must be non-zero");
-        }
-        if algorithm != expected.algorithm() || construction != expected.construction() {
-            return Err("index identity scheme does not match the store");
-        }
-        Ok(())
+        key::read_scheme(self.bytes, &mut self.offset, expected.into()).map_err(key_error)
     }
+}
 
-    fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
-        self.scheme(scheme)?;
-        let digest_len =
-            usize::try_from(self.u32()?).map_err(|_| "index digest length overflow")?;
-        if digest_len == 0 {
-            return Err("index digest length must be non-zero");
-        }
-        self.take(digest_len)?
-            .try_into()
-            .map(ObjectId::new)
-            .map_err(|_| "index digest length does not match the active scheme")
+fn key_error(error: key::Error) -> &'static str {
+    match error {
+        key::Error::Read(root_wire::ReadError::Overflow(_)) => "index length overflow",
+        key::Error::Read(root_wire::ReadError::Truncated) => "truncated index record",
+        key::Error::ZeroScheme => "index identity scheme fields must be non-zero",
+        key::Error::WrongScheme => "index identity scheme does not match the store",
+        key::Error::LengthOverflow => "index digest length overflow",
+        key::Error::ZeroLength => "index digest length must be non-zero",
+        key::Error::Capacity => "index location count exceeds frame capacity",
+        key::Error::Order => "index identities are not canonically ordered",
+        key::Error::WrongLength => "index digest length does not match the active scheme",
     }
 }

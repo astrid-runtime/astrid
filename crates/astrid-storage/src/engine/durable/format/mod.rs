@@ -476,8 +476,7 @@ pub(super) fn ensure_payload_limit(
     Ok(())
 }
 
-#[cfg(test)]
-fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
+pub(super) fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
     verified_record::append_identity(bytes, scheme.into(), *id.as_bytes());
 }
 

@@ -83,10 +83,11 @@ def consumer_defects():
             f"arena append {name}", source,
             lambda s, a=original, b=changed: replace_once(s, a, b), target,
         )
+    checkpoint_key = Path("crates/astrid-storage/src/engine/durable/index/key.rs")
     for name, source, original, changed, target in [
         ("encodes offset in the length field", append, "little_endian(self.payload_len)", "little_endian(self.offset)", append),
         ("reads the checksum one byte early", append, "checksum.copy_from_slice(&bytes[16..]);", "checksum.copy_from_slice(&bytes[15..47]);", append),
-        ("loses successful decode bytes", append, "loc.wire() == bytes@,", "true,", readback),
+        ("loses successful decode bytes", append, "loc.wire() == bytes@,", "true,", checkpoint_key),
         ("forgets the encoded placement", append, "final(bytes)@ == old(bytes)@ + self.wire(),", "true,", readback),
         ("drops the header from the restored endpoint", append, "self.offset.checked_add(WIDTH as u64)?.checked_add(self.payload_len)", "self.offset.checked_add(self.payload_len)", append),
         ("loses the endpoint relation", append, "(end matches Some(value) ==> value == e)", "true", readback),
@@ -97,6 +98,24 @@ def consumer_defects():
             f"checkpoint placement {name}", source,
             lambda s, a=original, b=changed: replace_once(s, a, b), target,
         )
+    for name, original, changed, target in [
+        ("uses the wrong digest", "Ok(ObjectId::new(id))", "Ok(ObjectId::new([0;32]))", checkpoint_key),
+        ("ignores the construction", "construction.as_slice() != expected.construction.as_slice()", "false", checkpoint_key),
+        ("accepts a repeated key", "Some(prior) => prior.strictly_before(&id)", "Some(prior) => true", checkpoint_key),
+        ("loses the decoded row identity", "&& id.digest() == bytes@.subrange(start+8,start+40)", "&& true", readback),
+        ("loses the selected location bytes", "&&& loc.wire() == bytes@.subrange(start+40,start+88)", "&&& true", readback),
+        ("drops recovered map provenance", "mapped(bytes@,*old(cursor) as int,count as nat,map@) &&", "true &&", readback),
+        ("drops table ordering", "(forall|i:int| 0 <= i < count ==> #[trigger] ordered_row(bytes@,*old(cursor) as int,i,scheme)),", "true,", readback),
+    ]:
+        yield (
+            f"checkpoint keys {name}", checkpoint_key,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
+    yield (
+        "checkpoint keys permit spurious table lookup failure", readback,
+        lambda s: replace_once(s, "out.is_some() == (forall|i:int| 0 <= i < count",
+            "out.is_some() ==> (forall|i:int| 0 <= i < count"), readback,
+    )
     for name, clause, weaker in [
         ("loses acceptance of equal frames", "out.is_ok() == ((*old(self).payload)@ == (*incoming.payload)@)", "out.is_ok() ==> ((*old(self).payload)@ == (*incoming.payload)@)"),
         ("loses the retained record", "final(self).record == old(self).record", "true"),

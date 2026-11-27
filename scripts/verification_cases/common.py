@@ -70,6 +70,7 @@ INPUTS = [
     Path("verification/hosted_arena_append.rs"),
     Path("verification/hosted_record_roundtrip.rs"),
     Path("crates/astrid-storage/src/engine/durable/arena_index.rs"),
+    Path("crates/astrid-storage/src/engine/durable/index/key.rs"),
     Path("crates/astrid-storage/src/engine/durable/arena_frame.rs"),
     Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs"),
     Path("crates/astrid-storage/src/engine/durable/direct_placement.rs"),

@@ -170,3 +170,43 @@ fn borrowed_snapshot_preserves_canonical_wire_and_complete_locations() {
     assert_eq!(recovered.arena_len, state.arena_len);
     validate_state(&recovered, 0).unwrap();
 }
+
+#[test]
+fn checkpoint_rows_reject_duplicate_reversed_and_foreign_names() {
+    let low = ObjectId::new([0x11; 32]);
+    let high = ObjectId::new([0x22; 32]);
+    let foreign = IdentityScheme::new(1, 2).unwrap();
+
+    for (first, second, second_scheme, detail) in [
+        (
+            low,
+            low,
+            scheme(),
+            "index identities are not canonically ordered",
+        ),
+        (
+            high,
+            low,
+            scheme(),
+            "index identities are not canonically ordered",
+        ),
+        (
+            low,
+            high,
+            foreign,
+            "index identity scheme does not match the store",
+        ),
+    ] {
+        let mut bytes = 2_u64.to_le_bytes().to_vec();
+        encode_identity(&mut bytes, scheme(), first);
+        location(1).encode(&mut bytes);
+        encode_identity(&mut bytes, second_scheme, second);
+        location(2).encode(&mut bytes);
+        let mut reader = WireReader::new(&bytes);
+        assert!(matches!(
+            decode_locations(&mut reader, scheme(), 17),
+            Err(DurableError::Corrupt { file: INDEX_FILE, offset: 17, detail: observed })
+                if observed == detail
+        ));
+    }
+}

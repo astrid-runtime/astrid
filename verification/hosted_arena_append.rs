@@ -171,18 +171,34 @@ fn publish_selected<S:frame::Sink,K:Ord+Copy>(
 }
 
 /// Feed the persisted location from one delta row back into the recovery map.
-fn reload_row<K:Ord+Copy>(recovered:&mut std::collections::BTreeMap<K,frame::ArenaLocation>,
-    key:K, loc:frame::ArenaLocation, frontier:u64) -> (ok:bool)
+fn reload_row(recovered:&mut std::collections::BTreeMap<crate::ObjectId,frame::ArenaLocation>,
+    scheme:Scheme, key:crate::ObjectId, loc:frame::ArenaLocation, frontier:u64) -> (ok:bool)
     requires vstd::std_specs::btree::btree_map_inv(old(recovered)),
-        vstd::laws_cmp::obeys_cmp::<K>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<K>(),
+        vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        scheme.algorithm@ != seq![0u8,0u8], scheme.construction@ != seq![0u8,0u8],
     ensures ok == (loc.offset as int + frame::WIDTH + loc.payload_len <= frontier &&
             (!old(recovered)@.contains_key(key) || old(recovered)@[key] == loc)),
         final(recovered)@ == if ok {old(recovered)@.insert(key,loc)} else {old(recovered)@},
 {
     let mut bytes = Vec::new();
+    let raw = *key.as_bytes();
+    record::append_identity(&mut bytes,scheme,raw);
     loc.encode(&mut bytes);
-    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
-    let Some(parsed) = frame::ArenaLocation::decode(&bytes) else {assert(false);return false;};
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(loc.wire().len() == 48);
+        assert(bytes@.subrange(0,40) =~= record::wire(scheme,raw));
+        record::tag_written(bytes@,0,scheme,raw);
+        assert(bytes@.subrange(0,4) =~= scheme.algorithm@ + scheme.construction@);
+    }
+    let mut cursor = 0;
+    let Ok((decoded_key,parsed)) = crate::checkpoint_key::row(&bytes,&mut cursor,scheme,None)
+        else {assert(false);return false;};
+    proof {
+        crate::ObjectId::same_digest(key,decoded_key);
+        assert(bytes@.subrange(40,88) =~= loc.wire());
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+    }
     proof {
         assert(loc.wire().take(8) =~= vstd::bytes::spec_u64_to_le_bytes(loc.offset));
         assert(parsed.wire().take(8) =~= vstd::bytes::spec_u64_to_le_bytes(parsed.offset));
@@ -195,20 +211,115 @@ fn reload_row<K:Ord+Copy>(recovered:&mut std::collections::BTreeMap<K,frame::Are
     }
     let Some(end) = parsed.end() else {return false;};
     if end > frontier {return false;}
-    crate::arena_index::restore_location(recovered,key,parsed)
+    crate::arena_index::restore_location(recovered,decoded_key,parsed)
+}
+
+/// Recover an arbitrary named row, including an interior row. Later names
+/// must be distinct from the requested name.
+proof fn selected_mapping(bytes:Seq<u8>,start:int,count:nat,selected:nat,
+    expected:crate::ObjectId,map:Map<crate::ObjectId,frame::ArenaLocation>)
+    requires selected < count, crate::checkpoint_key::mapped(bytes,start,count,map),
+        expected.digest() == bytes.subrange(start + selected*88 + 8,start + selected*88 + 40),
+        forall|j:int| selected < j < count ==> #[trigger] bytes.subrange(start+j*88+8,start+j*88+40) != expected.digest(),
+    ensures map.contains_key(expected), map[expected].wire() == bytes.subrange(start+selected*88+40,start+selected*88+88),
+    decreases count,
+{
+    let at = start + (count-1)*88;
+    let (prior,id,loc) = choose|p:Map<crate::ObjectId,frame::ArenaLocation>,id:crate::ObjectId,loc:frame::ArenaLocation|
+        crate::checkpoint_key::mapped(bytes,start,(count-1) as nat,p) &&
+        id.digest() == bytes.subrange(at+8,at+40) && loc.wire() == bytes.subrange(at+40,at+88) &&
+        map == #[trigger] p.insert(id,loc);
+    if selected == count-1 {
+        crate::ObjectId::same_digest(expected,id);
+    } else {
+        assert(bytes.subrange(at+8,at+40) != expected.digest());
+        selected_mapping(bytes,start,(count-1) as nat,selected,expected,prior);
+    }
+}
+
+proof fn increasing(bytes:Seq<u8>,start:int,count:nat,i:int,j:int,scheme:Scheme)
+    requires 0 <= start, 0 <= i < j < count,
+        forall|h:int| 0 <= h < count ==> #[trigger] crate::checkpoint_key::ordered_row(bytes,start,h,scheme),
+    ensures crate::ObjectId::digest_before(bytes.subrange(start+i*88+8,start+i*88+40),bytes.subrange(start+j*88+8,start+j*88+40)),
+    decreases j-i,
+{
+    assert(crate::checkpoint_key::ordered_row(bytes,start,i,scheme));
+    assert(crate::checkpoint_key::ordered_row(bytes,start,j,scheme));
+    if i+1 < j {
+        increasing(bytes,start,count,i,j-1,scheme);
+        assert(crate::checkpoint_key::ordered_row(bytes,start,j-1,scheme));
+        crate::ObjectId::digest_order_transitive(bytes.subrange(start+i*88+8,start+i*88+40),
+            bytes.subrange(start+(j-1)*88+8,start+(j-1)*88+40),bytes.subrange(start+j*88+8,start+j*88+40));
+    }
+}
+
+fn recover_selected(bytes:&[u8],start:usize,count:usize,selected:usize,scheme:Scheme,expected:crate::ObjectId)
+    -> (out:Option<frame::ArenaLocation>)
+    requires start <= bytes.len(), selected < count,
+        vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        expected.digest() == bytes@.subrange(start as int + selected as int*88 + 8,start as int + selected as int*88 + 40),
+    ensures out.is_some() == (forall|i:int| 0 <= i < count ==> #[trigger] crate::checkpoint_key::ordered_row(bytes@,start as int,i,scheme)),
+        out matches Some(loc) ==> loc.wire() == bytes@.subrange(start as int+selected as int*88+40,start as int+selected as int*88+88),
+{
+    let mut cursor = start;
+    let map = crate::checkpoint_key::rows(bytes,&mut cursor,count,scheme).ok()?;
+    proof {
+        assert forall|j:int| selected < j < count implies #[trigger] bytes@.subrange(start as int+j*88+8,start as int+j*88+40) != expected.digest() by {
+            increasing(bytes@,start as int,count as nat,selected as int,j,scheme);
+        }
+        selected_mapping(bytes@,start as int,count as nat,selected as nat,expected,map@);
+    }
+    map.get(&expected).copied()
+}
+
+/// Decode the first of two writer-produced rows at a nonzero cursor.
+fn checkpoint_pair(first:crate::ObjectId,second:crate::ObjectId,a:frame::ArenaLocation,b:frame::ArenaLocation,
+    scheme:Scheme) -> (out:Option<frame::ArenaLocation>)
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        scheme.algorithm@ != seq![0u8,0u8], scheme.construction@ != seq![0u8,0u8],
+    ensures out.is_some() == crate::ObjectId::digest_before(first.digest(),second.digest()),
+        out matches Some(loc) ==> loc.wire() == a.wire(),
+{
+    let mut bytes = Vec::new();
+    bytes.push(0);
+    let x = *first.as_bytes();
+    let y = *second.as_bytes();
+    record::append_identity(&mut bytes,scheme,x);
+    a.encode(&mut bytes);
+    record::append_identity(&mut bytes,scheme,y);
+    b.encode(&mut bytes);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(bytes@.subrange(1,41) =~= record::wire(scheme,x));
+        assert(bytes@.subrange(89,129) =~= record::wire(scheme,y));
+        record::tag_written(bytes@,1,scheme,x);
+        record::tag_written(bytes@,89,scheme,y);
+        assert(bytes@.subrange(1,5) =~= scheme.algorithm@ + scheme.construction@);
+        assert(bytes@.subrange(89,93) =~= scheme.algorithm@ + scheme.construction@);
+        assert(bytes@.subrange(41,89) =~= a.wire());
+        assert(crate::checkpoint_key::ordered_row(bytes@,1,0,scheme));
+        assert(crate::checkpoint_key::ordered_row(bytes@,1,1,scheme) == crate::ObjectId::digest_before(first.digest(),second.digest()));
+        if crate::ObjectId::digest_before(first.digest(),second.digest()) {
+            assert forall|i:int| 0 <= i < 2 implies #[trigger] crate::checkpoint_key::ordered_row(bytes@,1,i,scheme) by {
+                assert(i==0 || i==1);
+            }
+        }
+    }
+    recover_selected(&bytes,1,2,0,scheme,first)
 }
 
 /// Replay a selected row from the actual append delta. The restored position
 /// addresses the same submitted interval, even when the arena began nonempty.
-fn publish_and_reload<S:frame::Sink,K:Ord+Copy>(
-    sink:&mut S,frames:&[frame::PreparedFrame],ids:&[K],row:usize,base:u64,
-    live:&mut std::collections::BTreeMap<K,frame::ArenaLocation>,delta:&mut Vec<(K,frame::ArenaLocation)>,
-    recovered:&mut std::collections::BTreeMap<K,frame::ArenaLocation>,frontier:u64,
+fn publish_and_reload<S:frame::Sink>(
+    sink:&mut S,frames:&[frame::PreparedFrame],ids:&[crate::ObjectId],row:usize,base:u64,scheme:Scheme,
+    live:&mut std::collections::BTreeMap<crate::ObjectId,frame::ArenaLocation>,delta:&mut Vec<(crate::ObjectId,frame::ArenaLocation)>,
+    recovered:&mut std::collections::BTreeMap<crate::ObjectId,frame::ArenaLocation>,frontier:u64,
 ) -> (out:Result<bool,frame::AppendError<S::Error>>)
     requires ids.len() == frames.len(), row < ids.len(),
         forall|i:int| row < i < ids.len() ==> #[trigger] ids@[i] != ids@[row as int],
         vstd::std_specs::btree::btree_map_inv(old(live)),vstd::std_specs::btree::btree_map_inv(old(recovered)),
-        vstd::laws_cmp::obeys_cmp::<K>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<K>(),
+        vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        scheme.algorithm@ != seq![0u8,0u8], scheme.construction@ != seq![0u8,0u8],
     ensures match out {
         Ok(ok) => {
             let key = ids@[row as int];
@@ -227,8 +338,8 @@ fn publish_and_reload<S:frame::Sink,K:Ord+Copy>(
 {
     let prior = delta.len();
     publish_selected(sink,frames,ids,row,base,live,delta)?;
-    let (key,loc) = delta[prior.saturating_add(row)];
-    Ok(reload_row(recovered,key,loc,frontier))
+    let (key,loc) = delta[prior + row];
+    Ok(reload_row(recovered,scheme,key,loc,frontier))
 }
 
 /// Connect the production vector builder and partial-write driver. The native
