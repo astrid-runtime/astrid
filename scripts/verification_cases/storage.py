@@ -474,3 +474,19 @@ def group_root_consumer_defects():
             lambda source, a=old, b=new: replace_once(source, a, b),
             Path("verification/hosted_wal_writer_trace.rs"),
         )
+
+
+def key_projection_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/context/range/key_projection.rs")
+    consumer = Path("verification/hosted_key_projection.rs")
+    for label, clause, weaker in [
+        ("checkpoint insertion", "final(map).deep_view() == old(map).deep_view().insert(key.deep_view(),true)", "true"),
+        ("overlay replacement", "final(map).deep_view() == old(map).deep_view().insert(key.deep_view(),value.is_some())", "true"),
+        ("visible keys", "&& (forall|k:K| #[trigger] seen.contains(k) == (keys@.get(k) == Some(true)))", "&& (forall|k:K| #[trigger] seen.contains(k) ==> (keys@.get(k) == Some(true)))"),
+        ("projected value", "&& (forall|i:int| 0 <= i < seen.len() ==> #[trigger] project.ensures((&seen[i],),Ok(out@[i])))", ""),
+        ("namespace suffix", "out matches Some(bytes) ==> bytes@ == key@.skip(strip as int)", "true"),
+    ]:
+        yield (
+            f"KV key projection loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )

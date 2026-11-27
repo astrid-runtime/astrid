@@ -7,6 +7,8 @@ use super::{
     StorageError, StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
+mod key_projection;
+
 #[cfg(test)]
 mod tests;
 
@@ -110,24 +112,13 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
     ) -> StorageResult<Vec<String>> {
         let mut keys = BTreeMap::new();
         self.visit_slots_in_range(header.tree, start, end, |_, entry| {
-            keys.insert(entry.key, true);
+            key_projection::checkpoint(&mut keys, entry.key);
             Ok(())
         })?;
         for (key, value) in header.overlay.range(start, end) {
-            keys.insert(key.to_vec(), value.is_some());
+            key_projection::overlay(&mut keys, key.to_vec(), value);
         }
-        keys.into_iter()
-            .filter(|(_, present)| *present)
-            .map(|(key, _)| {
-                key.get(strip..)
-                    .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))
-                    .and_then(|key| {
-                        std::str::from_utf8(key)
-                            .map(str::to_owned)
-                            .map_err(|error| StorageError::Serialization(error.to_string()))
-                    })
-            })
-            .collect()
+        key_projection::collect(&keys, |key| suffix(key, strip).map(str::to_owned))
     }
 
     pub(in crate::kv::tree) fn projected_entries_in_range(
@@ -179,8 +170,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
 }
 
 fn suffix(key: &[u8], strip: usize) -> StorageResult<&str> {
-    let key = key
-        .get(strip..)
+    let key = key_projection::suffix(key, strip)
         .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))?;
     std::str::from_utf8(key).map_err(|error| StorageError::Serialization(error.to_string()))
 }

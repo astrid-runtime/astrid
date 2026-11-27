@@ -251,6 +251,8 @@ INPUTS = [
     ENTRY,
     MODEL,
     AUTHORITY,
+    Path("verification/hosted_key_projection.rs"),
+    Path("crates/astrid-storage/src/kv/tree/context/range/key_projection.rs"),
     Path("verification/hosted_token_recovery.rs"),
     Path("crates/astrid-capabilities/src/store/marker_batch.rs"),
     Path("crates/astrid-capabilities/src/store/marker_key.rs"),

@@ -277,6 +277,9 @@ mod root_wire;
 
 #[path = "../crates/astrid-storage/src/kv/encoding.rs"]
 mod encoding;
+#[path = "../crates/astrid-storage/src/kv/tree/context/range/key_projection.rs"]
+mod key_projection;
+mod hosted_key_projection;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/traversal.rs"]
 mod traversal;
