@@ -859,21 +859,17 @@ fn unregister_one_principal_does_not_touch_peer_runtime() {
             uid(2),
         )
         .expect("register bob");
+    let retiring = registry.get_for(&alice, &id).unwrap();
+    let peer = registry.get_for(&bob, &id).unwrap();
     let peer_source = registry.source_id_for(&bob, &id).unwrap();
 
     let removed = registry
         .unregister_for(&alice, &id)
         .expect("alice unregister");
-    assert_eq!(removed.capsule.id().as_str(), "shared-capsule");
+    assert!(Arc::ptr_eq(&removed.capsule, &retiring));
     assert!(removed.torn_down);
-    assert!(
-        registry.get_for(&alice, &id).is_none(),
-        "alice's view no longer contains the capsule"
-    );
-    assert!(
-        registry.get_for(&bob, &id).is_some(),
-        "bob's independent runtime remains registered"
-    );
+    assert!(registry.get_for(&alice, &id).is_none());
+    assert!(Arc::ptr_eq(&registry.get_for(&bob, &id).unwrap(), &peer));
     assert_eq!(registry.len(), 1);
     assert_eq!(registry.refcount_for_hash(&hash), Some(1));
     assert_eq!(

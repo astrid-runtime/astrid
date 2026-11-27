@@ -74,4 +74,40 @@ fn prepare_restart<C: ?Sized,A>(next: &mut u64, views: &HashMap<u64,HashMap<u64,
     Some((handle,candidate))
 }
 
+
+// A detached authenticated view supplies both the concrete generation and the
+// installed handle used by the kernel when it asks that runtime to quiesce.
+fn detach_for_quiescence<C: ?Sized,A>(views: &mut HashMap<u64,HashMap<u64,Id>>,
+    instances: &HashMap<Id,Entry<C,A>>, owner: u64, package: u64, peer: u64)
+    -> (out: Option<(Id,Option<Arc<C>>)>)
+    requires hash_map_inv(old(views)), hash_map_inv(instances), obeys_key_model::<Id>(),
+        obeys_concrete_eq::<Id>(), peer != owner,
+        old(views)@.contains_key(owner) ==> hash_map_inv(&old(views)@[owner]),
+    ensures ({
+        let before = old(views)@;
+        let after = final(views)@;
+        &&& after.contains_key(peer) == before.contains_key(peer)
+        &&& before.contains_key(peer) ==> after[peer] == before[peer]
+        &&& if before.contains_key(owner) && before[owner]@.contains_key(package) {
+            let id = before[owner]@[package];
+            let remaining = before[owner]@.remove(package);
+            &&& out == Some((id, if instances@.contains_key(id) { Some(instances@[id].capsule) } else { None }))
+            &&& if remaining.is_empty() { !after.contains_key(owner) }
+                else { after.contains_key(owner) && after[owner]@ == remaining }
+        } else { out.is_none() && after == before }
+    }),
+{
+    let ghost before = views@;
+    let out = view_lookup::detach(views, instances, &owner, &package);
+    proof {
+        let after = views@;
+        assert(before.remove(owner).contains_key(peer) == before.contains_key(peer));
+        assert(after.remove(owner).contains_key(peer) == after.contains_key(peer));
+        if before.contains_key(peer) {
+            assert(before.remove(owner)[peer] == before[peer]);
+            assert(after.remove(owner)[peer] == after[peer]);
+        }
+    }
+    out
+}
 }

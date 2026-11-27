@@ -486,21 +486,10 @@ impl CapsuleRegistry {
         principal: &PrincipalId,
         id: &CapsuleId,
     ) -> CapsuleResult<Unregistered> {
-        let runtime_id = self
-            .views
-            .get_mut(principal)
-            .and_then(|view| view.remove(id))
-            .ok_or_else(|| CapsuleError::NotFound(format!("capsule {id}")))?;
-
-        if self.views.get(principal).is_some_and(HashMap::is_empty) {
-            self.views.remove(principal);
-        }
-
-        let capsule = self
-            .instances
-            .get(&runtime_id)
-            .map(|entry| Arc::clone(&entry.capsule))
-            .expect("principal view referenced missing capsule runtime");
+        let (runtime_id, capsule) =
+            view_lookup::detach(&mut self.views, &self.instances, principal, id)
+                .ok_or_else(|| CapsuleError::NotFound(format!("capsule {id}")))?;
+        let capsule = capsule.expect("principal view referenced missing capsule runtime");
 
         let owner_departed = self
             .instances

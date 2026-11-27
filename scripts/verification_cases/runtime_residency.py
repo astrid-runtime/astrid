@@ -15,6 +15,19 @@ def defects():
             Path("verification/hosted_route_retirement.rs"),
         )
     lookup = Path("crates/astrid-capsule/src/registry/view_lookup.rs")
+    for name, clause, weakened in [
+        ("loses the installed generation and handle",
+         "out == match slot(old(views)@,*principal,*capsule)", "instances@.len() == 0 ==> out == match slot(old(views)@,*principal,*capsule)"),
+        ("mutates a missing view", "out.is_none() ==> final(views)@ == old(views)@", "true"),
+        ("leaves an empty owner row", "after == before.remove(*principal)", "true"),
+        ("alters another owner's row", "after.remove(*principal) == before.remove(*principal)", "true"),
+        ("loses a sibling package", "after[*principal]@ == remaining", "true"),
+    ]:
+        yield (
+            f"runtime detachment {name}", lookup,
+            lambda s, a=clause, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     for name, original, weakened in [
         ("loses equality with the captured generation", "ensures yes == (slot", "ensures yes ==> (slot"),
         ("admits a stale generation", "ensures yes == (slot", "ensures yes <== (slot"),

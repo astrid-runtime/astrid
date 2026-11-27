@@ -28,6 +28,45 @@ pub(super) fn resolve<'a,P: Eq + Hash,K: Eq + Hash,V>(
     views.get(principal)?.get(capsule)
 }
 
+/// Detach only the named slot and prune its owner row when it becomes empty.
+pub(super) fn detach<P: Eq + Hash + Clone, K: Eq + Hash, V: Eq + Hash, C: ?Sized, A>(
+    views: &mut HashMap<P,HashMap<K,V>>, instances: &HashMap<V,Entry<C,A>>, principal: &P, capsule: &K,
+) -> (out: Option<(V, Option<Arc<C>>)>)
+    requires hash_map_inv(instances), obeys_key_model::<V>(), obeys_concrete_eq::<V>(),
+        hash_map_inv(old(views)), vstd::pervasive::obeys_clone_eq::<P>(), obeys_key_model::<P>(), obeys_concrete_eq::<P>(),
+        obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+        old(views)@.contains_key(*principal) ==> hash_map_inv(&old(views)@[*principal]),
+    ensures
+        hash_map_inv(final(views)),
+        out == match slot(old(views)@,*principal,*capsule) {
+            Some(id) => Some((id, if instances@.contains_key(id) { Some(instances@[id].capsule) } else { None })),
+            None => None,
+        },
+        out.is_none() ==> final(views)@ == old(views)@,
+        out.is_some() ==> ({
+            let before = old(views)@;
+            let after = final(views)@;
+            let remaining = before[*principal]@.remove(*capsule);
+            if remaining.is_empty() { after == before.remove(*principal) }
+            else {
+                &&& after.contains_key(*principal)
+                &&& after[*principal]@ == remaining
+                &&& hash_map_inv(&after[*principal])
+                &&& after.remove(*principal) == before.remove(*principal)
+            }
+        }),
+{
+    proof { reveal(vstd::pervasive::obeys_clone_eq); }
+    let key = principal.clone();
+    assert(vstd::pervasive::cloned(*principal, key));
+    let std::collections::hash_map::Entry::Occupied(mut row) = views.entry(key) else { return None; };
+    if !row.get().contains_key(capsule) { return None; }
+    let generation = row.get_mut().remove(capsule)?;
+    if row.get().is_empty() { row.remove_entry(); }
+    let handle = instance_swap::installed(instances, &generation);
+    Some((generation, handle))
+}
+
 pub(super) fn current<P: Eq + Hash,K: Eq + Hash,V: Eq>(
     views: &HashMap<P,HashMap<K,V>>, principal: &P, capsule: &K, expected: &V,
 ) -> (yes: bool)
