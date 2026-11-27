@@ -258,10 +258,17 @@ pub(super) fn recover_index(
         .collect::<Vec<_>>();
     ordered.sort_by_key(|(_, location)| location.offset);
     // A valid tail alone cannot account for a missing object in the prefix.
-    // The authoritative scanner resolves any gap, including duplicate frames.
+    // A gap may contain additional copies of already validated objects.
     let mut covered = 0;
     for (id, location) in ordered {
-        if location.offset != covered {
+        if !super::format::duplicate_range(
+            arena,
+            &state.objects,
+            scheme,
+            limits,
+            covered,
+            location.offset,
+        ) {
             return None;
         }
         covered = validation::location_end(&location).ok()?;
@@ -269,7 +276,14 @@ pub(super) fn recover_index(
             return None;
         }
     }
-    if covered != authoritative_arena_len {
+    if !super::format::duplicate_range(
+        arena,
+        &state.objects,
+        scheme,
+        limits,
+        covered,
+        authoritative_arena_len,
+    ) {
         return None;
     }
     match state.arena_tail {
