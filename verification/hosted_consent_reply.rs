@@ -73,4 +73,35 @@ fn answer<'a>(principal:&'a [u8],owner:u128,stamped:Option<&[u8]>,stamped_owner:
     Some(held.apply(wire,principal,action,target,profile))
 }
 
+/// Persistent write trace for two signed envelopes. Registry binding is a
+/// premise per envelope; profile eligibility is computed by the production selector.
+fn signed_answer<'a>(
+    principal:&'a [u8], owner:u128, stamped:Option<&[u8]>, stamped_owner:Option<u128>,
+    caller:&crate::hosted_device_profile::SignedLookup,
+    responder:&crate::hosted_device_profile::SignedLookup, wire:&[u8],
+    action:&'a [u8], target:Result<Destination<&'a [u8]>,Error>, profile:&mut Profile<'a>,
+) -> (out:Option<Result<Decision,Error>>)
+    ensures ({
+        let matched = stamped matches Some(p) && p@ == principal@ && stamped_owner == Some(owner);
+        let live = caller.permitted() && responder.permitted();
+        let decision = consent_reply::scope(wire@);
+        &&& final(profile).calls@ == match target {
+            Ok(d) if matched && live && decision == Decision::Always =>
+                old(profile).calls@.push((principal,action,d)),
+            _ => old(profile).calls@,
+        }
+        &&& out == if !matched {None} else if !live {Some(Err(Error::Retired))}
+            else if decision != Decision::Always {Some(Ok(decision))}
+            else {Some(match target {Err(e) => Err(e), Ok(d) =>
+                match old(profile).result(principal,action,d) {
+                    Ok(()) => Ok(Decision::Always), Err(e) => Err(e),
+                }
+            })}
+    }),
+{
+    if !consent_identity::matches(principal,owner,stamped,stamped_owner) {return None;}
+    answer(principal,owner,stamped,stamped_owner,wire,caller.admission(),responder.admission(),
+        action,target,profile)
+}
+
 }

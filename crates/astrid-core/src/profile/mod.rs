@@ -530,9 +530,13 @@ impl PrincipalProfile {
         id: &DeviceKeyId<S>,
         generation: Option<uuid::Uuid>,
     ) -> Option<&DeviceKey> {
-        device_registration::match_generation(
-            self.active_device(id),
+        device_registration::active(
+            self.enabled,
+            self.auth.methods.contains(&AuthMethod::Keypair),
+            &self.auth.public_keys,
+            id.as_str(),
             generation.map(|g| g.as_u128()),
+            |record| record.key_id.as_str(),
             |record| {
                 record
                     .registration_id
@@ -583,6 +587,33 @@ impl Default for Quotas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_requires_active_policy_unique_fingerprint_and_exact_generation() {
+        let mut profile = PrincipalProfile::default();
+        let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+        let key = DeviceKeyId::new(device.key_id.clone()).unwrap();
+        let generation = device.registration_id.map(Into::into);
+        assert!(generation.is_some());
+        profile.add_device(device.clone());
+        assert!(profile.active_registration(&key, generation).is_none());
+
+        profile.auth.methods.push(AuthMethod::Keypair);
+        assert_eq!(profile.active_registration(&key, generation), Some(&device));
+        assert!(profile.active_registration(&key, None).is_none());
+        profile.enabled = false;
+        assert!(profile.active_registration(&key, generation).is_none());
+        profile.enabled = true;
+
+        let mut legacy = device.clone();
+        legacy.registration_id = None;
+        profile.add_device(legacy.clone());
+        assert!(profile.active_registration(&key, generation).is_none());
+        assert!(profile.active_registration(&key, None).is_none());
+        profile.auth.public_keys.remove(0);
+        assert_eq!(profile.active_registration(&key, None), Some(&legacy));
+        assert!(profile.active_registration(&key, generation).is_none());
+    }
 
     #[test]
     fn default_is_permissive_but_fail_closed_egress() {

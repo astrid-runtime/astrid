@@ -29,6 +29,27 @@ def consumer_defects():
             f"approval reply {name}", reply,
             lambda s, a=original, b=changed: replace_once(s, a, b), target,
         )
+    registration = Path("crates/astrid-core/src/profile/device_registration.rs")
+    profile_trace = Path("verification/hosted_device_profile.rs")
+    for name, original, changed in [
+        ("omits enabled profile policy", "Some(record) => enabled && keypair &&", "Some(record) => keypair &&"),
+        ("forgets the selected generation", "&& generation.ensures((record,),expected)", ""),
+        ("forgets the selected record", "&& *record == rows@[i],", ","),
+        ("permits rejection of a live record", "None => !enabled || !keypair", "None => true || !enabled || !keypair"),
+    ]:
+        yield (
+            f"device profile {name}", registration,
+            lambda s, a=original, b=changed: replace_once(s, a, b), profile_trace,
+        )
+    for name, original, changed, expected_file in [
+        ("loses signed lookup rejection", "ensures r.is_ok() == self.permitted()", "ensures true", trace),
+        ("ignores a retiring registry", "&& self.registry_accepts { Ok(self.generation)", "{ Ok(self.generation)", profile_trace),
+    ]:
+        yield (
+            f"device profile {name}", profile_trace,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            expected_file,
+        )
     copies = Path("crates/astrid-storage/src/engine/durable/format/duplicates.rs")
     copies_trace = Path("verification/hosted_duplicate_recovery.rs")
     for name, original, changed, target in [

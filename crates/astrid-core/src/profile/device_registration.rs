@@ -25,7 +25,7 @@ pub(super) fn match_generation<T, F: Fn(&T) -> Option<u128>>(
     if matches { Some(record) } else { None }
 }
 
-pub(super) closed spec fn observed<T, F: Fn(&T) -> &str>(
+pub(super) open spec fn observed<T, F: Fn(&T) -> &str>(
     identify: F, registration: T, requested: &str, matched: bool,
 ) -> bool {
     exists|k: &str| identify.ensures((&registration,), k) && (k@ == requested@) == matched
@@ -91,6 +91,42 @@ pub(super) fn resolve_unique<'a, T, F: Fn(&T) -> &str>(
 {
     let index = unique_index(registrations, requested, identify)?;
     Some(&registrations[index])
+}
+
+pub(super) open spec fn unique_at<T,F:Fn(&T)->&str>(
+    rows:Seq<T>, key:&str, identify:F, i:int,
+) -> bool {
+    &&& 0 <= i < rows.len()
+    &&& forall|j:int| 0 <= j < rows.len() ==>
+        observed(identify, #[trigger] rows[j], key, j == i)
+}
+
+/// Combine the live profile policy, unique fingerprint and captured generation.
+pub(super) fn active<'a,T,F:Fn(&T)->&str + Copy,G:Fn(&T)->Option<u128> + Copy>(
+    enabled:bool, keypair:bool, rows:&'a [T], key:&str, expected:Option<u128>,
+    identify:F, generation:G,
+) -> (selected:Option<&'a T>)
+    requires
+        forall|r:&T| #[trigger] identify.requires((r,)),
+        forall|r:&T| #[trigger] generation.requires((r,)),
+    ensures match selected {
+        Some(record) => enabled && keypair && generation.ensures((record,),expected)
+            && exists|i:int| unique_at(rows@,key,identify,i) && *record == rows@[i],
+        None => !enabled || !keypair
+            || (forall|j:int| 0 <= j < rows.len() ==> observed(identify, #[trigger] rows@[j],key,false))
+            || (exists|i:int,j:int| 0 <= i < j < rows.len()
+                && observed(identify,rows@[i],key,true) && observed(identify,rows@[j],key,true))
+            || (exists|i:int,g:Option<u128>| unique_at(rows@,key,identify,i)
+                && generation.ensures((&rows@[i],),g) && g != expected),
+    },
+{
+    let keys = super::device_admission::enabled_keys(enabled,keypair,rows)?;
+    let record = resolve_unique(keys,key,identify)?;
+    let ghost i = choose|i:int| 0 <= i < rows.len() && *record == rows@[i]
+        && forall|j:int| 0 <= j < rows.len() ==>
+            observed(identify, #[trigger] rows@[j],key,j == i);
+    assert(unique_at(rows@,key,identify,i));
+    match_generation(Some(record),expected,generation)
 }
 
 /// The key projection in the profile adapter reads the record's fingerprint.

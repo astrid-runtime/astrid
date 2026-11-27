@@ -111,6 +111,7 @@ INPUTS = [
     CONSENT_IDENTITY,
     Path("crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs"),
     Path("verification/hosted_consent_reply.rs"),
+    Path("verification/hosted_device_profile.rs"),
     DEVICE_ADMISSION,
     INGRESS_FRAME,
     PRINCIPAL_SYNTAX,
