@@ -17,6 +17,41 @@ def consumer_defects():
     )
     record = Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs")
     record_trace = Path("verification/hosted_record_model.rs")
+    overlay = Path("crates/astrid-storage/src/engine/durable/wal/overlay_object.rs")
+    for name, clause, weaker in [
+        ("loses acceptance of equal frames", "out.is_ok() == ((*old(self).payload)@ == (*incoming.payload)@)", "out.is_ok() ==> ((*old(self).payload)@ == (*incoming.payload)@)"),
+        ("loses the retained record", "final(self).record == old(self).record", "true"),
+        ("loses direct metadata on upgrade", "final(self).direct == incoming.direct", "true"),
+    ]:
+        yield (
+            f"pending WAL merge {name}", overlay,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), record_trace,
+        )
+    for name, clause, weaker, target in [
+        ("accepts a trailing byte", "if cursor != bytes.len() {return Err(BodyError::Trailing);}", "", record),
+        ("forgets the canonical bytes", "fields.2 == bytes.subrange(data,refs)", "true", record_trace),
+        ("loses relation-code provenance", "forall|i:nat| i < fields.3.len() ==> #[trigger] stored_reference(bytes,position(bytes,refs,i),fields.3[i as int])", "true", record_trace),
+        ("loses the exact payload retained", "name == id && (*retained)@ == (**frame)@ &&", "name == id &&", record_trace),
+        ("forgets positive admission for valid references", "!leaf_body((**frame)@,40) && (complete_body((**frame)@,40,scheme) ==> e is Allocation)", "!leaf_body((**frame)@,40)", record_trace),
+        ("permits a spurious wrong name", "id.digest() != (**frame)@.subrange(8,40)", "true", record_trace),
+    ]:
+        yield (
+            f"canonical record {name}", record,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
+        )
+    yield (
+        "canonical record forgets strict label ordering", record,
+        lambda s: replace_once(s, "&&& ObjectRecord::labels_ordered(fields.3)", "&&& true"), record_trace,
+    )
+    roundtrip = Path("verification/hosted_record_roundtrip.rs")
+    for name, clause, weaker in [
+        ("drops the writer field layout", "bytes@ == scheme.algorithm@ + scheme.construction@ + seq![32u8,0u8,0u8,0u8] + id.digest() +\n            header_wire(f.0,f.1,f.5) + payload_wire(f.4,f.2,f.3.len() as usize) + reference_prefix(f.3,f.3.len(),scheme)", "true"),
+        ("loses full body acceptance", "tag(frame@,0,scheme) && !leaf_body(frame@,40) &&\n            (complete_body(frame@,40,scheme) ==> e is Allocation)", "tag(frame@,0,scheme) && !leaf_body(frame@,40)"),
+    ]:
+        yield (
+            f"object round trip {name}", record,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), roundtrip,
+        )
     layers = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     transactions = Path("crates/astrid-storage/src/engine/transaction_records.rs")
     closure_trace = Path("verification/hosted_closure_model.rs")
@@ -49,7 +84,7 @@ def consumer_defects():
     yield ("closure lookup substitutes pending for incoming", layers, pending_before_incoming, layers)
     yield (
         "closure lookup treats an evidence reference as owned", layers,
-        lambda s: replace_once(s, "self.kind().owned_target(self.target())", "Some(self.target())"), walk_source,
+        lambda s: replace_once(s, "self.owning_target()", "Some(self.target())"), walk_source,
     )
     yield (
         "closure authentication omits the last transaction row", transactions,

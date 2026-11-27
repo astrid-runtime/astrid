@@ -45,6 +45,140 @@ fn truncated_payload(bytes:&[u8],start:usize)
     assert(out.is_err());
 }
 
+/// Any well-formed leaf for which the supplied identity implementation returns
+/// the requested name reaches the WAL overlay with its exact physical bytes.
+fn pending_leaf<H:Fn(&crate::ObjectRecord)->[u8;32]>(frame:&std::sync::Arc<[u8]>,scheme:Scheme,id:crate::ObjectId,identify:H)
+    -> (out:Option<record::PendingFrame<crate::ObjectRecord>>)
+    requires record::tag((**frame)@,0,scheme),record::leaf_body((**frame)@,40),
+        (**frame)@.subrange(8,40) == id.digest(),forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|r:&crate::ObjectRecord,digest:[u8;32]| record::record_at((**frame)@,40,scheme,*r) &&
+            #[trigger] identify.ensures((r,),digest) ==> digest@ == id.digest(),
+    ensures out matches Some((name,payload,r)) && name == id && (*payload)@ == (**frame)@ &&
+        r.contents().0.wire_code() == record::field16((**frame)@,40) && r.contents().1 == record::field16((**frame)@,42) &&
+        r.contents().5.wire_code() == (**frame)@[44] && r.contents().4 == record::u64_field((**frame)@,45) &&
+        r.contents().2 == (**frame)@.skip(69) && r.contents().3.len() == 0,
+{
+    let result = record::pending(frame,scheme,id,identify);
+    let Ok((name,payload,r)) = result else {assert(false);return None;};
+    assert(r.contents().2 =~= (**frame)@.skip(69));
+    Some((name,payload,r))
+}
+
+use crate::closure_walk::{self as walk,Edge};
+
+proof fn concrete_children(rows:Seq<crate::ObjectReference>,key:crate::ObjectId)
+    ensures walk::children(rows).contains(key) == (exists|i:int| 0 <= i < rows.len() &&
+        #[trigger] Edge::target(&rows[i]) == Some(key)),
+    decreases rows.len(),
+{
+    if rows.len() > 0 {
+        let tail = rows.skip(1);
+        concrete_children(tail,key);
+        if exists|i:int| 0 <= i < tail.len() && #[trigger] Edge::target(&tail[i]) == Some(key) {
+            let i = choose|i:int| 0 <= i < tail.len() && #[trigger] Edge::target(&tail[i]) == Some(key);
+            assert(rows[i+1] == tail[i]);
+        }
+        if exists|i:int| 0 <= i < rows.len() && #[trigger] Edge::target(&rows[i]) == Some(key) {
+            let i = choose|i:int| 0 <= i < rows.len() && #[trigger] Edge::target(&rows[i]) == Some(key);
+            if i > 0 {assert(tail[i-1] == rows[i]);}
+        }
+    }
+}
+
+spec fn wire_edge(bytes:Seq<u8>,i:nat,key:crate::ObjectId) -> bool {
+    let first = 69+record::u64_field(bytes,53);
+    let target = record::target_offset(bytes,record::position(bytes,first,i));
+    &&& i < record::u64_field(bytes,61)
+    &&& bytes[target+40] == 0
+    &&& bytes.subrange(target+8,target+40) == key.digest()
+}
+
+spec fn physical_work(bytes:Seq<u8>,actions:Seq<walk::Work<crate::ObjectId>>) -> bool {
+    &&& forall|j:int| 0 <= j < actions.len() ==> (#[trigger] actions[j] matches walk::Work::Visit(key) &&
+        exists|i:nat| #[trigger] wire_edge(bytes,i,key))
+    &&& forall|i:nat,key:crate::ObjectId| #[trigger] wire_edge(bytes,i,key) ==>
+        exists|j:int| 0 <= j < actions.len() && #[trigger] actions[j] == walk::Work::Visit(key)
+}
+
+/// The worklist of an accepted pending frame contains exactly the owning
+/// targets encoded on the wire. A valid named frame can also fail allocation.
+fn pending_children<H:Fn(&crate::ObjectRecord)->[u8;32]>(frame:&std::sync::Arc<[u8]>,scheme:Scheme,id:crate::ObjectId,identify:H)
+    -> (out:Result<Vec<walk::Work<crate::ObjectId>>,record::Error<record::BodyError>>)
+    requires record::tag((**frame)@,0,scheme),record::complete_body((**frame)@,40,scheme),
+        (**frame)@.subrange(8,40) == id.digest(),forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|r:&crate::ObjectRecord,digest:[u8;32]| record::record_at((**frame)@,40,scheme,*r) &&
+            #[trigger] identify.ensures((r,),digest) ==> digest@ == id.digest(),
+    ensures match out {
+        Err(e) => e matches record::Error::Decode(record::DecodeError::Record(record::BodyError::Allocation)),
+        Ok(actions) => physical_work((**frame)@,actions@),
+    },
+{
+    let (_,_,r) = record::pending(frame,scheme,id,identify)?;
+    let refs = r.references();
+    let mut stack = Vec::new();
+    walk::schedule(refs,&mut stack);
+    let ghost bytes = (**frame)@;
+    let ghost first = 69+record::u64_field(bytes,53);
+    proof {
+        assert forall|key:crate::ObjectId| walk::children(refs@).contains(key) <==>
+            (exists|i:nat| #[trigger] wire_edge(bytes,i,key)) by {
+            concrete_children(refs@,key);
+            if walk::children(refs@).contains(key) {
+                let i = choose|i:int| 0 <= i < refs.len() && #[trigger] Edge::target(&refs@[i]) == Some(key);
+                assert(record::stored_reference(bytes,record::position(bytes,first,i as nat),refs@[i]));
+                assert(wire_edge(bytes,i as nat,key));
+            } else if exists|i:nat| #[trigger] wire_edge(bytes,i,key) {
+                let i = choose|i:nat| #[trigger] wire_edge(bytes,i,key);
+                assert(record::stored_reference(bytes,record::position(bytes,first,i),refs@[i as int]));
+                crate::ObjectId::same_digest(refs@[i as int].fields().1,key);
+                assert(Edge::target(&refs@[i as int]) == Some(key));
+            }
+        }
+        assert(walk::scheduled(Seq::empty(),stack@,walk::children(refs@)));
+        assert forall|i:nat,key:crate::ObjectId| #[trigger] wire_edge(bytes,i,key) implies
+            exists|j:int| 0 <= j < stack.len() && #[trigger] stack@[j] == walk::Work::Visit(key) by {
+            assert(walk::children(refs@).contains(key));
+        }
+        assert forall|j:int| 0 <= j < stack.len() implies (#[trigger] stack@[j] matches walk::Work::Visit(key) &&
+            exists|i:nat| #[trigger] wire_edge(bytes,i,key)) by {
+            if let walk::Work::Visit(key) = stack@[j] {assert(walk::children(refs@).contains(key));}
+        }
+    }
+    Ok(stack)
+}
+
+/// Repeated labels cannot create two relations for the same name in an admitted object.
+fn duplicate_labels(frame:&[u8],scheme:Scheme,start:usize)
+    requires start as int+29 <= frame.len(),record::u64_field(frame@,start as int+21) >= 2,
+        ({
+            let first = start as int+29+record::u64_field(frame@,start as int+13);
+            record::label_at(frame@,first,0) == record::label_at(frame@,first,1)
+        }),
+{
+    let out = record::body(frame,start,scheme);
+    if let Ok(r) = out {
+        let ghost rows = r.contents().3;
+        let ghost first = start as int+29+record::u64_field(frame@,start as int+13);
+        assert(record::stored_reference(frame@,record::position(frame@,first,0),rows[0]));
+        assert(record::stored_reference(frame@,record::position(frame@,first,1),rows[1]));
+        assert(crate::ObjectRecord::label_before(rows[0].fields().0,rows[1].fields().0));
+        assert(false);
+    }
+}
+
+/// Replaying a name may add a staged placement if the payload agrees, while
+/// retaining the originally decoded record, even when the candidate differs.
+fn repeated<R:Copy>(retained:&mut crate::overlay_object::Object<R,u64,u64>,candidate:crate::overlay_object::Object<R,u64,u64>)
+    -> (accepted:bool)
+    ensures accepted == ((*old(retained).payload)@ == (*candidate.payload)@),
+        final(retained).record == old(retained).record && final(retained).payload == old(retained).payload,
+        if accepted && old(retained).location.is_none() && candidate.location.is_some() {
+            final(retained).location == candidate.location && final(retained).direct == candidate.direct
+        } else {*final(retained) == *old(retained)},
+{
+    retained.merge(candidate).is_ok()
+}
+
 /// A record may charge a logical size different from its payload length.
 fn payload_round_trip(prefix:&[u8],suffix:&[u8],logical:u64,data:&[u8],count:usize) -> (result:Option<()>)
     requires prefix.len() as int + 24 + data.len() + suffix.len() <= usize::MAX,
@@ -117,7 +251,7 @@ fn indexed<R:Copy,H>(scheme:Scheme,embedded:[u8;32],expected:[u8;32],suffix:&[u8
     out
 }
 
-proof fn written_reference(bytes:Seq<u8>,at:int,label:Seq<u8>,scheme:Scheme,id:[u8;32],code:u8)
+pub(super) proof fn written_reference(bytes:Seq<u8>,at:int,label:Seq<u8>,scheme:Scheme,id:[u8;32],code:u8)
     requires at >= 0,at+49+label.len() <= bytes.len(),code <= 3,label.len() <= usize::MAX,
         scheme.algorithm@ != seq![0u8,0u8],scheme.construction@ != seq![0u8,0u8],
         bytes.subrange(at,at+49+label.len()) ==

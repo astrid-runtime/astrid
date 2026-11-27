@@ -27,7 +27,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::num::{NonZeroU16, NonZeroU32};
+use core::num::NonZeroU32;
 mod object_reference;
 pub use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 mod object_codes;
@@ -111,48 +111,8 @@ impl StorageNodeId {
     }
 }
 
-/// Non-zero schema version of one [`ObjectKind`].
-///
-/// Versions are scoped to a kind so unrelated object families can evolve
-/// without rewriting every identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObjectFormatVersion(NonZeroU16);
-
-impl ObjectFormatVersion {
-    /// First schema version for a kind.
-    pub const V1: Self = Self(NonZeroU16::MIN);
-
-    /// Construct a non-zero object-format version.
-    #[must_use]
-    pub const fn new(value: u16) -> Option<Self> {
-        match NonZeroU16::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-
-    /// Return the numeric schema version.
-    #[must_use]
-    pub const fn get(self) -> u16 {
-        self.0.get()
-    }
-}
-
-/// Canonical object bytes and their typed child references.
-///
-/// `logical_bytes` is the number of user-visible bytes contributed by this
-/// object. Structural objects normally contribute zero. The complete canonical
-/// record—including payload and references—remains part of retained accounting
-/// regardless of class.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObjectRecord {
-    kind: ObjectKind,
-    format_version: ObjectFormatVersion,
-    canonical_bytes: Vec<u8>,
-    references: Vec<ObjectReference>,
-    logical_bytes: u64,
-    class: ObjectClass,
-}
+mod object_record;
+pub use object_record::{ObjectFormatVersion, ObjectRecord};
 
 impl ObjectRecord {
     // Stable widths in the logical canonical record encoding. Durable engines
@@ -186,44 +146,15 @@ impl ObjectRecord {
         logical_bytes: u64,
         class: ObjectClass,
     ) -> Result<Self, ModelError> {
-        if references
-            .windows(2)
-            .any(|pair| pair[0].label >= pair[1].label)
-        {
-            return Err(ModelError::NonCanonicalReferences);
-        }
-        Ok(Self {
+        Self::from_fields(
             kind,
             format_version,
             canonical_bytes,
             references,
             logical_bytes,
             class,
-        })
-    }
-
-    /// Return the semantic object kind.
-    #[must_use]
-    pub const fn kind(&self) -> ObjectKind {
-        self.kind
-    }
-
-    /// Return the kind-scoped object schema version.
-    #[must_use]
-    pub const fn format_version(&self) -> ObjectFormatVersion {
-        self.format_version
-    }
-
-    /// Borrow the canonical bytes used for collision checking.
-    #[must_use]
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical_bytes
-    }
-
-    /// Borrow the object's child references.
-    #[must_use]
-    pub fn references(&self) -> &[ObjectReference] {
-        &self.references
+        )
+        .ok_or(ModelError::NonCanonicalReferences)
     }
 
     /// Iterate over strong ownership references.
@@ -231,7 +162,7 @@ impl ObjectRecord {
     pub fn owning_references(&self) -> impl DoubleEndedIterator<Item = ObjectId> + '_ {
         self.references
             .iter()
-            .filter_map(|reference| reference.kind.owned_target(reference.target))
+            .filter_map(ObjectReference::owning_target)
     }
 
     /// Return the stable bytes charged for retaining this canonical record.
@@ -306,18 +237,6 @@ impl ObjectRecord {
         }
         reference.target = replacement;
         Ok(next)
-    }
-
-    /// Return the user-visible byte contribution.
-    #[must_use]
-    pub const fn logical_bytes(&self) -> u64 {
-        self.logical_bytes
-    }
-
-    /// Return the accounting class.
-    #[must_use]
-    pub const fn class(&self) -> ObjectClass {
-        self.class
     }
 }
 

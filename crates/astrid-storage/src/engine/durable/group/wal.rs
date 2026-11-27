@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::ProjectionPhase;
-use crate::storage_model::{ModelError, ObjectId, ObjectIdentity};
+use crate::storage_model::{ModelError, ObjectId};
 
 use super::super::wal::durable_error as wal_durable_error;
 use super::super::{
     ARENA_FILE, DurableEngine, DurableError, DurableInner, FaultPoint, Persisted,
-    PersistentObjectIdentity, Prepared, PrincipalCodec, WAL_FILE, decode_object_frame,
-    encode_object_frame, io_error, live_files_mut, read_indexed_object,
+    PersistentObjectIdentity, Prepared, PrincipalCodec, decode_object_frame, encode_object_frame,
+    io_error, live_files_mut, read_indexed_object,
 };
 use super::{AcceptedCommit, record_group};
 
@@ -130,22 +130,9 @@ where
         }
         for objects in prepared {
             for (id, payload) in objects {
-                let (decoded_id, record) = decode_object_frame(payload, self.identity.scheme())
-                    .map_err(|detail| DurableError::Corrupt {
-                        file: WAL_FILE,
-                        offset: 0,
-                        detail,
-                    })?;
-                if decoded_id != *id || self.identity.identify(&record) != *id {
-                    return Err(DurableError::Corrupt {
-                        file: WAL_FILE,
-                        offset: 0,
-                        detail: "WAL overlay object identity mismatch",
-                    });
-                }
-                inner
-                    .pending_wal
-                    .insert_prepared(*id, Arc::clone(payload), Arc::new(record))?;
+                let (name, retained, record) =
+                    super::super::format::pending_object_frame(payload, *id, &self.identity)?;
+                inner.pending_wal.insert_prepared(name, retained, record)?;
             }
         }
         for accepted in accepted {

@@ -94,6 +94,8 @@ mod root_transition;
 mod wal_root_history;
 #[path = "../crates/astrid-storage/src/engine/durable/closure_load.rs"]
 mod closure_load;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/overlay_object.rs"]
+mod overlay_object;
 #[path = "../crates/astrid-storage/src/engine/transaction_records.rs"]
 mod transaction_records;
 #[path = "../crates/astrid-storage/src/engine/durable/closure_walk.rs"]
@@ -106,10 +108,14 @@ mod reference_kind;
 use reference_kind::ReferenceKind;
 #[path = "../crates/astrid-storage/src/storage_model/object_reference.rs"]
 mod object_reference;
+#[path = "../crates/astrid-storage/src/storage_model/object_record.rs"]
+mod object_record;
+use object_record::{ObjectRecord,ObjectFormatVersion};
 use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 #[path = "../crates/astrid-storage/src/engine/durable/format/verified_record.rs"]
 mod verified_record;
 mod hosted_record_model;
+mod hosted_record_roundtrip;
 mod hosted_closure_model;
 
 #[path = "../crates/astrid-storage/src/engine/durable/frontier.rs"]

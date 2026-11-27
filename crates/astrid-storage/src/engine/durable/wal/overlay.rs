@@ -14,18 +14,16 @@ use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 use super::super::representations::DirectArenaObject;
 use super::super::{ArenaLocation, DurableError, ModelError};
 
+#[path = "overlay_object.rs"]
+mod overlay_object;
+
 /// One immutable object retained by the pending WAL overlay.
 ///
 /// `location` is populated for an object that was already appended to the
 /// canonical arena by staging.  WAL-created objects have no canonical
 /// location until the next checkpoint folds them.
-#[derive(Clone, Debug)]
-pub(in crate::engine::durable) struct PendingWalObject {
-    payload: Arc<[u8]>,
-    record: Arc<ObjectRecord>,
-    location: Option<ArenaLocation>,
-    direct: Option<DirectArenaObject>,
-}
+pub(in crate::engine::durable) type PendingWalObject =
+    overlay_object::Object<Arc<ObjectRecord>, ArenaLocation, DirectArenaObject>;
 
 impl PendingWalObject {
     pub(in crate::engine::durable) fn staged(
@@ -199,22 +197,10 @@ impl<P: Ord> PendingWalOverlay<P> {
                 entry.insert(incoming);
                 Ok(())
             },
-            std::collections::btree_map::Entry::Occupied(entry)
-                if entry.get().payload() == incoming.payload() =>
-            {
-                // A staged location is stronger evidence than a pending
-                // location.  Preserve it when a later group repeats an equal
-                // WAL object.
-                if entry.get().location().is_none() && incoming.location().is_some() {
-                    let existing = entry.into_mut();
-                    existing.location = incoming.location;
-                    existing.direct = incoming.direct;
-                }
-                Ok(())
-            },
-            std::collections::btree_map::Entry::Occupied(_) => {
-                Err(ModelError::ObjectCollision(id).into())
-            },
+            std::collections::btree_map::Entry::Occupied(entry) => entry
+                .into_mut()
+                .merge(incoming)
+                .map_err(|()| ModelError::ObjectCollision(id).into()),
         }
     }
 

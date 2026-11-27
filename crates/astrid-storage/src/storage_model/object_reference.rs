@@ -13,7 +13,12 @@ verus! {
 pub struct ObjectId([u8; 32]);
 
 impl ObjectId {
-    pub closed spec fn digest(self) -> Seq<u8> { self.0@ }
+    pub closed spec fn raw(self) -> [u8;32] {self.0}
+    pub open spec fn digest(self) -> Seq<u8> {self.raw()@}
+
+    pub(crate) proof fn same_digest(a:Self,b:Self)
+        requires a.digest() == b.digest(), ensures a == b,
+    {assert(a.0 =~= b.0);}
     /// Construct an object identifier from its digest bytes.
     #[must_use]
     pub const fn new(bytes: [u8; 32]) -> (out:Self) ensures out.digest() == bytes@ {
@@ -64,9 +69,84 @@ pub struct ObjectReference {
     pub(super) kind: ReferenceKind,
 }
 
+pub(crate) open spec fn before(a:Seq<u8>,b:Seq<u8>) -> bool {
+    (a.len() < b.len() && a == b.take(a.len() as int)) ||
+        exists|i:int| 0 <= i < a.len() && i < b.len() && a.take(i) == b.take(i) && #[trigger] a[i] < #[trigger] b[i]
+}
+
+proof fn first_difference(a:Seq<u8>,b:Seq<u8>,i:int)
+    requires 0 <= i < a.len(),i < b.len(),a.take(i) == b.take(i),a[i] != b[i],
+    ensures before(a,b) == (a[i] < b[i]),
+{
+    if a[i] < b[i] {
+        assert(exists|j:int| 0 <= j < a.len() && j < b.len() && a.take(j) == b.take(j) && #[trigger] a[j] < #[trigger] b[j]) by {assert(a[i] < b[i]);}
+    } else {
+        if a.len() < b.len() {assert(b.take(a.len() as int)[i] == b[i]);}
+        assert forall|j:int| 0 <= j < a.len() && j < b.len() && a.take(j) == b.take(j) implies !(#[trigger] a[j] < #[trigger] b[j]) by {
+            if j < i {assert(a.take(i)[j] == a[j]);assert(b.take(i)[j] == b[j]);}
+            if j > i {assert(a.take(j)[i] == a[i]);assert(b.take(j)[i] == b[i]);}
+        }
+    }
+}
+
 impl ObjectReference {
     pub closed spec fn fields(&self) -> (Seq<u8>,ObjectId,ReferenceKind) {
         (self.label.value()@,self.target,self.kind)
+    }
+
+    pub(crate) proof fn label_fits(&self)
+        ensures self.fields().0.len() <= usize::MAX,
+    {assert(self.label.0.len() <= usize::MAX);}
+
+    /// Return the stored target only for a strong ownership relation.
+    pub(crate) fn owning_target(&self) -> (out:Option<ObjectId>)
+        ensures out == if self.fields().2 is Owns {Some(self.fields().1)} else {None},
+    {
+        self.kind.owned_target(self.target)
+    }
+
+    pub(crate) fn label_bytes(&self) -> (bytes:&[u8]) ensures bytes@ == self.fields().0 {
+        self.label.0.as_slice()
+    }
+
+    pub(super) fn label_before(&self,next:&Self) -> (yes:bool)
+        ensures yes == before(self.fields().0,next.fields().0),
+    {
+        let a = self.label.0.as_slice();
+        let b = next.label.0.as_slice();
+        let end = a.len().min(b.len());
+        let mut i = 0usize;
+        while i < end
+            invariant a@ == self.fields().0,b@ == next.fields().0,i <= end,end == (if a.len() <= b.len() {a.len()} else {b.len()}),a@.take(i as int) == b@.take(i as int),
+            decreases end-i,
+        {
+            if a[i] != b[i] {
+                proof {first_difference(a@,b@,i as int);}
+                return a[i] < b[i];
+            }
+            // Skip common label prefixes in fixed-width slices so long
+            // directory or KV labels do not require one branch per byte.
+            if end.saturating_sub(i) >= 16 {
+                let next = i.saturating_add(16);
+                let left = &a[i..next];
+                let right = &b[i..next];
+                if left == right {
+                    assert(left@ =~= right@);
+                    assert forall|j:int| 0 <= j < next implies a@[j] == b@[j] by {
+                        if j < i {assert(a@.take(i as int)[j] == b@.take(i as int)[j]);}
+                        else {assert(left@[j-i] == a@[j]);assert(right@[j-i] == b@[j]);}
+                    }
+                    assert(a@.take(next as int) =~= b@.take(next as int));
+                    i = next;
+                    continue;
+                }
+            }
+            assert(a@.take(i as int+1) =~= b@.take(i as int+1));
+            i = i.saturating_add(1);
+        }
+        assert forall|j:int| 0 <= j < end implies a@[j] == b@[j] by {assert(a@.take(end as int)[j] == a@[j]);}
+        if a.len() <= b.len() {assert(a@ =~= a@.take(end as int));}
+        a.len() < b.len()
     }
 
     /// Construct a typed object reference.

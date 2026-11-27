@@ -17,8 +17,6 @@ use std::path::Path;
 const IDENTITY_PREFIX_BYTES: usize = 8;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
-const MIN_REFERENCE_WIRE_BYTES: usize =
-    std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
 #[cfg(test)]
 thread_local! {
@@ -485,6 +483,7 @@ pub(super) fn ensure_payload_limit(
     Ok(())
 }
 
+#[cfg(test)]
 fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
     verified_record::append_identity(bytes, scheme.into(), *id.as_bytes());
 }
@@ -494,32 +493,7 @@ pub(super) fn encode_object_frame(
     id: ObjectId,
     record: &ObjectRecord,
 ) -> Result<Vec<u8>, DurableError> {
-    let mut bytes = Vec::new();
-    encode_identity(&mut bytes, scheme, id);
-    verified_record::append_header(
-        &mut bytes,
-        record.kind(),
-        record.format_version().get(),
-        record.class(),
-    );
-    verified_record::append_payload(
-        &mut bytes,
-        record.logical_bytes(),
-        record.canonical_bytes(),
-        record.references().len(),
-    )
-    .map_err(|()| DurableError::EncodingOverflow)?;
-    for reference in record.references() {
-        verified_record::append_reference(
-            &mut bytes,
-            reference.label().as_bytes(),
-            scheme.into(),
-            *reference.target().as_bytes(),
-            reference.kind(),
-        )
-        .map_err(|()| DurableError::EncodingOverflow)?;
-    }
-    Ok(bytes)
+    verified_record::encode(scheme.into(), id, record).map_err(|()| DurableError::EncodingOverflow)
 }
 
 /// Check the fixed identity prefix of a canonical object frame without
@@ -561,6 +535,39 @@ pub(super) fn decode_object_frame(
     .map_err(decode_error_detail)
 }
 
+/// Confirm a prepared WAL frame before retaining its immutable payload and record.
+pub(super) fn pending_object_frame<I: PersistentObjectIdentity>(
+    frame: &std::sync::Arc<[u8]>,
+    id: ObjectId,
+    identity: &I,
+) -> Result<verified_record::PendingFrame<ObjectRecord>, DurableError> {
+    let scheme = identity.scheme();
+    verified_record::pending(frame, scheme.into(), id, |record| {
+        *identity.identify(record).as_bytes()
+    })
+    .map_err(|error| {
+        corrupt(
+            super::WAL_FILE,
+            0,
+            match error {
+                verified_record::Error::Decode(error) => body_error_detail(error),
+                verified_record::Error::Identifier | verified_record::Error::Identity => {
+                    "WAL overlay object identity mismatch"
+                },
+            },
+        )
+    })
+}
+
+fn body_error_detail(
+    error: verified_record::DecodeError<verified_record::BodyError>,
+) -> &'static str {
+    match error {
+        verified_record::DecodeError::Tag(e) => e.detail(),
+        verified_record::DecodeError::Record(e) => e.detail(),
+    }
+}
+
 fn decode_error_detail(error: verified_record::DecodeError<&'static str>) -> &'static str {
     match error {
         verified_record::DecodeError::Tag(e) => e.detail(),
@@ -573,68 +580,14 @@ fn decode_record_body(
     start: usize,
     scheme: IdentityScheme,
 ) -> Result<ObjectRecord, &'static str> {
-    let mut reader = SliceReader::new(bytes);
-    reader.offset = start;
-    let (kind, version, class) =
-        verified_record::header(bytes, &mut reader.offset).map_err(|error| match error {
-            verified_record::HeaderError::Read(root_wire::ReadError::Overflow(_)) => {
-                "frame length overflow"
-            },
-            verified_record::HeaderError::Read(root_wire::ReadError::Truncated) => {
-                "truncated frame payload"
-            },
-            verified_record::HeaderError::Kind => "unknown object-kind code",
-            verified_record::HeaderError::Version => "object-format version must be non-zero",
-            verified_record::HeaderError::Class => "unknown object-class code",
-        })?;
-    let version =
-        ObjectFormatVersion::new(version).ok_or("object-format version must be non-zero")?;
-    let (logical_bytes, canonical_bytes, reference_count) =
-        verified_record::payload(bytes, &mut reader.offset).map_err(|error| match error {
-            verified_record::PayloadError::Read(root_wire::ReadError::Overflow(_)) => {
-                "frame length overflow"
-            },
-            verified_record::PayloadError::Read(root_wire::ReadError::Truncated) => {
-                "truncated frame payload"
-            },
-            verified_record::PayloadError::Length => "length is not process-addressable",
-        })?;
-    let canonical_bytes = canonical_bytes.to_vec();
-    // Empty records have no reference bytes to decode. Avoid an out-of-line
-    // decoder call while keeping the trailing-byte and record checks below.
-    let references = if reference_count == 0 {
-        Vec::new()
-    } else {
-        decode_references(&mut reader, scheme, reference_count)?
-    };
-    if reader.remaining() != 0 {
-        return Err("trailing object-frame bytes");
-    }
-    let record = ObjectRecord::new(
-        kind,
-        version,
-        canonical_bytes,
-        references,
-        logical_bytes,
-        class,
-    )
-    .map_err(|_| "non-canonical object references")?;
-    Ok(record)
+    verified_record::body(bytes, start, scheme.into()).map_err(verified_record::BodyError::detail)
 }
 
+#[cfg(test)]
 fn decode_references(
     reader: &mut SliceReader<'_>,
     scheme: IdentityScheme,
     count: usize,
 ) -> Result<Vec<ObjectReference>, &'static str> {
-    if count > reader.remaining() / MIN_REFERENCE_WIRE_BYTES {
-        return Err("reference count exceeds frame capacity");
-    }
-    let mut references = Vec::new();
-    // The complete count is known: growth slack would live as long as the
-    // immutable decoded record, including while retained in the object cache.
-    references
-        .try_reserve_exact(count)
-        .map_err(|_| "reference allocation failed")?;
-    reader.references(scheme, count, references)
+    reader.references(scheme, count)
 }

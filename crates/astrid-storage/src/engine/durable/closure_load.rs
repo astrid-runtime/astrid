@@ -18,7 +18,7 @@ impl Edge<ObjectId> for ObjectReference {
     }
 
     fn owned_target(&self) -> Option<ObjectId> {
-        self.kind().owned_target(self.target())
+        self.owning_target()
     }
 }
 

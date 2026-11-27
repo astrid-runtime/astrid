@@ -260,19 +260,15 @@ fn verified_payload<I: PersistentObjectIdentity>(
     identity: &I,
 ) -> Result<ObjectRecord, DurableError> {
     use super::verified_record::{self, Error};
-    verified_record::read(
-        payload,
-        scheme.into(),
-        *expected.as_bytes(),
-        |input, start| super::decode_record_body(input, start, scheme),
-        |record| *identity.identify(record).as_bytes(),
-    )
+    verified_record::confirmed(payload, scheme.into(), expected, |record| {
+        *identity.identify(record).as_bytes()
+    })
     .map_err(|error| {
         corrupt(
             ARENA_FILE,
             offset,
             match error {
-                Error::Decode(e) => super::decode_error_detail(e),
+                Error::Decode(e) => super::body_error_detail(e),
                 Error::Identifier => "indexed object identifier mismatch",
                 Error::Identity => "indexed object identity does not match its canonical record",
             },
