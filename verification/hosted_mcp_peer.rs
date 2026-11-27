@@ -74,6 +74,23 @@ fn sandbox_path_rule(kind:&crate::seatbelt_profile::PathRule, path:&str) -> (out
     Some(kind.render(value))
 }
 
+/// Specify the authority of every ordered rule group independently of the renderer.
+spec fn seatbelt_file_policy(rules:&crate::seatbelt_profile::Rules) -> Seq<char> {
+    use crate::seatbelt_profile::{BASE_RULES, hidden_group, PathRule};
+    let early = hidden_group(rules.hidden@, true, rules.hidden@.len());
+    let late = hidden_group(rules.hidden@, false, rules.hidden@.len());
+    BASE_RULES@ + PathRule::Hide.group(early, early.len()) +
+        "\n(allow file-read-metadata\n"@ +
+        PathRule::Literal.group(rules.ancestors@, rules.ancestors@.len()) +
+        "\n)\n(allow file-read*\n    (subpath \""@ + rules.writable_root@ + "\")\n"@ +
+        PathRule::Subpath.group(rules.extra_reads@, rules.extra_reads@.len()) + seq!['\n'] +
+        PathRule::Literal.group(rules.injections@, rules.injections@.len()) +
+        "\n)\n(allow file-write*\n    (subpath \""@ + rules.writable_root@ + "\")\n"@ +
+        PathRule::Subpath.group(rules.extra_writes@, rules.extra_writes@.len()) +
+        "\n)\n"@ + PathRule::Hide.group(late, late.len()) + seq!['\n'] +
+        PathRule::DenyWrite.group(rules.injections@, rules.injections@.len())
+}
+
 /// Compare both native policy encodings for the same network setting. The
 /// Linux prefix supplied by the mount builder and Seatbelt file-rule inputs
 /// remain explicit parameters of this result.
@@ -81,7 +98,7 @@ fn platform_network(network:bool, rules:&crate::seatbelt_profile::Rules, mut mou
     -> (out:(String,Vec<&'static str>))
     ensures
         out.0@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ +
-            (if network { "(allow network*)"@ } else { seq![] }) + rules.remaining_rules(),
+            (if network { "(allow network*)"@ } else { seq![] }) + seatbelt_file_policy(rules),
         out.1@ == if network {
             mounts@ + seq!["--unshare-all","--share-net","--die-with-parent","--"]
         } else { mounts@ + seq!["--unshare-all","--die-with-parent","--"] },
@@ -101,7 +118,7 @@ fn capsule_platform_network<D,P>(domains:&[D], peers:&[P], rules:&crate::seatbel
     ensures match out {
         None => domains.len() > 0 || peers.len() > 0,
         Some((profile,args)) => domains.len() == 0 && peers.len() == 0 &&
-            profile@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ + rules.remaining_rules() &&
+            profile@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ + seatbelt_file_policy(rules) &&
             args@ == mounts@ + seq!["--unshare-all","--die-with-parent","--"],
     },
 {

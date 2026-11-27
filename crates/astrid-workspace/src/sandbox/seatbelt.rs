@@ -1,62 +1,27 @@
 use std::ffi::OsString;
 use std::io;
 
-use super::seatbelt_profile::PathRule;
 use super::{ProcessSandboxConfig, SandboxPrefix, validate_sandbox_str};
 
 impl ProcessSandboxConfig {
-    #[allow(clippy::too_many_lines)] // The generated profile's ordering is one security invariant.
     pub(super) fn build_seatbelt_prefix(&self) -> io::Result<SandboxPrefix> {
         let writable_root_str = validate_sandbox_str(&self.writable_root, "writable root")?;
 
-        // Build exact read grants applied after any containing hidden root is
-        // denied. This exposes the selected principal path without exposing
-        // sibling principals under the same runtime home.
-        let extra_read_rules: String = self
+        let extra_reads = self
             .extra_read_paths
             .iter()
-            .map(|p| {
-                validate_sandbox_str(p, "extra read path").map(|s| PathRule::Subpath.render(s))
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .join("\n");
-
-        // Build exact write grants applied after containing-root denies.
-        let extra_write_rules: String = self
+            .map(|p| validate_sandbox_str(p, "extra read path"))
+            .collect::<io::Result<Vec<_>>>()?;
+        let extra_writes = self
             .extra_write_paths
             .iter()
-            .map(|p| {
-                validate_sandbox_str(p, "extra write path").map(|s| PathRule::Subpath.render(s))
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .join("\n");
-
-        // Read-only file injections: allow reading the materialized literal
-        // (it lives AT `target` on macOS, there being no mount namespace), and
-        // append a trailing write-deny below so the child cannot modify it.
-        let inject_read_rules: String = self
+            .map(|p| validate_sandbox_str(p, "extra write path"))
+            .collect::<io::Result<Vec<_>>>()?;
+        let injections = self
             .ro_injections
             .iter()
-            .map(|inj| {
-                validate_sandbox_str(&inj.target, "injection target")
-                    .map(|s| PathRule::Literal.render(s))
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .join("\n");
-
-        // Trailing write-deny on each injection target. Emitted AFTER
-        // `hidden_deny_rules` so it is the last match — in SBPL the last
-        // matching rule wins, so this denies the write even if an
-        // allow-write subpath above (e.g. the writable root) covers `target`.
-        let inject_deny_rules: String = self
-            .ro_injections
-            .iter()
-            .map(|inj| {
-                validate_sandbox_str(&inj.target, "injection target")
-                    .map(|s| PathRule::DenyWrite.render(s))
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .join("\n");
+            .map(|inj| validate_sandbox_str(&inj.target, "injection target"))
+            .collect::<io::Result<Vec<_>>>()?;
 
         let has_grant_below = |hidden: &std::path::Path| {
             self.writable_root.starts_with(hidden)
@@ -73,41 +38,19 @@ impl ProcessSandboxConfig {
                     .iter()
                     .any(|injection| injection.target.starts_with(hidden))
         };
-        let deny_rule = |path: &std::path::Path| {
-            validate_sandbox_str(path, "hidden path").map(|s| PathRule::Hide.render(s))
-        };
-
-        // A hidden ancestor of an explicit grant is denied after broad system
-        // grants such as /private/tmp, then the exact child is allowed below.
-        let scoped_hidden_deny_rules: String = self
+        let hidden = self
             .hidden_paths
             .iter()
-            .filter(|hidden| has_grant_below(hidden))
-            .map(|path| deny_rule(path))
-            .collect::<io::Result<Vec<_>>>()?
-            .join("\n");
-
-        // Other hidden paths stay trailing hard denies and cannot be reopened
-        // by an earlier broad allow.
-        let hidden_deny_rules: String = self
-            .hidden_paths
-            .iter()
-            .filter(|hidden| !has_grant_below(hidden))
-            .map(|path| deny_rule(path))
-            .collect::<io::Result<Vec<_>>>()?
-            .join("\n");
-
-        let ancestor_metadata_rules = self.ancestor_metadata_rules()?;
-
+            .map(|p| Ok((validate_sandbox_str(p, "hidden path")?, has_grant_below(p))))
+            .collect::<io::Result<Vec<_>>>()?;
+        let ancestors = self.ancestor_metadata_paths()?;
         let profile = super::seatbelt_profile::Rules {
-            scoped_denies: &scoped_hidden_deny_rules,
-            ancestors: &ancestor_metadata_rules,
+            hidden: &hidden,
+            ancestors: &ancestors,
             writable_root: writable_root_str,
-            extra_reads: &extra_read_rules,
-            injected_reads: &inject_read_rules,
-            extra_writes: &extra_write_rules,
-            hidden_denies: &hidden_deny_rules,
-            injected_denies: &inject_deny_rules,
+            extra_reads: &extra_reads,
+            injections: &injections,
+            extra_writes: &extra_writes,
         }
         .render(self.allow_network);
 
@@ -124,7 +67,7 @@ impl ProcessSandboxConfig {
     /// metadata without opening ancestor directory listings or file contents.
     /// Keep these literals before trailing hidden-path denies, just like the
     /// existing exact read/write grants.
-    fn ancestor_metadata_rules(&self) -> io::Result<String> {
+    fn ancestor_metadata_paths(&self) -> io::Result<Vec<&str>> {
         use std::collections::BTreeSet;
         use std::path::{Path, PathBuf};
 
@@ -150,12 +93,8 @@ impl ProcessSandboxConfig {
             .collect();
         ancestors
             .into_iter()
-            .map(|path| {
-                validate_sandbox_str(path, "ancestor metadata path")
-                    .map(|path| PathRule::Literal.render(path))
-            })
-            .collect::<io::Result<Vec<_>>>()
-            .map(|rules| rules.join("\n"))
+            .map(|path| validate_sandbox_str(path, "ancestor metadata path"))
+            .collect()
     }
 }
 
@@ -298,6 +237,35 @@ mod tests {
             "the injection write-deny (offset {deny_pos}) must appear after \
              the allow-write block (offset {allow_write_pos}) so last-match-wins"
         );
+    }
+
+    #[test]
+    fn injection_targets_remain_paired_across_interleaved_hidden_paths() {
+        let prefix = ProcessSandboxConfig::new("/workspace")
+            .with_hidden("/private/a")
+            .with_hidden("/injected")
+            .with_hidden("/private/b")
+            .with_ro_inject("/source/one", "/injected/b")
+            .with_ro_inject("/source/two", "/injected/a")
+            .build_seatbelt_prefix()
+            .unwrap();
+        let profile = prefix.args[1].to_str().unwrap();
+        let early = profile
+            .find("(deny file-write* (subpath \"/injected\"))")
+            .unwrap();
+        let reads = profile
+            .find("    (literal \"/injected/b\")\n    (literal \"/injected/a\")")
+            .unwrap();
+        let tail = concat!(
+            "(deny file-read* (subpath \"/private/a\"))\n",
+            "(deny file-write* (subpath \"/private/a\"))\n",
+            "(deny file-read* (subpath \"/private/b\"))\n",
+            "(deny file-write* (subpath \"/private/b\"))\n",
+            "(deny file-write* (literal \"/injected/b\"))\n",
+            "(deny file-write* (literal \"/injected/a\"))",
+        );
+        assert!(early < reads);
+        assert!(profile[reads..].ends_with(tail));
     }
 
     /// Regression for #648: deny the containing root, then reopen only the

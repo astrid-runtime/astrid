@@ -36,14 +36,18 @@ pub(super) enum PathRule {
 }
 
 impl PathRule {
-    pub(super) fn render(&self, path: &str) -> (rule: String)
-        ensures rule@ == match self {
+    pub(super) open spec fn fragment(&self, path: &str) -> Seq<char> {
+        match self {
             Self::Subpath => "    (subpath \""@ + path@ + "\")"@,
             Self::Literal => "    (literal \""@ + path@ + "\")"@,
             Self::DenyWrite => "(deny file-write* (literal \""@ + path@ + "\"))"@,
             Self::Hide => "(deny file-read* (subpath \""@ + path@ +
                 "\"))\n(deny file-write* (subpath \""@ + path@ + "\"))"@,
-        },
+        }
+    }
+
+    pub(super) fn render(&self, path: &str) -> (rule: String)
+        ensures rule@ == self.fragment(path),
     {
         let mut rule = match self {
             Self::Subpath => "    (subpath \"",
@@ -62,64 +66,131 @@ impl PathRule {
         }
         rule
     }
+
+    #[verifier::opaque]
+    pub(super) open spec fn group(&self, paths: Seq<&str>, count: nat) -> Seq<char>
+        recommends count <= paths.len()
+        decreases count,
+    {
+        if count == 0 { seq![] } else {
+            self.group(paths, (count - 1) as nat)
+                + (if count == 1 { seq![] } else { seq!['\n'] })
+                + self.fragment(paths[count - 1])
+        }
+    }
+
+    fn append_group(&self, profile: &mut String, paths: &[&str])
+        ensures final(profile)@ == old(profile)@ + self.group(paths@, paths@.len()),
+    {
+        reveal(PathRule::group);
+        let mut i = 0;
+        while i < paths.len()
+            invariant
+                i <= paths.len(),
+                profile@ == old(profile)@ + self.group(paths@, i as nat),
+            decreases paths.len() - i,
+        {
+            reveal(PathRule::group);
+            if i > 0 { profile.push('\n'); }
+            profile.push_str(self.render(paths[i]).as_str());
+            i = i.saturating_add(1);
+        }
+    }
+}
+
+#[verifier::opaque]
+pub(super) open spec fn hidden_group<'a>(paths: Seq<(&'a str, bool)>, scoped: bool, count: nat) -> Seq<&'a str>
+    recommends count <= paths.len()
+    decreases count,
+{
+    if count == 0 { seq![] } else {
+        let before = hidden_group(paths, scoped, (count - 1) as nat);
+        let (path, grant_below) = paths[count - 1];
+        if grant_below == scoped { before.push(path) } else { before }
+    }
+}
+
+/// Deny containing roots before explicit child grants and keep other denies trailing.
+fn partition_hidden<'a>(paths: &[(&'a str, bool)]) -> (groups: (Vec<&'a str>, Vec<&'a str>))
+    ensures groups.0@ == hidden_group(paths@, true, paths@.len()),
+            groups.1@ == hidden_group(paths@, false, paths@.len()),
+{
+    reveal(hidden_group);
+    let mut scoped = Vec::new();
+    let mut trailing = Vec::new();
+    let mut i = 0;
+    while i < paths.len()
+        invariant
+            i <= paths.len(),
+            scoped@ == hidden_group(paths@, true, i as nat),
+            trailing@ == hidden_group(paths@, false, i as nat),
+        decreases paths.len() - i,
+    {
+        reveal(hidden_group);
+        let (path, grant_below) = paths[i];
+        if grant_below { scoped.push(path); } else { trailing.push(path); }
+        i = i.saturating_add(1);
+    }
+    (scoped, trailing)
 }
 
 pub(super) struct Rules<'a> {
-    pub(super) scoped_denies: &'a str,
-    pub(super) ancestors: &'a str,
+    pub(super) hidden: &'a [(&'a str, bool)],
+    pub(super) ancestors: &'a [&'a str],
     pub(super) writable_root: &'a str,
-    pub(super) extra_reads: &'a str,
-    pub(super) injected_reads: &'a str,
-    pub(super) extra_writes: &'a str,
-    pub(super) hidden_denies: &'a str,
-    pub(super) injected_denies: &'a str,
+    pub(super) extra_reads: &'a [&'a str],
+    pub(super) injections: &'a [&'a str],
+    pub(super) extra_writes: &'a [&'a str],
 }
 
 impl Rules<'_> {
     pub(super) open spec fn remaining_rules(&self) -> Seq<char> {
+        let scoped = hidden_group(self.hidden@, true, self.hidden@.len());
+        let trailing = hidden_group(self.hidden@, false, self.hidden@.len());
         BASE_RULES@ +
-        self.scoped_denies@ +
+        PathRule::Hide.group(scoped, scoped.len()) +
         "\n(allow file-read-metadata\n"@ +
-        self.ancestors@ +
+        PathRule::Literal.group(self.ancestors@, self.ancestors@.len()) +
         "\n)\n(allow file-read*\n    (subpath \""@ +
         self.writable_root@ +
         "\")\n"@ +
-        self.extra_reads@ +
+        PathRule::Subpath.group(self.extra_reads@, self.extra_reads@.len()) +
         seq!['\n'] +
-        self.injected_reads@ +
+        PathRule::Literal.group(self.injections@, self.injections@.len()) +
         "\n)\n(allow file-write*\n    (subpath \""@ +
         self.writable_root@ +
         "\")\n"@ +
-        self.extra_writes@ +
+        PathRule::Subpath.group(self.extra_writes@, self.extra_writes@.len()) +
         "\n)\n"@ +
-        self.hidden_denies@ +
+        PathRule::Hide.group(trailing, trailing.len()) +
         seq!['\n'] +
-        self.injected_denies@
+        PathRule::DenyWrite.group(self.injections@, self.injections@.len())
     }
 
     pub(super) fn render(&self, network: bool) -> (profile: String)
         ensures profile@ == HEADER@ + (if network { NETWORK@ } else { seq![] }) + self.remaining_rules(),
     {
+        let (scoped, trailing) = partition_hidden(self.hidden);
         let mut profile = HEADER.to_string();
         if network { profile.push_str(NETWORK); }
         profile.push_str(BASE_RULES);
-        profile.push_str(self.scoped_denies);
+        PathRule::Hide.append_group(&mut profile, &scoped);
         profile.push_str("\n(allow file-read-metadata\n");
-        profile.push_str(self.ancestors);
+        PathRule::Literal.append_group(&mut profile, self.ancestors);
         profile.push_str("\n)\n(allow file-read*\n    (subpath \"");
         profile.push_str(self.writable_root);
         profile.push_str("\")\n");
-        profile.push_str(self.extra_reads);
+        PathRule::Subpath.append_group(&mut profile, self.extra_reads);
         profile.push('\n');
-        profile.push_str(self.injected_reads);
+        PathRule::Literal.append_group(&mut profile, self.injections);
         profile.push_str("\n)\n(allow file-write*\n    (subpath \"");
         profile.push_str(self.writable_root);
         profile.push_str("\")\n");
-        profile.push_str(self.extra_writes);
+        PathRule::Subpath.append_group(&mut profile, self.extra_writes);
         profile.push_str("\n)\n");
-        profile.push_str(self.hidden_denies);
+        PathRule::Hide.append_group(&mut profile, &trailing);
         profile.push('\n');
-        profile.push_str(self.injected_denies);
+        PathRule::DenyWrite.append_group(&mut profile, self.injections);
         profile
     }
 }
