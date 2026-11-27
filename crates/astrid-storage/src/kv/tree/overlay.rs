@@ -10,7 +10,9 @@ pub(super) struct OverlayMap {
     root: Option<Arc<Node>>,
 }
 
+use super::key_projection;
 use crate::kv::encoding;
+mod range;
 mod traversal;
 mod update;
 use traversal::Node;
@@ -29,26 +31,20 @@ impl OverlayMap {
         start: &'a [u8],
         end: &'a [u8],
     ) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
-        let mut cursor = self.root.as_deref();
-        let mut stack = Vec::new();
+        let mut cursor = range::Range::new(self.root.as_ref(), start, end);
         std::iter::from_fn(move || {
-            while let Some(node) = cursor {
-                if crate::kv::encoding::bytewise_less(&node.entry.key, start) {
-                    cursor = node.right.as_deref();
-                } else {
-                    stack.push(node);
-                    cursor = node.left.as_deref();
-                }
-            }
-            let node = stack.pop()?;
-            if !crate::kv::encoding::bytewise_less(&node.entry.key, end) {
-                cursor = None;
-                stack.clear();
-                return None;
-            }
-            cursor = node.right.as_deref();
-            Some((node.entry.key.as_slice(), node.entry.value.as_deref()))
+            let entry = cursor.next_entry()?;
+            Some((entry.key.as_slice(), entry.value.as_deref()))
         })
+    }
+
+    pub(super) fn project_presence(
+        &self,
+        keys: &mut std::collections::BTreeMap<Vec<u8>, bool>,
+        start: &[u8],
+        end: &[u8],
+    ) {
+        range::apply_presence(self.root.as_ref(), start, end, keys);
     }
 
     pub(super) fn all(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
@@ -103,6 +99,38 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn range_and_presence_match_the_same_snapshot_at_every_boundary() {
+        let mut overlay = OverlayMap::default();
+        let mut expected = BTreeMap::new();
+        for key in [7, 3, 11, 1, 5, 9, 13, 2, 10] {
+            let value = (key % 3 != 0).then(|| vec![key]);
+            overlay.insert(vec![key], value.clone());
+            expected.insert(vec![key], value);
+        }
+        let checkpoint: BTreeMap<_, _> = (0..16).step_by(2).map(|key| (vec![key], true)).collect();
+        for start in 0..=15 {
+            for end in 0..=15 {
+                let selected: Vec<_> = expected
+                    .iter()
+                    .filter(|(key, _)| start <= key[0] && key[0] < end)
+                    .map(|(key, value)| (key.as_slice(), value.as_deref()))
+                    .collect();
+                assert_eq!(
+                    overlay.range(&[start], &[end]).collect::<Vec<_>>(),
+                    selected
+                );
+                let mut projected = checkpoint.clone();
+                overlay.project_presence(&mut projected, &[start], &[end]);
+                let mut expected_presence = checkpoint.clone();
+                for (key, value) in selected {
+                    expected_presence.insert(key.to_vec(), value.is_some());
+                }
+                assert_eq!(projected, expected_presence);
+            }
+        }
+    }
+
     #[test]
     fn unrelated_overlay_insert_reuses_existing_payload_allocation() {
         let mut overlay = OverlayMap::default();

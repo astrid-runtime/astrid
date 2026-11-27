@@ -277,12 +277,15 @@ mod root_wire;
 
 #[path = "../crates/astrid-storage/src/kv/encoding.rs"]
 mod encoding;
-#[path = "../crates/astrid-storage/src/kv/tree/context/range/key_projection.rs"]
+#[path = "../crates/astrid-storage/src/kv/tree/key_projection.rs"]
 mod key_projection;
 mod hosted_key_projection;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/traversal.rs"]
 mod traversal;
+#[path = "../crates/astrid-storage/src/kv/tree/overlay/range.rs"]
+mod overlay_range;
+mod hosted_overlay_range;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/update.rs"]
 mod overlay_update;

@@ -34,6 +34,7 @@ mod header;
 mod hot_cache;
 #[cfg(test)]
 mod hot_cache_integration_tests;
+mod key_projection;
 mod legacy_avl;
 mod maintenance;
 mod memo;

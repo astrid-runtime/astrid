@@ -3,7 +3,9 @@
 use super::encoding;
 use super::traversal::{Entry, Node};
 #[cfg(verus_keep_ghost)]
-use super::traversal::{contains_entry, lookup_membership, lookup_spec, ordered, strict_order};
+use super::traversal::{
+    contains_entry, lookup_membership, lookup_spec, ordered, strict_order, transitive,
+};
 use std::cmp::Ordering;
 use std::sync::Arc;
 use vstd::prelude::*;
@@ -12,17 +14,6 @@ verus! {
 
 spec fn same_entries(a: Arc<Node>, b: Arc<Node>) -> bool {
     forall|k: Seq<u8>, v: Option<Vec<u8>>| #[trigger] contains_entry(Some(a), k, v) == contains_entry(Some(b), k, v)
-}
-
-proof fn transitive(a: Seq<u8>, b: Seq<u8>, c: Seq<u8>)
-    requires encoding::below(a, b), encoding::below(b, c),
-    ensures encoding::below(a, c),
-    decreases c.len(),
-{
-    reveal_with_fuel(encoding::below, 2);
-    if a.len() > 0 && b.len() > 0 && c.len() > 0 && a[0] == b[0] && b[0] == c[0] {
-        transitive(a.skip(1), b.skip(1), c.skip(1));
-    }
 }
 
 /// Starting with an empty root, every published overlay snapshot is ordered.

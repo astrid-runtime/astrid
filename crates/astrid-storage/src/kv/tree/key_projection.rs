@@ -22,7 +22,7 @@ pub(super) fn checkpoint(map: &mut BTreeMap<Vec<u8>,bool>, key: Vec<u8>)
     map.insert(key,true);
 }
 
-pub(super) fn overlay(map: &mut BTreeMap<Vec<u8>,bool>, key: Vec<u8>, value: Option<&[u8]>)
+pub(super) fn overlay<V: ?Sized>(map: &mut BTreeMap<Vec<u8>,bool>, key: Vec<u8>, value: Option<&V>)
     requires btree_map_inv(old(map)), obeys_cmp::<Vec<u8>>(), obeys_cmp_deep_eq::<Vec<u8>>(),
     ensures btree_map_inv(final(map)), final(map).deep_view() == old(map).deep_view().insert(key.deep_view(),value.is_some()),
 {

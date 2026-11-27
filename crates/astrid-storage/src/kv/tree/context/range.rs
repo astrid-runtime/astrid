@@ -7,7 +7,7 @@ use super::{
     StorageError, StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
-mod key_projection;
+use crate::kv::tree::key_projection;
 
 #[cfg(test)]
 mod tests;
@@ -115,9 +115,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             key_projection::checkpoint(&mut keys, entry.key);
             Ok(())
         })?;
-        for (key, value) in header.overlay.range(start, end) {
-            key_projection::overlay(&mut keys, key.to_vec(), value);
-        }
+        header.overlay.project_presence(&mut keys, start, end);
         key_projection::collect(&keys, |key| suffix(key, strip).map(str::to_owned))
     }
 

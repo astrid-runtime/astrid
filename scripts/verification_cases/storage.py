@@ -477,7 +477,7 @@ def group_root_consumer_defects():
 
 
 def key_projection_consumers():
-    path = Path("crates/astrid-storage/src/kv/tree/context/range/key_projection.rs")
+    path = Path("crates/astrid-storage/src/kv/tree/key_projection.rs")
     consumer = Path("verification/hosted_key_projection.rs")
     for label, clause, weaker in [
         ("checkpoint insertion", "final(map).deep_view() == old(map).deep_view().insert(key.deep_view(),true)", "true"),
@@ -488,5 +488,22 @@ def key_projection_consumers():
     ]:
         yield (
             f"KV key projection loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )
+
+
+def overlay_range_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/overlay/range.rs")
+    consumer = Path("verification/hosted_overlay_range.rs")
+    for label, clause, weaker in [
+        ("initial snapshot", "out.remaining() == rows(deref_option(root),start@,end@)", "true"),
+        ("yielded entry", "result == Some(&*old(self).remaining()[0])", "result.is_some()"),
+        ("remaining tail", "final(self).remaining() == old(self).remaining().drop_first()", "final(self).remaining().len() + 1 == old(self).remaining().len()"),
+        ("half-open membership", "== (contains_entry(root,key,value) && encoding::range_contains(start,end,key))",
+         "==> (contains_entry(root,key,value) && encoding::range_contains(start,end,key))"),
+        ("applied presence", "final(keys).deep_view() ==\n        fold(old(keys).deep_view(),rows(deref_option(root),start@,end@))", "true"),
+    ]:
+        yield (
+            f"overlay range loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
