@@ -214,7 +214,7 @@ fn recovery_observes_one_directory_across_reservations() {
     struct Observer<'a> {
         directory: &'a PrincipalDirectory,
         targets: Vec<PrincipalId>,
-        fail: bool,
+        fail_on: Option<PrincipalId>,
     }
     impl crate::RetirementSink<PrincipalId> for Observer<'_> {
         type Error = &'static str;
@@ -222,7 +222,7 @@ fn recovery_observes_one_directory_across_reservations() {
         fn restore(&mut self, alias: PrincipalId) -> Result<(), Self::Error> {
             assert!(self.directory.inner.try_write().is_none());
             self.targets.push(alias);
-            if self.fail {
+            if self.targets.last() == self.fail_on.as_ref() {
                 Err("recovery stopped")
             } else {
                 Ok(())
@@ -237,25 +237,36 @@ fn recovery_observes_one_directory_across_reservations() {
     directory.register(alias("second"), second).unwrap();
     let mut stored = serde_json::to_value(crate::OwnershipSnapshot::default()).unwrap();
     stored["principal_deletions"] =
-        serde_json::json!({ first.to_string(): {}, second.to_string(): {} });
+        serde_json::json!({ first.to_string(): { "alias": "retained" }, second.to_string(): {} });
     let ownership = serde_json::from_value(stored).unwrap();
 
     let mut observer = Observer {
         directory: &directory,
         targets: Vec::new(),
-        fail: true,
+        fail_on: Some(alias("retained")),
     };
     assert_eq!(
         directory.replay_retirements(&ownership, &mut observer),
         Err("recovery stopped")
     );
-    assert_eq!(observer.targets, [alias("first")]);
+    assert_eq!(observer.targets, [alias("retained")]);
     assert!(directory.inner.try_write().is_some());
-    observer.fail = false;
+    observer.fail_on = Some(alias("first"));
+    observer.targets.clear();
+    assert_eq!(
+        directory.replay_retirements(&ownership, &mut observer),
+        Err("recovery stopped")
+    );
+    assert_eq!(observer.targets, [alias("retained"), alias("first")]);
+    assert!(directory.inner.try_write().is_some());
+    observer.fail_on = None;
     observer.targets.clear();
     directory
         .replay_retirements(&ownership, &mut observer)
         .unwrap();
-    assert_eq!(observer.targets, [alias("first"), alias("second")]);
+    assert_eq!(
+        observer.targets,
+        [alias("retained"), alias("first"), alias("second")]
+    );
     assert!(directory.inner.try_write().is_some());
 }

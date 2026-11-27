@@ -34,8 +34,10 @@ def defects():
     replay = Path("crates/astrid-storage/src/ownership/recovery.rs")
     consumer = Path("verification/hosted_retirement_recovery.rs")
     for name, original, changed, location in [
-        ("skips the retained alias", "if let Some(alias) = first { sink.restore(alias)?; }", "let _ = first;", replay),
-        ("skips the live alias", "if let Some(alias) = second { sink.restore(alias)?; }", "let _ = second;", replay),
+        ("skips the retained alias", "if let Some(alias) = first {", "if let Some(alias) = None::<A> {", replay),
+        ("skips the live alias", "if let Some(alias) = second {", "if let Some(alias) = None::<A> {", replay),
+        ("may call another store after the first error", "stopped_at_first_error(old(sink).history(),final(sink).history(),result),", "true,", consumer),
+        ("may fail on an unreserved alias", "reserved(reservations@,directory@,#[trigger] final(sink).history()[i].0),", "true || reserved(reservations@,directory@,#[trigger] final(sink).history()[i].0),", consumer),
         ("loses the failure result", "final(sink).failure() == (match result { Ok(()) => None, Err(e) => Some(e) })", "true", consumer),
         ("may omit an unrelated bucket", "else { old(sink).authority(key) },\n{", "else { final(sink).authority(key) },\n{", consumer),
     ]:
