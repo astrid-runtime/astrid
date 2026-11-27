@@ -13,16 +13,11 @@
 //!
 //! ## Free checkout
 //!
-//! Any available instance serves any invocation for the runtime's one durable
-//! principal. This is sound because guest state never crosses PrincipalUid and
-//! interceptor capsules use wasmtime resources (subscriptions, HTTP streams)
-//! *within* a single invocation (subscribe → publish → recv → drop in one
-//! call), so no handle created on one Store is reused on another. The
-//! per-capsule pool-safety audit confirmed this for every pooled capsule;
-//! the one capsule that holds a live resource across invocations
-//! (`astrid-capsule-shell`'s background-process handles) is carved out to
-//! `size == 1` via its `host_process` capability and so never leases a
-//! second Store.
+//! A pool belongs to one authority-scoped runtime. On free checkout, a
+//! completed invocation returns its instance to the pool only after releasing
+//! its host resources. An outstanding resource retires the instance together
+//! with its Store. A size-one `host_process` pool keeps its Store and table
+//! together across successful calls so background process handles persist.
 //!
 //! ## Run-loop capsules are not pooled
 //!
@@ -199,8 +194,8 @@ pub(super) struct CapsuleInstancePool {
     /// orphans a live resource (HTTP stream, IPC subscription, net stream,
     /// process handle, WASI fd) in the returned Store must NOT leak it into
     /// the next lease. The CLEAR phase drops
-    /// the whole resource table to close those handles before the instance is
-    /// reusable. See [`PoolCheckout::drop`].
+    /// the whole resource table to close those handles. A free-checkout Store
+    /// with a nonempty table is discarded together with its guest instance. See [`PoolCheckout::drop`].
     ///
     /// `false` for the `host_process` carve-out (`size == 1`): that capsule
     /// deliberately holds live `ManagedProcess` handles across invocations
@@ -373,7 +368,8 @@ fn drain_excess<T>(queue: &mut VecDeque<T>, min_idle: usize) -> Vec<T> {
 
 /// RAII lease of one pooled instance.
 ///
-/// Completed calls clear their host state and return to the pool. Interrupted
+/// Completed calls clear invocation state. A free-checkout instance with live
+/// resources is discarded, and other completed instances return to the pool. Interrupted
 /// calls discard the entire Store: clearing host fields cannot repair guest
 /// state or Wasmtime's component-entry state after a trap or cancellation.
 pub(super) struct PoolCheckout {
@@ -411,13 +407,18 @@ impl PoolCheckout {
 impl Drop for PoolCheckout {
     fn drop(&mut self) {
         if let Some(mut pooled) = self.pooled.take() {
+            // A guest can retain component handles after a successful call.
+            // Replacing the host table does not clear those guest handles.
+            let reuse = self.reusable
+                && (!self.reset_resources_on_return
+                    || pooled.store.data().resource_table.is_empty());
             // Discard also releases shared resource quota, even for a size-1
             // pool that normally preserves handles between successful calls.
             clear_on_return(
                 pooled.store.data_mut(),
                 self.reset_resources_on_return || !self.reusable,
             );
-            if self.reusable {
+            if reuse {
                 self.available
                     .lock()
                     .expect("instance pool mutex poisoned")
@@ -428,7 +429,8 @@ impl Drop for PoolCheckout {
 }
 
 /// Tear down a returned instance's per-invocation [`HostState`] so the next
-/// lease starts clean. Interrupted guests are instead discarded entirely.
+/// lease starts clean. Interrupted guests and free-checkout guests returning
+/// with live host resources are discarded entirely.
 ///
 /// Two layers:
 ///
@@ -769,7 +771,7 @@ mod tests {
     /// Build a real (but empty) component pool so checkout exercises actual
     /// wasmtime instantiation. An empty `(component)` imports nothing, so a bare
     /// linker instantiates it; that is all we need to lease, grow, and bound.
-    async fn empty_pool(
+    pub(super) async fn empty_pool(
         max: usize,
         min_idle: usize,
         cancel: &CancellationToken,
@@ -958,3 +960,6 @@ mod tests {
         cancel.cancel();
     }
 }
+
+#[cfg(test)]
+mod return_tests;
