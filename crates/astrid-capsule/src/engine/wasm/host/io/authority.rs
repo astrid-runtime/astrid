@@ -6,8 +6,8 @@ use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::p2::StreamError;
 
 pub(super) struct Authority {
-    pub(super) principal: PrincipalId,
-    pub(super) owner: PrincipalUid,
+    principal: PrincipalId,
+    owner: PrincipalUid,
     _invocation: Option<crate::engine::wasm::PrincipalInvocationGuard>,
     pub(super) device: Option<DeviceSession>,
 }
@@ -36,23 +36,23 @@ impl Authority {
         })
     }
 
-    pub(super) fn start<'a, S: 'static, A, R, F>(
+    pub(super) fn start<'a, S, A, R, F>(
         &self,
         directory: &astrid_storage::PrincipalDirectory,
         cancel: &tokio_util::sync::CancellationToken,
         table: &'a mut ResourceTable,
-        stream: Resource<S>,
+        operand: S,
         args: A,
         operation: F,
     ) -> Result<R, StreamError>
     where
-        F: FnOnce(&'a mut ResourceTable, Resource<S>, A) -> R,
+        F: FnOnce(&'a mut ResourceTable, S, A) -> R,
     {
         directory
             .with_bound_input(
                 &self.principal,
                 self.owner,
-                (stream, args, operation),
+                (operand, args, operation),
                 |bound| {
                     super::dispatch::dispatch(
                         cancel.is_cancelled(),

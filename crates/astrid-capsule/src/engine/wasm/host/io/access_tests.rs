@@ -252,3 +252,48 @@ async fn queued_single_stream_access_rechecks_the_owner_before_consuming_or_writ
         assert!(sink.contents().is_empty());
     }
 }
+
+#[tokio::test]
+async fn cancellation_and_device_retirement_wake_a_pending_stream_read() {
+    for retire_device in [false, true] {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let temp = tempfile::tempdir().unwrap();
+        let key =
+            crate::engine::wasm::test_fixtures::register_stream_caller(&mut state, temp.path());
+        let principal = state.effective_principal();
+        let sessions = state.device_sessions.clone();
+        let cancel = state.effective_cancel_token();
+        let (reader, _writer) = tokio::io::duplex(16);
+        let input = state
+            .resource_table
+            .push::<DynInputStream>(Box::new(wasmtime_wasi::p2::pipe::AsyncReadStream::new(
+                reader,
+            )))
+            .unwrap();
+        let mut read = Box::pin(state.blocking_read(Resource::new_borrow(input.rep()), 4));
+        tokio::select! {
+            biased;
+            result = &mut read => panic!("expected pending read: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let mut retirement = Box::pin(sessions.retire(&principal, &key));
+        if retire_device {
+            tokio::select! {
+                biased;
+                result = &mut retirement => panic!("expected admitted read: {result:?}"),
+                () = std::future::ready(()) => {}
+            }
+        } else {
+            cancel.cancel();
+        }
+        let timeout = std::time::Duration::from_secs(5);
+        let outcome = tokio::time::timeout(timeout, read).await.unwrap();
+        assert!(matches!(outcome, Err(StreamError::Closed)));
+        if retire_device {
+            tokio::time::timeout(timeout, retirement)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}

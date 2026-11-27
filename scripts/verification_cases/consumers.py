@@ -82,6 +82,15 @@ def consumer_defects():
             f"I/O disposal {name}", disposal,
             lambda s, a=original, b=changed: replace_once(s, a, b), disposal_trace,
         )
+    for name, original, changed in [
+        ("removes a borrowed handle before refusal", "return Err(Refusal::Borrowed);", "let _ = remove(table,handle); return Err(Refusal::Borrowed);"),
+        ("removes an entry after failed lookup", "Err(e) => Err(Refusal::Table(e)),", "Err(e) => { let _ = remove(table,handle); Err(Refusal::Table(e)) },"),
+        ("removes a parent before refusal", "Ok(true) => Err(Refusal::HasChildren),", "Ok(true) => { let _ = remove(table,handle); Err(Refusal::HasChildren) },"),
+    ]:
+        yield (
+            f"I/O disposal {name}", disposal,
+            lambda s, a=original, b=changed: replace_once(s, a, b), disposal,
+        )
     pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
     pool_trace = Path("verification/hosted_pool_return.rs")
     for name, original, changed in [

@@ -7,7 +7,10 @@ pub(super) enum Refusal<E> { Borrowed, Table(E), HasChildren }
 pub(super) fn dispose<T,H,R,E,O,C,D>(table:T,handle:H,owned:O,children:C,remove:D)
     -> (out: Result<R,Refusal<E>>)
     where O:FnOnce(&H)->bool, C:FnOnce(&T,&H)->Result<bool,E>, D:FnOnce(T,H)->R,
-    requires owned.requires((&handle,)), children.requires((&table,&handle)), remove.requires((table,handle)),
+    requires owned.requires((&handle,)), children.requires((&table,&handle)),
+        // The caller only grants permission to remove an admitted table entry.
+        (owned.ensures((&handle,), true) && children.ensures((&table,&handle), Ok(false)))
+            ==> remove.requires((table,handle)),
     ensures match out {
         Err(Refusal::Borrowed) => owned.ensures((&handle,),false),
         Err(Refusal::Table(e)) => owned.ensures((&handle,),true) && children.ensures((&table,&handle),Err(e)),

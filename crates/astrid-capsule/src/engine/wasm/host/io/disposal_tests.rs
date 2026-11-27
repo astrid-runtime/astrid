@@ -97,3 +97,23 @@ async fn input_destruction_finishes_only_after_its_backend_drains() {
         .unwrap();
     assert!(state.resource_table.is_empty());
 }
+
+#[tokio::test]
+async fn stream_drop_refuses_a_borrow_and_preserves_the_owned_stream() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let stream = state
+        .resource_table
+        .push::<DynInputStream>(Box::new(MemoryInputPipe::new("sample")))
+        .unwrap();
+    let failure = HostInputStream::drop(&mut state, Resource::new_borrow(stream.rep()))
+        .await
+        .unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("cannot drop a borrowed resource")
+    );
+    assert!(state.resource_table.get(&stream).is_ok());
+    HostInputStream::drop(&mut state, stream).await.unwrap();
+    assert!(state.resource_table.is_empty());
+}

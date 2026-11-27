@@ -4,7 +4,6 @@ use super::splice::{Admitted, Mode, Request};
 use crate::engine::wasm::bindings::astrid::io::streams::{InputStream, OutputStream};
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use astrid_core::profile::device_sessions::DeviceSession;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::StreamError;
 
@@ -48,21 +47,21 @@ pub(super) fn immediate(
             Mode::Immediate,
             &mut state.resource_table,
             |guard, table, request| {
-                directory
-                    .with_bound_input(&guard.principal, guard.owner, request, |target| {
-                        if cancel.is_cancelled()
-                            || guard.device.as_ref().is_some_and(DeviceSession::is_retired)
-                        {
-                            return Err(StreamError::Closed);
-                        }
+                guard.start(
+                    directory,
+                    &cancel,
+                    table,
+                    request,
+                    (),
+                    |table, target, ()| {
                         HostOutputStream::splice(
                             table,
                             Resource::new_borrow(target.destination),
                             Resource::new_borrow(target.source),
                             target.length,
                         )
-                    })
-                    .unwrap_or(Err(StreamError::Closed))
+                    },
+                )?
             },
         )
         .ok_or(StreamError::Closed)?
@@ -87,16 +86,21 @@ pub(super) async fn blocking(
                 let transfer = util::bounded_await_cancellable(semaphore, &cancel, async {
                     // Validate the opening binding after acquiring capacity. Keep the
                     // directory lock out of the asynchronous WASI read and write.
-                    let work = directory
-                        .with_bound_input(&guard.principal, guard.owner, request, |target| {
+                    let work = guard.start(
+                        directory,
+                        &cancel,
+                        table,
+                        request,
+                        (),
+                        |table, target, ()| {
                             HostOutputStream::blocking_splice(
                                 table,
                                 Resource::new_borrow(target.destination),
                                 Resource::new_borrow(target.source),
                                 target.length,
                             )
-                        })
-                        .map_err(|_| StreamError::Closed)?;
+                        },
+                    )?;
                     work.await
                 });
                 let result = match &guard.device {
