@@ -142,6 +142,7 @@ INPUTS = [
     Path("verification/hosted_registry_lookup.rs"),
     Path("verification/hosted_source_lookup.rs"),
     Path("verification/hosted_process_selection.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/publication.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/signal_target.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/selection.rs"),
     Path("crates/astrid-capsule/src/registry/source_lookup.rs"),

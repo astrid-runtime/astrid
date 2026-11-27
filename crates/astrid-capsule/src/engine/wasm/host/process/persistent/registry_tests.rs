@@ -439,4 +439,46 @@ fn group_signal_fallback_uses_the_same_positive_pid_and_signal() {
             },
         }
     }
+    let fallback = deliver(
+        73,
+        15u8,
+        |_, _| false,
+        |pid, signal| {
+            assert_eq!((pid, signal), (73, 15));
+            Ok::<(), u8>(())
+        },
+    );
+    assert!(fallback.is_ok());
+}
+
+#[test]
+fn token_collision_never_replaces_another_child() {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    for fresh_at_end in [false, true] {
+        let mut entries = HashMap::from([(7u8, (42u8, "existing"))]);
+        let draws = Cell::new(0u8);
+        let result = super::publication::publish(
+            &mut entries,
+            "pending",
+            |attempt| {
+                assert_eq!(attempt, draws.get());
+                draws.set(attempt + 1);
+                attempt
+            },
+            |attempt| if fresh_at_end && *attempt == 8 { 9 } else { 7 },
+            |token, child| (*token, child),
+        );
+        assert_eq!(draws.get(), 9);
+        assert_eq!(entries[&7], (42, "existing"));
+        if fresh_at_end {
+            assert_eq!(result, Ok(8));
+            assert_eq!(entries[&9], (8, "pending"));
+            assert_eq!(entries.len(), 2);
+        } else {
+            assert_eq!(result, Err("pending"));
+            assert_eq!(entries.len(), 1);
+        }
+    }
 }

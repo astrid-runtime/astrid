@@ -298,9 +298,7 @@ pub(super) fn map_signal(sig: ProcessSignal) -> HostSignal {
 /// `process_group(0)`, so descendants are signalled too), falling back to
 /// the bare pid if the group send fails.
 pub(super) fn send_signal(pid: u32, sig: HostSignal) -> Result<(), ErrorCode> {
-    // Refuse pid 0: `killpg(0)` / `kill(0)` target the CALLER's (daemon's) own
-    // process group — never the child. A reaped child surfaces pid `None`
-    // (stored as 0); guard here as defense-in-depth (spawn also rejects it).
+    // Both platform paths refuse zero. On Unix zero would address the caller’s process group.
     #[cfg(unix)]
     {
         use nix::sys::signal::Signal;

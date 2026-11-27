@@ -36,15 +36,14 @@
 //!
 //! The `process-id` is a 256-bit host-minted CSPRNG token (lowercase base32,
 //! see [`ids`]). A keyed BLAKE3 digest indexes each entry. The entry retains
-//! the token so its owner can recover it through status and list. Possession is necessary but NOT sufficient: every
-//! id-keyed call re-resolves the live `(principal, capsule)` and checks them
-//! against the recorded creator before touching the entry, so a leaked token
-//! is inert across the principal/capsule boundary. Lookup refuses an absent or foreign entry. Release is idempotent for
-//! an absent entry and refuses a foreign entry.
+//! the token so its owner can recover it through status and list. Token
+//! lookup checks the recorded creator and capsule. Release is idempotent
+//! for an absent entry and refuses a foreign entry.
 
 mod config;
 mod entry;
 mod ids;
+mod publication;
 #[cfg(test)]
 mod registry_tests;
 mod ring;
@@ -241,24 +240,12 @@ impl PersistentProcessRegistry {
         let injection_guard = p.injection_guard;
         let process_storage_mount = p.process_storage_mount;
 
-        let mut id = mint_id();
-        let mut key = self.key_of(&id);
-        let mut tries = 0;
-        while map.contains_key(&key) {
-            id = mint_id();
-            key = self.key_of(&id);
-            tries += 1;
-            if tries > 8 {
-                // 256-bit space: unreachable in practice. Fail closed.
-                monitor.abort();
-                return Err(ErrorCode::Unknown(
-                    "process-id collision space exhausted".to_string(),
-                ));
-            }
-        }
-        map.insert(
-            key,
-            PersistentEntry {
+        publication::publish(
+            &mut map,
+            monitor,
+            |_| mint_id(),
+            |token| self.key_of(token),
+            |id, monitor| PersistentEntry {
                 id: id.clone(),
                 creator: p.creator,
                 capsule_id: p.capsule_id,
@@ -275,8 +262,11 @@ impl PersistentProcessRegistry {
                 injection_guard,
                 process_storage_mount,
             },
-        );
-        Ok(id)
+        )
+        .map_err(|monitor| {
+            monitor.abort();
+            ErrorCode::Unknown("process-id collision space exhausted".to_string())
+        })
     }
 
     /// Number of LIVE (not-yet-exited) persistent processes a principal owns.
