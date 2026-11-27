@@ -176,25 +176,21 @@ impl Kernel {
                 prepared.capsule.unload().await?;
                 return Ok(RestartOutcome::Superseded);
             }
-            if prepared.system_runtime
-                && let Err(error) = registry.validate_system_runtime_replacement(
-                    &current_runtime,
-                    prepared.capsule.as_ref(),
-                    &prepared.runtime_id,
-                )
-            {
-                drop(registry);
-                drop(load_guard);
-                prepared.capsule.retire();
-                super::capsule_removal::unload_rejected_runtime(prepared.capsule, id).await;
-                return Err(anyhow::anyhow!(error));
-            }
             let replaced = if prepared.system_runtime {
-                registry.replace_system_runtime_reserved(
+                match registry.try_replace_system_runtime_reserved(
                     &current_runtime,
                     prepared.capsule,
                     prepared.runtime_id,
-                )?
+                ) {
+                    Ok(replaced) => replaced,
+                    Err(rejected) => {
+                        drop(registry);
+                        drop(load_guard);
+                        rejected.capsule.retire();
+                        super::capsule_removal::unload_rejected_runtime(rejected.capsule, id).await;
+                        return Err(anyhow::anyhow!(rejected.error));
+                    },
+                }
             } else {
                 let uid = prepared
                     .principal_uid

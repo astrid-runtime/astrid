@@ -1,11 +1,39 @@
 use std::sync::Arc;
 
-use astrid_core::{PrincipalId, PrincipalUid};
+use astrid_core::{PrincipalId, PrincipalUid, UplinkDescriptor};
 
 use super::{
     Capsule, CapsuleError, CapsuleId, CapsuleRegistry, CapsuleResult, ReplacedRuntime, RuntimeId,
-    RuntimeScope, WasmHash, capsule_source_uuid, system_uplink_descriptors,
+    RuntimePublicationError, RuntimeScope, WasmHash, capsule_source_uuid,
+    system_uplink_descriptors,
 };
+
+/// Descriptors checked against the registered owners and each other before publication.
+struct CheckedSystemUplinks(Vec<UplinkDescriptor>);
+
+impl CheckedSystemUplinks {
+    fn new(
+        registry: &CapsuleRegistry,
+        id: &CapsuleId,
+        descriptors: Vec<UplinkDescriptor>,
+    ) -> CapsuleResult<Self> {
+        let mut pending = std::collections::HashSet::new();
+        for descriptor in &descriptors {
+            if registry
+                .uplinks
+                .get(&descriptor.id)
+                .is_some_and(|(owner, _)| owner != id)
+                || !pending.insert(descriptor.id)
+            {
+                return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                    "Uplink already registered: {}",
+                    descriptor.id
+                )));
+            }
+        }
+        Ok(Self(descriptors))
+    }
+}
 
 impl CapsuleRegistry {
     /// Atomically replace the principal runtime currently visible in one view.
@@ -76,6 +104,7 @@ impl CapsuleRegistry {
             },
         })?;
         self.swap_runtime(expected, runtime_id, replacement, Some(principal.clone()))
+            .map_err(|rejected| rejected.error)
     }
 
     /// Atomically replace an explicit system singleton and all of its views.
@@ -85,35 +114,14 @@ impl CapsuleRegistry {
         replacement: Box<dyn Capsule>,
         artifact: WasmHash,
     ) -> CapsuleResult<ReplacedRuntime> {
-        let id = replacement.id().clone();
-        if expected.key().scope() != RuntimeScope::SystemResident
-            || !self.instances.contains_key(expected)
-        {
-            return Err(CapsuleError::ExecutionFailed(format!(
-                "system runtime generation changed before replacing '{id}'"
-            )));
-        }
-        if expected.key().capsule_id() != &id {
-            return Err(CapsuleError::ExecutionFailed(format!(
-                "replacement capsule id '{id}' does not match runtime '{}'",
-                expected.key().capsule_id()
-            )));
-        }
-
-        let descriptors = system_uplink_descriptors(replacement.as_ref())?;
-        for descriptor in &descriptors {
-            if let Some((owner, _)) = self.uplinks.get(&descriptor.id)
-                && owner != &id
-            {
-                return Err(CapsuleError::UnsupportedEntryPoint(format!(
-                    "Uplink already registered: {}",
-                    descriptor.id
-                )));
-            }
-        }
-
-        let runtime_id = self.next_runtime_id(id, artifact, RuntimeScope::SystemResident)?;
-        self.replace_system_runtime_reserved(expected, replacement, runtime_id)
+        let descriptors = self.system_replacement_uplinks(expected, replacement.as_ref())?;
+        let runtime_id = self.next_runtime_id(
+            replacement.id().clone(),
+            artifact,
+            RuntimeScope::SystemResident,
+        )?;
+        self.publish_system_replacement(expected, replacement, runtime_id, descriptors)
+            .map_err(|rejected| rejected.error)
     }
 
     /// Atomically publish a preallocated system generation.
@@ -123,16 +131,49 @@ impl CapsuleRegistry {
         replacement: Box<dyn Capsule>,
         runtime_id: RuntimeId,
     ) -> CapsuleResult<ReplacedRuntime> {
-        self.validate_system_runtime_replacement(expected, replacement.as_ref(), &runtime_id)?;
-        let id = replacement.id().clone();
-        let descriptors = system_uplink_descriptors(replacement.as_ref())?;
+        self.try_replace_system_runtime_reserved(expected, replacement, runtime_id)
+            .map_err(|rejected| rejected.error)
+    }
+
+    /// Publish a reserved system replacement or return its candidate for teardown.
+    ///
+    /// # Errors
+    ///
+    /// A stale generation, mismatched reservation or conflicting uplink leaves the registry unchanged.
+    pub fn try_replace_system_runtime_reserved(
+        &mut self,
+        expected: &RuntimeId,
+        replacement: Box<dyn Capsule>,
+        runtime_id: RuntimeId,
+    ) -> Result<ReplacedRuntime, RuntimePublicationError> {
+        let descriptors =
+            match self.reserved_system_uplinks(expected, replacement.as_ref(), &runtime_id) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    return Err(RuntimePublicationError {
+                        capsule: replacement,
+                        error,
+                    });
+                },
+            };
+        self.publish_system_replacement(expected, replacement, runtime_id, descriptors)
+    }
+
+    fn publish_system_replacement(
+        &mut self,
+        expected: &RuntimeId,
+        replacement: Box<dyn Capsule>,
+        runtime_id: RuntimeId,
+        descriptors: CheckedSystemUplinks,
+    ) -> Result<ReplacedRuntime, RuntimePublicationError> {
         let owner_alias = self
             .instances
             .get(expected)
             .and_then(|entry| entry.owner_alias.clone());
         let replaced = self.swap_runtime(expected, runtime_id, replacement, owner_alias)?;
-        self.unregister_capsule_uplinks(&id);
-        for descriptor in descriptors {
+        let id = replaced.runtime_id.key().capsule_id();
+        self.unregister_capsule_uplinks(id);
+        for descriptor in descriptors.0 {
             self.uplinks.insert(descriptor.id, (id.clone(), descriptor));
         }
         Ok(replaced)
@@ -145,14 +186,33 @@ impl CapsuleRegistry {
         replacement: &dyn Capsule,
         runtime_id: &RuntimeId,
     ) -> CapsuleResult<()> {
-        let id = replacement.id().clone();
+        self.reserved_system_uplinks(expected, replacement, runtime_id)
+            .map(drop)
+    }
+
+    fn reserved_system_uplinks(
+        &self,
+        expected: &RuntimeId,
+        replacement: &dyn Capsule,
+        runtime_id: &RuntimeId,
+    ) -> CapsuleResult<CheckedSystemUplinks> {
+        let id = replacement.id();
         if runtime_id.key().scope() != RuntimeScope::SystemResident
-            || runtime_id.key().capsule_id() != &id
+            || runtime_id.key().capsule_id() != id
         {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "reserved runtime identity does not match system replacement '{id}'"
             )));
         }
+        self.system_replacement_uplinks(expected, replacement)
+    }
+
+    fn system_replacement_uplinks(
+        &self,
+        expected: &RuntimeId,
+        replacement: &dyn Capsule,
+    ) -> CapsuleResult<CheckedSystemUplinks> {
+        let id = replacement.id();
         if expected.key().scope() != RuntimeScope::SystemResident
             || !self.instances.contains_key(expected)
         {
@@ -160,31 +220,13 @@ impl CapsuleRegistry {
                 "system runtime generation changed before replacing '{id}'"
             )));
         }
-        if expected.key().capsule_id() != &id {
+        if expected.key().capsule_id() != id {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "replacement capsule id '{id}' does not match runtime '{}'",
                 expected.key().capsule_id()
             )));
         }
-        let descriptors = system_uplink_descriptors(replacement)?;
-        let mut pending = std::collections::HashSet::new();
-        for descriptor in &descriptors {
-            if let Some((owner, _)) = self.uplinks.get(&descriptor.id)
-                && owner != &id
-            {
-                return Err(CapsuleError::UnsupportedEntryPoint(format!(
-                    "Uplink already registered: {}",
-                    descriptor.id
-                )));
-            }
-            if !pending.insert(descriptor.id) {
-                return Err(CapsuleError::UnsupportedEntryPoint(format!(
-                    "Uplink already registered: {}",
-                    descriptor.id
-                )));
-            }
-        }
-        Ok(())
+        CheckedSystemUplinks::new(self, id, system_uplink_descriptors(replacement)?)
     }
 
     pub(super) fn next_runtime_id(
@@ -204,7 +246,7 @@ impl CapsuleRegistry {
         runtime_id: RuntimeId,
         replacement: Box<dyn Capsule>,
         owner_alias: Option<PrincipalId>,
-    ) -> CapsuleResult<ReplacedRuntime> {
+    ) -> Result<ReplacedRuntime, RuntimePublicationError> {
         let replacement = super::generation_replacement::Replacement {
             expected,
             reserved: &runtime_id,
@@ -222,10 +264,16 @@ impl CapsuleRegistry {
                 &mut self.uuid_id_map,
                 &mut self.legacy_uuid_map,
             )
-            .map_err(|_| CapsuleError::NotFound(format!("runtime {expected:?}")))?;
+            .map_err(|capsule| RuntimePublicationError {
+                error: CapsuleError::NotFound(format!("runtime {expected:?}")),
+                capsule,
+            })?;
         Ok(ReplacedRuntime {
             runtime_id,
             previous,
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

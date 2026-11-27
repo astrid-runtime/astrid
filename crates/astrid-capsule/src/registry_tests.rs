@@ -274,80 +274,11 @@ fn principal_generation_replacement_is_atomic_and_stale_safe() {
     assert!(Arc::ptr_eq(&successor.previous, &current));
 }
 
-#[test]
-fn system_generation_replacement_swaps_every_view() {
-    let mut registry = CapsuleRegistry::new();
-    let alice = pid("alice");
-    let bob = pid("bob");
-    let id = CapsuleId::from_static("system-service");
-    let old_hash = test_hash("system-old");
-    let old = registry
-        .register_system_runtime(
-            Box::new(MockCapsule::new("system-service")),
-            old_hash.clone(),
-            &alice,
-        )
-        .unwrap();
-    registry.register_existing(&id, &old_hash, &bob).unwrap();
-    let carol = pid("carol");
-    registry
-        .register_principal_runtime(
-            Box::new(MockCapsule::new("system-service")),
-            test_hash("private-artifact"),
-            &carol,
-            uid(3),
-        )
-        .expect("register an unrelated principal view");
-    let previous = registry.get_for(&bob, &id).unwrap();
-    let private = registry.get_for(&carol, &id).unwrap();
-    let private_source = capsule_source_uuid(&id, &test_hash("private-artifact"));
-    let new_source = capsule_source_uuid(&id, &test_hash("system-new"));
-
-    let replaced = registry
-        .replace_system_runtime(
-            &old,
-            Box::new(MockCapsule::new("system-service")),
-            test_hash("system-new"),
-        )
-        .unwrap();
-
-    let viewers = registry.principals_viewing_runtime(&replaced.runtime_id);
-    assert_eq!(viewers.len(), 2);
-    assert!(viewers.contains(&alice) && viewers.contains(&bob));
-    assert!(registry.principals_viewing_runtime(&old).is_empty());
-    let current = replaced.installed(&registry).unwrap();
-    for principal in [&alice, &bob] {
-        let routed = registry
-            .find_instance_by_uuid_for(principal, &new_source)
-            .unwrap();
-        assert!(Arc::ptr_eq(&current, &routed));
-    }
-    assert!(
-        registry
-            .find_instance_by_uuid_for(&carol, &new_source)
-            .is_none()
-    );
-    let private_route = registry
-        .find_instance_by_uuid_for(&carol, &private_source)
-        .unwrap();
-    assert!(Arc::ptr_eq(&private, &private_route));
-    assert_eq!(
-        registry.runtime_id_for(&alice, &id),
-        Some(replaced.runtime_id.clone())
-    );
-    assert_eq!(
-        registry.runtime_id_for(&bob, &id),
-        Some(replaced.runtime_id)
-    );
-    assert!(Arc::ptr_eq(&replaced.previous, &previous));
-    assert!(Arc::ptr_eq(
-        &current,
-        &registry.get_for(&alice, &id).unwrap()
-    ));
-    assert!(Arc::ptr_eq(&current, &registry.get_for(&bob, &id).unwrap()));
-}
+#[path = "registry/system_replacement_tests.rs"]
+mod system_replacement_tests;
 
 struct MockCapsule {
+    manifest_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
     id: CapsuleId,
     manifest: CapsuleManifest,
 }
@@ -355,6 +286,7 @@ struct MockCapsule {
 impl MockCapsule {
     fn new(name: &str) -> Self {
         Self {
+            manifest_reads: None,
             id: CapsuleId::from_static(name),
             manifest: CapsuleManifest {
                 package: PackageDef {
@@ -437,6 +369,9 @@ impl crate::capsule::Capsule for MockCapsule {
         &self.id
     }
     fn manifest(&self) -> &CapsuleManifest {
+        if let Some(reads) = &self.manifest_reads {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         &self.manifest
     }
     fn state(&self) -> CapsuleState {
