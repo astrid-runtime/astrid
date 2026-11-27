@@ -3,6 +3,8 @@
 extern crate self as astrid_core;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/command.rs"]
 mod process_command;
+#[path = "../crates/astrid-capsule/src/profile_cache/command.rs"]
+mod profile_command;
 mod hosted_process_command;
 #[path = "../crates/astrid-capsule/src/engine/wasm/guest_kv.rs"]
 mod guest_kv_dispatch;

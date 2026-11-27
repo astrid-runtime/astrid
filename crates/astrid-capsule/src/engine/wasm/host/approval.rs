@@ -12,7 +12,6 @@ use crate::engine::wasm::bindings::astrid::approval::host::{
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use crate::profile_cache::PrincipalProfileCache;
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
 use astrid_core::principal::PrincipalId;
@@ -136,35 +135,58 @@ fn approval_location(state: &HostState) -> CommandApprovalLocation {
     }
 }
 
-struct CommandGrants<'a>(&'a HostState);
+fn grant_destination(state: &HostState) -> Result<Destination<&str>, ErrorCode> {
+    state
+        .profile_cache
+        .as_ref()
+        .ok_or(ErrorCode::StoreUnavailable)?;
+    match approval_location(state) {
+        CommandApprovalLocation::AstridWorkspace => Ok(Destination::AstridWorkspace),
+        CommandApprovalLocation::Hosted => {
+            Ok(Destination::Hosted(hosted_workspace_identity(state)?))
+        },
+    }
+}
 
-impl<'a> CommandGrants<'a> {
-    fn destination(&self) -> Result<Destination<&'a str>, ErrorCode> {
-        self.0
+struct CommandGrants<'a> {
+    state: &'a HostState,
+    responder: &'a IpcMessage,
+}
+
+impl CommandGrants<'_> {
+    fn write(
+        &self,
+        owner: &PrincipalId,
+        family: &str,
+        path: Option<&str>,
+        location: CommandApprovalLocation,
+    ) -> Result<(), ErrorCode> {
+        let cache = self
+            .state
             .profile_cache
             .as_ref()
             .ok_or(ErrorCode::StoreUnavailable)?;
-        match approval_location(self.0) {
-            CommandApprovalLocation::AstridWorkspace => Ok(Destination::AstridWorkspace),
-            CommandApprovalLocation::Hosted => {
-                Ok(Destination::Hosted(hosted_workspace_identity(self.0)?))
-            },
+        let mut devices = [Default::default(); 2];
+        for (slot, message) in devices
+            .iter_mut()
+            .zip([self.state.caller_context.as_ref(), Some(self.responder)])
+        {
+            if let Some(message) = message {
+                let stamp = message.device_stamp();
+                if stamp.fingerprint.is_some()
+                    && message.principal.as_deref() != Some(owner.as_str())
+                {
+                    return Err(ErrorCode::StoreUnavailable);
+                }
+                *slot = stamp;
+            }
         }
-    }
-
-    fn write(
-        &self,
-        publish: impl FnOnce(&PrincipalProfileCache) -> Result<(), astrid_core::profile::ProfileError>,
-    ) -> Result<(), ErrorCode> {
-        let cache = self
-            .0
-            .profile_cache
-            .as_deref()
-            .ok_or(ErrorCode::StoreUnavailable)?;
-        publish(cache).map_err(|error| {
-            tracing::warn!(%error, "Cannot persist Always approval");
-            ErrorCode::StoreUnavailable
-        })
+        cache
+            .persist_command_at(owner, family, path, location, devices)
+            .map_err(|error| {
+                tracing::warn!(%error, "Cannot persist Always approval");
+                ErrorCode::StoreUnavailable
+            })
     }
 }
 
@@ -172,10 +194,15 @@ impl Writer<&PrincipalId, &str, &str> for CommandGrants<'_> {
     type Error = ErrorCode;
 
     fn hosted(&mut self, owner: &PrincipalId, family: &str, path: &str) -> Result<(), ErrorCode> {
-        self.write(|cache| cache.persist_command_always(owner, family, Some(path)))
+        self.write(owner, family, Some(path), CommandApprovalLocation::Hosted)
     }
     fn workspace(&mut self, owner: &PrincipalId, family: &str) -> Result<(), ErrorCode> {
-        self.write(|cache| cache.persist_astrid_command_always(owner, family))
+        self.write(
+            owner,
+            family,
+            None,
+            CommandApprovalLocation::AstridWorkspace,
+        )
     }
 }
 
@@ -462,8 +489,7 @@ impl approval::Host for HostState {
                 decision: ApprovalDecision::Denied,
             });
         };
-        let mut grants = CommandGrants(self);
-        let destination = grants.destination();
+        let destination = grant_destination(self);
         let request_id = Uuid::new_v4().to_string();
         let response_topic = Topic::approval_response(&request_id);
         // Durable before the prompt is published.
@@ -548,7 +574,10 @@ impl approval::Host for HostState {
                                     &principal,
                                     request.action.as_str(),
                                     destination,
-                                    &mut grants,
+                                    &mut CommandGrants {
+                                        state: self,
+                                        responder: message,
+                                    },
                                 )
                                 .inspect_err(|_| {
                                     audit.denied("user", "approve_always could not be persisted");

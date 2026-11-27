@@ -50,6 +50,34 @@ fn resolve<'a>(enabled:bool, keypair:bool,rows:&'a [Registration],key:&str,expec
     result
 }
 
+/// Both signed parties must still occur in the single snapshot held by the
+/// update. A successful callback returns the very rows it was given to publish.
+struct CommandProfile<'a> { enabled:bool, keypair:bool, rows:&'a [Registration] }
+
+spec fn current(profile:CommandProfile, stamp:(&str,Option<u128>)) -> bool {
+    profile.enabled && profile.keypair
+        && exists|i:int| eligible(profile.rows@,stamp.0,stamp.1,i)
+}
+
+fn current_stamp(profile:&CommandProfile, stamp:(&str,Option<u128>)) -> (r:bool)
+    ensures r == current(*profile,stamp),
+{
+    resolve(profile.enabled,profile.keypair,profile.rows,stamp.0,stamp.1).is_some()
+}
+
+fn publish_rows<'a>(profile:CommandProfile<'a>) -> (rows:&'a [Registration])
+    ensures rows == profile.rows,
+{ profile.rows }
+
+fn command_publication<'a>(profile:CommandProfile<'a>, caller:(&str,Option<u128>),
+    responder:(&str,Option<u128>)) -> (published:Option<&'a [Registration]>)
+    ensures published == if current(profile,caller) && current(profile,responder) {
+        Some(profile.rows)
+    } else { None },
+{
+    crate::profile_command::on_current_profile(profile,[caller,responder],current_stamp,publish_rows)
+}
+
 spec fn fenced(owner:&str,key:&str,retire:Option<(&str,&str)>) -> bool {
     retire matches Some((who,which)) && who@ == owner@ && which@ == key@
 }

@@ -46,6 +46,7 @@ INVOCATION_OWNER = Path("crates/astrid-capsule/src/engine/wasm/invocation_owner/
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
+    Path("crates/astrid-capsule/src/profile_cache/command.rs"),
     Path("verification/hosted_process_command.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/command.rs"),
     UID_TEXT,

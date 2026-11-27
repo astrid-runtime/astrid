@@ -9,6 +9,16 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    publication = Path("crates/astrid-capsule/src/profile_cache/command.rs")
+    for name, original, changed, target in [
+        ("ignores caller retirement", "if current(&profile, devices[0]) &&", "if", publication),
+        ("uses caller for both parties", "&& current(&profile, devices[1]) {", "&& current(&profile, devices[0]) {", publication),
+        ("loses the current responder requirement", "&& current.ensures((&profile, devices[1]), true)", "", Path("verification/hosted_device_profile.rs")),
+    ]:
+        yield (
+            f"command profile publication {name}", publication,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     command = Path("crates/astrid-capsule/src/engine/wasm/host/process/command.rs")
     for name, original, changed, target in [
         ("skips the environment clear", "    builder.clear_environment();", "", command),

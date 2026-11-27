@@ -115,3 +115,76 @@ async fn retirement_during_reply_lookup_rejects_an_unchanged_profile_record() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn command_writer_checks_both_registrations_after_admission_and_before_save() {
+    for removed_index in [None, Some(0usize), Some(1usize)] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+        let mut state = persistent_test_state(dir.path());
+        let owner = install_request_owner(&mut state);
+        let principal = state.effective_principal();
+        let devices = [
+            DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0),
+            DeviceKey::new("b".repeat(64), DeviceScope::Full, None, 0),
+        ];
+        let mut profile = PrincipalProfile::default();
+        profile.auth.methods.push(AuthMethod::Keypair);
+        for device in &devices {
+            profile.add_device(device.clone());
+        }
+        profile.save(&home, &principal).unwrap();
+        let mut reply = approval_response_event(
+            "test",
+            Some(principal.as_str()),
+            Some(owner),
+            "approve_always",
+        );
+        let AstridEvent::Ipc { message, .. } = &mut reply else {
+            unreachable!()
+        };
+        for (msg, device) in [state.caller_context.as_mut().unwrap(), &mut *message]
+            .into_iter()
+            .zip(&devices)
+        {
+            msg.device_key_id = Some(device.key_id.clone());
+            msg.device_registration_id = device.registration_id.map(Into::into);
+        }
+        let authority = consent_reply::admit(
+            state.begin_host_operation(),
+            || state.begin_device_operation(),
+            || state.begin_message_device_operation(message),
+        )
+        .unwrap();
+        if let Some(index) = removed_index {
+            let id = DeviceKeyId::new(devices[index].key_id.clone()).unwrap();
+            assert!(matches!(
+                state
+                    .profile_cache
+                    .as_ref()
+                    .unwrap()
+                    .remove_paired_device(&principal, &id)
+                    .unwrap(),
+                crate::profile_cache::DeviceRemoval::Removed(_)
+            ));
+        }
+        let result = authority.apply(
+            b"approve_always",
+            &principal,
+            "git push",
+            grant_destination(&state),
+            &mut CommandGrants {
+                state: &state,
+                responder: message,
+            },
+        );
+        let saved = PrincipalProfile::load_required(&home, &principal).unwrap();
+        if removed_index.is_some() {
+            assert!(matches!(result, Err(ErrorCode::StoreUnavailable)));
+            assert!(saved.approvals.command_always.is_empty());
+        } else {
+            assert!(matches!(result, Ok(Decision::Always)));
+            assert_eq!(saved.approvals.command_always.len(), 1);
+        }
+    }
+}

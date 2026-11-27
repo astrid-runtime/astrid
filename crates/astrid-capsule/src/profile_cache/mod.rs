@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
 
+mod command;
 mod load;
 use load::{ProfileLoad, ProfileLoadToken};
 
@@ -346,7 +347,7 @@ impl PrincipalProfileCache {
     /// The load-modify-save runs under the same cache write lock as
     /// [`Self::persist_egress`]. Both methods load the current profile from
     /// disk while holding that lock, so these two methods cannot drop each
-    /// other's writes. Other profile writers do not share this lock.
+    /// other's writes. Paired-device removal uses this lock as well.
     ///
     /// Host persist always supplies `Some(pristine hosted portal path)`, not
     /// the process-local `CoW` merged path. This method does not invent a
@@ -375,6 +376,7 @@ impl PrincipalProfileCache {
             command,
             workspace_root,
             astrid_core::profile::CommandApprovalLocation::Hosted,
+            [Default::default(); 2],
         )
     }
 
@@ -392,15 +394,17 @@ impl PrincipalProfileCache {
             command,
             None,
             astrid_core::profile::CommandApprovalLocation::AstridWorkspace,
+            [Default::default(); 2],
         )
     }
 
-    fn persist_command_at(
+    pub(crate) fn persist_command_at(
         &self,
         principal: &PrincipalId,
         command: &str,
         workspace_root: Option<&str>,
         location: astrid_core::profile::CommandApprovalLocation,
+        devices: [astrid_events::ipc::DeviceStamp<'_>; 2],
     ) -> ProfileResult<()> {
         let command = command.trim();
         if command.is_empty() {
@@ -433,26 +437,41 @@ impl PrincipalProfileCache {
 
         let path = self.astrid_home.profile_path(principal);
         // Approval cannot resurrect a principal removed while the prompt was open.
-        let mut profile = self.load_consent_profile(principal)?;
+        let profile = self.load_consent_profile(principal)?;
+        // Device removal can have published since the registry guards were acquired.
+        command::on_current_profile(
+            profile,
+            devices,
+            |profile, stamp| match stamp.fingerprint {
+                Some(raw) => DeviceKeyId::new(raw).ok().is_some_and(|key| {
+                    profile
+                        .active_registration(&key, stamp.registration)
+                        .is_some()
+                }),
+                None => stamp.registration.is_none(),
+            },
+            |mut profile| {
+                let already = profile.approvals.command_always.iter().any(|grant| {
+                    grant.command == command
+                        && grant.location == location
+                        && grant.workspace_root.as_deref() == workspace_root
+                });
+                if already {
+                    guard.profiles.insert(principal.clone(), Arc::new(profile));
+                    return Ok(());
+                }
 
-        let already = profile.approvals.command_always.iter().any(|grant| {
-            grant.command == command
-                && grant.location == location
-                && grant.workspace_root.as_deref() == workspace_root
-        });
-        if already {
-            guard.profiles.insert(principal.clone(), Arc::new(profile));
-            return Ok(());
-        }
-
-        profile.approvals.command_always.push(CommandAlwaysGrant {
-            command: command.to_string(),
-            location,
-            workspace_root: workspace_root.map(str::to_string),
-        });
-        profile.save_to_path(&path)?;
-        guard.invalidate(principal);
-        Ok(())
+                profile.approvals.command_always.push(CommandAlwaysGrant {
+                    command: command.to_string(),
+                    location,
+                    workspace_root: workspace_root.map(str::to_string),
+                });
+                profile.save_to_path(&path)?;
+                guard.invalidate(principal);
+                Ok(())
+            },
+        )
+        .ok_or_else(|| ProfileError::Invalid("approval device registration changed".into()))?
     }
 
     /// Number of principals currently cached. Test-only introspection.
