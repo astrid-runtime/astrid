@@ -3,6 +3,35 @@ use crate::{ObjectId,ObjectReference,ReferenceKind,workspace_references as refs}
 use vstd::prelude::*;
 
 verus! {
+spec fn commit_links(before:Seq<ObjectReference>,links:Seq<ObjectReference>,r:Option<crate::RootState>,state:ObjectId) -> bool {
+    &&& links.take(before.len() as int) == before
+    &&& links.last().fields() == (b"state"@,state,ReferenceKind::Owns)
+    &&& match r {
+        None => links.len() == before.len() + 1,
+        Some(parent) => links.len() == before.len() + 2 &&
+            links[before.len() as int].fields() == (b"parent"@,parent.commit,ReferenceKind::Lineage),
+    }
+}
+
+/// Check the arguments observed by the native transaction constructor against
+/// the header from which the candidate commit references were prepared.
+fn encoded_candidate<P,B,E,S>(owner:P,expected:Option<crate::RootState>,prior:Vec<ObjectReference>,state:ObjectId,seal:S)
+    -> (out:Result<(P,Option<crate::RootState>,ObjectId,B),E>)
+    where S:FnOnce(Vec<ObjectReference>)->Result<(ObjectId,B),E>,
+    requires forall|refs:Vec<ObjectReference>| #[trigger] seal.requires((refs,)),
+    ensures match out {
+        Ok((p,root,commit,records)) => p == owner && root == expected
+            && exists|refs:Vec<ObjectReference>| commit_links(prior@,refs@,expected,state)
+                && #[trigger] seal.ensures((refs,),Ok((commit,records))),
+        Err(e) => exists|refs:Vec<ObjectReference>| commit_links(prior@,refs@,expected,state)
+            && #[trigger] seal.ensures((refs,),Err(e)),
+    },
+{
+    let candidate = crate::commit_candidate::Candidate::new(owner,expected,prior,state);
+    assert(commit_links(prior@,candidate.parts().2@,expected,state));
+    candidate.seal(seal)
+}
+
 proof fn normalized(input:Seq<ObjectReference>, id:[u8;16])
     ensures ({
         let keep = |r:ObjectReference| refs::keep(r,id);

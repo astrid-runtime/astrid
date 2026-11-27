@@ -326,35 +326,27 @@ where
         .map_err(PrincipalProjectionError::Model)?;
         let state = self.insert(&mut records, state)?;
 
-        let mut commit_references = header.preserved_commit;
-        if let Some(previous) = header.root {
-            commit_references.push(ObjectReference::new(
-                ReferenceLabel::new(PARENT_LABEL.to_vec()),
-                previous.commit,
-                ReferenceKind::Lineage,
-            ));
-        }
-        commit_references.push(ObjectReference::owns(
-            ReferenceLabel::new(STATE_LABEL.to_vec()),
-            state,
-        ));
-        commit_references.sort();
-        let commit = ObjectRecord::new(
-            ObjectKind::Commit,
-            PRINCIPAL_GRAPH_VERSION,
-            Vec::new(),
-            commit_references,
-            0,
-            ObjectClass::Metadata,
-        )
-        .map_err(PrincipalProjectionError::Model)?;
-        let commit = self.insert(&mut records, commit)?;
-        Ok(RootTransaction::new(
+        let (owner, expected, commit, records) = super::commit_candidate::Candidate::new(
             principal,
             header.root,
-            commit,
-            records.into_iter().collect(),
-        ))
+            header.preserved_commit,
+            state,
+        )
+        .seal(|mut references| {
+            references.sort();
+            let commit = ObjectRecord::new(
+                ObjectKind::Commit,
+                PRINCIPAL_GRAPH_VERSION,
+                Vec::new(),
+                references,
+                0,
+                ObjectClass::Metadata,
+            )
+            .map_err(PrincipalProjectionError::Model)?;
+            let commit = self.insert(&mut records, commit)?;
+            Ok::<_, PrincipalContentError>((commit, records.into_iter().collect()))
+        })?;
+        Ok(RootTransaction::new(owner, expected, commit, records))
     }
 
     /// Return whether any catalog name begins with `prefix`.

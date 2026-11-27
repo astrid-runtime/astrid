@@ -35,3 +35,17 @@ def defects():
             f"workspace references {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-storage/src/content/store/commit_candidate.rs")
+    for name, old, new in [
+        ("owner can change", "p == self.parts().0 &&", "true &&"),
+        ("expected root can change", "r == self.parts().1", "true"),
+        ("commit can differ from encoder result", "&& seal.ensures((self.parts().2,),Ok((id,b)))", "&& true"),
+        ("error can differ from encoder result", "out matches Err(e) ==> seal.ensures((self.parts().2,),Err(e))", "true"),
+        ("parent relation can change", "after[before.len() as int].fields() == (PARENT@,root.commit,ReferenceKind::Lineage)", "after[before.len() as int].fields().1 == root.commit"),
+        ("state object can change", "after.last().fields() == (STATE@,state,ReferenceKind::Owns)", "after.last().fields().2 == ReferenceKind::Owns"),
+    ]:
+        yield (
+            f"content commit {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

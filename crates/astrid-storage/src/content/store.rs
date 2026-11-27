@@ -35,8 +35,8 @@ use crate::kv::{KvQuotaResolver, KvValidationCache, validated_projection_quota};
 use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VERSION};
 
 const KV_COMPONENT_LABEL: &[u8] = b"kv";
-const PARENT_LABEL: &[u8] = b"parent";
-pub(super) const STATE_LABEL: &[u8] = b"state";
+const PARENT_LABEL: &[u8] = commit_candidate::PARENT;
+pub(super) const STATE_LABEL: &[u8] = commit_candidate::STATE;
 // Native content transfer target, shared by batched writers and restoration.
 // Coalesces verified I/O while keeping transfer memory independent of file size.
 // This is a soft I/O batch size, not a retention, record, or deployment limit.
@@ -970,6 +970,7 @@ where
 
 mod append;
 mod bulk;
+mod commit_candidate;
 mod constructors;
 mod handoff;
 mod internals;
