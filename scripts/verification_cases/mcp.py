@@ -182,3 +182,22 @@ def defects():
             f"platform network policy {name}", source,
             lambda s, a=original, b=changed: replace_once(s, a, b), error,
         )
+
+    literal = Path("crates/astrid-workspace/src/sandbox/path_literal.rs")
+    for name, source, original, changed, error in [
+        ("accepts a forbidden byte", literal, "return None;", "return Some(path);", literal),
+        ("may substitute the selected path", literal, "value == path", "true", consumer),
+        ("drops the hidden write deny", macos, 'rule.push_str("\\"))\\n(deny file-write*', 'rule.push_str("\\"))\\n(deny file-read*', macos),
+    ]:
+        yield (
+            f"sandbox path rule {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), error,
+        )
+
+    # Change the implementation and its contract together. The caller must
+    # independently distinguish an exact file from a recursive subtree.
+    yield (
+        "sandbox path rule changes a literal into a subtree", macos,
+        lambda s: s.replace('Self::Literal => "    (literal', 'Self::Literal => "    (subpath'),
+        consumer,
+    )

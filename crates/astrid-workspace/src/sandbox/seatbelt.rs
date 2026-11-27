@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::io;
 
+use super::seatbelt_profile::PathRule;
 use super::{ProcessSandboxConfig, SandboxPrefix, validate_sandbox_str};
 
 impl ProcessSandboxConfig {
@@ -15,7 +16,7 @@ impl ProcessSandboxConfig {
             .extra_read_paths
             .iter()
             .map(|p| {
-                validate_sandbox_str(p, "extra read path").map(|s| format!("    (subpath \"{s}\")"))
+                validate_sandbox_str(p, "extra read path").map(|s| PathRule::Subpath.render(s))
             })
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
@@ -25,8 +26,7 @@ impl ProcessSandboxConfig {
             .extra_write_paths
             .iter()
             .map(|p| {
-                validate_sandbox_str(p, "extra write path")
-                    .map(|s| format!("    (subpath \"{s}\")"))
+                validate_sandbox_str(p, "extra write path").map(|s| PathRule::Subpath.render(s))
             })
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
@@ -39,7 +39,7 @@ impl ProcessSandboxConfig {
             .iter()
             .map(|inj| {
                 validate_sandbox_str(&inj.target, "injection target")
-                    .map(|s| format!("    (literal \"{s}\")"))
+                    .map(|s| PathRule::Literal.render(s))
             })
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
@@ -53,7 +53,7 @@ impl ProcessSandboxConfig {
             .iter()
             .map(|inj| {
                 validate_sandbox_str(&inj.target, "injection target")
-                    .map(|s| format!("(deny file-write* (literal \"{s}\"))"))
+                    .map(|s| PathRule::DenyWrite.render(s))
             })
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
@@ -74,12 +74,7 @@ impl ProcessSandboxConfig {
                     .any(|injection| injection.target.starts_with(hidden))
         };
         let deny_rule = |path: &std::path::Path| {
-            validate_sandbox_str(path, "hidden path").map(|s| {
-                format!(
-                    "(deny file-read* (subpath \"{s}\"))\n\
-                     (deny file-write* (subpath \"{s}\"))"
-                )
-            })
+            validate_sandbox_str(path, "hidden path").map(|s| PathRule::Hide.render(s))
         };
 
         // A hidden ancestor of an explicit grant is denied after broad system
@@ -157,7 +152,7 @@ impl ProcessSandboxConfig {
             .into_iter()
             .map(|path| {
                 validate_sandbox_str(path, "ancestor metadata path")
-                    .map(|path| format!("    (literal \"{path}\")"))
+                    .map(|path| PathRule::Literal.render(path))
             })
             .collect::<io::Result<Vec<_>>>()
             .map(|rules| rules.join("\n"))

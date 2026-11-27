@@ -9,6 +9,7 @@ use std::{fs::File, os::fd::AsRawFd};
 mod bwrap;
 #[cfg(target_os = "linux")]
 mod bwrap_flags;
+mod path_literal;
 mod prefix_policy;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod runtime_media;
@@ -64,16 +65,15 @@ fn validate_sandbox_str<'a>(path: &'a Path, label: &str) -> io::Result<&'a str> 
             format!("sandbox {label} is not valid UTF-8: {}", path.display()),
         )
     })?;
-    if s.contains(['"', '\\', '\0']) {
-        return Err(io::Error::new(
+    path_literal::checked(s).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "sandbox {label} contains forbidden characters (double-quote, backslash, or null): {}",
                 path.display()
             ),
-        ));
-    }
-    Ok(s)
+        )
+    })
 }
 
 /// A host-verified, read-only file the sandbox materializes inside a spawned

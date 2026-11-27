@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::std_specs::hash::hash_map_inv;
+#[cfg(verus_keep_ghost)]
+use vstd::string::StringSliceAdditionalSpecFns;
 
 verus! {
 /// Compose manifest admission with the two authority fields read by stdio
@@ -52,6 +54,24 @@ fn sandbox_child<C,P,E,H,T,B:crate::prefix_policy::Platform<C,P,E>,A:crate::stdi
 {
     let prefix = crate::prefix_policy::select(platform,config,policy);
     crate::stdio_policy::assemble(assembler,prefix,child)
+}
+
+/// After native path shape checks, no forbidden byte can enter a quoted field.
+/// Successful encoding preserves the selected operation and the exact path.
+fn sandbox_path_rule(kind:&crate::seatbelt_profile::PathRule, path:&str) -> (out:Option<String>)
+    ensures
+        out.is_none() == (exists|i:int| 0 <= i < path.spec_bytes().len() &&
+            ({ let byte = #[trigger] path.spec_bytes()[i]; byte == 0 || byte == 34 || byte == 92 })),
+        out matches Some(rule) ==> rule@ == match kind {
+            crate::seatbelt_profile::PathRule::Literal => "    (literal \""@ + path@ + "\")"@,
+            crate::seatbelt_profile::PathRule::Subpath => "    (subpath \""@ + path@ + "\")"@,
+            crate::seatbelt_profile::PathRule::DenyWrite => "(deny file-write* (literal \""@ + path@ + "\"))"@,
+            crate::seatbelt_profile::PathRule::Hide => "(deny file-read* (subpath \""@ + path@ +
+                "\"))\n(deny file-write* (subpath \""@ + path@ + "\"))"@,
+        },
+{
+    let value = crate::path_literal::checked(path)?;
+    Some(kind.render(value))
 }
 
 /// Compare both native policy encodings for the same network setting. The

@@ -28,6 +28,42 @@ pub(super) const BASE_RULES: &str = r#"
 )
 "#;
 
+pub(super) enum PathRule {
+    Subpath,
+    Literal,
+    DenyWrite,
+    Hide,
+}
+
+impl PathRule {
+    pub(super) fn render(&self, path: &str) -> (rule: String)
+        ensures rule@ == match self {
+            Self::Subpath => "    (subpath \""@ + path@ + "\")"@,
+            Self::Literal => "    (literal \""@ + path@ + "\")"@,
+            Self::DenyWrite => "(deny file-write* (literal \""@ + path@ + "\"))"@,
+            Self::Hide => "(deny file-read* (subpath \""@ + path@ +
+                "\"))\n(deny file-write* (subpath \""@ + path@ + "\"))"@,
+        },
+    {
+        let mut rule = match self {
+            Self::Subpath => "    (subpath \"",
+            Self::Literal => "    (literal \"",
+            Self::DenyWrite => "(deny file-write* (literal \"",
+            Self::Hide => "(deny file-read* (subpath \"",
+        }.to_string();
+        rule.push_str(path);
+        if let Self::Hide = self {
+            rule.push_str("\"))\n(deny file-write* (subpath \"");
+            rule.push_str(path);
+        }
+        match self {
+            Self::Subpath | Self::Literal => rule.push_str("\")"),
+            Self::DenyWrite | Self::Hide => rule.push_str("\"))"),
+        }
+        rule
+    }
+}
+
 pub(super) struct Rules<'a> {
     pub(super) scoped_denies: &'a str,
     pub(super) ancestors: &'a str,
