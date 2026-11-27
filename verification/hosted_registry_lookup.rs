@@ -200,9 +200,11 @@ fn publish_view(views: &mut HashMap<u64,HashMap<u64,Id>>, principal: u64, runtim
 // Bind a selected shared generation to one principal, including its exact
 // installed handle. A miss cannot publish a route to a principal-owned runtime.
 fn select_and_publish_shared<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
+    routes: &mut HashMap<(u64,u64),Id>, sources: &HashMap<Id,u64>, aliases: &HashMap<u64,[u8;32]>,
     instances: &HashMap<Id,Entry<C,u64>>, principal: u64, package: u64, artifact: [u8;32])
     -> (out: Option<Arc<C>>)
-    requires hash_map_inv(old(views)), hash_map_inv(instances), obeys_key_model::<Id>(),
+    requires hash_map_inv(old(routes)), hash_map_inv(sources), hash_map_inv(aliases), obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(),
+        hash_map_inv(old(views)), hash_map_inv(instances), obeys_key_model::<Id>(),
         vstd::pervasive::obeys_clone_eq::<Id>(), obeys_concrete_eq::<Id>(), obeys_concrete_eq::<[u8;32]>(),
         old(views)@.contains_key(principal) ==> hash_map_inv(&old(views)@[principal]),
     ensures match out {
@@ -211,16 +213,25 @@ fn select_and_publish_shared<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>
             &&& final(views)@.contains_key(principal) && final(views)@[principal]@.contains_key(package)
             &&& selected.identity().0 == (package,artifact,RuntimeScope::SystemResident)
             &&& instances@.contains_key(selected) && instances@[selected].capsule == handle
+            &&& final(routes)@ == if sources@.contains_key(selected) {
+                old(routes)@.insert((sources@[selected],principal),selected)
+            } else { old(routes)@ }
             &&& final(views)@.remove(principal) == old(views)@.remove(principal)
         }),
-        None => final(views)@ == old(views)@ &&
+        None => final(views)@ == old(views)@ && final(routes)@ == old(routes)@ &&
             forall|id:Id| instances@.contains_key(id) ==> id.identity().0 != (package,artifact,RuntimeScope::SystemResident),
     },
 {
     let selected = view_lookup::shared(instances,&package,&artifact)?;
     let installed = crate::instance_swap::installed(instances,&selected);
-    view_lookup::bind(views,principal,selected);
-    installed
+    view_lookup::attach(views,routes,sources,&principal,&selected);
+    if let Some(source) = sources.get(&selected) {
+        let routed = crate::source_lookup::capsule_for(routes,aliases,instances,views,(*source,principal));
+        assert(routed == installed);
+        routed
+    } else {
+        installed
+    }
 }
 
 // A system owner's departure may affect many packages in a peer's view. The

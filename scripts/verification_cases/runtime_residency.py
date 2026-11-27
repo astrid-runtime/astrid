@@ -85,6 +85,15 @@ def defects():
         )
     lookup = Path("crates/astrid-capsule/src/registry/view_lookup.rs")
     for name, clause, weaker in [
+        ("can omit the matching source route", "old(routes)@.insert((sources@[*runtime],*principal),*runtime)", "final(routes)@"),
+        ("can alter routes without a source", "} else { old(routes)@ },", "} else { final(routes)@ },"),
+    ]:
+        yield (
+            f"runtime source attachment {name}", lookup,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
+    for name, clause, weaker in [
         ("can select an uninstalled handle", "Some(id) => instances@.contains_key(id) &&", "Some(id) =>"),
         ("can select a different package, artifact or scope", "id.identity().0 == (*package,*artifact,super::RuntimeScope::SystemResident),", "true,"),
         ("can miss an installed shared generation", "None => forall|id:RuntimeId<K,A,super::RuntimeScope>|", "None => false ==> forall|id:RuntimeId<K,A,super::RuntimeScope>|"),

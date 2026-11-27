@@ -109,6 +109,40 @@ pub(super) fn bind<P: Eq + Hash,K: Eq + Hash + Clone,A,S>(
     }
 }
 
+/// Publish a shared view and, when available, its principal-scoped source route.
+pub(super) fn attach<U: Copy + Eq + Hash,P: Eq + Hash + Clone,K: Eq + Hash + Clone,A: Eq + Hash + Clone,S: Eq + Hash + Clone>(
+    views: &mut HashMap<P,HashMap<K,RuntimeId<K,A,S>>>, routes: &mut HashMap<(U,P),RuntimeId<K,A,S>>,
+    sources: &HashMap<RuntimeId<K,A,S>,U>, principal: &P, runtime: &RuntimeId<K,A,S>)
+    requires hash_map_inv(old(views)), hash_map_inv(old(routes)), hash_map_inv(sources),
+        obeys_key_model::<P>(), obeys_concrete_eq::<P>(), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+        obeys_key_model::<(U,P)>(), obeys_concrete_eq::<(U,P)>(), obeys_key_model::<RuntimeId<K,A,S>>(), obeys_concrete_eq::<RuntimeId<K,A,S>>(),
+        vstd::pervasive::obeys_clone_eq::<P>(), vstd::pervasive::obeys_clone_eq::<K>(),
+        vstd::pervasive::obeys_clone_eq::<RuntimeId<K,A,S>>(),
+        old(views)@.contains_key(*principal) ==> hash_map_inv(&old(views)@[*principal]),
+    ensures hash_map_inv(final(views)), hash_map_inv(final(routes)), final(views)@.contains_key(*principal),
+        hash_map_inv(&final(views)@[*principal]),
+        final(views)@.remove(*principal) == old(views)@.remove(*principal),
+        final(views)@[*principal]@ == (if old(views)@.contains_key(*principal) { old(views)@[*principal]@ }
+            else { Map::empty() }).insert(runtime.identity().0.0,*runtime),
+        final(routes)@ == if sources@.contains_key(*runtime) {
+            old(routes)@.insert((sources@[*runtime],*principal),*runtime)
+        } else { old(routes)@ },
+{
+    proof { reveal(vstd::pervasive::obeys_clone_eq); }
+    let owner = principal.clone();
+    let generation = runtime.clone();
+    assert(vstd::pervasive::cloned(*principal,owner));
+    assert(vstd::pervasive::cloned(*runtime,generation));
+    bind(views,owner,generation);
+    if let Some(source) = sources.get(runtime) {
+        let viewer = principal.clone();
+        let mapped = runtime.clone();
+        assert(vstd::pervasive::cloned(*principal,viewer));
+        assert(vstd::pervasive::cloned(*runtime,mapped));
+        routes.insert((*source,viewer),mapped);
+    }
+}
+
 pub(super) open spec fn slot<P,K,V>(views: Map<P,HashMap<K,V>>, principal: P, capsule: K) -> Option<V> {
     if views.contains_key(principal) && views[principal]@.contains_key(capsule) {
         Some(views[principal]@[capsule])

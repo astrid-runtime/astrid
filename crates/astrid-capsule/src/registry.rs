@@ -443,11 +443,13 @@ impl CapsuleRegistry {
                 entry.capsule.id()
             )));
         }
-        view_lookup::bind(&mut self.views, principal.clone(), runtime_id.clone());
-        if let Some(source_uuid) = self.source_uuid_by_runtime.get(runtime_id).copied() {
-            self.uuid_map
-                .insert((source_uuid, principal.clone()), runtime_id.clone());
-        }
+        view_lookup::attach(
+            &mut self.views,
+            &mut self.uuid_map,
+            &self.source_uuid_by_runtime,
+            principal,
+            runtime_id,
+        );
         info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation(), "Registered explicit system capsule view");
         Ok(())
     }
