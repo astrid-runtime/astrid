@@ -523,3 +523,19 @@ def checkpoint_range_consumers():
             f"checkpoint range loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_leaf_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_leaf.rs")
+    consumer = Path("verification/hosted_checkpoint_leaf.rs")
+    for label, clause, weaker in [
+        ("completed prefix", "Ok(s) => visited(rows@,rows@.len(),start@,end@,initial,s,callback)", "Ok(_) => true"),
+        ("earlier deliveries", "visited(rows@,i as nat,start@,end@,initial,s,callback) &&", "true &&"),
+        ("rejected range", "encoding::range_contains(start@,end@,rows@[i].key@) &&", "true &&"),
+        ("original failure", "#[trigger] callback.ensures((s,rows@[i]),Err(e)),",
+         "(#[trigger] callback.requires((s,rows@[i])) || callback.ensures((s,rows@[i]),Err(e))),"),
+    ]:
+        yield (
+            f"checkpoint leaf loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )

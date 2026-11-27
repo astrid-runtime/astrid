@@ -867,6 +867,7 @@ def consumer_defects():
     yield from storage.key_projection_consumers()
     yield from storage.overlay_range_consumers()
     yield from storage.checkpoint_range_consumers()
+    yield from storage.checkpoint_leaf_consumers()
     yield (
         "WAL replay contract loses idempotent publication",
         Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),

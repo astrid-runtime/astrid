@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::InMemoryEngine;
+use crate::error::StorageError;
 use crate::kv::tree_tests::{Resolver, TestIdentity};
 use crate::{KvStore, TreeKvStore};
 
@@ -129,6 +130,16 @@ async fn prefix_visitor_releases_decoded_checkpoint_pages_and_preserves_ordered_
                 context.nodes.is_empty(),
                 "key-only scan retained decoded checkpoint bodies"
             );
+            let physical = |index| crate::kv::composite_key(namespace, &format!("link/{index:04}"));
+            let mut attempted = Vec::new();
+            let refused = physical(103);
+            let result = context.visit_slots_in_range(header.tree, &physical(98), &physical(107), |_, entry| {
+                let stop = entry.key == refused;
+                attempted.push(entry.key);
+                if stop { Err(StorageError::Serialization("refused slot".into())) } else { Ok(()) }
+            });
+            assert!(matches!(result, Err(StorageError::Serialization(message)) if message == "refused slot"));
+            assert_eq!(attempted, (98..=103).map(physical).collect::<Vec<_>>());
             Ok(rows)
         })
         .unwrap();

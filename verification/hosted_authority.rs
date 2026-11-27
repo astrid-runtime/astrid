@@ -283,6 +283,9 @@ mod hosted_key_projection;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_range.rs"]
 mod checkpoint_range;
 mod hosted_checkpoint_range;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_leaf.rs"]
+mod checkpoint_leaf;
+mod hosted_checkpoint_leaf;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/traversal.rs"]
 mod traversal;

@@ -29,6 +29,7 @@ use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 use super::encoding;
 
 mod adapter;
+mod checkpoint_leaf;
 mod checkpoint_range;
 mod context;
 mod delta;

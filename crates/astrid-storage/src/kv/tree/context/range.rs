@@ -8,6 +8,7 @@ use super::{
 };
 
 use crate::kv::tree::{
+    checkpoint_leaf,
     checkpoint_range::{self, Page},
     key_projection,
 };
@@ -44,11 +45,16 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             }
             match handle.node {
                 Node::Leaf(leaf) => {
-                    for entry in leaf.entries {
-                        if crate::kv::encoding::entry_in_range(&entry.key, start, end) {
-                            visit(self, entry)?;
-                        }
-                    }
+                    checkpoint_leaf::visit(
+                        leaf.entries,
+                        start,
+                        end,
+                        &mut visit,
+                        |visitor, entry| {
+                            visitor(self, entry)?;
+                            Ok(visitor)
+                        },
+                    )?;
                 },
                 Node::Branch(branch) => {
                     checkpoint_range::schedule(branch.children, &mut stack, start, end);

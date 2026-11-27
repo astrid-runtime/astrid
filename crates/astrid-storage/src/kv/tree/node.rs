@@ -62,11 +62,7 @@ impl ValueSlot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LeafEntry {
-    pub(super) key: Vec<u8>,
-    pub(super) value: ValueSlot,
-}
+pub(super) type LeafEntry = super::checkpoint_leaf::Entry<ValueSlot>;
 
 impl LeafEntry {
     pub(super) fn totals(&self) -> StorageResult<NodeTotals> {
