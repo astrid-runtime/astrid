@@ -220,9 +220,9 @@ impl Kernel {
                     },
                 }
             };
-            let replacement = registry
-                .get_for(principal, id)
-                .expect("replacement generation was atomically published");
+            let replacement = replaced
+                .installed(&registry)
+                .expect("the write guard still holds the newly installed generation");
 
             // Close the old generation before publishing the candidate's
             // already-ready routes. Dispatcher lookups already resolve the new

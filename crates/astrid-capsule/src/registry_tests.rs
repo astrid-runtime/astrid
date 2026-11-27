@@ -261,12 +261,17 @@ fn principal_generation_replacement_is_atomic_and_stale_safe() {
         )
         .unwrap();
 
+    let current = replaced.installed(&registry).unwrap();
     assert!(replaced.runtime_id.generation() > old.generation());
     assert_eq!(
         registry.runtime_id_for(&alice, &id),
-        Some(replaced.runtime_id)
+        Some(replaced.runtime_id.clone())
     );
     assert!(Arc::ptr_eq(&replaced.previous, &old_arc));
+    assert!(Arc::ptr_eq(
+        &current,
+        &registry.get_for(&alice, &id).unwrap()
+    ));
     assert!(!Arc::ptr_eq(
         &old_arc,
         &registry.get_for(&alice, &id).unwrap()
@@ -277,6 +282,17 @@ fn principal_generation_replacement_is_atomic_and_stale_safe() {
             .is_none(),
         "a source id for old bytes must not resolve the replacement"
     );
+    let successor = registry
+        .replace_principal_runtime(
+            &replaced.runtime_id,
+            Box::new(MockCapsule::new("replaceable")),
+            test_hash("next"),
+            &alice,
+            uid(1),
+        )
+        .expect("replace the installed generation");
+    assert!(replaced.installed(&registry).is_none());
+    assert!(Arc::ptr_eq(&successor.previous, &current));
 }
 
 #[test]
@@ -294,6 +310,7 @@ fn system_generation_replacement_swaps_every_view() {
         )
         .unwrap();
     registry.register_existing(&id, &old_hash, &bob).unwrap();
+    let previous = registry.get_for(&bob, &id).unwrap();
 
     let replaced = registry
         .replace_system_runtime(
@@ -303,6 +320,7 @@ fn system_generation_replacement_swaps_every_view() {
         )
         .unwrap();
 
+    let current = replaced.installed(&registry).unwrap();
     assert_eq!(
         registry.runtime_id_for(&alice, &id),
         Some(replaced.runtime_id.clone())
@@ -311,10 +329,12 @@ fn system_generation_replacement_swaps_every_view() {
         registry.runtime_id_for(&bob, &id),
         Some(replaced.runtime_id)
     );
+    assert!(Arc::ptr_eq(&replaced.previous, &previous));
     assert!(Arc::ptr_eq(
-        &registry.get_for(&alice, &id).unwrap(),
-        &registry.get_for(&bob, &id).unwrap()
+        &current,
+        &registry.get_for(&alice, &id).unwrap()
     ));
+    assert!(Arc::ptr_eq(&current, &registry.get_for(&bob, &id).unwrap()));
 }
 
 struct MockCapsule {

@@ -5,6 +5,19 @@ from .common import GENERATION, replace_once
 
 
 def defects():
+    swap = Path("crates/astrid-capsule/src/registry/instance_swap.rs")
+    for name, original, weaker in [
+        ("can rewrite an unrelated view", "ensures *final(slot) == if *old(slot) == *expected { *reserved } else { *old(slot) }", "ensures *old(slot) == *expected ==> *final(slot) == *reserved"),
+        ("loses retired handle", "out == Some(before[*expected].capsule)", "out.is_some()"),
+        ("loses installed handle", "ensures out == if instances@.contains_key", "ensures false ==> out == if instances@.contains_key"),
+        ("loses installed entry", "final(instances)@ == before.remove(*expected).insert(reserved, Entry { capsule, owner_alias })", "true"),
+        ("permits stale retry to change another entry", "out.is_none() && final(instances)@ == before", "out.is_none()"),
+    ]:
+        yield (
+            f"registry replacement {name}", swap,
+            lambda s, a=original, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_runtime_residency.rs"),
+        )
     residency = Path("crates/astrid-kernel/src/runtime_residency.rs")
     for name, original, changed in [
         ("loses unapproved provider refusal", "ensures out == if uplinks.provides", "ensures allowed ==> out == if uplinks.provides"),

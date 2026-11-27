@@ -55,13 +55,8 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
         .collect()
 }
 
-/// A single authority-scoped executable runtime.
-struct InstanceEntry {
-    capsule: Arc<dyn Capsule>,
-    /// Current alias for diagnostics and view lookup. Authority is keyed by the
-    /// immutable UID in [`RuntimeId`], never by this reusable name.
-    owner_alias: Option<PrincipalId>,
-}
+mod instance_swap;
+type InstanceEntry = instance_swap::Entry<dyn Capsule, PrincipalId>;
 
 /// Outcome of removing one principal's runtime view.
 #[non_exhaustive]
@@ -83,6 +78,14 @@ pub struct ReplacedRuntime {
     pub runtime_id: RuntimeId,
     /// The generation removed from every affected view.
     pub previous: Arc<dyn Capsule>,
+}
+
+impl ReplacedRuntime {
+    /// Resolve this receipt under the registry guard. A removed generation has no handle.
+    #[must_use]
+    pub fn installed(&self, registry: &CapsuleRegistry) -> Option<Arc<dyn Capsule>> {
+        instance_swap::installed(&registry.instances, &self.runtime_id)
+    }
 }
 
 /// Publication failure that preserves ownership of the activated candidate so

@@ -70,3 +70,40 @@ fn allocate_pair<I,A,S>(next: &mut u64, first: (I,A,S), second: (I,A,S))
     (a,b)
 }
 }
+
+verus! {
+// After switching between distinct generations, retrying the removed one
+// cannot replace the installed instance or any unrelated registry entry.
+fn swap_and_retry(instances: &mut std::collections::HashMap<u64, crate::instance_swap::Entry<u64,u64>>,
+    old_id: u64, new_id: u64, candidate: std::sync::Arc<u64>, owner: Option<u64>)
+    requires vstd::std_specs::hash::hash_map_inv(old(instances)),
+        old(instances)@.contains_key(old_id), !old(instances)@.contains_key(new_id),
+    ensures final(instances)@ == old(instances)@.remove(old_id).insert(new_id,
+        crate::instance_swap::Entry { capsule: candidate, owner_alias: owner }),
+{
+    let ghost before = instances@;
+    let replaced = crate::instance_swap::replace(instances, &old_id, new_id, candidate.clone(), owner);
+    assert(replaced == Some(before[old_id].capsule));
+    let installed = crate::instance_swap::installed(instances, &new_id);
+    assert(installed == Some(candidate));
+    let removed = crate::instance_swap::installed(instances, &old_id);
+    assert(removed.is_none());
+    assert(!instances@.contains_key(old_id));
+    let retry = crate::instance_swap::replace(instances, &old_id, new_id, candidate, owner);
+    assert(retry.is_none());
+}
+}
+
+verus! {
+fn replace_view_pair(old_key: u64, new_key: u64, unrelated: u64)
+    -> (out: (u64, u64))
+    requires old_key != unrelated,
+    ensures out == (new_key, unrelated),
+{
+    let mut attached = old_key;
+    let mut other = unrelated;
+    crate::instance_swap::retarget(&mut attached, &old_key, &new_key);
+    crate::instance_swap::retarget(&mut other, &old_key, &new_key);
+    (attached, other)
+}
+}

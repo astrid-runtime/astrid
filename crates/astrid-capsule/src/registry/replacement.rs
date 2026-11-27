@@ -3,9 +3,8 @@ use std::sync::Arc;
 use astrid_core::{PrincipalId, PrincipalUid};
 
 use super::{
-    Capsule, CapsuleError, CapsuleId, CapsuleRegistry, CapsuleResult, InstanceEntry,
-    ReplacedRuntime, RuntimeId, RuntimeScope, WasmHash, capsule_source_uuid,
-    system_uplink_descriptors,
+    Capsule, CapsuleError, CapsuleId, CapsuleRegistry, CapsuleResult, ReplacedRuntime, RuntimeId,
+    RuntimeScope, WasmHash, capsule_source_uuid, system_uplink_descriptors,
 };
 
 impl CapsuleRegistry {
@@ -69,16 +68,7 @@ impl CapsuleRegistry {
                 "runtime generation changed before replacing '{id}' for '{principal}'"
             )));
         }
-        let previous = self.swap_runtime(
-            expected,
-            runtime_id.clone(),
-            replacement,
-            Some(principal.clone()),
-        )?;
-        Ok(ReplacedRuntime {
-            runtime_id,
-            previous,
-        })
+        self.swap_runtime(expected, runtime_id, replacement, Some(principal.clone()))
     }
 
     /// Atomically replace an explicit system singleton and all of its views.
@@ -133,15 +123,12 @@ impl CapsuleRegistry {
             .instances
             .get(expected)
             .and_then(|entry| entry.owner_alias.clone());
-        let previous = self.swap_runtime(expected, runtime_id.clone(), replacement, owner_alias)?;
+        let replaced = self.swap_runtime(expected, runtime_id, replacement, owner_alias)?;
         self.unregister_capsule_uplinks(&id);
         for descriptor in descriptors {
             self.uplinks.insert(descriptor.id, (id.clone(), descriptor));
         }
-        Ok(ReplacedRuntime {
-            runtime_id,
-            previous,
-        })
+        Ok(replaced)
     }
 
     /// Preflight a prepared system replacement without consuming it.
@@ -210,25 +197,19 @@ impl CapsuleRegistry {
         runtime_id: RuntimeId,
         replacement: Box<dyn Capsule>,
         owner_alias: Option<PrincipalId>,
-    ) -> CapsuleResult<Arc<dyn Capsule>> {
+    ) -> CapsuleResult<ReplacedRuntime> {
         let previous_artifact = expected.key().artifact().clone();
-        let previous = self
-            .instances
-            .remove(expected)
-            .ok_or_else(|| CapsuleError::NotFound(format!("runtime {expected:?}")))?
-            .capsule;
-        self.instances.insert(
+        let previous = super::instance_swap::replace(
+            &mut self.instances,
+            expected,
             runtime_id.clone(),
-            InstanceEntry {
-                capsule: Arc::from(replacement),
-                owner_alias,
-            },
-        );
+            Arc::from(replacement),
+            owner_alias,
+        )
+        .ok_or_else(|| CapsuleError::NotFound(format!("runtime {expected:?}")))?;
         for view in self.views.values_mut() {
             for mapped in view.values_mut() {
-                if mapped == expected {
-                    *mapped = runtime_id.clone();
-                }
+                super::instance_swap::retarget(mapped, expected, &runtime_id);
             }
         }
         self.uuid_map
@@ -258,6 +239,9 @@ impl CapsuleRegistry {
         self.uuid_id_map
             .insert(source_uuid, runtime_id.key().capsule_id().clone());
         self.remove_legacy_uuid_mappings_if_unused(&previous_artifact);
-        Ok(previous)
+        Ok(ReplacedRuntime {
+            runtime_id,
+            previous,
+        })
     }
 }

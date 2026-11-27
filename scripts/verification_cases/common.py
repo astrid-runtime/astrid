@@ -139,6 +139,7 @@ INPUTS = [
     INGRESS_FRAME,
     PRINCIPAL_SYNTAX,
     ROUTE_SCOPE,
+    Path("crates/astrid-capsule/src/registry/instance_swap.rs"),
     Path("crates/astrid-capsule/src/registry/runtime_scope.rs"),
     ROUTE_GATE,
     VIEW_OWNER,
