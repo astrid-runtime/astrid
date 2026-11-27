@@ -472,7 +472,7 @@ mod astrid_streams_impl {
             result
         }
 
-        fn blocking_splice(
+        async fn blocking_splice(
             &mut self,
             self_: Resource<OutputStream>,
             src: Resource<InputStream>,
@@ -482,12 +482,21 @@ mod astrid_streams_impl {
             let started = Instant::now();
             let dst = Resource::new_borrow(self_.rep());
             let src_borrow = Resource::new_borrow(src.rep());
-            let result = wasi_streams::HostOutputStream::blocking_splice(
-                &mut self.resource_table,
-                dst,
-                src_borrow,
-                len,
-            );
+            let cancel = self.effective_cancel_token();
+            let transfer =
+                wasmtime_wasi::p2::bindings::io::streams::HostOutputStream::blocking_splice(
+                    &mut self.resource_table,
+                    dst,
+                    src_borrow,
+                    len,
+                );
+            let result = super::super::util::bounded_await_cancellable(
+                &self.io_semaphore,
+                &cancel,
+                transfer,
+            )
+            .await
+            .unwrap_or(Err(RtStreamError::Closed));
             let bytes = result.as_ref().copied().unwrap_or(0);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             audit_io(
@@ -508,3 +517,6 @@ mod astrid_streams_impl {
         }
     }
 }
+
+#[cfg(test)]
+mod blocking_splice_tests;
