@@ -780,10 +780,8 @@ where
                 self.identify(record)
             })?;
         let kv_checkpoint_publication = admission.take_checkpoint(&mut kv_checkpoint_publication);
-        let actual = pending_roots
-            .get(&principal)
-            .copied()
-            .or_else(|| inner.roots_by_principal.get(&principal).copied());
+        let actual =
+            super::root_transition::current(pending_roots, &inner.roots_by_principal, &principal);
         let generation =
             match super::root_transition::advance(actual.map(Into::into), expected.map(Into::into))
             {

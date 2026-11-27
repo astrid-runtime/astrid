@@ -1,7 +1,8 @@
 """Mutations that must fail in a downstream proof consumer."""
 
 from pathlib import Path
-from . import persistent_process, runtime_residency, workspace_commit
+
+from . import persistent_process, runtime_residency, storage, workspace_commit
 from .common import (
     LEASE_CALLBACK,
     replace_once,
@@ -863,6 +864,7 @@ def consumer_defects():
         lambda source: replace_once(source, "ensures sink.ensures((&guard, store, effect), result)", "ensures true"),
         Path("verification/hosted_kv_model.rs"),
     )
+    yield from storage.group_root_consumer_defects()
     yield (
         "WAL replay contract loses idempotent publication",
         Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),

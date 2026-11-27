@@ -1,5 +1,12 @@
 //! Compare durable roots by their generation and the full commit identity.
+use std::collections::BTreeMap;
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
+    pervasive::obeys_clone_eq,
+    std_specs::btree::btree_map_inv,
+};
 
 verus! {
 
@@ -51,6 +58,16 @@ pub(super) fn advance(actual: Option<Version>, expected: Option<Version>) -> (de
             None => Advance::Overflow,
         },
     }
+}
+
+/// Group preparation observes the latest accepted entry for this owner.
+pub(super) fn current<P:Ord,R:Copy>(pending:&BTreeMap<P,R>, published:&BTreeMap<P,R>, owner:&P)
+    -> (root:Option<R>)
+    requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), btree_map_inv(pending), btree_map_inv(published),
+    ensures root == if pending@.contains_key(*owner) { Some(pending@[*owner]) }
+        else if published@.contains_key(*owner) { Some(published@[*owner]) } else { None },
+{
+    if let Some(root) = pending.get(owner) { Some(*root) } else { published.get(owner).copied() }
 }
 
 /// A WAL descriptor must name the successor permitted at preparation.
@@ -111,8 +128,20 @@ impl<P,R: Copy> PreparedRoot<P,R> {
     }
 
     pub(super) fn owner(&self) -> (p: &P) ensures *p == self.binding().0 { &self.owner }
-    pub(super) fn replacement(&self) -> (r: R) ensures r == self.binding().2 { self.replacement }
     pub(super) fn journal(&self) -> (j: &Vec<u8>) ensures *j == self.binding().3 { &self.journal }
+
+    /// Make this accepted replacement visible to subsequent preparations in the batch.
+    pub(super) fn stage(&self, pending:&mut BTreeMap<P,R>) where P:Ord+Clone,
+        requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), obeys_clone_eq::<P>(), btree_map_inv(old(pending)),
+        ensures btree_map_inv(final(pending)),
+            final(pending)@ == old(pending)@.insert(self.binding().0,self.binding().2),
+    {
+        proof { reveal(obeys_clone_eq); }
+        let owner = P::clone(&self.owner);
+        assert(vstd::pervasive::cloned(self.owner,owner));
+        assert(owner == self.owner);
+        pending.insert(owner,self.replacement);
+    }
 
     /// Stage or append this owner's prepared transition in the WAL.
     pub(super) fn write_wal<T,F>(&self, write: F) -> (result: T)

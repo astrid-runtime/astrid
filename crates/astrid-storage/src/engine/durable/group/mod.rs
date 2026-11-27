@@ -450,8 +450,7 @@ where
                         completions.push((request.receipt, Err(error)));
                         continue;
                     }
-                    pending_roots
-                        .insert(prepared.root.owner().clone(), prepared.root.replacement());
+                    prepared.root.stage(&mut pending_roots);
                     accepted.push(AcceptedCommit {
                         prepared,
                         receipt: request.receipt,

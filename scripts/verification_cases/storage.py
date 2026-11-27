@@ -450,3 +450,20 @@ def defects():
             lambda text: replace_once(text, "same_bytes(admitted, requested) && ", ""),
         ),
     ]
+
+
+def group_root_consumer_defects():
+    for name, old, new in [
+        ("staging can overwrite another owner", "final(pending)@ == old(pending)@.insert(self.binding().0,self.binding().2)", "final(pending)@.contains_key(self.binding().0)"),
+        (
+            "lookup can return an unrelated version",
+            "ensures root == if pending@.contains_key(*owner) { Some(pending@[*owner]) }\n"
+            "        else if published@.contains_key(*owner) { Some(published@[*owner]) } else { None },",
+            "ensures root.is_some() == (pending@.contains_key(*owner) || published@.contains_key(*owner)),",
+        ),
+    ]:
+        yield (
+            f"group root {name}", Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source, a=old, b=new: replace_once(source, a, b),
+            Path("verification/hosted_wal_writer_trace.rs"),
+        )
