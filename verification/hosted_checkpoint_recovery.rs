@@ -38,6 +38,8 @@ struct Candidate<'a> {
 }
 
 impl admission::Arena for Candidate<'_> {
+    closed spec fn gaps(&self,_map:Map<ObjectId,ArenaLocation>) -> vstd::iset::ISet<(int,int)> {vstd::iset::ISet::empty()}
+    fn gap(&mut self,_map:&std::collections::BTreeMap<ObjectId,ArenaLocation>,at:u64,end:u64) -> bool {at == end}
     closed spec fn entries(&self) -> vstd::iset::ISet<(ObjectId,ArenaLocation)> {
         vstd::iset::ISet::new(|p:(ObjectId,ArenaLocation)| reader::matches(self.media.image(),self.magic,self.version,p.1,self.scheme,p.0,self.limit))
     }
@@ -97,11 +99,17 @@ proof fn physical_prefix(bytes:Seq<u8>, rows:Seq<(ObjectId,ArenaLocation)>,
     ensures n <= rows.len(), forall|i:int| 0 <= i < n ==> #[trigger] walk[i] == rows[i],
     decreases n,
 {
+    assert forall|k:int| 0 <= k < rows.len() implies (#[trigger] rows[k]).1.offset == admission::frontier(rows,k) by {
+        assert(admission::bridges(vstd::iset::ISet::empty(),admission::frontier(rows,k),rows[k].1.offset as int));
+    }
+    assert(admission::frontier(rows,rows.len() as int) == bytes.len());
     if n > 0 {
         let i = n-1;
         physical_prefix(bytes,rows,walk,i,magic,version,scheme,limit);
         if i > 0 {assert(walk[i-1] == rows[i-1]);}
         assert(admission::frontier(rows,i) == admission::frontier(walk,i));
+        if i == rows.len() {assert(admission::frontier(rows,i) == bytes.len());}
+        if i < rows.len() {assert(rows[i].1.offset == admission::frontier(rows,i));}
         let (id,loc) = walk[i];
         assert(reader::matches(bytes,magic,version,loc,scheme,id,limit));
         assert(i < rows.len());

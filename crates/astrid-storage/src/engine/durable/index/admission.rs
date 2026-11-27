@@ -25,8 +25,8 @@ impl IndexState {
         requires candidate matches Some(s) ==> btree_map_inv(&s.objects),
             obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
         ensures out matches Some(s) ==> complete && candidate == Some(s) &&
-                consistent(s.objects@,s.arena_tail,s.arena_len,measured,old(arena).entries(),old(arena).tails()) && can_cover(s.objects@,measured),
-            complete && old(arena).reliable() && (candidate matches Some(s) && can_cover(s.objects@,measured) &&
+                consistent(s.objects@,s.arena_tail,s.arena_len,measured,old(arena).entries(),old(arena).tails()) && covered_with(s.objects@,measured,old(arena).gaps(s.objects@)),
+            complete && old(arena).reliable() && (candidate matches Some(s) && covered_with(s.objects@,measured,old(arena).gaps(s.objects@)) &&
                 consistent(s.objects@,s.arena_tail,s.arena_len,measured,old(arena).entries(),old(arena).tails())) ==> out.is_some(),
     {
         if !complete {return None;}
@@ -36,12 +36,19 @@ impl IndexState {
 }
 
 pub(super) trait Arena {
+    spec fn gaps(&self,map:Map<ObjectId,ArenaLocation>) -> vstd::iset::ISet<(int,int)>;
+    fn gap(&mut self,map:&BTreeMap<ObjectId,ArenaLocation>,at:u64,end:u64) -> (ok:bool)
+        requires btree_map_inv(map),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        ensures final(self).entries() == old(self).entries(),final(self).tails() == old(self).tails(),
+            final(self).reliable() == old(self).reliable(),final(self).gaps(map@) == old(self).gaps(map@),
+            ok ==> bridges(old(self).gaps(map@),at as int,end as int),
+            old(self).reliable() && bridges(old(self).gaps(map@),at as int,end as int) ==> ok;
     spec fn entries(&self) -> vstd::iset::ISet<(ObjectId,ArenaLocation)>;
     spec fn tails(&self) -> Set<ArenaLocation>;
     spec fn reliable(&self) -> bool;
     fn entry(&mut self, id:ObjectId, loc:ArenaLocation) -> (ok:bool)
         ensures final(self).entries() == old(self).entries(), final(self).tails() == old(self).tails(),
-            final(self).reliable() == old(self).reliable(), ok ==> old(self).entries().contains((id,loc)),
+            (forall|m| #[trigger] final(self).gaps(m) == old(self).gaps(m)), final(self).reliable() == old(self).reliable(), ok ==> old(self).entries().contains((id,loc)),
             old(self).reliable() && old(self).entries().contains((id,loc)) ==> ok;
     fn tail(&mut self, loc:ArenaLocation) -> (ok:bool)
         ensures ok ==> old(self).tails().contains(loc),
@@ -117,25 +124,37 @@ pub(super) open spec fn frontier(rows:Rows,i:int) -> int {
     if i == 0 {0} else {let loc = rows[i-1].1; loc.offset as int + WIDTH + loc.payload_len}
 }
 
+pub(super) open spec fn bridges(gaps:vstd::iset::ISet<(int,int)>,start:int,end:int) -> bool {
+    start == end || (0 <= start < end <= u64::MAX && gaps.contains((start,end)))
+}
+
+pub(super) open spec fn spanned(rows:Rows, measured:u64,gaps:vstd::iset::ISet<(int,int)>) -> bool {
+    &&& bridges(gaps,frontier(rows,rows.len() as int),measured as int)
+    &&& forall|i:int| 0 <= i < rows.len() ==> bridges(gaps,frontier(rows,i),(#[trigger] rows[i]).1.offset as int)
+}
+
 pub(super) open spec fn partition(rows:Rows, measured:u64) -> bool {
-    &&& frontier(rows,rows.len() as int) == measured
-    &&& forall|i:int| 0 <= i < rows.len() ==> (#[trigger] rows[i]).1.offset == frontier(rows,i)
+    spanned(rows,measured,vstd::iset::ISet::empty())
+}
+
+pub(super) open spec fn covered_with(map:Map<ObjectId,ArenaLocation>,measured:u64,gaps:vstd::iset::ISet<(int,int)>) -> bool {
+    exists|rows:Rows| #[trigger] ordered(rows,map) && spanned(rows,measured,gaps)
 }
 
 pub(super) open spec fn can_cover(map:Map<ObjectId,ArenaLocation>,measured:u64) -> bool {
-    exists|rows:Rows| #[trigger] ordered(rows,map) && partition(rows,measured)
+    covered_with(map,measured,vstd::iset::ISet::empty())
 }
 
 /// A contiguous physical ordering is unique, even if the sorting contract
 /// permits arbitrary ordering among equal keys on malformed input.
-proof fn unique_partition(map:Map<ObjectId,ArenaLocation>, actual:Rows, measured:u64)
-    requires ordered(actual,map), can_cover(map,measured),
-    ensures partition(actual,measured),
+proof fn unique_partition(map:Map<ObjectId,ArenaLocation>, actual:Rows, measured:u64,gaps:vstd::iset::ISet<(int,int)>)
+    requires ordered(actual,map), covered_with(map,measured,gaps),
+    ensures spanned(actual,measured,gaps),
 {
-    let witness = choose|w:Rows| #[trigger] ordered(w,map) && partition(w,measured);
+    let witness = choose|w:Rows| #[trigger] ordered(w,map) && spanned(w,measured,gaps);
     assert forall|i:int,j:int| 0 <= i < j < witness.len() implies
         (#[trigger] witness[i]).1.offset < (#[trigger] witness[j]).1.offset by {
-        assert(witness[i+1].1.offset == frontier(witness,i+1));
+        assert(witness[i+1].1.offset >= frontier(witness,i+1));
         if i+1 < j {assert(witness[i+1].1.offset <= witness[j].1.offset);}
     }
     assert(witness.no_duplicates());
@@ -180,22 +199,24 @@ pub(super) open spec fn consistent(map:Map<ObjectId,ArenaLocation>, tail:Option<
     &&& match tail {Some(loc) => tails.contains(loc),None => covered == 0}
 }
 
+#[verifier::rlimit(12)]
 pub(super) fn accept<A:Arena>(map:&BTreeMap<ObjectId,ArenaLocation>, tail:Option<ArenaLocation>,
     covered:u64, measured:u64, arena:&mut A) -> (ok:bool)
     requires btree_map_inv(map),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
     ensures
-        ok ==> can_cover(map@,measured) && consistent(map@,tail,covered,measured,old(arena).entries(),old(arena).tails()),
-        old(arena).reliable() && can_cover(map@,measured) && consistent(map@,tail,covered,measured,old(arena).entries(),old(arena).tails()) ==> ok,
+        ok ==> covered_with(map@,measured,old(arena).gaps(map@)) && consistent(map@,tail,covered,measured,old(arena).entries(),old(arena).tails()),
+        old(arena).reliable() && covered_with(map@,measured,old(arena).gaps(map@)) && consistent(map@,tail,covered,measured,old(arena).entries(),old(arena).tails()) ==> ok,
 {
     if covered != measured {return false;}
     let rows = physical_order(map);
-    proof {if can_cover(map@,measured) {unique_partition(map@,rows@,measured);}}
+    proof {if covered_with(map@,measured,old(arena).gaps(map@)) {unique_partition(map@,rows@,measured,old(arena).gaps(map@));}}
     let mut i = 0usize;
     let mut end = 0u64;
     while i < rows.len()
-        invariant end == frontier(rows@,i as int), ordered(rows@,map@),
-            can_cover(map@,measured) ==> partition(rows@,measured),
-            forall|j:int| 0 <= j < i ==> (#[trigger] rows@[j]).1.offset == frontier(rows@,j),
+        invariant btree_map_inv(map),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+            arena.gaps(map@) == old(arena).gaps(map@), end == frontier(rows@,i as int), ordered(rows@,map@),
+            covered_with(map@,measured,old(arena).gaps(map@)) ==> spanned(rows@,measured,old(arena).gaps(map@)),
+            forall|j:int| 0 <= j < i ==> bridges(old(arena).gaps(map@),frontier(rows@,j),(#[trigger] rows@[j]).1.offset as int),
             i <= rows.len(), rows@.to_set() == map@.kv_pairs(),
             arena.entries() == old(arena).entries(), arena.tails() == old(arena).tails(), arena.reliable() == old(arena).reliable(),
             forall|j:int| 0 <= j < i ==> arena.entries().contains(#[trigger] rows@[j]),
@@ -203,10 +224,16 @@ pub(super) fn accept<A:Arena>(map:&BTreeMap<ObjectId,ArenaLocation>, tail:Option
     {
         let (id,loc) = rows[i];
         assert(rows@.to_set().contains((id,loc)));
-        if loc.offset != end {return false;}
+        let ghost gaps = arena.gaps(map@);
+        if loc.offset != end && !arena.gap(map,end,loc.offset) {
+            proof {if arena.reliable() {assert(!bridges(gaps,frontier(rows@,i as int),rows@[i as int].1.offset as int));
+            assert(!spanned(rows@,measured,gaps));}}
+            return false;
+        }
+        assert(bridges(gaps,frontier(rows@,i as int),rows@[i as int].1.offset as int));
         let Some(next) = loc.end() else {
             assert(frontier(rows@,i as int+1) > u64::MAX);
-            assert(!partition(rows@,measured)) by {if i+1 < rows.len() {assert(rows@[i as int+1].1.offset <= u64::MAX);}}
+            assert(!spanned(rows@,measured,old(arena).gaps(map@))) by {if i+1 < rows.len() {assert(rows@[i as int+1].1.offset <= u64::MAX);}}
             return false;
         };
         end = next;
@@ -218,8 +245,15 @@ pub(super) fn accept<A:Arena>(map:&BTreeMap<ObjectId,ArenaLocation>, tail:Option
             let j = choose|j:int| 0 <= j < rows.len() && rows@[j] == p;
         }
     }
-    if end != measured {return false;}
-    assert(partition(rows@,measured));
+    if end != measured && !arena.gap(map,end,measured) {
+        proof {if arena.reliable() {
+            assert(!bridges(arena.gaps(map@),frontier(rows@,rows.len() as int),measured as int));
+            assert(!spanned(rows@,measured,arena.gaps(map@)));
+        }}
+        return false;
+    }
+    assert(spanned(rows@,measured,old(arena).gaps(map@)));
+    assert(covered_with(map@,measured,old(arena).gaps(map@)));
     match tail {Some(loc) => arena.tail(loc),None => covered == 0}
 }
 

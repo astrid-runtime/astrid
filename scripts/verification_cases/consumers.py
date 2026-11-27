@@ -24,6 +24,22 @@ def consumer_defects():
             f"approval reply {name}", reply,
             lambda s, a=original, b=changed: replace_once(s, a, b), target,
         )
+    copies = Path("crates/astrid-storage/src/engine/durable/format/duplicates.rs")
+    copies_trace = Path("verification/hosted_duplicate_recovery.rs")
+    for name, original, changed, target in [
+        ("accepts different bytes", "if original.as_slice() != copy.as_slice()", "if false", copies),
+        ("reads beyond the gap", "arena.bounded(cursor,end)", "arena.bounded(cursor,u64::MAX)", copies),
+        ("reads original at the duplicate offset", "arena.bounded(first.offset,cursor)", "arena.bounded(cursor,end)", copies),
+        ("ignores indexed payload length", " || first.payload_len != length", "", copies),
+        ("advances by the payload only", "cursor.checked_add(52)", "cursor.checked_add(0)", copies),
+        ("rejects complete duplicate runs", "    true\n}", "    false\n}", copies),
+        ("forgets successful coverage", "ok ==> tiled(old(arena).frames(),map@,scheme,start,end)", "ok ==> true", copies_trace),
+        ("forgets reliable admission", "old(arena).dependable() && tiled(old(arena).frames(),map@,scheme,start,end) ==> ok", "false ==> ok", copies_trace),
+    ]:
+        yield (
+            f"arena duplicate {name}", copies,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     walk_source = Path("crates/astrid-storage/src/engine/durable/closure_walk.rs")
     yield (
         "closure diagnostic loses the cycle through its reported object", walk_source,
@@ -147,10 +163,10 @@ def consumer_defects():
         ("accepts stale coverage", admission, "if covered != measured {return false;}", "if covered < measured {return false;}", admission),
         ("skips tail verification", admission, "Some(loc) => arena.tail(loc)", "Some(loc) => true", admission),
         ("drops admission provenance", admission, "complete && candidate == Some(s) &&\n                consistent(s.objects@,s.arena_tail,s.arena_len,measured,old(arena).entries(),old(arena).tails())", "complete && candidate == Some(s)", recovery),
-        ("skips a physical gap", admission, "if loc.offset != end {return false;}", "if loc.offset < end {return false;}", admission),
-        ("drops the final frame extent", admission, "if end != measured {return false;}", "if end > measured {return false;}", admission),
+        ("skips a physical gap", admission, "if loc.offset != end && !arena.gap(map,end,loc.offset)", "if loc.offset < end && !arena.gap(map,end,loc.offset)", admission),
+        ("drops the final frame extent", admission, "if end != measured && !arena.gap(map,end,measured)", "if end > measured && !arena.gap(map,end,measured)", admission),
         ("advances past the declared frame", admission, "end = next;", "end = next.saturating_add(1);", admission),
-        ("loses the accepted physical partition", admission, " && can_cover(s.objects@,measured),", ",", recovery),
+        ("loses the accepted physical partition", admission, " && covered_with(s.objects@,measured,old(arena).gaps(s.objects@)),", ",", recovery),
         ("loses accepted cache identity", rebuild, "Some(s) => out == Ok(s),", "Some(s) => true,", recovery),
         ("loses completed replacement", rebuild, "exists|value:&T,r:Result<(),E>| *value == s && r.is_ok() && #[trigger] publish.ensures((value,),r)", "true", recovery),
     ]:

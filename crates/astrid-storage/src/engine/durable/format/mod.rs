@@ -26,6 +26,7 @@ thread_local! {
 
 mod arena_span;
 mod checkpoint_reader;
+mod duplicates;
 const _: () = assert!(arena_span::HEADER_BYTES == FRAME_HEADER_LEN_USIZE);
 
 mod framed_append;
@@ -65,6 +66,25 @@ use reader::SliceReader;
 pub(super) use scan::scan_frames_prefix;
 use scan::{FrameScanBound, read_frame_preserving_cursor_within, scan_frames_with_bound};
 pub(super) use scan::{scan_frames, scan_frames_range, scan_frames_with_protected_prefix};
+
+struct CopyReader<'a, F>(&'a mut F, RecoveryLimits);
+
+impl<F: DurableIo> duplicates::Media for CopyReader<'_, F> {
+    fn bounded(&mut self, at: u64, end: u64) -> Option<Vec<u8>> {
+        read_frame_preserving_cursor_within(self.0, ARENA_FILE, ARENA_MAGIC, at, self.1, end).ok()
+    }
+}
+
+pub(in crate::engine::durable) fn duplicate_range(
+    arena: &mut impl DurableIo,
+    map: &BTreeMap<ObjectId, ArenaLocation>,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+    at: u64,
+    end: u64,
+) -> bool {
+    duplicates::check(&mut CopyReader(arena, limits), map, scheme.into(), at, end)
+}
 
 struct CheckpointInput<'a, F>(&'a mut F);
 

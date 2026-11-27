@@ -259,6 +259,10 @@ struct CandidateArena<'a> {
 }
 
 impl admission::Arena for CandidateArena<'_> {
+    fn gap(&mut self, map: &BTreeMap<ObjectId, ArenaLocation>, at: u64, end: u64) -> bool {
+        super::format::duplicate_range(self.arena, map, self.scheme, self.limits, at, end)
+    }
+
     fn entry(&mut self, id: ObjectId, location: ArenaLocation) -> bool {
         verify_indexed_location(self.arena, id, location, self.scheme, self.limits).is_ok()
     }

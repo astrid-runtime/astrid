@@ -120,6 +120,8 @@ mod arena_index;
 mod checkpoint_key;
 #[path = "../crates/astrid-storage/src/engine/durable/format/checkpoint_reader.rs"]
 mod checkpoint_reader;
+#[path = "../crates/astrid-storage/src/engine/durable/format/duplicates.rs"]
+mod duplicates;
 #[path = "../crates/astrid-storage/src/engine/durable/index/rebuild.rs"]
 mod checkpoint_rebuild;
 #[path = "../crates/astrid-storage/src/engine/durable/index/admission.rs"]
@@ -139,6 +141,7 @@ mod hosted_record_model;
 mod hosted_arena_placement;
 mod hosted_arena_append;
 mod hosted_checkpoint_recovery;
+mod hosted_duplicate_recovery;
 mod hosted_record_roundtrip;
 mod hosted_closure_model;
 
