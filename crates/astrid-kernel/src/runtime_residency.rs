@@ -6,15 +6,21 @@ verus! {
 pub(super) enum RuntimeResidency { Principal, SystemResident }
 pub(super) enum Refusal { UnapprovedProvider, SystemMcp }
 
-pub(super) fn classify(allowed: bool, provides: bool, uplink: bool, has_servers: bool)
+#[derive(Clone, Copy)]
+pub(super) struct Uplinks {
+    pub(super) provides: bool,
+    pub(super) capability: bool,
+}
+
+pub(super) fn classify(allowed: bool, uplinks: Uplinks, has_servers: bool)
     -> (out: Result<RuntimeResidency, Refusal>)
-    ensures out == if provides && !allowed { Err(Refusal::UnapprovedProvider) }
-        else if allowed && (provides || uplink) {
+    ensures out == if uplinks.provides && !allowed { Err(Refusal::UnapprovedProvider) }
+        else if allowed && (uplinks.provides || uplinks.capability) {
             if has_servers { Err(Refusal::SystemMcp) } else { Ok(RuntimeResidency::SystemResident) }
         } else { Ok(RuntimeResidency::Principal) },
 {
-    if provides && !allowed { return Err(Refusal::UnapprovedProvider); }
-    if allowed && (provides || uplink) {
+    if uplinks.provides && !allowed { return Err(Refusal::UnapprovedProvider); }
+    if allowed && (uplinks.provides || uplinks.capability) {
         if has_servers { Err(Refusal::SystemMcp) } else { Ok(RuntimeResidency::SystemResident) }
     } else { Ok(RuntimeResidency::Principal) }
 }

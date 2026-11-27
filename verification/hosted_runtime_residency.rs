@@ -12,7 +12,8 @@ fn runtime_owner(allowed: bool, provides: bool, uplink: bool, has_servers: bool,
         } else { match observed { Ok(uid) => Ok(Some(uid)), Err(e) => Err(e) } },
 {
     use crate::runtime_residency::Refusal;
-    let residency = match classify(allowed, provides, uplink, has_servers) {
+    let uplinks = crate::runtime_residency::Uplinks { provides, capability: uplink };
+    let residency = match classify(allowed, uplinks, has_servers) {
         Ok(scope) => scope,
         Err(Refusal::UnapprovedProvider) => return Err(1),
         Err(Refusal::SystemMcp) => return Err(2),

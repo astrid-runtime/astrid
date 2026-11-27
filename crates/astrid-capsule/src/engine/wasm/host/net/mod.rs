@@ -231,11 +231,7 @@ pub(super) fn validate_host(host: &str) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-/// Whether a TCP-bind host names a loopback interface. Capsule-hosted
-/// servers are confined to loopback (see `bind_tcp`): `127.0.0.0/8`, `::1`,
-/// or the literal `localhost`. A hostname other than `localhost` is refused
-/// rather than resolved — binding must name a concrete local interface, and
-/// resolving arbitrary names for a bind target is an SSRF-shaped footgun.
+/// Parse a concrete loopback TCP bind target without consulting name service.
 fn bind_target(host: &str, port: u16) -> Option<bind_target::Target> {
     let ip = if host.eq_ignore_ascii_case("localhost") {
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -673,11 +669,14 @@ impl net::Host for HostState {
                 quota: Arc::clone(&self.tcp_listener_count),
             });
         }
-        let actual_addr = match listener.local_addr() {
-            Ok(addr) if target.matches_bound(addr.ip().into(), addr.port()) => {
+        let actual_addr = match listener
+            .local_addr()
+            .map(|addr| target.confirm(addr, |a| (a.ip().into(), a.port())))
+        {
+            Ok(Ok(addr)) => {
                 format!("tcp:{addr}")
             },
-            Ok(addr) => {
+            Ok(Err(addr)) => {
                 let reason = format!("bound TCP endpoint {addr} differs from requested {endpoint}");
                 audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
                 if let Some(share) = share {

@@ -37,12 +37,21 @@ fn dial(answers:&[(bool,u16,u128)], port:u16) -> (out:Result<&[(bool,u16,u128)],
 verus! {
 fn accepted_listener(request: crate::tcp_bind_target::Address, port: u16,
     actual: crate::tcp_bind_target::Address, assigned: u16) -> (out: Option<(crate::tcp_bind_target::Address,u16)>)
-    ensures out == if request.loopback() && actual == request && assigned != 0 && (port == 0 || assigned == port) {
-        Some((request,port))
-    } else { None },
+    ensures ({
+        let loopback = match request {
+            crate::tcp_bind_target::Address::V4(bits) => 0x7f000000 <= bits <= 0x7fffffff,
+            crate::tcp_bind_target::Address::V6(bits) => bits == 1,
+        };
+        out == if loopback && actual == request && assigned != 0 && (port == 0 || assigned == port) {
+            Some((actual,assigned))
+        } else { None }
+    }),
 {
     let target = crate::tcp_bind_target::Target::admit(request, port)?;
-    if target.matches_bound(actual, assigned) { Some(target.endpoint()) } else { None }
+    let (ip, requested_port) = target.endpoint();
+    assert(ip == request && requested_port == port);
+    target.confirm((actual,assigned), |observed:&(crate::tcp_bind_target::Address,u16)|
+        -> (r:(crate::tcp_bind_target::Address,u16)) ensures r == *observed, { *observed }).ok()
 }
 }
 

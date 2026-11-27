@@ -7,8 +7,8 @@ from .common import GENERATION, replace_once
 def defects():
     residency = Path("crates/astrid-kernel/src/runtime_residency.rs")
     for name, original, changed in [
-        ("loses unapproved provider refusal", "ensures out == if provides", "ensures allowed ==> out == if provides"),
-        ("loses MCP declaration refusal", "ensures out == if provides", "ensures !has_servers ==> out == if provides"),
+        ("loses unapproved provider refusal", "ensures out == if uplinks.provides", "ensures allowed ==> out == if uplinks.provides"),
+        ("loses MCP declaration refusal", "ensures out == if uplinks.provides", "ensures !has_servers ==> out == if uplinks.provides"),
         ("allows a principal without a UID", "Ok(None) => false", "Ok(None) => true"),
         ("loses the bound UID", "lookup.ensures((principal,expected), Ok(uid))", "true"),
         ("loses the directory error", "lookup.ensures((principal,expected), Err(e))", "true"),

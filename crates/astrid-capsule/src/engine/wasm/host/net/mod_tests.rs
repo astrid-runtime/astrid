@@ -411,3 +411,29 @@ async fn equivalent_ipv6_spellings_publish_the_same_worker_listener() {
     assert_eq!(first.tcp_listener_count.load(Ordering::Acquire), 0);
     assert!(first.shared_listeners.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_rejects_a_cached_listener_with_a_different_os_port() {
+    let mut worker = worker_host_state(tokio::runtime::Handle::current());
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let actual = listener.local_addr().unwrap();
+    let requested = if actual.port() == 1 { 2 } else { 1 };
+    let key = (actual.ip().to_string(), requested);
+    worker.shared_listeners.insert(
+        key.clone(),
+        SharedTcpListener {
+            listener: Arc::new(listener),
+            holders: std::sync::atomic::AtomicUsize::new(1),
+        },
+    );
+    worker.tcp_listener_count.store(1, Ordering::Release);
+    let result = worker.bind_tcp(key.0.clone(), requested);
+    assert!(matches!(result, Err(ErrorCode::AirlockRejected)));
+    assert!(worker.resource_table.is_empty());
+    let original = worker.shared_listeners.get(&key).unwrap();
+    assert_eq!(original.holders.load(Ordering::Acquire), 1);
+    assert_eq!(original.listener.local_addr().unwrap(), actual);
+    assert_eq!(worker.tcp_listener_count.load(Ordering::Acquire), 1);
+}

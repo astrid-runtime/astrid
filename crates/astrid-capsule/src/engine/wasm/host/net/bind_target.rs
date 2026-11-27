@@ -54,5 +54,19 @@ impl Target {
         };
         same && assigned != 0 && (self.port == 0 || assigned == self.port)
     }
+
+    /// Return the precise OS observation for publication or refusal.
+    pub(super) fn confirm<T,F: FnOnce(&T) -> (Address,u16)>(self, observed: T, inspect: F)
+        -> (out: Result<T,T>)
+        requires inspect.requires((&observed,)),
+        ensures exists|a:Address,p:u16| #[trigger] inspect.ensures((&observed,),(a,p))
+            && out == if a == self.requested().0 && p != 0 && (self.requested().1 == 0 || p == self.requested().1) {
+                Ok(observed)
+            } else { Err(observed) },
+    {
+        let (actual, assigned) = inspect(&observed);
+        if self.matches_bound(actual,assigned) { Ok(observed) } else { Err(observed) }
+    }
+
 }
 }

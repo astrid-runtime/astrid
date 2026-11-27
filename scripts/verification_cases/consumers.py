@@ -60,12 +60,13 @@ def consumer_defects():
     quota = inbound.with_name("reservation.rs")
     inbound_trace = Path("verification/hosted_tcp_destinations.rs")
     for name, source, original, changed in [
+        ("loses the published observation", inbound, "Ok(observed)\n            } else { Err(observed) },", "out\n            } else { Err(observed) },"),
         ("loses nonloopback refusal", inbound, "else { out.is_none() },", "else { true },"),
-        ("accepts a zero assigned port", inbound_trace, "target.matches_bound(actual, assigned)", "target.matches_bound(actual, if assigned == 0 { 1 } else { assigned })"),
+        ("accepts a zero assigned port", inbound_trace, "target.confirm((actual,assigned),", "target.confirm((actual,if assigned == 0 { 1 } else { assigned }),"),
         ("uses an unrelated fixed port", inbound_trace, "Target::admit(request, port)", "Target::admit(request, 0)"),
         ("changes the admitted address", inbound, "t.requested() == (address, port)", "t.requested().1 == port"),
         ("forgets the OS operand", inbound, "out == self.requested()", "out.1 == self.requested().1"),
-        ("permits a mismatched endpoint", inbound, "ensures ok == (actual", "ensures ok <== (actual"),
+        ("permits a mismatched endpoint", inbound, "} else { Err(observed) },", "} else { out },"),
         ("loses the reserved unit", quota, "n as int == count as int + 1", "n > count"),
         ("loses full-capacity refusal", quota, "else { next.is_none() }", "else { true }"),
     ]:

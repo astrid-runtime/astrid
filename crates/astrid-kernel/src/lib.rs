@@ -606,8 +606,10 @@ fn classify_runtime_residency(
 ) -> Result<RuntimeResidency, anyhow::Error> {
     let decision = runtime_residency::classify(
         system_allowed,
-        !manifest.uplinks.is_empty(),
-        manifest.capabilities.uplink,
+        runtime_residency::Uplinks {
+            provides: !manifest.uplinks.is_empty(),
+            capability: manifest.capabilities.uplink,
+        },
         !manifest.mcp_servers.is_empty(),
     );
     decision.map_err(|reason| match reason {
