@@ -85,3 +85,30 @@ fn successive_accepts<T>(slot: &mut Option<T>, count: usize, limit: usize)
     (first, second)
 }
 }
+
+verus! {
+// Delivering a readiness reservation at capacity cannot take a fresh quota
+// unit. A failed insertion must release the charge and return the table error.
+fn publish_reserved<S,H,E,B:crate::net_reservation::StreamTable<S,H,E>>(
+    table: &mut B, slot: &mut Option<S>, limit: usize,
+) -> (out: Result<H,crate::net_reservation::RegisterError<E>>)
+    requires old(slot).is_some(),
+    ensures final(slot).is_none(),
+        match out {
+            Ok(h) => final(table).events() == old(table).events()
+                .push(crate::net_reservation::Event::Claim)
+                .push(crate::net_reservation::Event::Publish(old(slot).unwrap(),Ok(h))),
+            Err(crate::net_reservation::RegisterError::Table(e)) => final(table).events() == old(table).events()
+                .push(crate::net_reservation::Event::Claim)
+                .push(crate::net_reservation::Event::Publish(old(slot).unwrap(),Err(e)))
+                .push(crate::net_reservation::Event::Release),
+            Err(crate::net_reservation::RegisterError::Quota) => false,
+        },
+{
+    use crate::net_reservation::{admit,register,TcpAcceptAdmission,StreamCharge};
+    match admit(slot,limit,|| -> (n:usize) ensures n == limit, { limit }) {
+        TcpAcceptAdmission::Reserved(s) => register(table,s,StreamCharge::Reserved),
+        _ => { assert(false); Err(crate::net_reservation::RegisterError::Quota) },
+    }
+}
+}

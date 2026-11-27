@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use wasmtime::component::Resource;
+use wasmtime::component::{Resource, ResourceTableError};
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
-use super::reservation::{self, TcpAcceptAdmission};
+use super::reservation::{self, RegisterError, StreamCharge, StreamTable, TcpAcceptAdmission};
 use super::{
     HostState, MAX_ACTIVE_STREAMS, PendingTcpAccepted, PendingTcpConnection, TcpListenerSlot,
     audit_net_accept, map_io_err,
@@ -99,6 +99,33 @@ impl Pollable for TcpListenerReadiness {
     }
 }
 
+impl StreamTable<tokio::net::TcpStream, Resource<TcpStream>, ResourceTableError> for HostState {
+    fn claim(&mut self) {
+        self.claim_reserved_net_stream();
+    }
+
+    fn reserve(&mut self) -> bool {
+        self.reserve_net_stream()
+    }
+
+    fn publish(
+        &mut self,
+        stream: tokio::net::TcpStream,
+    ) -> Result<Resource<TcpStream>, ResourceTableError> {
+        let slot = TcpStreamSlot {
+            stream: Arc::new(tokio::sync::Mutex::new(stream)),
+            read_timeout: None,
+            write_timeout: None,
+        };
+        let resource = self.resource_table.push(NetStream::Tcp(slot))?;
+        Ok(Resource::new_own(resource.rep()))
+    }
+
+    fn release(&mut self) {
+        self.release_net_stream();
+    }
+}
+
 impl HostState {
     fn tcp_listener_slot(&self, rep: u32) -> Result<TcpListenerParts, ErrorCode> {
         let slot = self
@@ -115,28 +142,12 @@ impl HostState {
     fn register_accepted(
         &mut self,
         stream: tokio::net::TcpStream,
-        reserved: bool,
+        charge: StreamCharge,
     ) -> Result<Resource<TcpStream>, ErrorCode> {
-        if !reserved && !self.reserve_net_stream() {
-            drop(stream);
-            return Err(ErrorCode::Quota);
-        }
-        if reserved {
-            self.claim_reserved_net_stream();
-        }
-        let net_stream = NetStream::Tcp(TcpStreamSlot {
-            stream: Arc::new(tokio::sync::Mutex::new(stream)),
-            read_timeout: None,
-            write_timeout: None,
-        });
-        let resource = match self.resource_table.push(net_stream) {
-            Ok(resource) => resource,
-            Err(error) => {
-                self.release_net_stream();
-                return Err(ErrorCode::Unknown(format!("resource table: {error}")));
-            },
-        };
-        Ok(Resource::new_own(resource.rep()))
+        reservation::register(self, stream, charge).map_err(|error| match error {
+            RegisterError::Quota => ErrorCode::Quota,
+            RegisterError::Table(error) => ErrorCode::Unknown(format!("resource table: {error}")),
+        })
     }
 
     /// Readiness charges the capsule stream budget before it publishes a
@@ -163,7 +174,7 @@ impl HostState {
 impl HostTcpListener for HostState {
     fn accept(&mut self, self_: Resource<TcpListener>) -> Result<Resource<TcpStream>, ErrorCode> {
         let (listener, pending, _) = self.tcp_listener_slot(self_.rep())?;
-        let (stream, local_addr, peer_addr, reserved) = match self.admit_tcp_accept(pending)? {
+        let (stream, local_addr, peer_addr, charge) = match self.admit_tcp_accept(pending)? {
             TcpAcceptAdmission::Full => return Err(ErrorCode::Quota),
             TcpAcceptAdmission::Reserved(connection) => {
                 self.recv_yielded = true;
@@ -171,7 +182,7 @@ impl HostTcpListener for HostState {
                     connection.stream,
                     connection.local_addr,
                     connection.peer_addr,
-                    true,
+                    StreamCharge::Reserved,
                 )
             },
             TcpAcceptAdmission::Fresh => {
@@ -192,11 +203,17 @@ impl HostTcpListener for HostState {
                     |error| format!("unknown ({error})"),
                     |addr| addr.to_string(),
                 );
-                (stream, local_addr, peer_addr.to_string(), false)
+                (
+                    stream,
+                    local_addr,
+                    peer_addr.to_string(),
+                    StreamCharge::Fresh,
+                )
             },
         };
-        let result = self.register_accepted(stream, reserved);
-        if !reserved {
+        let fresh = matches!(charge, StreamCharge::Fresh);
+        let result = self.register_accepted(stream, charge);
+        if fresh {
             audit_net_accept(self, &local_addr, &peer_addr, &result);
         }
         result
@@ -212,7 +229,9 @@ impl HostTcpListener for HostState {
             TcpAcceptAdmission::Full => return Err(ErrorCode::Quota),
             TcpAcceptAdmission::Reserved(connection) => {
                 self.recv_yielded = true;
-                return self.register_accepted(connection.stream, true).map(Some);
+                return self
+                    .register_accepted(connection.stream, StreamCharge::Reserved)
+                    .map(Some);
             },
             TcpAcceptAdmission::Fresh => self.recv_yielded = true,
         }
@@ -231,7 +250,7 @@ impl HostTcpListener for HostState {
                     |addr| addr.to_string(),
                 );
                 let peer_addr = peer_addr.to_string();
-                let result = self.register_accepted(stream, false);
+                let result = self.register_accepted(stream, StreamCharge::Fresh);
                 audit_net_accept(self, &local_addr, &peer_addr, &result);
                 result.map(Some)
             },
@@ -468,6 +487,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(n, 0, "delivered stream drop must close the peer");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_publication_releases_reserved_stream_and_closes_peer() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        fill_other_stores(&mut state);
+        let listener = state.bind_tcp("127.0.0.1".into(), 0).unwrap();
+        let mut peer = reserve_last_connection(&mut state, listener.rep()).await;
+        state.resource_table.set_max_capacity(0);
+
+        let result = HostTcpListener::accept(&mut state, Resource::new_borrow(listener.rep()));
+
+        assert!(matches!(result, Err(ErrorCode::Unknown(message))
+            if message == format!("resource table: {}", ResourceTableError::Full)));
+        assert_eq!(stream_budget(&state), (MAX_ACTIVE_STREAMS - 1, 0, 0));
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0);
+        HostTcpListener::drop(&mut state, listener).unwrap();
+        assert_eq!(stream_budget(&state), (MAX_ACTIVE_STREAMS - 1, 0, 0));
     }
 
     #[tokio::test(flavor = "multi_thread")]
