@@ -150,4 +150,90 @@ fn detach_with_peer<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
     }
     (handle.unwrap(),decision)
 }
+
+// A system owner's departure may affect many packages in a peer's view. The
+// report names each affected peer once and retains every different generation.
+fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
+    instances: &HashMap<Id,Entry<C,u64>>, owner: u64, package: u64)
+    -> (out: (Arc<C>, bool, Vec<u64>))
+    requires hash_map_inv(old(views)), hash_map_inv(instances), obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
+        old(views)@.contains_key(owner), old(views)@[owner]@.dom() == set![package],
+        forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
+        old(views)@[owner]@[package].identity().0.2 is SystemResident,
+        instances@.contains_key(old(views)@[owner]@[package]),
+        instances@[old(views)@[owner]@[package]].owner_alias == Some(owner),
+    ensures ({
+        let before = old(views)@;
+        let after = final(views)@;
+        let id = before[owner]@[package];
+        let report = out.2@;
+        &&& out.0 == instances@[id].capsule && out.1
+        &&& report.len() > 0 && report[0] == owner && report.no_duplicates()
+        &&& forall|p:u64| #[trigger] report.contains(p) == (before.contains_key(p) && before[p]@.values().contains(id))
+        &&& forall|p:u64| #[trigger] after.contains_key(p) == (before.contains_key(p) && exists|k:u64| before[p]@.contains_key(k) && before[p]@[k] != id)
+        &&& forall|p:u64,k:u64| after.contains_key(p) ==> ((#[trigger] after[p]@.contains_key(k)) == (before[p]@.contains_key(k) && before[p]@[k] != id))
+        &&& forall|p:u64,k:u64| after.contains_key(p) && after[p]@.contains_key(k) ==> (#[trigger] after[p]@[k]) == before[p]@[k]
+    }),
+{
+    let ghost before = views@;
+    let (id,handle) = view_lookup::detach(views,instances,&owner,&package).unwrap();
+    assert(before[owner]@.remove(package).is_empty());
+    assert(views@ == before.remove(owner));
+    let installed = instances.get(&id).unwrap();
+    let mut report = Vec::new();
+    report.push(owner);
+    let tear_down = crate::dependent_views::depart(views,&id,id.key().scope(),installed.owner_alias.as_ref(),&owner,&mut report);
+    proof {
+        let peers = report@.skip(1);
+        assert(report@ == seq![owner] + peers);
+        assert(!peers.contains(owner));
+        assert forall|i:int,j:int| 0 <= i < j < report@.len() implies report@[i] != report@[j] by {
+            assert(peers[j-1] == report@[j]);
+            if i == 0 { assert(peers.contains(report@[j])); } else { assert(peers[i-1] == report@[i]); }
+        }
+        assert(before[owner]@.values().contains(id));
+        assert forall|p:u64| #[trigger] report@.contains(p) == (before.contains_key(p) && before[p]@.values().contains(id)) by {
+            let first = seq![owner];
+            if first.contains(p) {
+                let i = choose|i:int| 0 <= i < first.len() && first[i] == p;
+                assert(i == 0);
+            } else if p == owner { assert(first[0] == p); }
+            vstd::seq_lib::lemma_seq_concat_contains_all_elements(first, peers, p);
+            assert(report@.contains(p) == (p == owner || peers.contains(p)));
+        }
+        assert forall|p:u64| #[trigger] views@.contains_key(p) ==
+            (before.contains_key(p) && exists|k:u64| before[p]@.contains_key(k) && before[p]@[k] != id) by {
+            let middle = before.remove(owner);
+            assert(views@.contains_key(p) == (middle.contains_key(p) && !crate::dependent_views::kept(middle[p]@,id).is_empty()));
+            if before.contains_key(p) {
+                let surviving = crate::dependent_views::kept(before[p]@,id);
+                if p == owner { assert(surviving =~= Map::<u64,Id>::empty()); }
+                if !surviving.is_empty() {
+                    let k = choose|k:u64| surviving.contains_key(k);
+                    assert(before[p]@.contains_key(k) && before[p]@[k] != id);
+                }
+                if exists|k:u64| before[p]@.contains_key(k) && before[p]@[k] != id {
+                    let k = choose|k:u64| before[p]@.contains_key(k) && before[p]@[k] != id;
+                    assert(surviving.contains_key(k));
+                }
+            }
+        }
+    }
+    (handle.unwrap(),tear_down,report)
+}
+
+// Non-owner removal keeps a shared generation referenced by any remaining
+// package, preserving the entire view map and the caller's pending reports.
+fn retain_shared_generation(views: &mut HashMap<u64,HashMap<u64,Id>>, id: &Id,
+    operator: u64, departing: u64, peer: u64, package: u64, report: &mut Vec<u64>) -> (teardown: bool)
+    requires operator != departing, id.identity().0.2 is SystemResident,
+        hash_map_inv(old(views)), obeys_concrete_eq::<Id>(),
+        forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
+        old(views)@.contains_key(peer), old(views)@[peer]@.contains_key(package),
+        old(views)@[peer]@[package] == *id,
+    ensures !teardown, final(views)@ == old(views)@, final(report)@ == old(report)@,
+{
+    assert(views@[peer]@.values().contains(*id));
+    crate::dependent_views::depart(views,id,id.key().scope(),Some(&operator),&departing,report)
+}
 }

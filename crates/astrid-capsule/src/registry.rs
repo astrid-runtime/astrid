@@ -55,6 +55,7 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
         .collect()
 }
 
+mod dependent_views;
 mod instance_swap;
 mod source_lookup;
 mod view_lookup;
@@ -491,28 +492,18 @@ impl CapsuleRegistry {
                 .ok_or_else(|| CapsuleError::NotFound(format!("capsule {id}")))?;
         let capsule = capsule.expect("principal view referenced missing capsule runtime");
 
-        let departure = viewers::departure(
-            &self.views,
+        let mut removed_principals = vec![principal.clone()];
+        let torn_down = dependent_views::depart(
+            &mut self.views,
             &runtime_id,
             runtime_id.key().scope(),
             self.instances
                 .get(&runtime_id)
                 .and_then(|entry| entry.owner_alias.as_ref()),
             principal,
+            &mut removed_principals,
         );
-        let torn_down = !matches!(departure, viewers::Departure::KeepRuntime);
-        let mut removed_principals = vec![principal.clone()];
         if torn_down {
-            if matches!(departure, viewers::Departure::RemoveRuntimeAndViews) {
-                for (affected, view) in &mut self.views {
-                    let previous_len = view.len();
-                    view.retain(|_, candidate| candidate != &runtime_id);
-                    if view.len() != previous_len {
-                        removed_principals.push(affected.clone());
-                    }
-                }
-                self.views.retain(|_, view| !view.is_empty());
-            }
             self.instances.remove(&runtime_id);
             if self.any_principal_with(id).is_none() {
                 self.unregister_capsule_uplinks(id);

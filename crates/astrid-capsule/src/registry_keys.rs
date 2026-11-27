@@ -18,11 +18,13 @@ pub(super) fn owned_by(principal: &[u8], creator: &[u8]) -> (yes: bool)
 }
 
 // Scan under the registry lock. The iterator covers the initial map in arbitrary order.
-pub(super) fn keys_for<K: Copy + Eq + Hash, V, F: Fn(&V) -> bool>(
-    entries: &HashMap<K, V>, matches: F,
+pub(super) fn keys_for<K: Eq + Hash, V, F: Fn(&V) -> bool, C: Fn(&K) -> K>(
+    entries: &HashMap<K, V>, matches: F, key_for: C,
 ) -> (keys: Vec<K>)
     requires hash_map_inv(entries), obeys_key_model::<K>(),
-        forall|v:&V| matches.requires((v,)),
+        forall|k:K| entries@.contains_key(k) ==> matches.requires((&entries@[k],)),
+        forall|k:&K| key_for.requires((k,)),
+        forall|k:&K,c:K| key_for.ensures((k,),c) ==> c == *k,
     ensures keys@.no_duplicates(), forall|k:K| entries@.contains_key(k) ==> matches.ensures((&entries@[k],),keys@.contains(k)),
         forall|k:K| keys@.contains(k) ==> entries@.contains_key(k),
 {
@@ -36,7 +38,9 @@ pub(super) fn keys_for<K: Copy + Eq + Hash, V, F: Fn(&V) -> bool>(
             iter.decrease().is_some(),
             iter.remaining().len() <= initial.len(),
             iter.remaining() == initial.skip(initial.len() - iter.remaining().len()),
-            forall|v:&V| matches.requires((v,)),
+            forall|k:K| entries@.contains_key(k) ==> matches.requires((&entries@[k],)),
+            forall|k:&K| key_for.requires((k,)),
+            forall|k:&K,c:K| key_for.ensures((k,),c) ==> c == *k,
             forall|i:int| 0 <= i < initial.len() ==> entries@.contains_key(*initial[i].0) && entries@[*initial[i].0] == *initial[i].1,
             forall|k:K| entries@.contains_key(k) ==> initial.contains((&k,&entries@[k])),
             initial.no_duplicates(),
@@ -59,8 +63,9 @@ pub(super) fn keys_for<K: Copy + Eq + Hash, V, F: Fn(&V) -> bool>(
             if *initial[j].0 == *k { assert(initial[j] == initial[n]); }
         }
         let ghost prior = keys@;
+        assert(entries@[*initial[n].0] == *initial[n].1);
         let yes = matches(v);
-        if yes { keys.push(*k); }
+        if yes { keys.push(key_for(k)); }
         assert(entries@.contains_key(*k));
         assert forall|key:K| keys@.contains(key) implies entries@.contains_key(key) by {
             if key != *k { assert(prior.contains(key)); }

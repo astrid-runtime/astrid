@@ -101,34 +101,8 @@ fn recreated_alias_cannot_inherit_old_runtime_generation() {
     assert!(!Arc::ptr_eq(&removed.capsule, &current));
 }
 
-#[test]
-fn removing_system_owner_revokes_every_dependent_view() {
-    let mut registry = CapsuleRegistry::new();
-    let owner = PrincipalId::default();
-    let alice = pid("alice");
-    let bob = pid("bob");
-    let id = CapsuleId::from_static("operator-service");
-    let artifact = test_hash("operator-service-bytes");
-    registry
-        .register_system_runtime(
-            Box::new(MockCapsule::new("operator-service")),
-            artifact.clone(),
-            &owner,
-        )
-        .unwrap();
-    registry.register_existing(&id, &artifact, &alice).unwrap();
-    registry.register_existing(&id, &artifact, &bob).unwrap();
-
-    let removed = registry.unregister_for(&owner, &id).unwrap();
-    assert!(removed.torn_down);
-    assert!(registry.get_for(&alice, &id).is_none());
-    assert!(registry.get_for(&bob, &id).is_none());
-    assert!(registry.is_empty());
-    assert_eq!(removed.removed_principals.len(), 3);
-    for principal in [&owner, &alice, &bob] {
-        assert!(removed.removed_principals.contains(principal));
-    }
-}
+#[path = "registry/departure_tests.rs"]
+mod departure;
 
 #[test]
 fn artifact_replacement_removes_retired_public_source_identity() {

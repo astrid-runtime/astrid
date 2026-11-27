@@ -33,7 +33,7 @@ mod inject;
 mod managed;
 mod persistent;
 mod process_batch;
-mod registry_keys;
+use crate::registry_keys;
 mod spawn_admission;
 mod synchronous;
 mod tracker;

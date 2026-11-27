@@ -27,7 +27,7 @@ pub(super) fn drain_for<K: Copy + Eq + Hash, V, F: Fn(&V) -> bool>(
     }),
 {
     let ghost before = entries@;
-    let keys = registry_keys::keys_for(entries,matches);
+    let keys = registry_keys::keys_for(entries,matches,|k:&K| -> (out:K) ensures out == *k, { *k });
     let mut removed = Vec::new();
     let mut i = 0usize;
     // The registry loses exactly the processed prefix. The output retains its original values.

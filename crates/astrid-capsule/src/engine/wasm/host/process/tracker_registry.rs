@@ -38,6 +38,6 @@ pub(super) fn owned_pids<P,C,F: Fn(&P) -> bool>(
 {
     registry_keys::keys_for(entries,|record:&(P,Option<C>)| -> (yes:bool)
         ensures owns.ensures((&record.0,),yes),
-    { owns(&record.0) })
+    { owns(&record.0) }, |pid:&u32| -> (out:u32) ensures out == *pid, { *pid })
 }
 }

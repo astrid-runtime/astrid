@@ -51,7 +51,7 @@ mod workspace_commit;
 mod hosted_workspace_commit;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/spawn_admission.rs"]
 mod spawn_admission;
-#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/registry_keys.rs"]
+#[path = "../crates/astrid-capsule/src/registry_keys.rs"]
 mod registry_keys;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/process_batch.rs"]
 mod process_batch;
@@ -305,6 +305,8 @@ mod view_lookup;
 mod hosted_registry_lookup;
 #[path = "../crates/astrid-capsule/src/registry/viewers.rs"]
 mod viewers;
+#[path = "../crates/astrid-capsule/src/registry/dependent_views.rs"]
+mod dependent_views;
 
 #[path = "../crates/astrid-capsule/src/registry/view_owner.rs"]
 mod view_owner;

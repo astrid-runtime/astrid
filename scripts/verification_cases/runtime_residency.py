@@ -14,6 +14,24 @@ def defects():
             lambda s, a=original: replace_once(s, a, "ensures true" if a.startswith("ensures ") else "true"),
             Path("verification/hosted_route_retirement.rs"),
         )
+    sweep = Path("crates/astrid-capsule/src/registry/dependent_views.rs")
+    for name, clause, weakened in [
+        ("can change views on a retained runtime", "else { final(views)@ == before && final(removed)@ == old(removed)@ }",
+         "else { final(removed)@ == old(removed)@ }"),
+        ("can notify a peer on a retained runtime", "else { final(views)@ == before && final(removed)@ == old(removed)@ }",
+         "else { final(views)@ == before }"),
+        ("can replace the departing principal prefix", "reported == prior + appended", "true"),
+        ("can report a principal twice", "appended.no_duplicates()", "true"),
+        ("can omit an affected principal", "appended.contains(p) == (before.contains_key(p)", "appended.contains(p) ==> (before.contains_key(p)"),
+        ("can report an unaffected principal", "appended.contains(p) == (before.contains_key(p)", "appended.contains(p) <== (before.contains_key(p)"),
+        ("can keep orphan rows", "after.contains_key(p) == (before.contains_key(p)", "after.contains_key(p) <== (before.contains_key(p)"),
+        ("can change a surviving package", "after[p])@ == kept(before[p]@,runtime)", "after[p])@.dom() == kept(before[p]@,runtime).dom()"),
+    ]:
+        yield (
+            f"dependent view sweep {name}", sweep,
+            lambda s, a=clause, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
     for name, original, weakened in [
         ("can keep a principal runtime", "if !(scope is SystemResident) { Departure::RemoveRuntime }",

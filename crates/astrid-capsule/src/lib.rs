@@ -34,6 +34,7 @@ pub mod principal_class;
 pub mod profile_cache;
 pub mod readiness;
 pub mod registry;
+mod registry_keys;
 pub mod schema_catalog;
 pub mod security;
 pub mod tool_discovery;
