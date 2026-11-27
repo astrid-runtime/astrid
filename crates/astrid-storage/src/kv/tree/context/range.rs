@@ -3,11 +3,14 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ChildPointer, KvProjectionEngine, LeafEntry, Node, ObjectId, PreviousValue, Replacement,
-    StorageError, StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
+    KvProjectionEngine, LeafEntry, Node, ObjectId, PreviousValue, Replacement, StorageError,
+    StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
-use crate::kv::tree::key_projection;
+use crate::kv::tree::{
+    checkpoint_range::{self, Page},
+    key_projection,
+};
 
 #[cfg(test)]
 mod tests;
@@ -25,10 +28,18 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         let Some(root) = root else {
             return Ok(());
         };
-        let mut stack: Vec<(ObjectId, Option<ChildPointer>)> = vec![(root, None)];
-        while let Some((object, expected)) = stack.pop() {
+        let mut stack = vec![Page::Root(root)];
+        while let Some(page) = stack.pop() {
+            let object = page.object();
             let handle = decode_node(object, &self.record(object)?)?;
-            if expected.is_some_and(|expected| handle.pointer() != expected) {
+            if let Page::Child(expected) = page
+                && !expected.matches(
+                    &handle.object,
+                    handle.node.minimum_key(),
+                    handle.node.level(),
+                    &handle.node.totals(),
+                )
+            {
                 return Err(invalid(object, "persistent KV child summary disagrees"));
             }
             match handle.node {
@@ -40,17 +51,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
                     }
                 },
                 Node::Branch(branch) => {
-                    for (index, child) in branch.children.iter().enumerate().rev() {
-                        let upper = branch
-                            .children
-                            .get(index.saturating_add(1))
-                            .map(|next| next.lower_bound.as_slice());
-                        if !crate::kv::encoding::visit_child(&child.lower_bound, upper, start, end)
-                        {
-                            continue;
-                        }
-                        stack.push((child.object, Some(child.clone())));
-                    }
+                    checkpoint_range::schedule(branch.children, &mut stack, start, end);
                 },
             }
         }

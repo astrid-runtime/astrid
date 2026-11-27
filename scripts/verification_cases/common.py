@@ -254,6 +254,8 @@ INPUTS = [
     Path("verification/hosted_overlay_range.rs"),
     Path("crates/astrid-storage/src/kv/tree/overlay/range.rs"),
     Path("verification/hosted_key_projection.rs"),
+    Path("verification/hosted_checkpoint_range.rs"),
+    Path("crates/astrid-storage/src/kv/tree/checkpoint_range.rs"),
     Path("crates/astrid-storage/src/kv/tree/key_projection.rs"),
     Path("verification/hosted_token_recovery.rs"),
     Path("crates/astrid-capabilities/src/store/marker_batch.rs"),

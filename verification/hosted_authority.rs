@@ -280,6 +280,9 @@ mod encoding;
 #[path = "../crates/astrid-storage/src/kv/tree/key_projection.rs"]
 mod key_projection;
 mod hosted_key_projection;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_range.rs"]
+mod checkpoint_range;
+mod hosted_checkpoint_range;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/traversal.rs"]
 mod traversal;

@@ -507,3 +507,19 @@ def overlay_range_consumers():
             f"overlay range loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_range_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_range.rs")
+    consumer = Path("verification/hosted_checkpoint_range.rs")
+    for label, clause, weaker in [
+        ("summary equality", "ensures ok == (self.object == *object", "ensures ok ==> (self.object == *object"),
+        ("authenticated object", "ensures id == match self", "ensures false ==> id == match self"),
+        ("scheduled pointers", "final(stack)@ == old(stack)@ + scheduled(input@,0,start@,end@)", "true"),
+        ("covering child", "if selected(children,i as int,start,end) { tail.push", "if false && selected(children,i as int,start,end) { tail.push"),
+        ("pop order", "tail.push(Page::Child(children[i as int]))", "seq![Page::Child(children[i as int])] + tail"),
+    ]:
+        yield (
+            f"checkpoint range loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )

@@ -26,7 +26,10 @@ use super::tree_error::map_engine;
 use crate::error::{StorageError, StorageResult};
 use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 
+use super::encoding;
+
 mod adapter;
+mod checkpoint_range;
 mod context;
 mod delta;
 mod handoff;

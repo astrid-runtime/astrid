@@ -80,13 +80,7 @@ impl LeafEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ChildPointer {
-    pub(super) lower_bound: Vec<u8>,
-    pub(super) object: ObjectId,
-    pub(super) level: u16,
-    pub(super) totals: NodeTotals,
-}
+pub(super) type ChildPointer = super::checkpoint_range::Child<ObjectId, NodeTotals>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LeafNode {
