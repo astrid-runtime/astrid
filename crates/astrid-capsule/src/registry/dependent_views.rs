@@ -80,10 +80,9 @@ pub(super) fn revoke_sources<U: Eq + Hash + Copy,P: Eq + Hash + Clone,V: Eq + Ha
 {
     if tear_down {
         remove_generation(routes,runtime);
-        if let Some(source) = sources.remove(runtime) {
-            if !super::viewers::attached(sources,&source) {
-                names.remove(&source);
-            }
+        let Some(source) = sources.remove(runtime) else { return; };
+        if !super::viewers::attached(sources,&source) {
+            names.remove(&source);
         }
     } else if let Some(source) = sources.get(runtime) {
         proof { reveal(obeys_clone_eq); }
