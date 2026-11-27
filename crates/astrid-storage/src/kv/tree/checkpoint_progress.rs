@@ -1,5 +1,6 @@
 //! The authenticated range stack decreases when a branch expands into its children.
-use crate::checkpoint_range::{Child,Page,scheduled,selected};
+#[cfg(verus_keep_ghost)]
+use super::checkpoint_range::{Child, Page, scheduled, selected};
 use vstd::prelude::*;
 
 verus! {
@@ -71,7 +72,7 @@ proof fn capacity_monotone(low:nat,high:nat)
 
 // The old stack ends in the page just read. Its child level comes from the
 // decoder and, for a non-root page, must agree with the authenticated pointer.
-proof fn branch_progress<I,T>(pending:Seq<Page<I,T>>, page:Page<I,T>, rows:Vec<Child<I,T>>,
+pub(super) proof fn branch_progress<I,T>(pending:Seq<Page<I,T>>, page:Page<I,T>, rows:Vec<Child<I,T>>,
     level:u16,start:Seq<u8>,end:Seq<u8>)
     requires level > 0, page matches Page::Child(c) ==> c.level == level,
         forall|i:int| 0 <= i < rows.len() ==> (#[trigger] rows@[i]).level as nat+1 == level,
@@ -87,5 +88,14 @@ proof fn branch_progress<I,T>(pending:Seq<Page<I,T>>, page:Page<I,T>, rows:Vec<C
     assert(rows.len()*w <= (usize::MAX as nat)*w) by(nonlinear_arith)
         requires rows.len() as nat <= usize::MAX as nat;
     if page is Root { capacity_monotone(level as nat,u16::MAX as nat+1); }
+}
+
+pub(super) proof fn leaf_progress<I,T>(pending:Seq<Page<I,T>>, page:Page<I,T>)
+    ensures rank(pending) < rank(pending.push(page)),
+{
+    let h = match page { Page::Root(_) => u16::MAX as nat+1, Page::Child(child) => child.level as nat };
+    capacity_monotone(0,h);
+    assert(pending.push(page).drop_last() =~= pending);
+    assert(pending.push(page).last() == page);
 }
 }

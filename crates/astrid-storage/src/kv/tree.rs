@@ -30,7 +30,9 @@ use super::encoding;
 
 mod adapter;
 mod checkpoint_leaf;
+mod checkpoint_progress;
 mod checkpoint_range;
+mod checkpoint_walk;
 mod context;
 mod delta;
 mod handoff;

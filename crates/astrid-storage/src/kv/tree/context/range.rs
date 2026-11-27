@@ -9,7 +9,8 @@ use super::{
 
 use crate::kv::tree::{
     checkpoint_leaf,
-    checkpoint_range::{self, Page},
+    checkpoint_range::Page,
+    checkpoint_walk::{self, Contents},
     key_projection,
 };
 
@@ -24,36 +25,34 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         root: Option<ObjectId>,
         start: &[u8],
         end: &[u8],
-        mut state: S,
+        state: S,
         visit: impl Fn(S, LeafEntry) -> StorageResult<S> + Copy,
     ) -> StorageResult<S> {
-        let Some(root) = root else {
-            return Ok(state);
-        };
-        let mut stack = vec![Page::Root(root)];
-        while let Some(page) = stack.pop() {
-            let object = page.object();
-            let handle = decode_node(object, &self.record(object)?)?;
-            if let Page::Child(expected) = page
-                && !expected.matches(
-                    &handle.object,
-                    handle.node.minimum_key(),
-                    handle.node.level(),
-                    &handle.node.totals(),
-                )
-            {
-                return Err(invalid(object, "persistent KV child summary disagrees"));
-            }
-            match handle.node {
-                Node::Leaf(leaf) => {
-                    state = checkpoint_leaf::visit(leaf.entries, start, end, state, visit)?;
-                },
-                Node::Branch(branch) => {
-                    checkpoint_range::schedule(branch.children, &mut stack, start, end);
-                },
-            }
-        }
-        Ok(state)
+        checkpoint_walk::fold(
+            root,
+            start,
+            end,
+            state,
+            |page| {
+                let object = page.object();
+                let handle = decode_node(object, &self.record(object)?)?;
+                if let Page::Child(expected) = page
+                    && !expected.matches(
+                        &handle.object,
+                        handle.node.minimum_key(),
+                        handle.node.level(),
+                        &handle.node.totals(),
+                    )
+                {
+                    return Err(invalid(object, "persistent KV child summary disagrees"));
+                }
+                Ok(match handle.node {
+                    Node::Leaf(leaf) => Contents::Leaf(leaf.entries),
+                    Node::Branch(branch) => Contents::Branch(branch.level, branch.children),
+                })
+            },
+            visit,
+        )
     }
 
     pub(in crate::kv::tree) fn projected_deletions_in_range(

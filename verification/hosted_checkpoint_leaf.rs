@@ -88,7 +88,7 @@ use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_deep_eq},std_specs::btree::btree_map_i
 type Presence = BTreeMap<Vec<u8>,bool>;
 
 verus! {
-spec fn checkpoint_keys<V>(before:Map<Seq<u8>,bool>,rows:Seq<Entry<V>>,n:nat,start:Seq<u8>,end:Seq<u8>)
+pub(super) open spec fn checkpoint_keys<V>(before:Map<Seq<u8>,bool>,rows:Seq<Entry<V>>,n:nat,start:Seq<u8>,end:Seq<u8>)
     -> Map<Seq<u8>,bool>
     decreases n,
 {
@@ -99,7 +99,7 @@ spec fn checkpoint_keys<V>(before:Map<Seq<u8>,bool>,rows:Seq<Entry<V>>,n:nat,sta
     }
 }
 
-proof fn marks<V,E,F:Fn(Presence,Entry<V>)->Result<Presence,E>>(
+pub(super) proof fn marks<V,E,F:Fn(Presence,Entry<V>)->Result<Presence,E>>(
     rows:Seq<Entry<V>>, n:nat,start:Seq<u8>,end:Seq<u8>,initial:Presence,after:Presence,callback:F,
 )
     requires n <= rows.len(), btree_map_inv(&initial), visited(rows,n,start,end,initial,after,callback),

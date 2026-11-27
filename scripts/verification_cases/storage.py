@@ -541,3 +541,20 @@ def checkpoint_leaf_consumers():
             f"checkpoint leaf loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_walk_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_walk.rs")
+    consumer = Path("verification/hosted_checkpoint_walk.rs")
+    for label, clause, weaker in [
+        ("starting root", "all[0] == (initial(root),first)", "true"),
+        ("leaf delivery", "visited(rows@,rows@.len(),start,end,state,after,visit)", "true"),
+        ("branch frontier", "next == stack.drop_last()+scheduled(children@,0,start,end)", "true"),
+        ("reader binding", "#[trigger] read.ensures((stack.last(),),Ok(contents)) &&", "(#[trigger] read.ensures((stack.last(),),Ok(contents)) || true) &&"),
+        ("complete traversal", "ensures completed(result,root,first,start@,end@,read,visit)", "ensures true"),
+        ("error provenance", "failed(stack,s,start,end,read,visit,e),", "true,"),
+    ]:
+        yield (
+            f"checkpoint walk loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )
