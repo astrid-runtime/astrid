@@ -75,4 +75,47 @@ fn guest<'a>(access:Access<u64>,gate:&'a str,target:VfsTarget,mounts:[Option<Mou
             { in_table(table,h,p,w,t) })??;
     Some((guard,call))
 }
+/// Follow a storage-backed replacement from guest dispatch to the close-time publication arguments.
+/// The input path is the backend's resolved file path, after its directory lookup and join.
+fn storage_replace<'a>(path:&'a str, existing:Option<u64>, content:&[u8], allowed:bool)
+    -> (out:Option<(&'a str,Vec<u8>)>)
+    ensures out.is_some() == allowed,
+        out matches Some((target,data)) ==> target == path && data@ == content@,
+{
+    let access = Access::<u64>::Write(None);
+    let (_,retained) = access.authorize(path,|policy:Policy,p:&'a str| -> (r:Result<(),()>)
+        ensures r.is_ok() == (policy == Policy::Write && allowed), {
+        if matches!(policy,Policy::Write) && allowed { Ok(()) } else { Err(()) }
+    }).ok()?;
+    let mut file = retained.open((),path,|_:(),p:&'a str,w:bool,t:bool| -> (r:Option<crate::storage_file::OpenFile<&'a str>>)
+        ensures w && t ==> (r matches Some(f) && f.destination() == p && f.buffered().len() == 0
+            && f.position() == 0 && f.can_write() && f.changed()), {
+        crate::storage_file::open_at(p,existing,w,t,|_:&&str,_:u64,_:u64| -> Result<Vec<u8>,()> { Err(()) }).ok()
+    })??;
+    file.write_bytes(content);
+    let (target,data) = file.publication()?;
+    assert(data@ =~= content@);
+    Some((*target,data.clone()))
+}
+
+/// Preserving opens read exactly the statted range of this path. Refusals retain their precedence.
+fn storage_preserve(path:u64, existing:Option<u64>, write:bool, truncate:bool, bytes:Vec<u8>, readable:bool)
+    -> (out:Result<crate::storage_file::OpenFile<u64>,crate::storage_file::OpenError<()>>)
+    ensures match (existing,write,truncate) {
+        (None,false,_) => out matches Err(crate::storage_file::OpenError::Missing),
+        (Some(_),false,true) => out matches Err(crate::storage_file::OpenError::TruncateDenied),
+        (None,true,_) | (Some(_),true,true) =>
+            out matches Ok(f) && f.destination() == path && f.changed() && f.buffered().len() == 0,
+        (Some(_),_,false) => if readable {
+            out matches Ok(f) && f.destination() == path && f.buffered() == bytes@ && !f.changed() && f.can_write() == write
+        } else { out matches Err(crate::storage_file::OpenError::Read(())) },
+    },
+{
+    crate::storage_file::open_at(path,existing,write,truncate,
+        |target:&u64,offset:u64,length:u64| -> (r:Result<Vec<u8>,()>)
+            ensures r == if *target == path && offset == 0 && Some(length) == existing && readable { Ok(bytes) } else { Err(()) }, {
+            if *target == path && offset == 0 && Some(length) == existing && readable { Ok(bytes) } else { Err(()) }
+        })
+}
+
 }

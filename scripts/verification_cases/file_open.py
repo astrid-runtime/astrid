@@ -23,3 +23,15 @@ def defects():
         after = "ensures exists|b:B| " + " && ".join(flags[:index] + flags[index + 1:])
         yield (f"guest file open loses native {label} option", options,
                lambda s, a=before, b=after: replace_once(s, a, b), consumer)
+    storage_file = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
+    for label, before, after in [
+        ("destination", "f.destination() == path && f.position()", "true && f.position()"),
+        ("writable flag", "f.can_write() == write,", "true,"),
+        ("empty replacement", "f.buffered().len() == 0 && f.changed()", "f.changed()"),
+        ("replacement publication", "f.buffered().len() == 0 && f.changed()", "f.buffered().len() == 0"),
+        ("preserved contents", "b@ == f.buffered()", "true"),
+        ("missing refusal", "out matches Err(OpenError::Missing)", "out.is_err()"),
+        ("truncate refusal", "out matches Err(OpenError::TruncateDenied)", "out.is_err()"),
+    ]:
+        yield (f"storage file open loses {label}", storage_file,
+               lambda s, a=before, b=after: replace_once(s, a, b), consumer)

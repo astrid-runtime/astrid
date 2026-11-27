@@ -18,6 +18,39 @@ pub(super) enum WriteRange {
     End(usize),
 }
 
+pub(super) enum OpenError<E> { Missing, TruncateDenied, Read(E) }
+
+/// The classified storage path becomes the descriptor destination on every successful open.
+pub(super) fn open_at<P,E,F:FnOnce(&P,u64,u64)->Result<Vec<u8>,E>>(
+    path:P, existing:Option<u64>, write:bool, truncate:bool, read:F,
+) -> (out:Result<OpenFile<P>,OpenError<E>>)
+    requires existing matches Some(length) ==> read.requires((&path,0,length)),
+    ensures
+        out matches Ok(f) ==> f.destination() == path && f.position() == 0 && f.can_write() == write,
+        if !write && existing.is_none() { out matches Err(OpenError::Missing) }
+        else if !write && truncate { out matches Err(OpenError::TruncateDenied) }
+        else if write && (truncate || existing.is_none()) {
+            out matches Ok(f) && f.buffered().len() == 0 && f.changed()
+        } else {
+            match out {
+                Ok(f) => !f.changed() && exists|b:Vec<u8>| b@ == f.buffered()
+                    && #[trigger] read.ensures((&path,0,existing.unwrap()),Ok(b)),
+                Err(OpenError::Read(e)) => read.ensures((&path,0,existing.unwrap()),Err(e)),
+                _ => false,
+            }
+        },
+{
+    if !write && existing.is_none() { return Err(OpenError::Missing); }
+    if !write && truncate { return Err(OpenError::TruncateDenied); }
+    match existing {
+        Some(length) if !truncate => match read(&path,0,length) {
+            Ok(bytes) => Ok(OpenFile::new(path,bytes,write,false)),
+            Err(error) => Err(OpenError::Read(error)),
+        },
+        _ => Ok(OpenFile::new(path,Vec::new(),write,true)),
+    }
+}
+
 impl<P> OpenFile<P> {
     pub(super) closed spec fn destination(&self) -> P { self.path }
     pub(super) closed spec fn buffered(&self) -> Seq<u8> { self.bytes@ }

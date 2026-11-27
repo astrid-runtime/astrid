@@ -10,7 +10,7 @@
 
 #![cfg(not(target_family = "wasm"))]
 
-use super::storage_file::{OpenFile, WriteRange};
+use super::storage_file::{OpenError, OpenFile, WriteRange};
 use super::storage_handles::HandleTable;
 use std::sync::Arc;
 
@@ -304,47 +304,36 @@ impl AstridStorageVfs {
         base.join(raw).map_err(map_filesystem_error)
     }
 
-    async fn file_entry(
+    fn file_entry(
         &self,
         path: &FilesystemPath,
         write: bool,
         truncate: bool,
-    ) -> VfsResult<(Vec<u8>, bool)> {
-        let existing = match self.filesystem.stat(path) {
-            Ok(entry) => Some(entry),
+    ) -> VfsResult<OpenFile<FilesystemPath>> {
+        let length = match self.filesystem.stat(path) {
+            Ok(entry) if entry.kind() == FilesystemEntryKind::File => Some(entry.logical_bytes()),
+            Ok(_) => {
+                return Err(map_filesystem_error(FilesystemError::IsDirectory(
+                    path.clone(),
+                )));
+            },
             Err(FilesystemError::NotFound(_)) => None,
             Err(error) => return Err(map_filesystem_error(error)),
         };
-        if let Some(entry) = &existing
-            && entry.kind() != FilesystemEntryKind::File
-        {
-            return Err(map_filesystem_error(FilesystemError::IsDirectory(
-                path.clone(),
-            )));
-        }
-        if !write && existing.is_none() {
-            return Err(map_filesystem_error(FilesystemError::NotFound(
-                path.clone(),
-            )));
-        }
-        if !write && truncate {
-            return Err(VfsError::PermissionDenied(
-                "truncate requires a writable file handle".to_owned(),
-            ));
-        }
-
-        let created_or_truncated = write && (truncate || existing.is_none());
-        let bytes = if created_or_truncated {
-            Vec::new()
-        } else {
-            let length = existing
-                .as_ref()
-                .map_or(0, astrid_storage::FilesystemEntry::logical_bytes);
-            self.filesystem
-                .read(path, 0, length)
-                .map_err(map_filesystem_error)?
-        };
-        Ok((bytes, created_or_truncated))
+        super::storage_file::open_at(
+            path.clone(),
+            length,
+            write,
+            truncate,
+            |path, offset, length| self.filesystem.read(path, offset, length),
+        )
+        .map_err(|error| match error {
+            OpenError::Missing => map_filesystem_error(FilesystemError::NotFound(path.clone())),
+            OpenError::TruncateDenied => {
+                VfsError::PermissionDenied("truncate requires a writable file handle".to_owned())
+            },
+            OpenError::Read(error) => map_filesystem_error(error),
+        })
     }
 }
 
@@ -438,9 +427,8 @@ impl Vfs for AstridStorageVfs {
                 "cannot open capability root as a file".to_owned(),
             ));
         }
-        let (bytes, dirty) = self.file_entry(&path, write, truncate).await?;
-        self.register_file(FileHandle::new(), OpenFile::new(path, bytes, write, dirty))
-            .await
+        let file = self.file_entry(&path, write, truncate)?;
+        self.register_file(FileHandle::new(), file).await
     }
 
     async fn open_dir(
@@ -595,6 +583,30 @@ mod tests {
         let read_handle = vfs.open(&root, "note", false, false).await.expect("reopen");
         assert_eq!(vfs.read(&read_handle).await.expect("read"), b"persisted");
         vfs.close(&read_handle).await.expect("close read");
+    }
+
+    #[tokio::test]
+    async fn empty_replacement_publishes_only_when_closed() {
+        let (_directory, store) = fixture().await;
+        let root = DirHandle::new();
+        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x12; 32]));
+        let vfs = AstridStorageVfs::new(&store, owner, root.clone());
+        let path = FilesystemPath::new("note").unwrap();
+        let direct = AstridFilesystem::new(store.content(), owner);
+        assert!(matches!(
+            vfs.open(&root, "note", false, true).await,
+            Err(VfsError::NotFound(_))
+        ));
+        direct.write(&path, b"previous").unwrap();
+        assert!(matches!(
+            vfs.open(&root, "note", false, true).await,
+            Err(VfsError::PermissionDenied(_))
+        ));
+        let handle = vfs.open(&root, "note", true, true).await.unwrap();
+        assert_eq!(direct.read(&path, 0, 8).unwrap(), b"previous");
+        vfs.write(&handle, &[]).await.unwrap();
+        vfs.close(&handle).await.unwrap();
+        assert_eq!(direct.stat(&path).unwrap().logical_bytes(), 0);
     }
 
     #[tokio::test]
