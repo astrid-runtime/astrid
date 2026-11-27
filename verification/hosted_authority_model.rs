@@ -16,32 +16,6 @@ use crate::token_authority::{Admission, Marker, TokenStatus};
 
 verus! {
 
-/// Reusing an outstanding log operation after retirement requires the same
-/// tracker and owner. Otherwise opening a managed log needs a new guard.
-fn log_operation<'a>(tracker:&u64,owner:&u64,held:Option<&'a (u64,Option<u64>)>,live:bool)
-    -> (out:Option<crate::native_log_admission::Operation<'a,(u64,Option<u64>)>>)
-    ensures ({
-        let matches = held matches Some(g) && g.0 == *tracker && g.1 == Some(*owner);
-        match out {
-            Some(crate::native_log_admission::Operation::Borrowed{_borrowed:g}) => matches && held == Some(g),
-            Some(crate::native_log_admission::Operation::Owned{_owned:g}) => !matches && live && g == (*tracker,Some(*owner)),
-            None => !matches && !live,
-        }
-    }),
-{
-    let covers = |g:&(u64,Option<u64>),t:&u64,p:&u64| -> (ok:bool)
-        ensures ok == (g.0 == *t && g.1 == Some(*p))
-    {
-        crate::principal_invocation_state::covers(&g.0,g.1.as_ref(),t,p,
-            |a:&u64,b:&u64| -> (same:bool) ensures same == (*a == *b) { *a == *b })
-    };
-    let begin = |t:&u64,p:&u64| -> (g:Option<(u64,Option<u64>)>)
-        ensures g == (if live {Some((*t,Some(*p)))} else {None})
-    { if live { Some((*t,Some(*p))) } else { None } };
-    crate::native_log_admission::admit(tracker,owner,held,covers,begin)
-}
-
-
 /// One transition of a grant's authority.
 enum GrantEvent {
     /// Close live admission before the durable write. `completed` reports

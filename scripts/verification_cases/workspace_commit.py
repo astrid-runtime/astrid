@@ -217,7 +217,7 @@ def defects():
         )
 
     source = Path("crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs")
-    trace = Path("verification/hosted_authority_model.rs")
+    trace = Path("verification/hosted_native_log.rs")
     for name, old, new in [
         ("borrow may ignore coverage", "existing == Some(g) && covers.ensures((g,tracker,principal),true)", "existing == Some(g)"),
         ("fresh guard may ignore admission", "uncovered && begin.ensures((tracker,principal),Some(g))", "uncovered"),
@@ -225,5 +225,16 @@ def defects():
     ]:
         yield (
             f"native log {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )
+
+    source = Path("crates/astrid-storage/src/principal_directory/binding.rs")
+    for name, old, new in [
+        ("missing UID may invoke the callback", "None => out == Err(operation)", "None => true"),
+        ("mismatched forward UID may invoke the callback", "} else { out == Err(operation) },", "} else { true },"),
+        ("callback may receive another alias", "out matches Ok(r) && operation.ensures((&alias,),r)", "out.is_ok()"),
+    ]:
+        yield (
+            f"live UID {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )

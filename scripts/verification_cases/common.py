@@ -180,6 +180,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/content/store/header_cache.rs"),
     Path("crates/astrid-storage/src/kv/tree/memo_admission.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs"),
+    Path("verification/hosted_native_log.rs"),
     Path("crates/astrid-storage/src/content/store/header_graph.rs"),
     Path("crates/astrid-storage/src/content/store/components.rs"),
     Path("crates/astrid-storage/src/content/component_labels.rs"),

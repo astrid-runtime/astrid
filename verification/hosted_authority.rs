@@ -13,6 +13,7 @@ mod batch_slots;
 mod memo_admission;
 #[path = "../crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs"]
 mod native_log_admission;
+mod hosted_native_log;
 mod hosted_batch_slots;
 mod hosted_chunk_tree_range;
 #[path = "../crates/astrid-storage/src/storage_words.rs"]

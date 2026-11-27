@@ -152,15 +152,9 @@ impl PrincipalDirectory {
         operation: impl FnOnce(&PrincipalId) -> std::io::Result<T>,
     ) -> std::io::Result<Option<T>> {
         let state = self.inner.read();
-        let Some(alias) = state.principals.get(&uid) else {
-            return Ok(None);
-        };
-        if state.aliases.get(alias) != Some(&uid) {
-            return Ok(None);
-        }
-        let result = operation(alias);
+        let result = binding::with_live_alias(&state.aliases, &state.principals, &uid, operation);
         drop(state);
-        result.map(Some)
+        result.ok().transpose()
     }
 
     /// Run a synchronous operation with an owned input while both sides of the

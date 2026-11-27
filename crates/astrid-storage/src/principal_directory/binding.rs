@@ -55,6 +55,29 @@ pub(super) fn with_pair<T,R,F:FnOnce(T)->R>(
 verus! {
 broadcast use vstd::std_specs::hash::group_hash_axioms;
 
+/// Select the alias from the reverse map, then confirm its forward UID
+/// before passing that exact alias to an operation under the directory guard.
+pub(super) fn with_live_alias<U:Eq+Hash,A:Eq+Hash,R,F:FnOnce(&A)->R>(
+    aliases:&HashMap<A,U>,principals:&HashMap<U,A>,uid:&U,operation:F,
+) -> (out:Result<R,F>)
+    requires hash_map_inv(aliases), hash_map_inv(principals),
+        obeys_key_model::<U>(), obeys_concrete_eq::<U>(),
+        obeys_key_model::<A>(), obeys_concrete_eq::<A>(),
+        forall|alias:&A| #[trigger] operation.requires((alias,)),
+    ensures match principals@.get(*uid) {
+        None => out == Err(operation),
+        Some(alias) => if aliases@.get(alias) == Some(*uid) {
+            out matches Ok(r) && operation.ensures((&alias,),r)
+        } else { out == Err(operation) },
+    },
+{
+    reveal(obeys_concrete_eq);
+    let Some(alias) = principals.get(uid) else { return Err(operation); };
+    let Some(current) = aliases.get(alias) else { return Err(operation); };
+    if !U::eq(current,uid) { return Err(operation); }
+    Ok(operation(alias))
+}
+
 /// Return the retained name and any distinct live name of this generation.
 pub(crate) fn recovery_aliases<U: Eq + Hash, A: Eq + Clone>(directory: &HashMap<U,A>, uid: &U, retained: Option<A>)
     -> (targets: [Option<A>;2])
