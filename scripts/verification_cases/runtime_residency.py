@@ -135,6 +135,15 @@ def defects():
             lambda s, a=clause, b=weakened: replace_once(s, a, b),
             Path("verification/hosted_registry_lookup.rs"),
         )
+    for name, clause in [
+        ("loses the selected forward UID", "ensures out.0 == (if aliases@.contains_key(*alias)"),
+        ("loses the selected reverse alias", "out.1 == (if principals@.contains_key(*uid)"),
+    ]:
+        yield (
+            f"directory candidate {name}", Path("crates/astrid-storage/src/principal_directory/binding.rs"),
+            lambda s, a=clause: replace_once(s, a, a.replace("out.", "false ==> out.", 1)),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     route_domain = "final(routes)@.contains_key(key) ==\n            ((old(routes)"
     route_value = "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==\n            if key.0 == source && final(views)@"
     for name, clause, weakened in [

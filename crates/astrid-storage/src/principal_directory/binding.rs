@@ -55,6 +55,18 @@ pub(super) fn with_pair<T,R,F:FnOnce(T)->R>(
 verus! {
 broadcast use vstd::std_specs::hash::group_hash_axioms;
 
+/// Read both sides of the requested alias and UID from the same directory snapshot.
+pub(super) fn observations<'a,U:Eq+Hash,A:Eq+Hash>(
+    aliases:&'a HashMap<A,U>, principals:&'a HashMap<U,A>, alias:&A, uid:&U,
+) -> (out:(Option<&'a U>,Option<&'a A>))
+    requires hash_map_inv(aliases), hash_map_inv(principals), obeys_key_model::<U>(), obeys_concrete_eq::<U>(),
+        obeys_key_model::<A>(), obeys_concrete_eq::<A>(),
+    ensures out.0 == (if aliases@.contains_key(*alias) { Some(&aliases@[*alias]) } else { None }),
+        out.1 == (if principals@.contains_key(*uid) { Some(&principals@[*uid]) } else { None }),
+{
+    (aliases.get(alias),principals.get(uid))
+}
+
 /// Select the alias from the reverse map, then confirm its forward UID
 /// before passing that exact alias to an operation under the directory guard.
 pub(super) fn with_live_alias<U:Eq+Hash,A:Eq+Hash,R,F:FnOnce(&A)->R>(

@@ -402,6 +402,23 @@ fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
     Some((old_handle,new_handle))
 }
 
+// Model the directory's canonical key bytes; preserve the candidate through permission or return.
+fn directory_candidate<T,R,F:FnOnce(T)->R>(aliases:&HashMap<Vec<u8>,[u8;32]>,
+    principals:&HashMap<[u8;32],Vec<u8>>, alias:&Vec<u8>, uid:&[u8;32], candidate:T, operation:F)
+    -> (out:Result<R,T>)
+    requires hash_map_inv(aliases), hash_map_inv(principals), obeys_key_model::<Vec<u8>>(),
+        obeys_concrete_eq::<Vec<u8>>(), obeys_key_model::<[u8;32]>(), obeys_concrete_eq::<[u8;32]>(),
+        operation.requires((candidate,)),
+    ensures if aliases@.contains_key(*alias) && aliases@[*alias]@ == uid@ &&
+        principals@.contains_key(*uid) && principals@[*uid]@ == alias@ {
+        out matches Ok(result) && operation.ensures((candidate,),result)
+    } else { out == Err(candidate) },
+{
+    let (forward,reverse) = crate::principal_binding::observations(aliases,principals,alias,uid);
+    let reverse_bytes = match reverse { Some(key) => Some(key.as_slice()), None => None };
+    crate::principal_binding::with_pair(alias.as_slice(),uid,forward,reverse_bytes,candidate,operation)
+}
+
 // Bind the principal preflight to the six-map publication and an actual scoped lookup.
 fn publish_principal_if_current<C: ?Sized>(instances:&mut HashMap<Id,Entry<C,u64>>,
     views:&mut HashMap<u64,HashMap<u64,Id>>, routes:&mut HashMap<(u64,u64),Id>,

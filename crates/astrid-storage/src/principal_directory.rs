@@ -172,11 +172,13 @@ impl PrincipalDirectory {
         operation: impl FnOnce(T) -> R,
     ) -> Result<R, T> {
         let state = self.inner.read();
+        let (forward, reverse) =
+            binding::observations(&state.aliases, &state.principals, alias, &uid);
         let result = binding::with_pair(
             alias.as_str().as_bytes(),
             uid.as_bytes(),
-            state.aliases.get(alias).map(PrincipalUid::as_bytes),
-            state.principals.get(&uid).map(|id| id.as_str().as_bytes()),
+            forward.map(PrincipalUid::as_bytes),
+            reverse.map(|id| id.as_str().as_bytes()),
             input,
             operation,
         );
