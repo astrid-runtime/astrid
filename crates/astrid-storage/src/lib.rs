@@ -62,6 +62,7 @@ mod resident_cache;
 /// Kernel-owned resident-memory authorities used by native storage.
 pub mod resources;
 pub mod secret;
+mod storage_fields;
 /// Portable executable model for principal state.
 pub mod storage_model;
 mod storage_words;

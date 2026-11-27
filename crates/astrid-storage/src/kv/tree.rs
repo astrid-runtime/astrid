@@ -34,6 +34,7 @@ mod checkpoint_page;
 mod checkpoint_progress;
 mod checkpoint_range;
 mod checkpoint_reference;
+mod checkpoint_totals;
 mod checkpoint_walk;
 mod context;
 mod delta;

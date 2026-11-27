@@ -18,12 +18,7 @@ const BRANCH_MAGIC: &[u8] = b"astrid-kv-bplus-branch-v1\0";
 const INLINE_VALUE: u8 = 0;
 const SPILLED_VALUE: u8 = 1;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct NodeTotals {
-    pub(super) entries: u64,
-    pub(super) logical_bytes: u64,
-    pub(super) quota_bytes: u64,
-}
+pub(super) use super::checkpoint_totals::NodeTotals;
 
 impl NodeTotals {
     pub(super) fn add(self, other: Self) -> StorageResult<Self> {
@@ -121,7 +116,7 @@ pub(super) fn leaf_record(entries: &[LeafEntry]) -> StorageResult<ObjectRecord> 
     let mut canonical = Vec::new();
     canonical.extend_from_slice(LEAF_MAGIC);
     push_count(&mut canonical, entries.len())?;
-    push_totals(&mut canonical, totals);
+    totals.append(&mut canonical);
     let mut references = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let key_length = u32::try_from(entry.key.len()).map_err(|_| arithmetic_overflow())?;
@@ -180,14 +175,14 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
     canonical.extend_from_slice(BRANCH_MAGIC);
     canonical.extend_from_slice(&level.to_le_bytes());
     push_count(&mut canonical, children.len())?;
-    push_totals(&mut canonical, totals);
+    totals.append(&mut canonical);
     let mut references = Vec::with_capacity(children.len());
     for (index, child) in children.iter().enumerate() {
         let lower_bound = child.lower_bound.as_slice();
         let key_length = u32::try_from(lower_bound.len()).map_err(|_| arithmetic_overflow())?;
         canonical.extend_from_slice(&key_length.to_le_bytes());
         canonical.extend_from_slice(lower_bound);
-        push_totals(&mut canonical, child.totals);
+        child.totals.append(&mut canonical);
         references.push(ObjectReference::owns(
             checkpoint_reference::label(Relation::Child, index).ok_or_else(arithmetic_overflow)?,
             child.object,
@@ -381,12 +376,6 @@ fn sum_totals(totals: impl IntoIterator<Item = NodeTotals>) -> StorageResult<Nod
         .try_fold(NodeTotals::default(), NodeTotals::add)
 }
 
-fn push_totals(bytes: &mut Vec<u8>, totals: NodeTotals) {
-    bytes.extend_from_slice(&totals.entries.to_le_bytes());
-    bytes.extend_from_slice(&totals.logical_bytes.to_le_bytes());
-    bytes.extend_from_slice(&totals.quota_bytes.to_le_bytes());
-}
-
 fn push_count(bytes: &mut Vec<u8>, count: usize) -> StorageResult<()> {
     let count = u16::try_from(count).map_err(|_| arithmetic_overflow())?;
     bytes.extend_from_slice(&count.to_le_bytes());
@@ -405,6 +394,13 @@ fn model_error(error: &crate::storage_model::ModelError) -> StorageError {
     StorageError::Serialization(error.to_string())
 }
 
+fn page_read_error(id: ObjectId, error: crate::storage_fields::ReadError) -> StorageError {
+    match error {
+        crate::storage_fields::ReadError::Overflow(_) => arithmetic_overflow(),
+        crate::storage_fields::ReadError::Truncated => invalid(id, "truncated persistent KV page"),
+    }
+}
+
 struct Cursor<'a> {
     id: ObjectId,
     bytes: &'a [u8],
@@ -421,16 +417,8 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, length: usize) -> StorageResult<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or_else(arithmetic_overflow)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| invalid(self.id, "truncated persistent KV page"))?;
-        self.offset = end;
-        Ok(value)
+        crate::storage_fields::take(self.bytes, &mut self.offset, length)
+            .map_err(|error| page_read_error(self.id, error))
     }
 
     fn require(&mut self, expected: &[u8]) -> StorageResult<()> {
@@ -441,9 +429,8 @@ impl<'a> Cursor<'a> {
     }
 
     fn array<const N: usize>(&mut self) -> StorageResult<[u8; N]> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| invalid(self.id, "truncated persistent KV integer"))
+        crate::storage_fields::fixed(self.bytes, &mut self.offset)
+            .map_err(|error| page_read_error(self.id, error))
     }
 
     fn u8(&mut self) -> StorageResult<u8> {
@@ -468,11 +455,8 @@ impl<'a> Cursor<'a> {
     }
 
     fn totals(&mut self) -> StorageResult<NodeTotals> {
-        Ok(NodeTotals {
-            entries: self.u64()?,
-            logical_bytes: self.u64()?,
-            quota_bytes: self.u64()?,
-        })
+        NodeTotals::read(self.bytes, &mut self.offset)
+            .map_err(|error| page_read_error(self.id, error))
     }
 
     fn done(self) -> StorageResult<()> {

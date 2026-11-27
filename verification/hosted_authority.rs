@@ -24,6 +24,8 @@ mod hosted_batch_slots;
 mod hosted_chunk_tree_range;
 #[path = "../crates/astrid-storage/src/storage_words.rs"]
 mod storage_words;
+#[path = "../crates/astrid-storage/src/storage_fields.rs"]
+mod storage_fields;
 mod hosted_file_descriptor;
 #[path = "../crates/astrid-storage/src/content/catalog/summary.rs"]
 mod catalog_summary;
@@ -289,6 +291,9 @@ mod checkpoint_leaf;
 mod checkpoint_page;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_reference.rs"]
 mod checkpoint_reference;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_totals.rs"]
+mod checkpoint_totals;
+mod hosted_checkpoint_totals;
 mod hosted_checkpoint_reference;
 mod hosted_checkpoint_page;
 mod hosted_checkpoint_leaf;

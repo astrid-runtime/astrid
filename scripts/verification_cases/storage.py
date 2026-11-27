@@ -305,7 +305,7 @@ def defects():
         ),
         (
             "root payload reader skips the last byte of a field",
-            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            Path("crates/astrid-storage/src/storage_fields.rs"),
             lambda source: replace_once(source, "*cursor = end;", "*cursor = end.saturating_sub(1);"),
         ),
         (
@@ -588,5 +588,20 @@ def checkpoint_reference_consumers():
     ]:
         yield (
             f"checkpoint reference loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )
+
+
+def checkpoint_totals_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_totals.rs")
+    consumer = Path("verification/hosted_checkpoint_totals.rs")
+    for label, clause, weaker in [
+        ("writer bytes", "final(bytes)@ == old(bytes)@ + self.wire()", "true"),
+        ("reader bytes", "crate::storage_fields::at(bytes@,*old(cursor) as int,t.wire())", "true"),
+        ("full field acceptance", "out.is_ok() == (*old(cursor)", "out.is_ok() ==> (*old(cursor)"),
+        ("short field rejection", "out.is_ok() == (*old(cursor)", "out.is_ok() <== (*old(cursor)"),
+    ]:
+        yield (
+            f"checkpoint totals lose {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )

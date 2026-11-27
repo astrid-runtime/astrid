@@ -7,6 +7,7 @@ verus! {
 pub(super) const CHILD:[u8;6] = [b'c',b'h',b'i',b'l',b'd',b'/'];
 pub(super) const VALUE:[u8;6] = [b'v',b'a',b'l',b'u',b'e',b'/'];
 
+#[derive(Clone,Copy)]
 pub(super) enum Relation { Child, Value }
 
 impl Relation {
@@ -16,7 +17,7 @@ impl Relation {
             Self::Value => VALUE@,
         }
     }
-    fn prefix(&self) -> (out:&'static [u8])
+    fn prefix(self) -> (out:&'static [u8])
         ensures out@ == self.tag(),
     {
         let prefix:&[u8;6] = match self { Self::Child => &CHILD, Self::Value => &VALUE };
@@ -45,7 +46,7 @@ pub(super) fn label(rel:Relation,slot:usize) -> (out:Option<ReferenceLabel>)
 {
     let bytes = suffix(slot)?;
     let prefix = rel.prefix();
-    let mut encoded = Vec::with_capacity(prefix.len()+bytes.len());
+    let mut encoded = Vec::with_capacity(prefix.len().saturating_add(bytes.len()));
     encoded.extend_from_slice(prefix);
     encoded.extend_from_slice(&bytes);
     Some(ReferenceLabel::new(encoded))
@@ -67,7 +68,7 @@ pub(super) fn target(refs:&[ObjectReference],position:usize,rel:Relation,slot:us
     let Some(bytes) = suffix(slot) else { return Err(Rejection::IndexOverflow); };
     let prefix = rel.prefix();
     let actual = edge.label_bytes();
-    if actual.len() != prefix.len()+2 { return Err(Rejection::Mismatch); }
+    if actual.len() != prefix.len().saturating_add(bytes.len()) { return Err(Rejection::Mismatch); }
     let (tag,index) = actual.split_at(prefix.len());
     if !matches!(encoding::bytewise_cmp(tag,prefix),std::cmp::Ordering::Equal) ||
         !matches!(encoding::bytewise_cmp(index,&bytes),std::cmp::Ordering::Equal) {
