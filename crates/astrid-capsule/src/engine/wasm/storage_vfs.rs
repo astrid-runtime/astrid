@@ -10,7 +10,7 @@
 
 #![cfg(not(target_family = "wasm"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use astrid_capabilities::{DirHandle, FileHandle};
@@ -153,7 +153,9 @@ struct OpenFile {
 pub(crate) struct AstridStorageVfs {
     filesystem: Box<dyn StorageBackend>,
     open_dirs: RwLock<HashMap<DirHandle, FilesystemPath>>,
-    open_files: RwLock<HashMap<FileHandle, Arc<Mutex<OpenFile>>>>,
+    // Read/write borrow an entry through the table guard. Removing it gives close
+    // exclusive ownership, with no further lock wait before publication.
+    open_files: RwLock<HashMap<FileHandle, Mutex<OpenFile>>>,
 }
 
 impl AstridStorageVfs {
@@ -279,6 +281,15 @@ impl AstridStorageVfs {
             }
         }
         Ok(())
+    }
+
+    async fn register_file(&self, handle: FileHandle, file: OpenFile) -> VfsResult<FileHandle> {
+        let mut files = self.open_files.write().await;
+        let Entry::Vacant(entry) = files.entry(handle.clone()) else {
+            return Err(VfsError::Io(std::io::Error::other("file handle collision")));
+        };
+        entry.insert(Mutex::new(file));
+        Ok(handle)
     }
 
     async fn dir_path(&self, handle: &DirHandle) -> VfsResult<FilesystemPath> {
@@ -445,18 +456,17 @@ impl Vfs for AstridStorageVfs {
             ));
         }
         let (bytes, dirty) = self.file_entry(&path, write, truncate).await?;
-        let new_handle = FileHandle::new();
-        self.open_files.write().await.insert(
-            new_handle.clone(),
-            Arc::new(Mutex::new(OpenFile {
+        self.register_file(
+            FileHandle::new(),
+            OpenFile {
                 path,
                 bytes,
                 offset: 0,
                 writable: write,
                 dirty,
-            })),
-        );
-        Ok(new_handle)
+            },
+        )
+        .await
     }
 
     async fn open_dir(
@@ -484,13 +494,8 @@ impl Vfs for AstridStorageVfs {
     }
 
     async fn read(&self, handle: &FileHandle) -> VfsResult<Vec<u8>> {
-        let file = self
-            .open_files
-            .read()
-            .await
-            .get(handle)
-            .cloned()
-            .ok_or(VfsError::InvalidHandle)?;
+        let files = self.open_files.read().await;
+        let file = files.get(handle).ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
         let bytes = file.bytes[file.offset..].to_vec();
         file.offset = file.bytes.len();
@@ -498,13 +503,8 @@ impl Vfs for AstridStorageVfs {
     }
 
     async fn write(&self, handle: &FileHandle, content: &[u8]) -> VfsResult<()> {
-        let file = self
-            .open_files
-            .read()
-            .await
-            .get(handle)
-            .cloned()
-            .ok_or(VfsError::InvalidHandle)?;
+        let files = self.open_files.read().await;
+        let file = files.get(handle).ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
         if !file.writable {
             return Err(VfsError::PermissionDenied(
@@ -532,7 +532,7 @@ impl Vfs for AstridStorageVfs {
             .await
             .remove(handle)
             .ok_or(VfsError::InvalidHandle)?;
-        let file = file.lock().await;
+        let file = file.into_inner();
         if file.writable && file.dirty {
             self.filesystem
                 .write(&file.path, &file.bytes)
@@ -771,6 +771,74 @@ mod tests {
             .close(&reopened_handle)
             .await
             .expect("close persisted");
+    }
+
+    #[tokio::test]
+    async fn duplicate_file_registration_preserves_the_original_dirty_buffer() {
+        let (_directory, store) = fixture().await;
+        let root = DirHandle::new();
+        let vfs = AstridStorageVfs::new(
+            &store,
+            StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32])),
+            root.clone(),
+        );
+        let original = vfs.open(&root, "original", true, true).await.unwrap();
+        vfs.write(&original, b"saved").await.unwrap();
+        let replacement = OpenFile {
+            path: FilesystemPath::new("replacement").unwrap(),
+            bytes: b"other".to_vec(),
+            offset: 0,
+            writable: true,
+            dirty: true,
+        };
+        assert!(matches!(
+            vfs.register_file(original.clone(), replacement).await,
+            Err(VfsError::Io(_))
+        ));
+        vfs.close(&original).await.unwrap();
+        let read = vfs.open(&root, "original", false, false).await.unwrap();
+        assert_eq!(vfs.read(&read).await.unwrap(), b"saved");
+        vfs.close(&read).await.unwrap();
+        assert!(!vfs.exists(&root, "replacement").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_an_admitted_write_and_can_be_cancelled_before_retirement() {
+        let (_directory, store) = fixture().await;
+        let root = DirHandle::new();
+        let vfs = AstridStorageVfs::new(
+            &store,
+            StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32])),
+            root.clone(),
+        );
+        let handle = vfs.open(&root, "note", true, true).await.unwrap();
+        let files = vfs.open_files.read().await;
+        let file = files.get(&handle).unwrap().lock().await;
+        let mut write = Box::pin(vfs.write(&handle, b"saved"));
+        tokio::select! {
+            biased;
+            _ = &mut write => panic!("write completed while its buffer was locked"),
+            () = std::future::ready(()) => {}
+        }
+        drop(file);
+        drop(files);
+        {
+            let mut close = Box::pin(vfs.close(&handle));
+            tokio::select! {
+                biased;
+                _ = &mut close => panic!("close overtook an admitted write"),
+                () = std::future::ready(()) => {}
+            }
+        }
+        write.await.unwrap();
+        vfs.close(&handle).await.unwrap();
+        assert!(matches!(
+            vfs.read(&handle).await,
+            Err(VfsError::InvalidHandle)
+        ));
+        let reopened = vfs.open(&root, "note", false, false).await.unwrap();
+        assert_eq!(vfs.read(&reopened).await.unwrap(), b"saved");
+        vfs.close(&reopened).await.unwrap();
     }
 
     #[tokio::test]
