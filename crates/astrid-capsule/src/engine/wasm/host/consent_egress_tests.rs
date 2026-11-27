@@ -41,6 +41,14 @@ fn set_caller(
 /// response topic, echoing the request principal. Mirrors what an uplink/broker
 /// does for the operator.
 fn spawn_responder(bus: astrid_events::EventBus, decision: &'static str) {
+    respond_after(bus, decision, || {});
+}
+
+fn respond_after(
+    bus: astrid_events::EventBus,
+    decision: &'static str,
+    before_reply: impl FnOnce() + Send + 'static,
+) {
     let mut req_rx = bus.subscribe_topic("astrid.v1.approval");
     tokio::spawn(async move {
         while let Some(event) = req_rx.recv().await {
@@ -50,6 +58,7 @@ fn spawn_responder(bus: astrid_events::EventBus, decision: &'static str) {
             let IpcPayload::ApprovalRequired { request_id, .. } = &message.payload else {
                 continue;
             };
+            before_reply();
             let response_topic = Topic::approval_response(request_id);
             let payload = IpcPayload::ApprovalResponse {
                 request_id: request_id.clone(),
@@ -129,7 +138,7 @@ fn runtime_grant_is_per_principal() {
     let alice = PrincipalId::new("alice").unwrap();
     let bob = PrincipalId::new("bob").unwrap();
 
-    add_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234, true);
+    add_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234);
 
     assert!(
         has_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234),
@@ -148,7 +157,7 @@ fn runtime_grant_is_per_capsule() {
     let store = AllowanceStore::new();
     let alice = PrincipalId::new("alice").unwrap();
 
-    add_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234, true);
+    add_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234);
 
     assert!(
         has_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234),
@@ -164,7 +173,7 @@ fn runtime_grant_is_per_capsule() {
 fn runtime_grant_is_port_specific() {
     let store = AllowanceStore::new();
     let p = PrincipalId::new("alice").unwrap();
-    add_runtime_grant(&store, &p, "react", "127.0.0.1", 1234, true);
+    add_runtime_grant(&store, &p, "react", "127.0.0.1", 1234);
 
     assert!(has_runtime_grant(&store, &p, "react", "127.0.0.1", 1234));
     // A different port on the same host is a different grant — not covered.
@@ -403,6 +412,9 @@ async fn local_socket_approve_always_persists_under_capsule_key() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
+    PrincipalProfile::default()
+        .save_to_path(&home.profile_path(&PrincipalId::new("alice").unwrap()))
+        .unwrap();
     let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
 
     let rt = tokio::runtime::Handle::current();
@@ -451,6 +463,9 @@ async fn approve_always_for_one_capsule_does_not_exempt_another_capsule() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
+    PrincipalProfile::default()
+        .save_to_path(&home.profile_path(&PrincipalId::new("alice").unwrap()))
+        .unwrap();
     let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
     let store = Arc::new(AllowanceStore::new());
 
@@ -469,15 +484,15 @@ async fn approve_always_for_one_capsule_does_not_exempt_another_capsule() {
     assert!(react_permitted, "react's approve_always must permit");
 
     let alice = PrincipalId::new("alice").unwrap();
-    // The session grant is cached for react and NOT for openai-compat.
-    assert!(
-        has_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234),
-        "react holds the session grant"
-    );
-    assert!(
-        !has_runtime_grant(&store, &alice, "openai-compat", "127.0.0.1", 1234),
-        "openai-compat must NOT inherit react's session grant"
-    );
+    // Durable consent must have only one authority source. Removing it
+    // from the profile must not leave a process-lifetime duplicate.
+    assert!(!has_runtime_grant(
+        &store,
+        &alice,
+        "react",
+        "127.0.0.1",
+        1234
+    ));
     // The persisted grant landed under "react" only.
     let profile = PrincipalProfile::load(&home, &alice).expect("load profile");
     assert_eq!(
@@ -551,6 +566,9 @@ async fn persisted_approve_always_grant_survives_empty_store_and_is_isolated() {
     alice_profile
         .save_to_path(&home.profile_path(&alice))
         .expect("seed alice profile");
+    PrincipalProfile::default()
+        .save_to_path(&home.profile_path(&PrincipalId::new("bob").unwrap()))
+        .unwrap();
 
     let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
 
@@ -634,7 +652,7 @@ async fn local_socket_existing_grant_short_circuits_without_eliciting() {
     let mut state = minimal_host_state(rt);
     let store = Arc::new(AllowanceStore::new());
     let alice = PrincipalId::new("alice").unwrap();
-    add_runtime_grant(&store, &alice, "test", "127.0.0.1", 1234, true);
+    add_runtime_grant(&store, &alice, "test", "127.0.0.1", 1234);
     state.allowance_store = Some(store.clone());
     set_caller(&mut state, MessageOrigin::LocalSocket, "alice");
 
@@ -730,5 +748,187 @@ async fn consent_prompt_and_decisions_are_audited() {
             (Some(prompts[0].clone()), true, "user".to_owned()),
             (None, false, "session_grant".to_owned()),
         ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_profile_cancels_a_pending_egress_approval() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let path = home.profile_path(&principal);
+    PrincipalProfile::default().save_to_path(&path).unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let store = Arc::new(AllowanceStore::new());
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(store.clone());
+    state.profile_cache = Some(cache.clone());
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+
+    let target = principal.clone();
+    respond_after(state.event_bus.clone(), "approve_always", move || {
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate(&target);
+    });
+    assert!(!tokio::task::block_in_place(
+        || state.consent_local_egress("127.0.0.1", 1234)
+    ));
+    assert!(!has_runtime_grant(
+        &store,
+        &principal,
+        "test",
+        "127.0.0.1",
+        1234
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_profile_cancels_a_pending_session_egress_approval() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let path = home.profile_path(&principal);
+    PrincipalProfile::default().save_to_path(&path).unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let store = Arc::new(AllowanceStore::new());
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(store.clone());
+    state.profile_cache = Some(cache.clone());
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+
+    let target = principal.clone();
+    respond_after(state.event_bus.clone(), "approve_session", move || {
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate(&target);
+    });
+    assert!(!tokio::task::block_in_place(|| {
+        state.consent_local_egress("127.0.0.1", 1234)
+    }));
+    assert!(
+        !has_runtime_grant(&store, &principal, "test", "127.0.0.1", 1234),
+        "a session approval must not cache a grant after the admitted profile is replaced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_grant_does_not_bypass_a_disabled_profile() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let profile = PrincipalProfile {
+        enabled: false,
+        ..PrincipalProfile::default()
+    };
+    profile
+        .save_to_path(&home.profile_path(&principal))
+        .unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let store = Arc::new(AllowanceStore::new());
+    add_runtime_grant(&store, &principal, "test", "127.0.0.1", 1234);
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(store);
+    state.profile_cache = Some(cache);
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+
+    let mut watch = state.event_bus.subscribe_topic("astrid.v1.approval");
+    assert!(!tokio::task::block_in_place(|| {
+        state.consent_local_egress("127.0.0.1", 1234)
+    }));
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        !elicited,
+        "a disabled profile must deny before a session grant can skip the prompt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_grant_does_not_bypass_a_missing_profile() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::dirs::AstridHome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let store = Arc::new(AllowanceStore::new());
+    add_runtime_grant(&store, &principal, "test", "127.0.0.1", 1234);
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(store);
+    state.profile_cache = Some(cache);
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+
+    let mut watch = state.event_bus.subscribe_topic("astrid.v1.approval");
+    assert!(!tokio::task::block_in_place(|| {
+        state.consent_local_egress("127.0.0.1", 1234)
+    }));
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        !elicited,
+        "a missing profile must deny before a session grant can skip the prompt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replaced_profile_without_endpoint_is_not_honored() {
+    use astrid_core::dirs::AstridHome;
+    use astrid_core::profile::PrincipalProfile;
+
+    use crate::profile_cache::PrincipalProfileCache;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let path = home.profile_path(&principal);
+    let mut remembered = PrincipalProfile::default();
+    remembered
+        .network
+        .capsule_egress
+        .insert("test".to_string(), vec!["127.0.0.1:1234".to_string()]);
+    remembered.save_to_path(&path).unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let primed = cache
+        .resolve(&principal)
+        .expect("prime the remembered profile");
+    assert!(has_persisted_grant(&primed, "test", "127.0.0.1", 1234));
+
+    PrincipalProfile::default().save_to_path(&path).unwrap();
+    cache.invalidate(&principal);
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(Arc::new(AllowanceStore::new()));
+    state.profile_cache = Some(cache);
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+    let mut watch = state.event_bus.subscribe_topic("astrid.v1.approval");
+    spawn_responder(state.event_bus.clone(), "deny");
+
+    assert!(
+        !tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234)),
+        "a replaced profile must not keep the remembered endpoint"
+    );
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        elicited,
+        "dropping the remembered endpoint must elicit, not short-circuit"
     );
 }

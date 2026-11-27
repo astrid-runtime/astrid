@@ -92,6 +92,22 @@ impl PrincipalProfileCache {
         }
     }
 
+    fn load_profile(&self, principal: &PrincipalId) -> ProfileResult<PrincipalProfile> {
+        if principal == &PrincipalId::default() {
+            PrincipalProfile::load(&self.astrid_home, principal)
+        } else {
+            PrincipalProfile::load_required(&self.astrid_home, principal)
+        }
+    }
+
+    fn load_consent_profile(&self, principal: &PrincipalId) -> ProfileResult<PrincipalProfile> {
+        let profile = self.load_profile(principal)?;
+        if !profile.enabled {
+            return Err(ProfileError::Invalid("principal is disabled".into()));
+        }
+        Ok(profile)
+    }
+
     /// Resolve the profile for `principal`, populating the cache on first use.
     ///
     /// The first call for a given principal reads
@@ -126,11 +142,7 @@ impl PrincipalProfileCache {
             }
             drop(state);
             let load = self.begin_load(principal);
-            let profile = Arc::new(if *principal == PrincipalId::default() {
-                PrincipalProfile::load(&self.astrid_home, principal)?
-            } else {
-                PrincipalProfile::load_required(&self.astrid_home, principal)?
-            });
+            let profile = Arc::new(self.load_profile(principal)?);
             if let Some(profile) = self.publish_loaded(profile, &load) {
                 return Ok(profile);
             }
@@ -195,14 +207,22 @@ impl PrincipalProfileCache {
     ///
     /// # Errors
     ///
-    /// Returns [`ProfileError`] on load/validate/save failure. The caller treats
-    /// any error as a fail-closed no-op (the in-flight session grant still
-    /// stands; only the disk persistence is skipped).
+    /// Returns [`ProfileError`] on load, validation or save failure.
     pub fn persist_egress(
         &self,
         principal: &PrincipalId,
         capsule_id: &str,
         endpoint: &str,
+    ) -> ProfileResult<()> {
+        self.persist_egress_for_profile(principal, capsule_id, endpoint, None)
+    }
+
+    pub(crate) fn persist_egress_for_profile(
+        &self,
+        principal: &PrincipalId,
+        capsule_id: &str,
+        endpoint: &str,
+        expected: Option<&Arc<PrincipalProfile>>,
     ) -> ProfileResult<()> {
         // Serialize the load-modify-save against any other writer on this cache
         // (and against a concurrent `resolve` populating the same key) by
@@ -220,9 +240,24 @@ impl PrincipalProfileCache {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        if let Some(expected) = expected
+            && !guard
+                .profiles
+                .get(principal)
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            return Err(ProfileError::Invalid(
+                "principal profile changed during consent".into(),
+            ));
+        }
         let path = self.astrid_home.profile_path(principal);
-        let mut profile = PrincipalProfile::load_from_path(&path)?;
+        let mut profile = self.load_consent_profile(principal)?;
 
+        if expected.is_some_and(|admitted| admitted.as_ref() != &profile) {
+            return Err(ProfileError::Invalid(
+                "principal profile changed on disk during consent".into(),
+            ));
+        }
         let entries = profile
             .network
             .capsule_egress
@@ -234,7 +269,9 @@ impl PrincipalProfileCache {
             // just loaded from disk while holding the cache write lock, so it
             // is the current system-of-record value and can refresh the cache
             // directly without invalidating in-flight loads or another disk read.
-            guard.profiles.insert(principal.clone(), Arc::new(profile));
+            if expected.is_none() {
+                guard.profiles.insert(principal.clone(), Arc::new(profile));
+            }
             return Ok(());
         }
 
@@ -350,14 +387,7 @@ impl PrincipalProfileCache {
 
         let path = self.astrid_home.profile_path(principal);
         // Approval cannot resurrect a principal removed while the prompt was open.
-        let mut profile = if principal == &PrincipalId::default() {
-            PrincipalProfile::load_from_path(&path)?
-        } else {
-            PrincipalProfile::load_required(&self.astrid_home, principal)?
-        };
-        if !profile.enabled {
-            return Err(ProfileError::Invalid("principal is disabled".into()));
-        }
+        let mut profile = self.load_consent_profile(principal)?;
 
         let already = profile.approvals.command_always.iter().any(|grant| {
             grant.command == command

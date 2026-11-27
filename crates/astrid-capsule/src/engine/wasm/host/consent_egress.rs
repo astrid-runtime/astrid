@@ -60,29 +60,12 @@
 //! only AFTER the upstream origin gate (`LocalSocket` only) and SSRF airlock, so
 //! it short-circuits the elicitation — never the origin/airlock checks.
 //!
-//! # Revocation requires a daemon restart (no live revocation)
+//! # Revocation
 //!
-//! Neither exemption source is revoked live; both take effect on the **next
-//! daemon start**, so an operator who edits config (or deletes a grant) to
-//! revoke is NOT immediately protected:
-//!
-//! - **Operator pre-bless** (`[security.capsule_local_egress]`) is read into a
-//!   load-time snapshot ([`HostState::local_egress`], cloned per pooled instance
-//!   at capsule load). Removing or narrowing an entry has no effect on a running
-//!   daemon — the snapshot is fixed at load and only re-read on restart.
-//! - **Persisted `approve_always` grant**
-//!   (`profile.network.capsule_egress[<capsule>]`) is consulted through a
-//!   process-lifetime `PrincipalProfileCache` with no TTL or file watcher.
-//!   Deleting the on-disk grant (or revoking the bless that authorized it) does
-//!   not evict the cached profile, so the grant keeps permitting local egress
-//!   until the daemon restarts and the cache is rebuilt.
-//!
-//! This is a deliberate v1 limitation: the gate is fail-secure on the GRANT path
-//! (it never grants more than the snapshot/cache allows) but is NOT fail-secure
-//! on the REVOKE path within a single daemon lifetime. A live-revocation verb is
-//! tracked separately; until it lands, revocation = edit config / delete grant
-//! **then restart the daemon**. The CLI add-path prints this caveat at grant
-//! time so an operator is not falsely reassured a later config edit revokes.
+//! Managed profile invalidation removes a remembered endpoint on the next
+//! admission. A durable approval has no duplicate session allowance. Direct
+//! disk edits need an explicit cache invalidation or daemon restart. Operator
+//! pre-bless is a load-time snapshot and still requires reload or restart.
 
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
@@ -96,7 +79,7 @@ use uuid::Uuid;
 use crate::audit_sink::HostApprovalScope;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use crate::profile_cache::PrincipalProfileCache;
+
 use crate::security::net_connect_pattern_matches;
 
 /// Maximum time to wait for the operator's consent response, in milliseconds.
@@ -121,7 +104,7 @@ fn egress_action(capsule_id: &str, host: &str, port: u16) -> SensitiveAction {
 
 /// `true` if `principal` already holds a runtime grant for `capsule_id`
 /// reaching `host:port` in the allowance store. A prior
-/// `approve`/`approve_session`/`approve_always` left a
+/// session consent left a
 /// [`AllowancePattern::NetworkHost`] entry; matching it here is what makes a
 /// second request to the same endpoint silent.
 ///
@@ -163,20 +146,12 @@ fn has_runtime_grant(
 /// - **per-principal** — the profile is resolved for THIS principal only, so
 ///   principal X's remembered grant never matches principal Y.
 ///
-/// Fail-closed: a profile load/parse error (malformed TOML, unknown field,
-/// future `profile_version`) returns `false` — the gate falls through to
-/// eliciting consent rather than silently permitting on an unreadable profile.
 fn has_persisted_grant(
-    cache: &PrincipalProfileCache,
-    principal: &PrincipalId,
+    profile: &astrid_core::PrincipalProfile,
     capsule_id: &str,
     host: &str,
     port: u16,
 ) -> bool {
-    let Ok(profile) = cache.resolve(principal) else {
-        // Unreadable/invalid profile → no remembered grant we can trust.
-        return false;
-    };
     let Some(entries) = profile.network.capsule_egress.get(capsule_id) else {
         return false;
     };
@@ -188,18 +163,13 @@ fn has_persisted_grant(
 /// Add an unlimited runtime egress grant for `principal` + `capsule_id` to
 /// `host:port`.
 ///
-/// `session_only = true` for `approve`/`approve_session` (cleared when the
-/// principal's last session disconnects); `false` for `approve_always` (also
-/// persisted to the profile on disk by the caller). Keyed per-principal in the
-/// shared store and per-capsule via the pattern's `capsule_id`, so it never
-/// leaks to another principal NOR to another capsule of the same principal.
+/// Session allowances expire when the principal's last session disconnects.
 fn add_runtime_grant(
     store: &AllowanceStore,
     principal: &PrincipalId,
     capsule_id: &str,
     host: &str,
     port: u16,
-    session_only: bool,
 ) {
     let keypair = KeyPair::generate();
     let allowance = Allowance {
@@ -214,7 +184,7 @@ fn add_runtime_grant(
         expires_at: None,
         max_uses: None,
         uses_remaining: None,
-        session_only,
+        session_only: true,
         // A network egress grant is not workspace-relative — it holds for the
         // principal regardless of cwd.
         workspace_root: None,
@@ -239,7 +209,7 @@ enum Decision {
     Once,
     /// Approve for the session: cache a session-scoped per-principal grant.
     Session,
-    /// Approve always: cache a non-session grant AND persist to the profile.
+    /// Remember the grant in the profile, or for the session on a cacheless host.
     Always,
     /// Deny / unknown / empty — fail closed.
     Deny,
@@ -337,25 +307,28 @@ impl HostState {
     ///    arbitrary capsule would let it forge local origin and self-approve
     ///    egress. Those authentication and capability boundaries—not this
     ///    origin comparison—are the enforcement floor.
-    /// 2. Else, if `principal` already holds a runtime grant for THIS capsule
+    /// 2. Else, when a profile cache is installed, resolve the principal
+    ///    before either allowance. A failed resolve or `enabled = false`
+    ///    returns `false` with no prompt and no new runtime grant. The
+    ///    resolved `Arc` is the profile this decision admits.
+    /// 3. Else, if `principal` already holds a runtime grant for THIS capsule
     ///    reaching `host:port`, return `true` immediately (no prompt). The grant
     ///    is keyed on `capsule_id` too, so capsule B never short-circuits on
-    ///    capsule A's grant.
-    /// 3. Else, if `principal`'s on-disk profile remembers an `approve_always`
-    ///    grant for THIS capsule reaching `host:port`
-    ///    (`network.capsule_egress[<capsule>]`), return `true` immediately (no
-    ///    prompt). The in-memory store above starts empty after a daemon
-    ///    restart, so this persisted consult is what makes `approve_always`
-    ///    actually survive a restart. It is per-capsule AND per-principal by
-    ///    construction (only this capsule's bucket in this principal's profile
-    ///    is read).
-    /// 4. Else elicit consent (`ApprovalRequired` on `astrid.v1.approval`,
+    ///    capsule A's grant. This check runs only after step 2 succeeds.
+    /// 4. Else, if the admitted profile remembers an `approve_always` grant for
+    ///    THIS capsule reaching `host:port` (`network.capsule_egress[<capsule>]`),
+    ///    return `true` immediately (no prompt). The in-memory store above starts
+    ///    empty after a daemon restart, so this persisted consult is what makes
+    ///    `approve_always` actually survive a restart. It is per-capsule AND
+    ///    per-principal by construction.
+    /// 5. Else elicit consent (`ApprovalRequired` on `astrid.v1.approval`,
     ///    resource = `host:port` only, reason names the capsule) and block,
-    ///    bounded by [`CONSENT_TIMEOUT_MS`] and the capsule cancel token. On
-    ///    approve / approve_session: cache a per-principal, per-capsule session
-    ///    grant and return `true`. On approve_always: also persist to the
-    ///    capsule-keyed `profile.network.capsule_egress[<capsule>]` on disk. On
-    ///    deny / timeout / cancel / unknown decision: return `false`.
+    ///    bounded by [`CONSENT_TIMEOUT_MS`] and the capsule cancel token.
+    ///    A changed admitted profile denies the reply and records no session
+    ///    grant. A one-shot approval admits this request. Session approval
+    ///    records an in-memory allowance. Durable approval writes the capsule's
+    ///    profile entry and rechecks the admitted profile under the write lock.
+    ///    Denial and timeout close the request.
     ///
     /// `host` is the URL host (an IP literal in v1 scope); `port` is the
     /// resolved request port.
@@ -395,14 +368,29 @@ impl HostState {
             &endpoint,
         );
 
-        // 2. EXISTING-GRANT FAST PATH. A prior consent for this principal +
+        // Pin the profile used for this decision before consulting either
+        // allowance source. Invalidation while a prompt is open cancels it.
+        let admitted_profile = if let Some(cache) = &self.profile_cache {
+            let Ok(profile) = cache.resolve(&principal) else {
+                audit.denied("profile", "principal profile unavailable");
+                return false;
+            };
+            if !profile.enabled {
+                audit.denied("profile", "principal disabled");
+                return false;
+            }
+            Some(profile)
+        } else {
+            None
+        };
+        // 3. EXISTING-GRANT FAST PATH. A prior consent for this principal +
         // capsule + endpoint short-circuits the prompt.
         if has_runtime_grant(&store, &principal, &capsule_id, host, port) {
             audit.granted(HostApprovalScope::Session, "session_grant");
             return true;
         }
 
-        // 3. PERSISTED-GRANT FAST PATH. The in-memory store above is empty
+        // 4. PERSISTED-GRANT FAST PATH. The in-memory store above is empty
         // after a daemon restart, so a prior `approve_always` would otherwise be
         // silently forgotten and the operator re-prompted. Consult the
         // principal's on-disk profile for a remembered grant under THIS capsule
@@ -412,8 +400,8 @@ impl HostState {
         // This short-circuits only the ELICIT — the origin gate and SSRF airlock
         // upstream still bind (we are only reached on a `LocalSocket`,
         // airlock-rejected IP-literal endpoint).
-        if let Some(cache) = self.profile_cache.as_ref()
-            && has_persisted_grant(cache, &principal, &capsule_id, host, port)
+        if let Some(profile) = &admitted_profile
+            && has_persisted_grant(profile, &capsule_id, host, port)
         {
             tracing::debug!(
                 target: "astrid.audit.http",
@@ -426,8 +414,16 @@ impl HostState {
             return true;
         }
 
-        // 4. ELICIT. Publish `ApprovalRequired` and block for the response.
+        // 5. ELICIT. Publish `ApprovalRequired` and block for the response.
         let decision = self.elicit_egress_consent(&principal, &endpoint, &mut audit);
+        if let (Some(cache), Some(admitted)) = (&self.profile_cache, &admitted_profile)
+            && !cache
+                .resolve(&principal)
+                .is_ok_and(|current| std::sync::Arc::ptr_eq(admitted, &current))
+        {
+            audit.denied("profile", "principal profile changed during consent");
+            return false;
+        }
         match classify_decision(&decision) {
             Decision::Deny => {
                 audit.denied("user", "not approved");
@@ -455,7 +451,7 @@ impl HostState {
                 true
             },
             Decision::Session => {
-                add_runtime_grant(&store, &principal, &capsule_id, host, port, true);
+                add_runtime_grant(&store, &principal, &capsule_id, host, port);
                 tracing::info!(
                     security_event = true,
                     capsule_id = %self.capsule_id.as_str(),
@@ -467,30 +463,20 @@ impl HostState {
                 true
             },
             Decision::Always => {
-                // Cache a non-session grant for the running daemon AND persist
-                // to disk so it survives a restart. A disk-persist failure is a
-                // fail-closed no-op for the persistence only — the in-flight
-                // request still proceeds on the in-memory grant just added.
-                add_runtime_grant(&store, &principal, &capsule_id, host, port, false);
                 if let Some(cache) = self.profile_cache.as_ref() {
-                    if let Err(e) = cache.persist_egress(&principal, &capsule_id, &endpoint) {
-                        tracing::warn!(
-                            security_event = true,
-                            %principal,
-                            endpoint = %endpoint,
-                            error = %e,
-                            "local-egress consent: approve_always disk persist failed; \
-                             in-memory grant stands for this session"
-                        );
+                    if let Err(error) = cache.persist_egress_for_profile(
+                        &principal,
+                        &capsule_id,
+                        &endpoint,
+                        admitted_profile.as_ref(),
+                    ) {
+                        tracing::warn!(security_event = true, %principal, %endpoint, %error,
+                            "could not persist local egress approval");
+                        audit.denied("profile", "could not persist egress approval");
+                        return false;
                     }
                 } else {
-                    tracing::warn!(
-                        security_event = true,
-                        %principal,
-                        endpoint = %endpoint,
-                        "local-egress consent: approve_always but no profile cache wired; \
-                         grant is session-scoped only"
-                    );
+                    add_runtime_grant(&store, &principal, &capsule_id, host, port);
                 }
                 tracing::info!(
                     security_event = true,
