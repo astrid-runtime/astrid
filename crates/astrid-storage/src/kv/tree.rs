@@ -37,6 +37,7 @@ mod hot_cache_integration_tests;
 mod legacy_avl;
 mod maintenance;
 mod memo;
+mod memo_admission;
 mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
@@ -50,7 +51,7 @@ pub(crate) use self::handoff::seed_owner_memo_if_live;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
-pub(crate) use self::memo::MemoEpoch;
+pub(crate) use self::memo_admission::MemoEpoch;
 pub(crate) use self::publication::{KvCheckpointPublication, RetiredKvProjection};
 pub(crate) use self::validation::CertifiedValueMembership;
 pub(super) use self::validation::TreeValidation;
@@ -104,15 +105,9 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         // Order every cache publisher and check currency inside that guard.
         // Never hold it across graph validation or an authoritative commit.
         let mut projections = self.projections.lock();
-        if !self.epoch_is_current(epoch) {
-            return;
-        }
-        let Ok(Some(current)) = engine.current_kv_root(&owner) else {
-            // An optional cache query must not false-fail an already successful
-            // commit or historical snapshot read.
-            return;
-        };
-        if current != expected {
+        if !epoch.admits_root(self.memo_epoch(), &owner, Some(expected), |principal| {
+            engine.current_kv_root(principal)
+        }) {
             return;
         }
         // Nested cache order is projections -> trees. The engine root method

@@ -9,6 +9,8 @@ mod chunk_range;
 mod child_range;
 #[path = "../crates/astrid-storage/src/engine/durable/batch_slots.rs"]
 mod batch_slots;
+#[path = "../crates/astrid-storage/src/kv/tree/memo_admission.rs"]
+mod memo_admission;
 mod hosted_batch_slots;
 mod hosted_chunk_tree_range;
 #[path = "../crates/astrid-storage/src/storage_words.rs"]

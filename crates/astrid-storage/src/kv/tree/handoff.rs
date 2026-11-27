@@ -63,13 +63,9 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         }
         // Mirror publish_if_current lock order: projections, then trees.
         let mut projections = self.projections.lock();
-        if !self.epoch_is_current(epoch) {
-            return false;
-        }
-        let Ok(current) = engine.current_kv_root(&owner) else {
-            return false;
-        };
-        if current != live_root {
+        if !epoch.admits_root(self.memo_epoch(), &owner, live_root, |principal| {
+            engine.current_kv_root(principal)
+        }) {
             return false;
         }
         self.trees.lock().insert(owner.clone(), tree);

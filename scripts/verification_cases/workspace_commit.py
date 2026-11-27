@@ -202,3 +202,16 @@ def defects():
             f"durable root selection {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-storage/src/kv/tree/memo_admission.rs")
+    trace = Path("verification/hosted_kv_model.rs")
+    for name, old, new in [
+        ("purge may reuse an earlier epoch", "next as int == if", "next as int <= if"),
+        ("revoked ticket can admit", "!admitted\n        }", "true\n        }"),
+        ("acceptance can omit the sampled root", "else if admitted { sample.ensures((owner,),Ok(expected)) }", "else if admitted { true }"),
+        ("rejection can ignore a matching root", "wrong != expected && #[trigger]", "#[trigger]"),
+    ]:
+        yield (
+            f"KV memo {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

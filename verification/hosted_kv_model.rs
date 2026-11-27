@@ -8,6 +8,29 @@ use vstd::prelude::*;
 
 verus! {
 
+/// Once a purge advances the epoch, even an unchanged root for the same
+/// owner cannot revive an older ticket. A saturated counter stays closed.
+fn memo_after_purge<P>(before:u64,later:u64,owner:&P,expected:Option<crate::RootState>) -> (ok:bool)
+    requires later >= before,
+    ensures !ok,
+{
+    let captured = crate::memo_admission::MemoEpoch::new(before);
+    let after = crate::memo_admission::MemoEpoch::new(later).after_purge();
+    captured.admits_root(crate::memo_admission::MemoEpoch::new(after),owner,expected,
+        |_p:&P| -> (r:Result<Option<crate::RootState>,()>) ensures r == Ok(expected) { Ok(expected) })
+}
+
+/// Matching the root includes its full generation and commit, including
+/// the absent-root case used when seeding an empty destination.
+fn memo_for_sample<P>(epoch:u64,owner:&P,expected:Option<crate::RootState>,sample:Result<Option<crate::RootState>,()>)
+    -> (ok:bool)
+    ensures ok == (epoch < u64::MAX && sample == Ok(expected)),
+{
+    let captured = crate::memo_admission::MemoEpoch::new(epoch);
+    captured.admits_root(captured,owner,expected,
+        |_p:&P| -> (r:Result<Option<crate::RootState>,()>) ensures r == sample { sample })
+}
+
 #[derive(Clone, Copy)]
 enum Store<'a> { Neutral, Pinned { namespace: &'a [u8], owner: [u8;32] } }
 
