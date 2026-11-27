@@ -143,6 +143,9 @@ def defects():
     source = Path("crates/astrid-storage/src/content/store/quota_transition.rs")
     for name, old, new in [
         ("owner may substitute a refusal", "out == decision(other + previous, other + next, limit)", "out.is_ok() == decision(other + previous, other + next, limit).is_ok()"),
+        ("promotion may ignore an impossible branch charge", "out == if branch > components { Err(Refusal::AccountingOverflow) }", "out == if branch > components { out }"),
+        ("promotion may drop an unrelated component charge", "decision(components + catalog, components - branch + merged, limit)", "decision(components + catalog, merged as int, limit)"),
+        ("promotion may report the wrong refusal", "else { decision(components + catalog, components - branch + merged, limit) }", "else { if decision(components + catalog, components - branch + merged, limit).is_err() {out} else {Ok(())} }"),
         ("branch may admit an impossible prior charge", "out == if previous > components { Err(Refusal::AccountingOverflow) }", "out == if previous > components { out }"),
         ("over-limit growth may succeed", "else if after > limit && after > before", "else if false"),
         ("over-limit reductions may be refused", "else if after > limit && after > before", "else if after > limit"),

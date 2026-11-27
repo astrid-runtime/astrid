@@ -239,24 +239,14 @@ where
         else {
             return Ok(());
         };
-        let new_other = header
-            .other_quota_bytes
-            .checked_sub(old_branch_quota)
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let new_used = new_other
-            .checked_add(catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let old_used = header
-            .other_quota_bytes
-            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        if new_used > limit && new_used > old_used {
-            return Err(WorkspaceBranchError::QuotaExceeded {
-                used: new_used,
-                limit,
-            });
-        }
-        Ok(())
+        quota_transition::promote(
+            header.other_quota_bytes,
+            header.catalog.map_or(0, |root| root.summary.quota_bytes),
+            old_branch_quota,
+            catalog.map_or(0, |root| root.summary.quota_bytes),
+            limit,
+        )
+        .map_err(WorkspaceBranchError::from)
     }
 
     pub(super) fn completion_receipt(
@@ -388,14 +378,7 @@ where
             new_branch_quota,
             limit,
         )
-        .map_err(|error| match error {
-            quota_transition::Refusal::AccountingOverflow => {
-                PrincipalContentError::AccountingOverflow.into()
-            },
-            quota_transition::Refusal::Exceeded { used, limit } => {
-                WorkspaceBranchError::QuotaExceeded { used, limit }
-            },
-        })
+        .map_err(WorkspaceBranchError::from)
     }
 
     pub(super) fn mutate_catalog<F>(
@@ -457,5 +440,18 @@ where
                 Err(error) => Err(error.into()),
             }
         })
+    }
+}
+
+impl From<quota_transition::Refusal> for WorkspaceBranchError {
+    fn from(error: quota_transition::Refusal) -> Self {
+        match error {
+            quota_transition::Refusal::AccountingOverflow => {
+                PrincipalContentError::AccountingOverflow.into()
+            },
+            quota_transition::Refusal::Exceeded { used, limit } => {
+                Self::QuotaExceeded { used, limit }
+            },
+        }
     }
 }

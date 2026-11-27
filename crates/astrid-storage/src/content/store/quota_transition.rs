@@ -40,4 +40,15 @@ pub(super) fn replace_branch(catalog:u64, components:u64, previous:u64, next:u64
     let updated = remaining.checked_add(next).ok_or(Refusal::AccountingOverflow)?;
     replace(catalog, components, updated, limit)
 }
+
+/// Promotion replaces the owner catalog and removes the consumed branch's charge.
+pub(super) fn promote(components:u64, catalog:u64, branch:u64, merged:u64, limit:u64)
+    -> (out:Result<(),Refusal>)
+    ensures out == if branch > components { Err(Refusal::AccountingOverflow) }
+        else { decision(components + catalog, components - branch + merged, limit) },
+{
+    let remaining = components.checked_sub(branch).ok_or(Refusal::AccountingOverflow)?;
+    let replaced = catalog.checked_add(branch).ok_or(Refusal::AccountingOverflow)?;
+    replace(remaining,replaced,merged,limit)
+}
 }

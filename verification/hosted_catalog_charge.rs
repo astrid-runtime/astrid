@@ -60,4 +60,19 @@ fn branch_insert(catalog:u64, components:u64, branch:CatalogSummary, name:&[u8],
     let updated = extend(branch,name,logical).ok_or(Refusal::AccountingOverflow)?;
     branch_replacement(catalog,components,branch.quota_bytes,updated.quota_bytes,limit)
 }
+
+/// A published owner cannot gain uncharged bytes by consuming a branch. If the
+/// merged catalog fits within the two replaced charges, a lowered limit permits it.
+fn promotion(components:u64,catalog:u64,branch:u64,merged:u64,limit:u64) -> (out:Result<(),Refusal>)
+    ensures ({
+        let before = components + catalog;
+        let after = components - branch + merged;
+        let invalid = branch > components || before > u64::MAX || after > u64::MAX;
+        &&& (out == Err(Refusal::AccountingOverflow)) == invalid
+        &&& (out == Ok(())) == (!invalid && (after <= limit || merged <= catalog + branch))
+        &&& out matches Err(Refusal::Exceeded { used, limit:l }) ==> used == after && l == limit
+    }),
+{
+    quota_transition::promote(components,catalog,branch,merged,limit)
+}
 }
