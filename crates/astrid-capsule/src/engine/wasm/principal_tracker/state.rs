@@ -131,31 +131,27 @@ pub(super) fn active_locked<K: Eq + Hash>(entries: &HashMap<K,PrincipalInvocatio
 
 pub(super) enum DrainAction { Finish, Resume }
 
-pub(super) fn drain_locked<K: Eq + Hash + Clone>(entries: &mut HashMap<K,PrincipalInvocation>, key: &K, action: DrainAction)
-    requires vstd::pervasive::obeys_clone_eq::<K>(), hash_map_inv(old(entries)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+pub(super) fn drain_locked<K: Eq + Hash>(entries: &mut HashMap<K,PrincipalInvocation>, key: K, action: DrainAction)
+    requires hash_map_inv(old(entries)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
     ensures hash_map_inv(final(entries)), ({
-        let (retired,n) = binding(old(entries)@,*key);
+        let (retired,n) = binding(old(entries)@,key);
         let after = match action {
             DrainAction::Finish => (retired, if n > 0 { n - 1 } else { 0int }),
             DrainAction::Resume => (false,n),
         };
-        &&& binding(final(entries)@,*key) == after
-        &&& final(entries)@.contains_key(*key) == (after.0 || after.1 > 0)
-        &&& final(entries)@.remove(*key) == old(entries)@.remove(*key)
+        &&& binding(final(entries)@,key) == after
+        &&& final(entries)@.contains_key(key) == (after.0 || after.1 > 0)
+        &&& final(entries)@.remove(key) == old(entries)@.remove(key)
     }),
 {
-    proof { reveal(vstd::pervasive::obeys_clone_eq); }
-    if let Some(mut entry) = entries.remove(key) {
+    if let std::collections::hash_map::Entry::Occupied(mut slot) = entries.entry(key) {
+        let entry = slot.get_mut();
         match action {
             DrainAction::Finish => entry.finish(),
             DrainAction::Resume => entry.resume(),
         }
-        if !entry.discardable() {
-            let owned = K::clone(key);
-            assert(vstd::pervasive::cloned(*key,owned));
-            entries.insert(owned,entry);
-        }
+        if entry.discardable() { slot.remove(); }
     }
-    assert(entries@.remove(*key) =~= old(entries)@.remove(*key));
+    assert(entries@.remove(key) =~= old(entries)@.remove(key));
 }
 }

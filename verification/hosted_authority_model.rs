@@ -590,8 +590,8 @@ fn apply_tracker_event<K: Eq + std::hash::Hash + Clone>(
     let admitted = match event {
         OperationEvent::Begin => acquire(entries,&key).is_some(),
         OperationEvent::Retire => { retire_locked(entries,key); false },
-        OperationEvent::Finish => { drain_locked(entries,&key,DrainAction::Finish); false },
-        OperationEvent::Resume => { drain_locked(entries,&key,DrainAction::Resume); false },
+        OperationEvent::Finish => { drain_locked(entries,key,DrainAction::Finish); false },
+        OperationEvent::Resume => { drain_locked(entries,key,DrainAction::Resume); false },
     };
     assert(entries@.remove(key).get(other) == entries@.get(other));
     assert(old(entries)@.remove(key).get(other) == old(entries)@.get(other));
@@ -615,11 +615,14 @@ fn drop_admitted_after_retirement<K: Eq + std::hash::Hash + Clone>(
 {
     use crate::principal_invocation_state::{acquire,active_locked,retire_locked,drain_locked,DrainAction};
     let owner = acquire(entries,&key).unwrap();
-    retire_locked(entries,key);
-    drain_locked(entries,&owner,DrainAction::Finish);
+    proof { reveal(vstd::pervasive::obeys_clone_eq); }
+    let retired = K::clone(&key);
+    assert(vstd::pervasive::cloned(key,retired));
+    retire_locked(entries,retired);
+    drain_locked(entries,owner,DrainAction::Finish);
     assert(entries@.remove(owner).get(other) == entries@.get(other));
     assert(old(entries)@.remove(owner).get(other) == old(entries)@.get(other));
-    active_locked(entries,&owner)
+    active_locked(entries,&key)
 }
 
 // ---- One fuel window ----

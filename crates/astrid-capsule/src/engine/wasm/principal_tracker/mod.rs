@@ -14,7 +14,7 @@ pub(in crate::engine) struct PrincipalInvocationTracker {
 
 pub(crate) struct PrincipalInvocationGuard {
     tracker: Arc<PrincipalInvocationTracker>,
-    principal: astrid_core::PrincipalId,
+    principal: Option<astrid_core::PrincipalId>,
 }
 
 #[cfg(test)]
@@ -35,7 +35,7 @@ impl PrincipalInvocationTracker {
         let principal = state::acquire(&mut state, principal)?;
         Some(PrincipalInvocationGuard {
             tracker: Arc::clone(self),
-            principal,
+            principal: Some(principal),
         })
     }
 
@@ -52,7 +52,7 @@ impl PrincipalInvocationTracker {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state::drain_locked(&mut state, principal, state::DrainAction::Resume);
+        state::drain_locked(&mut state, principal.clone(), state::DrainAction::Resume);
     }
 
     pub(super) fn active(&self, principal: &astrid_core::PrincipalId) -> usize {
@@ -114,18 +114,21 @@ impl PrincipalInvocationGuard {
         tracker: &Arc<PrincipalInvocationTracker>,
         principal: &astrid_core::PrincipalId,
     ) -> bool {
-        Arc::ptr_eq(&self.tracker, tracker) && &self.principal == principal
+        Arc::ptr_eq(&self.tracker, tracker) && self.principal.as_ref() == Some(principal)
     }
 }
 
 impl Drop for PrincipalInvocationGuard {
     fn drop(&mut self) {
+        let Some(principal) = self.principal.take() else {
+            return;
+        };
         let mut state = self
             .tracker
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state::drain_locked(&mut state, &self.principal, state::DrainAction::Finish);
+        state::drain_locked(&mut state, principal, state::DrainAction::Finish);
         drop(state);
         self.tracker.changed.notify_waiters();
     }

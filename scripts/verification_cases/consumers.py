@@ -33,7 +33,7 @@ def consumer_defects():
         ("loses guard owner", "guard == if allowed { Some(*principal) } else { None }", "guard.is_some() == allowed"),
         ("may erase another retirement", "final(entries)@.remove(key) == old(entries)@.remove(key),", "true,"),
         ("loses the drain observation", "n == binding(entries@,*key).1", "true"),
-        ("may reopen the owner on finish", "binding(final(entries)@,*key) == after", "binding(final(entries)@,*key).1 == after.1"),
+        ("may reopen the owner on finish", "binding(final(entries)@,key) == after", "binding(final(entries)@,key).1 == after.1"),
     ]:
         yield (
             f"principal tracker {name}", tracker,

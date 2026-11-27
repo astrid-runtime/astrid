@@ -66,8 +66,9 @@ pub(super) fn recovery_aliases<U: Eq + Hash, A: Eq + Clone>(directory: &HashMap<
     proof { reveal(obeys_concrete_eq); reveal(obeys_clone_eq); }
     let live = match directory.get(uid) {
         Some(current) => {
-            if let Some(prior) = &retained {
-                if A::eq(prior,current) { return [retained,None]; }
+            match &retained {
+                Some(prior) if A::eq(prior,current) => return [retained,None],
+                _ => {},
             }
             let alias = A::clone(current);
             assert(cloned(*current,alias));
