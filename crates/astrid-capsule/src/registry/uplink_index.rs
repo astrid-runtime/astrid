@@ -55,7 +55,7 @@ pub(super) fn prune_unviewed<P:Eq+Hash,O:Eq+Hash,V,D,K:Eq+Hash+Copy>(
             forall|i:int| 0 <= i < n ==> !(#[trigger] all[i].1)@.contains_key(*package),
         decreases views@.dom().len() - n,
     {
-        let Some((principal,view)) = rows.next() else {
+        let Some((_principal,view)) = rows.next() else {
             assert(n == all.len());
             assert forall|p:P| views@.contains_key(p) implies !(#[trigger] views@[p])@.contains_key(*package) by {
                 let i = all.index_of((&p,&views@[p]));
@@ -66,9 +66,9 @@ pub(super) fn prune_unviewed<P:Eq+Hash,O:Eq+Hash,V,D,K:Eq+Hash+Copy>(
             withdraw(entries,package);
             return;
         };
-        assert(all[n] == (principal,view));
-        assert(views@.contains_key(*principal));
-        assert(views@[*principal] == *view);
+        assert(all[n] == (_principal,view));
+        assert(views@.contains_key(*_principal));
+        assert(views@[*_principal] == *view);
         if view.contains_key(package) { return; }
         assert(rows.remaining() =~= all.skip(n+1));
         proof { n = n+1; }
