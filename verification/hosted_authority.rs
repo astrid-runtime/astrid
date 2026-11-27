@@ -359,3 +359,6 @@ mod hosted_io_splice;
 #[path = "../crates/astrid-kernel/src/runtime_residency.rs"]
 mod runtime_residency;
 mod hosted_runtime_residency;
+
+#[path = "../crates/astrid-core/src/principal/retirement.rs"]
+mod principal_fences;

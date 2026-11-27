@@ -7,7 +7,7 @@
 //! match. This is Layer 4 of the production multi-tenancy work (issue #668).
 
 use crate::error::{ApprovalError, ApprovalResult};
-use astrid_core::principal::PrincipalId;
+use astrid_core::principal::{PrincipalId, retirement};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -65,7 +65,7 @@ impl AllowanceStore {
             .retiring_principals
             .read()
             .map_err(|e| ApprovalError::Storage(e.to_string()))?;
-        if retirement.contains(&allowance.principal) {
+        if retirement::fenced(&retirement, &allowance.principal) {
             return Err(ApprovalError::Storage(format!(
                 "principal {} is retiring",
                 allowance.principal
@@ -105,7 +105,7 @@ impl AllowanceStore {
         if self
             .retiring_principals
             .read()
-            .map_or(true, |retiring| retiring.contains(principal))
+            .map_or(true, |retiring| retirement::fenced(&retiring, principal))
         {
             return None;
         }
@@ -140,7 +140,7 @@ impl AllowanceStore {
         if self
             .retiring_principals
             .read()
-            .map_or(true, |retiring| retiring.contains(principal))
+            .map_or(true, |retiring| retirement::fenced(&retiring, principal))
         {
             return None;
         }
@@ -269,7 +269,7 @@ impl AllowanceStore {
             .retiring_principals
             .write()
             .map_err(|e| ApprovalError::Storage(e.to_string()))?;
-        retirement.insert(principal.clone());
+        retirement::fence(&mut retirement, principal.clone());
         let mut allowances = self
             .allowances
             .write()
@@ -280,10 +280,11 @@ impl AllowanceStore {
 
     /// Release an in-process retirement fence after durable reclamation.
     pub fn finish_principal_retirement(&self, principal: &PrincipalId) {
-        self.retiring_principals
+        let mut retirement = self
+            .retiring_principals
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(principal);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retirement::release(&mut retirement, principal);
     }
 
     /// Remove every principal's session-only allowances.

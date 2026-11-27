@@ -207,6 +207,17 @@ impl PrincipalDirectory {
             })
     }
 
+    /// Select the retained and distinct live aliases to fence for a pending deletion at startup.
+    pub fn retirement_aliases(
+        &self,
+        uid: PrincipalUid,
+        retained: Option<PrincipalId>,
+    ) -> impl Iterator<Item = PrincipalId> {
+        binding::recovery_aliases(&self.inner.read().principals, &uid, retained)
+            .into_iter()
+            .flatten()
+    }
+
     /// Whether a durable UID currently names an admitted live principal.
     #[must_use]
     pub fn contains_uid(&self, uid: PrincipalUid) -> bool {

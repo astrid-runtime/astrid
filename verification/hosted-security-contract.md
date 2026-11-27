@@ -229,6 +229,10 @@ and string-level executable contract rely on Rust UTF-8 string semantics.
 
 Admission returns the principal key that the invocation guard stores alongside the owning tracker. A checked update of the production hash map refines each begin, finish, retire and resume to the one-principal transition, preserving every other key. A consumer acquires a guard, retires its owner, finishes using the returned key and samples the same count used by the quiescence waiter. The count returns to its original value, including zero, and the retired entry stays closed. This applies to arbitrary initial counts below saturation. At saturation, begin refuses without changing the count. The proof assumes the standard hash, equality and clone laws for the principal key. Mutex exclusion, guard lifetime, waiter notification and restoration of fences at startup still need a concurrent runtime refinement.
 
+### Restoring retirement fences before serving
+
+For each pending deletion in the loaded ownership snapshot, kernel startup selects the retained alias and any distinct current alias of the reserved UID. It reads the reverse directory map under one read lock. A legacy reservation with no retained alias therefore fences the current name when one exists. Capability and allowance stores use the same checked set insertion and membership functions. A composition proof shows that applying the selected names in both sets preserves all previous fences and closes precisely those additional names. Native tests exercise an older reservation, a changed alias, an unrelated principal, and storage reopened after abrupt exit. Snapshot decoding and validation, completeness of reservation enumeration, async dispatch to both stores, and the ordering of admission after startup still require refinement.
+
 ## Guest identity policy
 
 All five identity host methods call the security gate before using the

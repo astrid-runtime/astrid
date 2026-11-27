@@ -43,3 +43,38 @@ pub(super) fn with_pair<T,R,F:FnOnce(T)->R>(
 }
 
 }
+
+use std::{collections::HashMap, hash::Hash};
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    laws_eq::obeys_concrete_eq,
+    pervasive::{cloned, obeys_clone_eq},
+    std_specs::hash::{hash_map_inv, obeys_key_model},
+};
+
+verus! {
+broadcast use vstd::std_specs::hash::group_hash_axioms;
+
+/// Return the retained name and any distinct live name of this generation.
+pub(super) fn recovery_aliases<U: Eq + Hash, A: Eq + Clone>(directory: &HashMap<U,A>, uid: &U, retained: Option<A>)
+    -> (targets: [Option<A>;2])
+    requires hash_map_inv(directory), obeys_key_model::<U>(), obeys_concrete_eq::<U>(),
+        obeys_concrete_eq::<A>(), obeys_clone_eq::<A>(),
+    ensures targets[0] == retained,
+        targets[1] == if directory@.get(*uid) == retained { None } else { directory@.get(*uid) },
+{
+    proof { reveal(obeys_concrete_eq); reveal(obeys_clone_eq); }
+    let live = match directory.get(uid) {
+        Some(current) => {
+            if let Some(prior) = &retained {
+                if A::eq(prior,current) { return [retained,None]; }
+            }
+            let alias = A::clone(current);
+            assert(cloned(*current,alias));
+            Some(alias)
+        },
+        None => None,
+    };
+    [retained,live]
+}
+}

@@ -7,6 +7,8 @@
 
 mod syntax;
 
+pub mod retirement;
+
 use std::fmt;
 use std::str::FromStr;
 

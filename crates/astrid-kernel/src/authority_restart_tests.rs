@@ -156,3 +156,73 @@ async fn hosted_token_revocation_and_consumption_survive_storage_reopen() {
     drop(reopened);
     kv.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn restored_fences_cover_legacy_and_renamed_reservations_in_both_stores() {
+    use astrid_core::PrincipalUid;
+    use astrid_storage::{MemoryKvStore, OwnershipStore, PrincipalDirectory};
+
+    let old = PrincipalId::new("retained").unwrap();
+    let renamed = PrincipalId::new("renamed").unwrap();
+    let legacy = PrincipalId::new("legacy").unwrap();
+    let unrelated = PrincipalId::new("unrelated").unwrap();
+    let renamed_uid = PrincipalUid::from_bytes([1; 32]);
+    let legacy_uid = PrincipalUid::from_bytes([2; 32]);
+    let directory = PrincipalDirectory::default();
+    directory.register(old.clone(), renamed_uid).unwrap();
+    directory.register(legacy.clone(), legacy_uid).unwrap();
+    let ownership = OwnershipStore::new(Arc::new(MemoryKvStore::new()), directory).unwrap();
+    drop(
+        ownership
+            .guard_principal_deletion_for_alias(renamed_uid, old.clone())
+            .await
+            .unwrap(),
+    );
+    drop(
+        ownership
+            .guard_principal_deletion(legacy_uid)
+            .await
+            .unwrap(),
+    );
+    let snapshot = ownership.load().await.unwrap();
+
+    let recovered = PrincipalDirectory::default();
+    recovered.register(renamed.clone(), renamed_uid).unwrap();
+    recovered.register(legacy.clone(), legacy_uid).unwrap();
+    recovered
+        .register(unrelated.clone(), PrincipalUid::from_bytes([3; 32]))
+        .unwrap();
+    let capabilities = CapabilityStore::in_memory();
+    let allowances = AllowanceStore::new();
+    super::authority_recovery::restore_retirement_fences(
+        &snapshot,
+        &recovered,
+        &capabilities,
+        &allowances,
+    )
+    .await
+    .unwrap();
+    for (alias, expected) in [
+        (old, true),
+        (renamed, true),
+        (legacy, true),
+        (unrelated, false),
+    ] {
+        assert_eq!(capabilities.is_principal_retiring(&alias).await, expected);
+        let allowance = Allowance {
+            id: AllowanceId::new(),
+            principal: alias,
+            action_pattern: AllowancePattern::ServerTools {
+                server: "test".to_owned(),
+            },
+            created_at: Timestamp::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            session_only: true,
+            workspace_root: None,
+            signature: KeyPair::generate().sign(b"recovery"),
+        };
+        assert_eq!(allowances.add_allowance(allowance).is_err(), expected);
+    }
+}

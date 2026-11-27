@@ -6,6 +6,7 @@
 //! `SurrealKV` constructor for compatibility during the migration window.
 
 use astrid_core::principal::PrincipalId;
+use astrid_core::principal::retirement;
 use astrid_core::{Permission, TokenId};
 use astrid_storage::{KvStore, SurrealKvStore};
 use std::collections::HashMap;
@@ -176,7 +177,7 @@ impl CapabilityStore {
     /// Returns an error if the token is invalid or storage fails.
     pub async fn add(&self, token: CapabilityToken) -> CapabilityResult<()> {
         let retirement = self.retiring_principals.read().await;
-        if retirement.contains(&token.principal) {
+        if retirement::fenced(&retirement, &token.principal) {
             return Err(CapabilityError::StorageError(format!(
                 "principal {} is retiring",
                 token.principal
@@ -268,7 +269,7 @@ impl CapabilityStore {
                 .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
             for principal_map in tokens.values() {
                 if let Some(token) = principal_map.get(token_id) {
-                    if retirement.contains(&token.principal) {
+                    if retirement::fenced(retirement, &token.principal) {
                         return Ok(None);
                     }
                     return Ok(Some(token.clone()));
@@ -283,7 +284,7 @@ impl CapabilityStore {
         if let Some(store) = &self.persistent_store
             && let Some(token) = Self::read_persistent_token_any_principal(store, token_id).await?
         {
-            if retirement.contains(&token.principal) {
+            if retirement::fenced(retirement, &token.principal) {
                 return Ok(None);
             }
             return Ok(Some(token));
@@ -404,7 +405,7 @@ impl CapabilityStore {
         permission: Permission,
     ) -> Option<CapabilityToken> {
         let retirement = self.retiring_principals.read().await;
-        if retirement.contains(principal) {
+        if retirement::fenced(&retirement, principal) {
             return None;
         }
         // Check session tokens (this principal's inner map only). Matching
@@ -483,7 +484,7 @@ impl CapabilityStore {
     /// the subsequent purge observes every earlier add and every later add is
     /// rejected.
     pub async fn begin_principal_retirement(&self, principal: PrincipalId) {
-        self.retiring_principals.write().await.insert(principal);
+        retirement::fence(&mut *self.retiring_principals.write().await, principal);
     }
 
     /// Return whether new authority for `principal` is currently fenced.
@@ -492,12 +493,12 @@ impl CapabilityStore {
     /// loading, so an on-disk profile retained temporarily for reclamation
     /// policy cannot make a retiring principal live again.
     pub async fn is_principal_retiring(&self, principal: &PrincipalId) -> bool {
-        self.retiring_principals.read().await.contains(principal)
+        retirement::fenced(&*self.retiring_principals.read().await, principal)
     }
 
     /// Release an in-process retirement fence after durable reclamation.
     pub async fn finish_principal_retirement(&self, principal: &PrincipalId) {
-        self.retiring_principals.write().await.remove(principal);
+        retirement::release(&mut *self.retiring_principals.write().await, principal);
     }
 
     /// Revoke a token (global — all principals).

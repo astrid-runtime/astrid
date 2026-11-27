@@ -14,21 +14,10 @@ pub(super) async fn restore_retirement_fences(
     allowances: &AllowanceStore,
 ) -> std::io::Result<()> {
     for (uid, retained_alias) in ownership.pending_principal_deletions() {
-        let live_alias = if principals.contains_uid(uid) {
-            // Older reservations lack an alias. If the directory still
-            // resolves the generation, fence that name as well.
-            Some(principals.alias_for(uid).map_err(std::io::Error::other)?)
-        } else {
-            None
-        };
-        for alias in retained_alias.into_iter().chain(
-            live_alias
-                .as_ref()
-                .filter(|alias| Some(*alias) != retained_alias),
-        ) {
+        for alias in principals.retirement_aliases(uid, retained_alias.cloned()) {
             capabilities.begin_principal_retirement(alias.clone()).await;
             allowances
-                .begin_principal_retirement(alias)
+                .begin_principal_retirement(&alias)
                 .map_err(std::io::Error::other)?;
         }
     }
