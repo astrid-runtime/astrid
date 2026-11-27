@@ -824,8 +824,10 @@ async fn session_grant_does_not_bypass_a_disabled_profile() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path());
     let principal = PrincipalId::new("alice").unwrap();
-    let mut profile = PrincipalProfile::default();
-    profile.enabled = false;
+    let profile = PrincipalProfile {
+        enabled: false,
+        ..PrincipalProfile::default()
+    };
     profile
         .save_to_path(&home.profile_path(&principal))
         .unwrap();
