@@ -737,6 +737,33 @@ async fn captured_runtime_uid_is_not_relooked_up_when_alias_is_reused_before_bin
 }
 
 #[tokio::test]
+async fn warm_file_classification_uses_the_selected_arc_and_fences_only_its_binding() {
+    let (_parent, _root, mut state, tracker) = fixture();
+    state.log(LogLevel::Info, "populate the managed slot".into());
+    let managed = state.capsule_log.as_ref().unwrap();
+    let binding = state.deferred_logs.owner.as_ref();
+    {
+        let destination = resolve_file(managed, binding, None);
+        assert!(
+            matches!(destination, ResolvedLog::Managed(ref file, _) if Arc::ptr_eq(file, managed))
+        );
+        assert_eq!(tracker.active(&state.principal), 1);
+    }
+    assert_eq!(tracker.active(&state.principal), 0);
+    tracker.retire(&state.principal);
+    assert!(matches!(
+        resolve_file(managed, binding, None),
+        ResolvedLog::Absent
+    ));
+
+    // An embedder may explicitly supply another Arc even for the same OS file.
+    let injected = Arc::new(Mutex::new(managed.lock().unwrap().try_clone().unwrap()));
+    assert!(matches!(resolve_file(&injected, binding, None),
+        ResolvedLog::Explicit(ref file) if Arc::ptr_eq(file, &injected)));
+    assert_eq!(tracker.active(&state.principal), 0);
+}
+
+#[tokio::test]
 async fn warm_log_admits_the_current_uid_alias_after_rename() {
     let (_parent, root, mut state, tracker) = fixture();
     let pending = Arc::clone(state.deferred_logs.owner.as_ref().unwrap());

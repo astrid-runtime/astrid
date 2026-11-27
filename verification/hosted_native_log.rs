@@ -103,6 +103,44 @@ fn managed_write<'a,F,R,O:Output<F,Operation<'a,(u64,Option<u64>)>,R>>(
     crate::native_log_dispatch::dispatch(output,&destination,record,policy);
 }
 
+/// Once a public file slot is populated, compare its identity to the selected
+/// binding before writing. The concrete Arc pointer comparison and observation
+/// of the eager or OnceLock slot supply these identities in the native host.
+fn warm_write<B,G,R,A:crate::native_log_dispatch::Admission<B,G>,O:Output<u64,G,R>>(
+    admission:&mut A, output:&mut O, file:u64, cached:Option<(&B,&u64)>,
+    record:&R, policy:DaemonPolicy,
+)
+    ensures ({
+        let attempts = final(admission).attempts();
+        let old_attempts = old(admission).attempts();
+        let before = old(output).events();
+        let after = final(output).events();
+        let matched = cached matches Some((_,other)) && *other == file;
+        &&& if matched {
+            cached matches Some((binding,_)) && attempts == old_attempts.push((*binding,attempts.last().1))
+        } else { attempts == old_attempts }
+        &&& if matched && attempts.last().1.is_none() {
+            after == before.push(Event::Daemon(*record))
+        } else {
+            let guard = if matched { attempts.last().1 } else { None };
+            match after[before.len() as int] {
+                Event::Write(f,g,line,written) => {
+                    &&& f == file && g == guard && line == *record
+                    &&& {
+                        let first = before.push(Event::Write(file,guard,*record,written));
+                        after == if !written || policy is Always { first.push(Event::Daemon(*record)) } else { first }
+                    }
+                },
+                _ => false,
+            }
+        }
+    }),
+{
+    let destination = crate::native_log_dispatch::resolve_warm(admission,file,cached,
+        |a:&u64,b:&u64| -> (same:bool) ensures same == (*a == *b) { *a == *b });
+    crate::native_log_dispatch::dispatch(output,&destination,record,policy);
+}
+
 /// On Unix, either exclusive creation returned this handle, or the open
 /// of the same parent and leaf returned it and identity confirmation passed.
 fn append_handle<T,I,H,E,A:crate::private_append_leaf::LeafAccess<T,I,H,E>>(io:&mut A,target:&T)

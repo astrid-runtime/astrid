@@ -287,3 +287,15 @@ def defects():
             f"guest log dispatch {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), failure,
         )
+
+    for name, old, new, failure in [
+        ("admits a different cached file", "if same(other,&file)", "if !same(other,&file)", source),
+        ("refusal falls back to the supplied file", "None => Destination::Absent,", "None => Destination::Explicit(file),", source),
+        ("explicit file may attempt owner admission", "f == file && after == before && match cached", "f == file && match cached", trace),
+        ("matching file may return another guard", "after == before.push((*b,Some(g)))", "after.len() == before.len()+1", trace),
+        ("file refusal may consult another binding", "after == before.push((*b,None))", "after.len() == before.len()+1", trace),
+    ]:
+        yield (
+            f"warm log binding {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), failure,
+        )

@@ -235,6 +235,31 @@ impl BoundLog {
         &self,
         admitted: Option<&'a PrincipalInvocationGuard>,
     ) -> Option<ResolvedLog<'a>> {
+        self.with_operation(admitted, |operation| {
+            // Admission failure deliberately does not initialize the cache:
+            // a resumed view can retry. Only an attempted filesystem open is
+            // cached, and no lifecycle guard is retained beyond this write.
+            let opened = match &self.source {
+                LogSource::Eager(file) => Some(file),
+                LogSource::Deferred(deferred) => deferred
+                    .opened
+                    .get_or_init(|| {
+                        #[cfg(test)]
+                        tests::before_open().ok()?;
+                        let file = deferred.root.open(&deferred.target).ok()?;
+                        Some(Arc::new(Mutex::new(file)))
+                    })
+                    .as_ref(),
+            };
+            opened.map(|opened| ResolvedLog::Managed(Arc::clone(opened), operation))
+        })
+    }
+
+    fn with_operation<'a, T>(
+        &self,
+        admitted: Option<&'a PrincipalInvocationGuard>,
+        run: impl FnOnce(admission::Operation<'a, PrincipalInvocationGuard>) -> Option<T>,
+    ) -> Option<T> {
         // Resolve only the immutable UID's current live alias. A rename keeps
         // the UID/date destination; alias reuse can never select another UID.
         self.directory
@@ -248,22 +273,7 @@ impl BoundLog {
                 ) else {
                     return Ok(None);
                 };
-                // Admission failure deliberately does not initialize the cache:
-                // a resumed view can retry. Only an attempted filesystem open is
-                // cached, and no lifecycle guard is retained beyond this write.
-                let opened = match &self.source {
-                    LogSource::Eager(file) => Some(file),
-                    LogSource::Deferred(deferred) => deferred
-                        .opened
-                        .get_or_init(|| {
-                            #[cfg(test)]
-                            tests::before_open().ok()?;
-                            let file = deferred.root.open(&deferred.target).ok()?;
-                            Some(Arc::new(Mutex::new(file)))
-                        })
-                        .as_ref(),
-                };
-                Ok(opened.map(|opened| ResolvedLog::Managed(Arc::clone(opened), operation)))
+                Ok(run(operation))
             })
             .ok()
             .flatten()
@@ -307,20 +317,32 @@ fn resolve_file<'a>(
 ) -> ResolvedLog<'a> {
     // All engine-bound handles carry their owner fence on every write.
     // Arbitrary explicit File injections retain the existing eager interface.
-    let cached = pending.filter(|pending| {
+    let cached = pending.and_then(|pending| {
         let managed = match &pending.source {
             LogSource::Eager(file) => Some(file),
             LogSource::Deferred(deferred) => deferred.opened.get().and_then(Option::as_ref),
         };
-        managed.is_some_and(|opened| Arc::ptr_eq(opened, file))
+        managed.map(|opened| (pending.as_ref(), opened))
     });
-    if let Some(pending) = cached {
-        // The FD stays UID-bound, but aliases and their lifecycle views can
-        // change. Reuse the same live-binding admission for warm writes;
-        // the initialized OnceLock performs no filesystem open or lookup.
-        return pending.resolve(admitted).unwrap_or(ResolvedLog::Absent);
+    dispatch::resolve_warm(
+        &mut WarmAdmission(admitted),
+        Arc::clone(file),
+        cached,
+        Arc::ptr_eq,
+    )
+}
+
+struct WarmAdmission<'a>(Option<&'a PrincipalInvocationGuard>);
+
+impl<'a> dispatch::Admission<BoundLog, admission::Operation<'a, PrincipalInvocationGuard>>
+    for WarmAdmission<'a>
+{
+    fn acquire(
+        &mut self,
+        binding: &BoundLog,
+    ) -> Option<admission::Operation<'a, PrincipalInvocationGuard>> {
+        binding.with_operation(self.0, Some)
     }
-    ResolvedLog::Explicit(Arc::clone(file))
 }
 
 pub(super) fn valid_name(capsule: &str) -> bool {

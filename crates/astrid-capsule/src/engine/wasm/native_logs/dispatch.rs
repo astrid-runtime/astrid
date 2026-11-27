@@ -47,6 +47,42 @@ impl<F,G> Destination<F,G> {
     }
 }
 
+/// Recheck the live owner of a file that matches the selected managed binding.
+pub(crate) trait Admission<B,G> {
+    spec fn attempts(&self) -> Seq<(B,Option<G>)>;
+
+    fn acquire(&mut self, binding: &B) -> (guard: Option<G>)
+        ensures final(self).attempts() == old(self).attempts().push((*binding,guard));
+}
+
+pub(crate) fn resolve_warm<F,B,G,A:Admission<B,G>,C:FnOnce(&F,&F)->bool>(
+    admission: &mut A, file: F, cached: Option<(&B,&F)>, same: C,
+) -> (out: Destination<F,G>)
+    requires cached matches Some((_,other)) ==> same.requires((other,&file)),
+    ensures ({
+        let before = old(admission).attempts();
+        let after = final(admission).attempts();
+        match out {
+            Destination::Explicit(f) => f == file && after == before && match cached {
+                None => true,
+                Some((_,other)) => same.ensures((other,&file),false),
+            },
+            Destination::Managed(f,g) => f == file && (cached matches Some((b,other)) &&
+                same.ensures((other,&file),true) && after == before.push((*b,Some(g)))),
+            Destination::Absent => cached matches Some((b,other)) &&
+                same.ensures((other,&file),true) && after == before.push((*b,None)),
+        }
+    }),
+{
+    match cached {
+        Some((binding,other)) if same(other,&file) => match admission.acquire(binding) {
+            Some(guard) => Destination::Managed(file,guard),
+            None => Destination::Absent,
+        },
+        _ => Destination::Explicit(file),
+    }
+}
+
 pub(crate) fn dispatch<F,G,R,O:Output<F,G,R>>(output: &mut O, destination: &Destination<F,G>, record: &R, policy: DaemonPolicy)
     ensures ({
         let prior = old(output).events();
