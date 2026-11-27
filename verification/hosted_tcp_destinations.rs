@@ -66,3 +66,22 @@ fn successive_reservations(count: usize, limit: usize) -> (second: Option<usize>
     crate::net_reservation::reserve(first, limit)
 }
 }
+
+verus! {
+// The second accept cannot receive the first accept's reserved socket, even
+// when the stream budget is already exhausted at the first observation.
+fn successive_accepts<T>(slot: &mut Option<T>, count: usize, limit: usize)
+    -> (out: (crate::net_reservation::TcpAcceptAdmission<T>, crate::net_reservation::TcpAcceptAdmission<T>))
+    ensures
+        final(slot).is_none(),
+        match *old(slot) {
+            Some(value) => out.0 matches crate::net_reservation::TcpAcceptAdmission::Reserved(v) && v == value,
+            None => if count < limit { out.0 is Fresh } else { out.0 is Full },
+        },
+        if count < limit { out.1 is Fresh } else { out.1 is Full },
+{
+    let first = crate::net_reservation::admit(slot, limit, || -> (n: usize) ensures n == count, { count });
+    let second = crate::net_reservation::admit(slot, limit, || -> (n: usize) ensures n == count, { count });
+    (first, second)
+}
+}

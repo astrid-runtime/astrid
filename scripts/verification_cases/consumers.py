@@ -71,6 +71,9 @@ def consumer_defects():
         ("changes the admitted address", inbound, "t.requested() == (address, port)", "t.requested().1 == port"),
         ("forgets the OS operand", inbound, "out == self.requested()", "out.1 == self.requested().1"),
         ("permits a mismatched endpoint", inbound, "} else { Err(observed) },", "} else { out },"),
+        ("forgets the accepted socket", quota, "*old(slot) == Some(value)", "old(slot).is_some()"),
+        ("retains a spent accept slot", quota, "final(slot).is_none()", "true"),
+        ("allows fresh accept at capacity", quota, "&& n < limit", "&& n <= limit"),
         ("loses the reserved unit", quota, "n as int == count as int + 1", "n > count"),
         ("loses full-capacity refusal", quota, "else { next.is_none() }", "else { true }"),
     ]:

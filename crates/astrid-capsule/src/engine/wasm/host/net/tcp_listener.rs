@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
+use super::reservation::{self, TcpAcceptAdmission};
 use super::{
     HostState, MAX_ACTIVE_STREAMS, PendingTcpAccepted, PendingTcpConnection, TcpListenerSlot,
     audit_net_accept, map_io_err,
@@ -145,28 +146,18 @@ impl HostState {
     fn admit_tcp_accept(
         &self,
         pending: Arc<PendingTcpConnection>,
-    ) -> Result<TcpAcceptAdmission, ErrorCode> {
+    ) -> Result<TcpAcceptAdmission<PendingTcpAccepted>, ErrorCode> {
         let runtime = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
         let cancel = self.effective_cancel_token();
         util::bounded_block_on_cancellable(&runtime, &semaphore, &cancel, async move {
             let mut slot = pending.connection.lock().await;
-            if let Some(connection) = slot.take() {
-                TcpAcceptAdmission::Reserved(connection)
-            } else if pending.stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
-                TcpAcceptAdmission::Full
-            } else {
-                TcpAcceptAdmission::Fresh
-            }
+            reservation::admit(&mut slot, MAX_ACTIVE_STREAMS, || {
+                pending.stream_count.load(Ordering::Acquire)
+            })
         })
         .ok_or(ErrorCode::Closed)
     }
-}
-
-enum TcpAcceptAdmission {
-    Reserved(PendingTcpAccepted),
-    Fresh,
-    Full,
 }
 
 impl HostTcpListener for HostState {
