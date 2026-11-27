@@ -75,4 +75,38 @@ fn read_receipt(read: Option<Result<Option<Vec<u8>>, u8>>, timeout: u8, receipt:
         |error: u8| -> (r: (u8, Option<u64>)) ensures r == (error, Some(receipt)), { (error, Some(receipt)) })
 }
 
+type ReadObservation = crate::http_body::Observation<u64, Option<Result<Option<Vec<u8>>,u8>>>;
+
+/// A successful disclosure requires the directory binding, both live admissions,
+/// and a match between the observed and selected response identities.
+fn guarded_eof(
+    alias: &[u8], owner: &[u8;32], forward: Option<&[u8;32]>, reverse: Option<&[u8]>,
+    reader: &str, creator: &str, expected: Option<&[u8;32]>, opening: bool, reading: bool,
+    source: u64, selected: u64, receipt: u64,
+) -> (out: Option<(Result<Vec<u8>,u8>,Option<u64>)>)
+    ensures ({
+        let allowed = (forward matches Some(f) && f@ == owner@)
+            && (reverse matches Some(r) && r@ == alias@) && reader@ == creator@
+            && (match expected { Some(uid) => uid@ == owner@, None => true })
+            && opening && reading && source == selected;
+        if allowed {
+            out matches Some(v) && v.0 matches Ok(bytes) && bytes@.len() == 0 && v.1 == Some(receipt)
+        } else { out.is_none() }
+    }),
+{
+    let same_owner = crate::http_body::same_owner(reader,creator,expected,owner);
+    let eof: Option<Result<Option<Vec<u8>>,u8>> = Some(Ok(None));
+    let observed = crate::http_body::Observation::new(source,eof);
+    let bound = crate::principal_binding::with_pair(alias,owner,forward,reverse,observed,
+        |o: ReadObservation|
+            -> (v: ReadObservation) ensures v == o, {o});
+    let Ok(observation) = bound else { return None };
+    let admitted = crate::http_body::disclose(same_owner,opening,reading,observation,
+        |o: ReadObservation|
+            -> (v: ReadObservation) ensures v == o, {o});
+    let o = admitted?;
+    let read = o.release_for(&selected, |a:&u64,b:&u64| -> (v:bool) ensures v == (*a == *b), { a == b })?;
+    Some(read_receipt(read,0,receipt))
+}
+
 }

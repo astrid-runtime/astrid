@@ -61,6 +61,16 @@ def consumer_defects():
         )
     body = Path("crates/astrid-capsule/src/engine/wasm/host/http/body.rs")
     for name, original, changed in [
+        ("loses its captured origin", "read.parts() == (source, outcome)", "read.parts().1 == outcome"),
+        ("loses the captured payload", "read.parts() == (source, outcome)", "read.parts().0 == source"),
+        ("permits mismatched publication", "&& out == (if matched { Some(self.parts().1) } else { None })",
+         "&& (matched ==> out == Some(self.parts().1))"),
+    ]:
+        yield (
+            f"HTTP read observation {name}", body,
+            lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
+        )
+    for name, original, changed in [
         ("loses selected chunk", "data.ensures((bytes,), result.0) && result.1.is_none()", "result.1.is_none()"),
         ("allows a completion with a chunk", "data.ensures((bytes,), result.0) && result.1.is_none()", "data.ensures((bytes,), result.0)"),
         ("loses EOF result", "result.0@.len() == 0 && end.ensures((), result.1)", "end.ensures((), result.1)"),

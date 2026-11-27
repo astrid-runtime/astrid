@@ -89,4 +89,26 @@ pub(super) fn read_outcome<B, W, E, C, Success: FnOnce(Option<B>) -> (Vec<u8>, O
     }
 }
 
+/// The outcome belongs to the transport on which the read was issued.
+pub(super) struct Observation<H, T> { source: H, outcome: T }
+
+impl<H, T> Observation<H, T> {
+    pub(super) closed spec fn parts(&self) -> (H, T) { (self.source, self.outcome) }
+
+    pub(super) fn new(source: H, outcome: T) -> (read: Self)
+        ensures read.parts() == (source, outcome),
+    { Self { source, outcome } }
+
+    pub(super) fn release_for<F: FnOnce(&H, &H) -> bool>(self, selected: &H, same: F)
+        -> (out: Option<T>)
+        requires same.requires((&self.parts().0,selected)),
+        ensures exists|matched: bool| #[trigger] same.ensures((&self.parts().0, selected), matched)
+            && out == (if matched { Some(self.parts().1) } else { None }),
+    {
+        let matched = same(&self.source, selected);
+        assert(same.ensures((&self.source, selected), matched));
+        if matched { Some(self.outcome) } else { None }
+    }
+}
+
 }

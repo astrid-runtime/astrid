@@ -797,10 +797,7 @@ pub(super) async fn stream_read_chunk(
     let cancel = state.effective_cancel_token();
     let sem = state.io_semaphore.clone();
     let started = Instant::now();
-    let read = util::bounded_await_cancellable(&sem, &cancel, async {
-        let mut resp = open.response.lock().await;
-        tokio::time::timeout(read_timeout, resp.chunk()).await
-    });
+    let read = util::bounded_await_cancellable(&sem, &cancel, open.read(read_timeout));
     let result = reader
         .while_live(open.while_live(Box::pin(read)))
         .await
@@ -817,34 +814,21 @@ pub(super) async fn stream_read_chunk(
             complete_stream(&audit, false, HostAuditOutcome::Failed("cancelled")).await;
             Ok(Vec::new())
         },
-        Some(outcome) => {
+        Some(observation) => {
             let publication = stream
                 .lifetime
-                .access(state, &stream.creator, &reader, |_| {
-                    super::body::read_outcome(
-                        outcome.ok(),
-                        ErrorCode::Timeout,
-                        |received| {
-                            super::body::stream_result(
-                                received,
-                                |bytes| {
-                                    with_exchange(&audit, |exchange| exchange.digest(&bytes));
-                                    bytes.to_vec()
-                                },
-                                || take_stream_completion(&audit, true, HostAuditOutcome::Allowed),
-                            )
-                        },
-                        |error| {
-                            let error = map_reqwest_err(&error);
-                            let record = take_stream_completion(
-                                &audit,
-                                false,
-                                HostAuditOutcome::Failed(&error_text(&error)),
-                            );
-                            (error, record)
-                        },
-                    )
-                });
+                .access_with(
+                    state,
+                    &stream.creator,
+                    &reader,
+                    observation,
+                    |(selected, observation)| {
+                        selected
+                            .outcome_of(observation)
+                            .map(|outcome| prepare_read(&audit, outcome))
+                    },
+                )
+                .flatten();
             match publication {
                 Some((result, record)) => {
                     if let Some(record) = record {
@@ -885,6 +869,32 @@ pub(super) async fn stream_read_chunk(
         ),
     }
     bytes_result
+}
+
+fn prepare_read(
+    audit: &std::sync::Mutex<HttpExchange>,
+    outcome: super::stream_lifetime::WireRead,
+) -> (Result<Vec<u8>, ErrorCode>, Option<super::audit::Completion>) {
+    super::body::read_outcome(
+        outcome.ok(),
+        ErrorCode::Timeout,
+        |received| {
+            super::body::stream_result(
+                received,
+                |bytes| {
+                    with_exchange(audit, |exchange| exchange.digest(&bytes));
+                    bytes.to_vec()
+                },
+                || take_stream_completion(audit, true, HostAuditOutcome::Allowed),
+            )
+        },
+        |error| {
+            let error = map_reqwest_err(&error);
+            let record =
+                take_stream_completion(audit, false, HostAuditOutcome::Failed(&error_text(&error)));
+            (error, record)
+        },
+    )
 }
 
 /// Run `f` on a stream's audit exchange (skipped if the lock is poisoned).

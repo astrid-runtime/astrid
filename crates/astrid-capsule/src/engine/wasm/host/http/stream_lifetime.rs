@@ -9,7 +9,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub(super) struct OpenResponse {
     // Drop the transport before releasing the admission.
-    pub(super) response: tokio::sync::Mutex<reqwest::Response>,
+    response: tokio::sync::Mutex<reqwest::Response>,
     pub(super) authority: EgressAuthority,
     pub(super) status: u16,
     pub(super) headers: Vec<KeyValuePair>,
@@ -90,11 +90,22 @@ impl StreamLifetime {
         reader: &EgressAuthority,
         effect: impl FnOnce(Arc<OpenResponse>) -> T,
     ) -> Option<T> {
+        self.access_with(state, creator, reader, (), |(open, ())| effect(open))
+    }
+
+    pub(super) fn access_with<I, T>(
+        &self,
+        state: &HostState,
+        creator: &PrincipalId,
+        reader: &EgressAuthority,
+        input: I,
+        effect: impl FnOnce((Arc<OpenResponse>, I)) -> T,
+    ) -> Option<T> {
         let principal = state.effective_principal();
         let open = self.open.upgrade()?;
         state
             .principal_directory
-            .with_bound_input(&principal, self.owner, open, |open| {
+            .with_bound_input(&principal, self.owner, (open, input), |(open, input)| {
                 let expected = state.invocation_storage_uid.or(state.runtime_owner_uid);
                 super::body::disclose(
                     super::body::same_owner(
@@ -105,7 +116,7 @@ impl StreamLifetime {
                     ),
                     open.live_now(),
                     state.invocation_authority_active() && reader.devices_live(),
-                    open,
+                    (open, input),
                     effect,
                 )
             })
@@ -127,7 +138,22 @@ impl StreamLifetime {
     }
 }
 
+pub(super) type WireRead =
+    Result<Result<Option<bytes::Bytes>, reqwest::Error>, tokio::time::error::Elapsed>;
+
+type Observation = super::body::Observation<Arc<OpenResponse>, WireRead>;
+
 impl OpenResponse {
+    pub(super) fn outcome_of(self: &Arc<Self>, observation: Observation) -> Option<WireRead> {
+        observation.release_for(self, Arc::ptr_eq)
+    }
+
+    pub(super) async fn read(self: &Arc<Self>, timeout: std::time::Duration) -> Observation {
+        let mut response = self.response.lock().await;
+        let outcome = tokio::time::timeout(timeout, response.chunk()).await;
+        Observation::new(Arc::clone(self), outcome)
+    }
+
     fn live_now(&self) -> bool {
         self.authority.devices_live()
             && !self.owner_cancel.is_cancelled()
@@ -148,3 +174,6 @@ impl OpenResponse {
             .flatten()
     }
 }
+
+#[cfg(test)]
+mod tests;
