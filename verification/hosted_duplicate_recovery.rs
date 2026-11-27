@@ -31,6 +31,15 @@ pub(super) open spec fn gaps(frames:vstd::imap::IMap<u64,Seq<u8>>,map:Map<Object
         duplicates::tiled(frames,map,scheme,r.0 as u64,r.1 as u64))
 }
 
+/// Specialize both directions of the duplicate reader contract to a stable
+/// physical frame table before feeding the result to map admission.
+fn checked_gap(media:&Frames,map:&BTreeMap<ObjectId,ArenaLocation>,scheme:Scheme,at:u64,end:u64) -> (ok:bool)
+    requires btree_map_inv(map),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+    ensures ok == duplicates::tiled(media.frames(),map@,scheme,at,end),
+{
+    duplicates::check(&mut Frames{slots:media.slots},map,scheme,at,end)
+}
+
 struct Arena<'a> { media:Frames<'a>,scheme:Scheme,tail:ArenaLocation }
 
 impl admission::Arena for Arena<'_> {
@@ -49,7 +58,7 @@ impl admission::Arena for Arena<'_> {
     closed spec fn tails(&self) -> Set<ArenaLocation> {Set::empty().insert(self.tail)}
     closed spec fn reliable(&self) -> bool {true}
     fn gap(&mut self,map:&BTreeMap<ObjectId,ArenaLocation>,at:u64,end:u64) -> bool {
-        duplicates::check(&mut Frames{slots:self.media.slots},map,self.scheme,at,end)
+        checked_gap(&self.media,map,self.scheme,at,end)
     }
     fn entry(&mut self,id:ObjectId,loc:ArenaLocation) -> bool {
         let Ok(at) = usize::try_from(loc.offset) else {return false;};
