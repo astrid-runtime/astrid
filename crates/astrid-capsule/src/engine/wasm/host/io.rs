@@ -358,16 +358,18 @@ mod astrid_streams_impl {
 
     /// Copy one chunk from `src` to `dst`.
     ///
-    /// Cancellation is observed only while no bytes have left the source:
-    /// waiting for an I/O permit, for the destination to accept a write, or
-    /// for the source to become readable. `InputStream::blocking_read` awaits
-    /// readiness and then copies synchronously, and this select prefers that
-    /// completed read over a token that became ready in the same poll.
+    /// Cancellation is observed while no bytes have left the source: waiting
+    /// for an I/O permit, for the destination permit, or for the source read.
+    /// The read arm is polled first, so a read that completes in the same poll
+    /// as cancellation is kept.
     ///
-    /// After the read returns, the chunk is owned here. The destination write
-    /// and flush run to completion even if the capsule is cancelled, because
-    /// dropping Wasmtime's combined splice at that point discards the chunk
-    /// and still reports `Closed`.
+    /// That destination permit authorizes one synchronous `write`
+    /// of at most that many bytes. The write runs before the next await. The
+    /// engine retires a call by dropping this future, and an await between the
+    /// read and the write would discard the chunk. `flush` does not block.
+    /// `Closed` from flush, or from the flush-completion wait, is success, as
+    /// in Wasmtime's `blocking_write_and_flush`. Cancellation during that wait
+    /// returns the transferred count instead of parking on backpressure.
     async fn blocking_splice_preserving_input(
         state: &mut HostState,
         dst_rep: u32,
@@ -376,6 +378,10 @@ mod astrid_streams_impl {
     ) -> StreamResult<u64> {
         use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
 
+        let transferred = |copied: usize| {
+            u64::try_from(copied)
+                .map_err(|_| RtStreamError::trap("transferred byte count does not fit in u64"))
+        };
         let cancel = state.effective_cancel_token();
         if cancel.is_cancelled() {
             return Err(RtStreamError::Closed);
@@ -422,13 +428,36 @@ mod astrid_streams_impl {
             return Ok(0);
         }
 
-        let output = state
-            .resource_table
-            .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
-            .map_err(RtStreamError::from)?;
-        output.blocking_write_and_flush(contents).await?;
-        u64::try_from(copied)
-            .map_err(|_| RtStreamError::trap("transferred byte count does not fit in u64"))
+        // No await in this block. `writable` is the permit `write_ready`
+        // already returned, and `copied` is at most that permit.
+        {
+            let output = state
+                .resource_table
+                .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
+                .map_err(RtStreamError::from)?;
+            output.write(contents)?;
+            match output.flush() {
+                Ok(()) => {},
+                Err(RtStreamError::Closed) => return transferred(copied),
+                Err(error) => return Err(error),
+            }
+        }
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return transferred(copied),
+            ready = async {
+                let output = state
+                    .resource_table
+                    .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
+                    .map_err(RtStreamError::from)?;
+                output.write_ready().await
+            } => match ready {
+                Ok(_) | Err(RtStreamError::Closed) => {}
+                Err(error) => return Err(error),
+            },
+        }
+        transferred(copied)
     }
 
     impl HostOutputStream for HostState {
