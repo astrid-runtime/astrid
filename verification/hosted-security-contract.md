@@ -797,7 +797,9 @@ The current verifier entry point imports production modules directly alongside a
 The hosted security argument must state its assumptions about the OS, hardware, Wasmtime, cryptography, persistent storage, compiler and verifier. Release evidence must identify the source, build configuration, binary digest and proof result. Evidence about an installed instance must also identify the running binary and security-relevant configuration through a measurement mechanism whose trust assumptions are disclosed.
 
 
-### Logical filesystem authorization paths
+### Physical and logical filesystem authorization paths
+
+For native workspace, home and temporary mounts, the resolver canonicalizes the root and the deepest existing ancestor. It collects missing child names from leaf to ancestor. The production reconstruction appends them in the reverse order and calls platform prefix removal on that exact result and the canonical root. Success retains the physical gate path and its relative VFS address together. Eight guest VFS operations pass their policy gate, relative address and selected mount through the checked admission function. Successful admission returns the policy guard with that mount and address. Each native operation retains the guard in its resolved VFS address. A component-sequence consumer proves that binding succeeds exactly when the gate allows the reconstructed path, the selected mount exists and the root is a prefix. Rejoining the root and address recovers the path recorded in the guard. The native tests also check the relative address for an existing in-root link and for absent children. The platform path push and strip operations, filesystem observations under concurrent rename, correspondence of native roots to registered handles, and conversion of OS paths to VFS strings remain assumptions or open obligations. This theorem starts after the ancestor has been identified.
 
 For a storage-backed home or workspace, the filesystem host passes the validated
 relative path to `LogicalRoot::bind_path`. Its checked result couples the gate

@@ -16,6 +16,30 @@ def consumer_defects():
     yield from file_descriptor.defects()
     yield from retirement.defects()
     yield from mcp.defects()
+    for label, before, after in [
+        ("policy evidence", "=> check.ensures((gate,),Ok(guard))", "=> true"),
+        ("mount identity", "Some(mount) == selected && address == path", "address == path"),
+        ("effect address", "Some(mount) == selected && address == path", "Some(mount) == selected"),
+        ("permission refusal", "Err(e) => check.ensures((gate,),Err(e))", "Err(e) => true"),
+    ]:
+        yield (
+            f"physical mount binding loses {label}",
+            Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs"),
+            lambda s, a=before, b=after: replace_once(s, a, b),
+            Path("verification/hosted_physical_path.rs"),
+        )
+    physical = Path("crates/astrid-capsule/src/engine/wasm/host/fs/physical.rs")
+    for label, before, after in [
+        ("gate identity", "gate.parts() == full && P::stripped", "true && P::stripped"),
+        ("relative address", "P::stripped(full,root.parts()) == Some(address.parts())", "P::stripped(full,root.parts()).is_some()"),
+        ("root confinement", "P::stripped(full,root.parts()) == Some(address.parts())", "true"),
+        ("availability inside root", "path.parts() == full && P::stripped(full,root.parts()).is_none()", "path.parts() == full"),
+    ]:
+        yield (
+            f"physical mount binding loses {label}", physical,
+            lambda s, a=before, b=after: replace_once(s, a, b),
+            Path("verification/hosted_physical_path.rs"),
+        )
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [

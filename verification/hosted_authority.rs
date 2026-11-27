@@ -112,6 +112,9 @@ mod principal_uid_text;
 
 #[path = "../crates/astrid-capsule/src/engine/wasm/mount_selection.rs"]
 mod mount_selection;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/fs/physical.rs"]
+mod physical;
+mod hosted_physical_path;
 
 #[path = "../crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs"]
 mod receipt_validation;

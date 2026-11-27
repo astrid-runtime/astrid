@@ -49,6 +49,28 @@ impl LogicalRoot {
 }
 
 impl VfsTarget {
+    /// Hold the policy result together with the mount and address it releases.
+    pub(super) fn admitted<K,P,M,G,E,F:FnOnce(K)->Result<G,E>>(
+        self, gate:K, path:P, mounts:(Option<M>,Option<M>,Option<M>), missing:E, check:F,
+    ) -> (out:Result<(G,M,P),E>)
+        requires check.requires((gate,)),
+        ensures ({
+            let selected = match self { Self::Workspace => mounts.0, Self::Home => mounts.1, Self::Tmp => mounts.2 };
+            match out {
+                Ok((guard,mount,address)) => check.ensures((gate,),Ok(guard))
+                    && Some(mount) == selected && address == path,
+                Err(e) => check.ensures((gate,),Err(e)) || (selected.is_none() && e == missing
+                    && exists|g:G| #[trigger] check.ensures((gate,),Ok(g))),
+            }
+        }),
+    {
+        let guard = check(gate)?;
+        match self.bind(path,mounts.0,mounts.1,mounts.2) {
+            Some((mount,address)) => Ok((guard,mount,address)),
+            None => Err(missing),
+        }
+    }
+
     /// Return the selected mount with the same admitted relative path.
     #[expect(clippy::manual_map, reason = "The explicit match lets Verus track the original mount and path through both branches")]
     pub(super) fn bind<M, P>(self, path: P, workspace: Option<M>, home: Option<M>, tmp: Option<M>)

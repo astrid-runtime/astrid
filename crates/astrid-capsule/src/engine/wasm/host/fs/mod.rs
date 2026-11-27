@@ -23,6 +23,7 @@
 //! logical `home://<relative>` spelling because no host path exists.
 
 mod file_handle;
+mod physical;
 mod resolve;
 
 use wasmtime::component::Resource;
@@ -33,7 +34,7 @@ use crate::engine::wasm::bindings::astrid::fs::host::{
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use resolve::{ResolvedPath, resolve_vfs};
+use resolve::{ResolvedPath, admit_vfs};
 
 /// Audit envelope for path-based fs operations.
 ///
@@ -438,8 +439,7 @@ impl fs::Host for HostState {
     fn fs_exists(&mut self, path: String) -> Result<bool, ErrorCode> {
         let access = FsAccess::Probe;
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_read_path(self, &resolved.gate_path)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         let exists = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
@@ -463,8 +463,7 @@ impl fs::Host for HostState {
     fn fs_mkdir(&mut self, path: String) -> Result<(), ErrorCode> {
         let access = FsAccess::Write(None);
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         admit(self, access.event(&resolved.gate_path))?;
 
         // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
@@ -523,8 +522,7 @@ impl fs::Host for HostState {
         // promises.
         let access = FsAccess::Write(None);
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         admit(self, access.event(&resolved.gate_path))?;
         let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
@@ -548,8 +546,7 @@ impl fs::Host for HostState {
     fn fs_readdir(&mut self, path: String) -> Result<Vec<String>, ErrorCode> {
         let access = FsAccess::Probe;
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_read_path(self, &resolved.gate_path)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
@@ -573,8 +570,7 @@ impl fs::Host for HostState {
     fn fs_stat(&mut self, path: String) -> Result<FileStat, ErrorCode> {
         let access = FsAccess::Probe;
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_read_path(self, &resolved.gate_path)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
@@ -599,8 +595,7 @@ impl fs::Host for HostState {
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {
         let access = FsAccess::Delete;
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Delete)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         admit(self, access.event(&resolved.gate_path))?;
         let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
@@ -624,8 +619,7 @@ impl fs::Host for HostState {
     fn read_file(&mut self, path: String) -> Result<Vec<u8>, ErrorCode> {
         let access = FsAccess::Read;
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_read_path(self, &resolved.gate_path)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         admit(self, access.event(&resolved.gate_path))?;
         // Sentinel string used to encode the "too large at stat time"
         // case as a `PermissionDenied` payload so we can re-raise it
@@ -695,8 +689,7 @@ impl fs::Host for HostState {
         }
         let access = FsAccess::Write(None);
         let resolved = resolve_guest_path(self, &path, access)?;
-        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
-        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs_path = admit_vfs(self, &resolved, access)?;
         let content_hash = Some(astrid_crypto::ContentHash::hash(&content));
         let access = FsAccess::Write(content_hash);
         admit(self, access.event(&resolved.gate_path))?;

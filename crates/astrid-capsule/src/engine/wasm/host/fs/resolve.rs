@@ -41,7 +41,28 @@ fn make_relative(requested: &str) -> &Path {
 /// Result of resolving a path to a physical absolute location on disk.
 pub(super) struct ResolvedPhysical {
     pub(super) physical: PathBuf,
-    pub(super) canonical_root: PathBuf,
+    pub(super) relative: PathBuf,
+}
+
+impl super::physical::PhysicalPath<&std::ffi::OsStr> for PathBuf {
+    fn append(&mut self, name: &std::ffi::OsStr) {
+        self.push(name);
+    }
+
+    fn relative(&self, root: &Self) -> Option<Self> {
+        self.strip_prefix(root).ok().map(Path::to_path_buf)
+    }
+}
+
+impl ResolvedPhysical {
+    fn into_target(self, target: VfsTarget) -> ResolvedPath {
+        ResolvedPath {
+            gate_path: self.physical.to_string_lossy().into_owned(),
+            physical: Some(self.physical),
+            relative: self.relative,
+            target,
+        }
+    }
 }
 
 /// Compute the true physical absolute path for the security gate by
@@ -56,7 +77,7 @@ pub(super) fn resolve_physical_absolute(
     let joined = canonical_root.join(make_relative(requested));
     let mut existing = joined.as_path();
     let mut missing = Vec::new();
-    let mut physical = loop {
+    let ancestor = loop {
         match std::fs::symlink_metadata(existing) {
             Ok(_) => {
                 break existing.canonicalize().map_err(|error| {
@@ -80,19 +101,14 @@ pub(super) fn resolve_physical_absolute(
             Err(error) => return Err(format!("cannot inspect {}: {error}", existing.display())),
         }
     };
-    for name in missing.into_iter().rev() {
-        physical.push(name);
-    }
-    if !physical.starts_with(&canonical_root) {
-        return Err(format!(
-            "path escapes root boundary: {requested} resolves to {}",
-            physical.display()
-        ));
-    }
-    Ok(ResolvedPhysical {
-        physical,
-        canonical_root,
-    })
+    super::physical::confine(&canonical_root, ancestor, missing)
+        .map(|(physical, relative)| ResolvedPhysical { physical, relative })
+        .map_err(|physical| {
+            format!(
+                "path escapes root boundary: {requested} resolves to {}",
+                physical.display()
+            )
+        })
 }
 
 /// Phase-1 resolution: physical path for the security gate + VFS-relative
@@ -110,6 +126,7 @@ pub(super) struct ResolvedPath {
 /// Phase-2 resolution: the VFS instance and capability handle to use
 /// for the actual filesystem operation.
 pub(super) struct ResolvedVfsPath {
+    _operation: Option<crate::engine::wasm::PrincipalInvocationGuard>,
     pub(super) relative: PathBuf,
     pub(super) vfs: Arc<dyn astrid_vfs::Vfs>,
     pub(super) handle: astrid_capabilities::DirHandle,
@@ -130,17 +147,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             return resolve_logical_workspace(stripped);
         }
         let resolved = resolve_physical_absolute(&state.workspace_root, stripped)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved cwd path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Workspace,
-        })
+        Ok(resolved.into_target(VfsTarget::Workspace))
     } else if let Some(stripped) = raw_path.strip_prefix(HOME_SCHEME) {
         let home = state
             .effective_home()
@@ -158,17 +165,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             return Err("home:// storage mount did not resolve logically".to_owned());
         };
         let resolved = resolve_physical_absolute(root, stripped)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved home path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Home,
-        })
+        Ok(resolved.into_target(VfsTarget::Home))
     } else if raw_path.starts_with(TMP_PREFIX) || raw_path == "/tmp" {
         let tmp_mount = state
             .effective_tmp()
@@ -183,17 +180,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             return Err("/tmp mount is not a native scratch directory".to_owned());
         };
         let resolved = resolve_physical_absolute(root, stripped)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved /tmp path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Tmp,
-        })
+        Ok(resolved.into_target(VfsTarget::Tmp))
     } else {
         if state.effective_workspace().is_some_and(|mount| {
             matches!(
@@ -204,17 +191,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             return resolve_logical_workspace(raw_path);
         }
         let resolved = resolve_physical_absolute(&state.workspace_root, raw_path)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Workspace,
-        })
+        Ok(resolved.into_target(VfsTarget::Workspace))
     }
 }
 
@@ -242,24 +219,33 @@ fn logical_path(root: LogicalRoot, path: &astrid_storage::FilesystemPath) -> Res
 }
 
 /// Phase 2: pick the VFS instance + capability handle for `resolved`.
-pub(super) fn resolve_vfs(
+pub(super) fn admit_vfs(
     state: &HostState,
     resolved: &ResolvedPath,
-) -> Result<ResolvedVfsPath, String> {
-    let (mount, relative) = resolved
-        .target
-        .bind(
-            &resolved.relative,
-            state.effective_workspace(),
-            state.effective_home(),
-            state.effective_tmp(),
-        )
-        .ok_or_else(|| match resolved.target {
-            VfsTarget::Home => "home:// VFS is not mounted".to_owned(),
-            VfsTarget::Tmp => "/tmp VFS is not mounted".to_owned(),
-            VfsTarget::Workspace => "workspace VFS is not mounted".to_owned(),
-        })?;
+    access: super::FsAccess,
+) -> Result<ResolvedVfsPath, super::ErrorCode> {
+    let mounts = (
+        state.effective_workspace(),
+        state.effective_home(),
+        state.effective_tmp(),
+    );
+    let (guard, mount, relative) = resolved.target.admitted(
+        resolved.gate_path.as_str(),
+        &resolved.relative,
+        mounts,
+        super::ErrorCode::CapabilityDenied,
+        |path| match access {
+            super::FsAccess::Probe | super::FsAccess::Read => super::gate_read_path(state, path),
+            super::FsAccess::Write(_) => {
+                super::gate_write_path(state, path, super::WriteKind::Write)
+            },
+            super::FsAccess::Delete => {
+                super::gate_write_path(state, path, super::WriteKind::Delete)
+            },
+        },
+    )?;
     Ok(ResolvedVfsPath {
+        _operation: guard,
         relative: relative.clone(),
         vfs: mount.vfs.clone(),
         handle: mount.handle.clone(),
@@ -323,6 +309,7 @@ mod tests {
         assert!(resolve_physical_absolute(&absent, "child").is_err());
         for spelling in ["absent/child", "absent/./child", "./absent/child"] {
             let result = resolve_physical_absolute(root.path(), spelling).unwrap();
+            assert_eq!(result.relative, Path::new("absent/child"));
             assert_eq!(
                 result.physical,
                 root.path().canonicalize().unwrap().join("absent/child")
@@ -340,6 +327,7 @@ mod tests {
         std::os::unix::fs::symlink("child", root.path().join("inside")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
         let resolved = resolve_physical_absolute(root.path(), "inside/new").unwrap();
+        assert_eq!(resolved.relative, Path::new("child/new"));
         assert_eq!(
             resolved.physical,
             root.path().canonicalize().unwrap().join("child/new")
