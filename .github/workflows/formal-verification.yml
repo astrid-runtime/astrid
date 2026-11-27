@@ -13,8 +13,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
 
 jobs:
-  fuel-ledger:
-    name: Verify hosted authority transitions
+  defects:
+    name: Verify hosted authority mutations (shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ubuntu-latest
     # Each deliberate defect requires a separate full verifier run.
     timeout-minutes: 60
@@ -48,4 +52,19 @@ jobs:
         run: python3 -m unittest scripts/test_verification_defect_checks.py
 
       - name: Check that deliberate defects fail the verifier
-        run: python3 scripts/verification_defect_checks.py
+        env:
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_COUNT: ${{ strategy.job-total }}
+        run: python3 -u scripts/verification_defect_checks.py --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT"
+
+  fuel-ledger:
+    name: Verify hosted authority transitions
+    needs: defects
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all verifier shards to pass
+        env:
+          SHARDS_RESULT: ${{ needs.defects.result }}
+        run: test "$SHARDS_RESULT" = success

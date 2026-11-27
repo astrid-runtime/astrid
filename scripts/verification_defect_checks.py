@@ -115,8 +115,15 @@ def check_defect(verus: str, base: Path, name: str, relative: Path, defect, expe
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--verus", default="verus", help="path to the pinned verifier")
+    parser.add_argument("--shard-index", type=int, default=0, help="zero-based shard index")
+    parser.add_argument("--shard-count", type=int, default=1, help="number of disjoint shards")
     args = parser.parse_args()
     checks = [(*check, None) for check in defects()] + list(consumer_defects())
+    if not 0 <= args.shard_index < args.shard_count <= len(checks):
+        parser.error("require 0 <= shard-index < shard-count <= number of checks")
+    total = len(checks)
+    checks = checks[args.shard_index::args.shard_count]
+    print(f"Shard {args.shard_index + 1}/{args.shard_count}: {len(checks)} of {total} checks")
     with tempfile.TemporaryDirectory(prefix="astrid-verification-defects-") as scratch:
         base = Path(scratch)
         copy_inputs(ROOT, base)

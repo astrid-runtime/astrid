@@ -56,3 +56,20 @@ async fn completed_persistent_checkout_keeps_the_instance_and_resource() {
     );
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn free_checkout_discards_an_unpaired_http_response() {
+    let cancel = CancellationToken::new();
+    let pool = empty_pool(1, 1, &cancel).await;
+    let mut checkout = pool.checkout().await.unwrap();
+    checkout.begin_call();
+    let state = checkout.store_mut().data_mut();
+    assert!(state.resource_table.is_empty());
+    let stream =
+        super::super::host::http::ActiveHttpStream::dummy_for_test(&state.effective_principal());
+    state.active_http_streams.insert(1, stream);
+    checkout.complete_call();
+    drop(checkout);
+    assert!(pool.available.lock().unwrap().is_empty());
+    cancel.cancel();
+}

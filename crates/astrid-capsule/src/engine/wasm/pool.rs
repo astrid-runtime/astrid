@@ -36,6 +36,8 @@ use tokio_util::sync::CancellationToken;
 use wasmtime::Store;
 use wasmtime::component::{Instance, InstancePre};
 
+mod return_policy;
+
 use super::accounted_store::AccountedStore;
 use super::host_state::HostState;
 use crate::error::{CapsuleError, CapsuleResult};
@@ -406,19 +408,19 @@ impl PoolCheckout {
 
 impl Drop for PoolCheckout {
     fn drop(&mut self) {
-        if let Some(mut pooled) = self.pooled.take() {
-            // A guest can retain component handles after a successful call.
-            // Replacing the host table does not clear those guest handles.
-            let reuse = self.reusable
-                && (!self.reset_resources_on_return
-                    || pooled.store.data().resource_table.is_empty());
-            // Discard also releases shared resource quota, even for a size-1
-            // pool that normally preserves handles between successful calls.
-            clear_on_return(
-                pooled.store.data_mut(),
-                self.reset_resources_on_return || !self.reusable,
+        if let Some(pooled) = self.pooled.take() {
+            let state = pooled.store.data();
+            let decision = return_policy::policy(
+                self.reusable,
+                self.reset_resources_on_return,
+                &state.active_http_streams,
+                || state.resource_table.is_empty(),
             );
-            if reuse {
+            let returned = return_policy::finish(decision, pooled, |mut instance, reset| {
+                clear_on_return(instance.store.data_mut(), reset);
+                instance
+            });
+            if let return_policy::Returned::Warm(pooled) = returned {
                 self.available
                     .lock()
                     .expect("instance pool mutex poisoned")
@@ -487,14 +489,14 @@ pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.invocation_cancel_token = None;
     state.clear_ingress_frame();
 
+    // The Wasmtime table holds the markers; the Rust map owns the HTTP responses.
+    return_policy::reset_resources(
+        &mut state.resource_table,
+        &mut state.active_http_streams,
+        reset_resources,
+        wasmtime::component::ResourceTable::new,
+    );
     if reset_resources {
-        // Drops every entry still in the old table (orphaned subscriptions,
-        // HTTP/net streams, process handles, WASI fds) via their `Drop` impls.
-        state.resource_table = wasmtime::component::ResourceTable::new();
-        // The mirror counters are O(1) shadows of the table's contents; reset
-        // them to the empty-table baseline so the per-(principal) gates start
-        // from zero for the next lease.
-        state.active_http_streams.clear();
         let local_streams = state.local_net_stream_count.swap(0, Ordering::AcqRel);
         state.net_stream_count = 0;
         if local_streams != 0 {

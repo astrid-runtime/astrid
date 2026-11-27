@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import pathlib
 import re
 import tempfile
@@ -97,6 +98,19 @@ class Defects(unittest.TestCase):
         for name, relative, defect, *_ in [*checks.defects(), *checks.consumer_defects()]:
             with self.subTest(defect=name):
                 defect((checks.ROOT / relative).read_text())
+
+    def test_shards_execute_every_registered_case_once(self) -> None:
+        names = [case[0] for case in [*checks.defects(), *checks.consumer_defects()]]
+        with (
+            patch.object(checks, "copy_inputs"),
+            patch.object(checks, "verify", return_value=(0, "verification results:: 1 verified, 0 errors")),
+            patch.object(checks, "check_defect", return_value=True) as run,
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            for index in range(8):
+                with patch("sys.argv", ["checks", "--shard-index", str(index), "--shard-count", "8"]):
+                    self.assertEqual(checks.main(), 0)
+            self.assertCountEqual([call.args[2] for call in run.call_args_list], names)
 
     def test_each_defect_uses_the_verified_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

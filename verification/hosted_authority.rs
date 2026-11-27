@@ -262,3 +262,7 @@ mod ordered_dispatch;
 
 #[path = "../crates/astrid-core/src/session_token/registered_bearer.rs"]
 mod registered_bearer;
+
+#[path = "../crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs"]
+mod pool_return;
+mod hosted_pool_return;

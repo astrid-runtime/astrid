@@ -9,6 +9,22 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
+    pool_trace = Path("verification/hosted_pool_return.rs")
+    for name, original, changed in [
+        ("loses unfinished retirement", "if !healthy { decision == Policy::Discard }", "if !healthy { true }"),
+        ("loses outstanding response retirement", "if responses@.len() != 0 { decision == Policy::Discard }", "if responses@.len() != 0 { true }"),
+        ("loses observed table occupancy", "&& decision == (if observed { Policy::ResetAndReuse } else { Policy::Discard })", "&& true"),
+        ("loses cleanup on warm return", "&& clear.ensures((instance, decision == Policy::ResetAndReuse), clean)", "&& true"),
+        ("loses replacement table", "fresh.ensures((), *final(table)) && final(responses)@ == Map::empty()", "final(responses)@ == Map::empty()"),
+        ("loses retired HTTP responses", "fresh.ensures((), *final(table)) && final(responses)@ == Map::empty()", "fresh.ensures((), *final(table))"),
+        ("loses preserved responses", "*final(table) == *old(table) && final(responses)@ == old(responses)@", "*final(table) == *old(table)"),
+        ("loses cleanup on discard", "decision == Policy::Discard && clear.ensures((instance, true), clean)", "decision == Policy::Discard"),
+    ]:
+        yield (
+            f"pool return {name}", pool,
+            lambda s, a=original, b=changed: replace_once(s, a, b), pool_trace,
+        )
     hop = Path("crates/astrid-capsule/src/engine/wasm/host/http/hop.rs")
     hop_trace = Path("verification/hosted_http_hop.rs")
     for name, original, changed in [
