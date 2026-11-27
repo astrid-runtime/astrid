@@ -163,7 +163,7 @@ fn retire_principal<T>(entries:&mut HashMap<[u8;32],Entry<T>>, principal:&[u8])
 {
     let ghost before = entries@;
     let owns = |entry:&Entry<T>| -> (yes:bool) ensures yes == (entry.creator@ == principal@), {
-        crate::process_retirement::owned_by(principal,entry.creator.as_slice())
+        crate::registry_keys::owned_by(principal,entry.creator.as_slice())
     };
     let removed = crate::process_retirement::drain_for(entries,owns);
     proof {
@@ -219,7 +219,7 @@ fn publish_then_retire<T>(entries: &mut HashMap<[u8;32],Entry<(u8,T)>>,
 
 struct Cleanup<T> { received: Vec<T> }
 
-impl<T> crate::process_cleanup::Reaper<T> for Cleanup<T> {
+impl<T> crate::process_batch::Reaper<T> for Cleanup<T> {
     closed spec fn calls(&self) -> Seq<T> { self.received@ }
     fn reap(&mut self, entry: T) { self.received.push(entry); }
 }
@@ -242,7 +242,7 @@ fn retire_and_reap<T>(entries: &mut HashMap<[u8;32],Entry<T>>, principal: &[u8],
 {
     let ghost before = entries@;
     let batch = retire_principal(entries,principal);
-    crate::process_cleanup::reap_batch(batch,cleanup);
+    crate::process_batch::reap_batch(batch,cleanup);
     proof {
         let keys = choose|ks:Seq<[u8;32]>| ks.no_duplicates() && ks.len() == batch@.len()
             && (forall|k:[u8;32]| #[trigger] before.contains_key(k) ==> (ks.contains(k) == (before[k].creator@ == principal@)))

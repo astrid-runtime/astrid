@@ -8,7 +8,6 @@ def defects():
     persistent = Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent")
     process_trace = Path("verification/hosted_process_selection.rs")
     for file, name, clause, weakened in [
-        ("cleanup", "batch cleanup may skip entries", "ensures final(reaper).calls() == old(reaper).calls() + entries@", "ensures true"),
         ("cleanup", "shutdown may leave a live slot", "final(entries)@ == Map::<K,T>::empty()", "true"),
         ("cleanup", "shutdown can detach the wrong map", "drained@ == old(entries)@", "true"),
         ("cleanup", "shutdown cleanup may omit a registered pair", "&& order.to_set() == drained@.kv_pairs()", "&& true"),
@@ -36,6 +35,26 @@ def defects():
         yield (
             f"persistent process {name}", persistent / f"{file}.rs",
             lambda s, a=clause, b=weakened: replace_once(s, a, b), process_trace,
+        )
+
+    yield (
+        "persistent process batch cleanup may skip entries", persistent.parent / "process_batch.rs",
+        lambda s: replace_once(s, "ensures final(reaper).calls() == old(reaper).calls() + entries@", "ensures true"),
+        process_trace,
+    )
+
+    for name, clause, weakened in [
+        ("allows zero registration", "ensures allowed == (pid != 0)", "ensures true"),
+        ("loses registration ownership", "final(entries)@ == old(entries)@.insert(pid,record)", "true"),
+        ("leaves a removed PID", "final(entries)@ == old(entries)@.remove(pid)", "true"),
+        ("may repeat a target", "ensures pids@.no_duplicates()", "ensures true"),
+        ("loses creator selection", "owns.ensures((&entries@[pid].0,),pids@.contains(pid))", "entries@.contains_key(pid)"),
+        ("can introduce a foreign PID", "pids@.contains(pid) ==> entries@.contains_key(pid)", "pids@.contains(pid) ==> true"),
+    ]:
+        yield (
+            f"ephemeral process retirement {name}", persistent.parent / "tracker_registry.rs",
+            lambda s, a=clause, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_ephemeral_process.rs"),
         )
 
     for name, clause in [

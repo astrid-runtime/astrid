@@ -1,6 +1,13 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/registry_keys.rs"]
+mod registry_keys;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/process_batch.rs"]
+mod process_batch;
+mod hosted_ephemeral_process;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/tracker_registry.rs"]
+mod tracker_registry;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/command.rs"]
 mod process_command;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/selection.rs"]

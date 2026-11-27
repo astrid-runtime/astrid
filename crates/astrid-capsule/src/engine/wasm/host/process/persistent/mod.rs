@@ -41,6 +41,8 @@
 //! Possession of another capsule’s token grants no access. Release is idempotent
 //! for an absent entry and refuses a foreign entry.
 
+use super::{process_batch, registry_keys};
+
 mod cleanup;
 mod config;
 mod entry;
@@ -596,7 +598,7 @@ impl PersistentProcessRegistry {
         }
         // Reap (killpg + abort) outside the map lock.
         let n = reaped.len();
-        cleanup::reap_batch(reaped, &mut NativeReaper);
+        process_batch::reap_batch(reaped, &mut NativeReaper);
         n
     }
 
@@ -609,18 +611,18 @@ impl PersistentProcessRegistry {
     /// Kill and remove entries owned by one retiring principal only.
     pub fn shutdown_for(&self, principal: &PrincipalId) {
         let removed = retirement::drain_for(&mut self.lock(), |entry| {
-            retirement::owned_by(
+            registry_keys::owned_by(
                 principal.as_str().as_bytes(),
                 entry.creator.as_str().as_bytes(),
             )
         });
-        cleanup::reap_batch(removed, &mut NativeReaper);
+        process_batch::reap_batch(removed, &mut NativeReaper);
     }
 }
 
 struct NativeReaper;
 
-impl cleanup::Reaper<PersistentEntry> for NativeReaper {
+impl process_batch::Reaper<PersistentEntry> for NativeReaper {
     fn reap(&mut self, entry: PersistentEntry) {
         reap_entry(entry);
     }

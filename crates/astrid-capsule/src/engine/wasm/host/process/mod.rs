@@ -32,8 +32,11 @@ mod handle;
 mod inject;
 mod managed;
 mod persistent;
+mod process_batch;
+mod registry_keys;
 mod synchronous;
 mod tracker;
+mod tracker_registry;
 
 use std::collections::VecDeque;
 use std::process::Stdio;

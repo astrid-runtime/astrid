@@ -23,6 +23,16 @@ pub struct ProcessTracker {
     active_pids: Arc<Mutex<TrackedProcesses>>,
 }
 
+#[cfg(unix)]
+struct GroupKiller;
+
+#[cfg(unix)]
+impl super::process_batch::Reaper<u32> for GroupKiller {
+    fn reap(&mut self, pid: u32) {
+        super::managed::kill_process_group(pid);
+    }
+}
+
 impl ProcessTracker {
     /// Construct a fresh tracker.
     #[must_use]
@@ -47,13 +57,17 @@ impl ProcessTracker {
         principal: astrid_core::PrincipalId,
         call_id: Option<String>,
     ) {
-        if pid == 0 {
-            return; // Guard: PID 0 means "no process" on some platforms.
+        if !super::tracker_registry::registrable(pid) {
+            return;
         }
-        self.active_pids
-            .lock()
-            .expect("process tracker lock poisoned")
-            .insert(pid, (principal, call_id));
+        super::tracker_registry::register(
+            &mut self
+                .active_pids
+                .lock()
+                .expect("process tracker lock poisoned"),
+            pid,
+            (principal, call_id),
+        );
     }
 
     /// Whether any child process is currently registered as running.
@@ -73,10 +87,13 @@ impl ProcessTracker {
 
     /// Unregister a child process PID (process has exited).
     pub fn unregister(&self, pid: u32) {
-        self.active_pids
-            .lock()
-            .expect("process tracker lock poisoned")
-            .remove(&pid);
+        super::tracker_registry::unregister(
+            &mut self
+                .active_pids
+                .lock()
+                .expect("process tracker lock poisoned"),
+            pid,
+        );
     }
 
     /// Cancel processes matching the given call_ids.
@@ -122,20 +139,23 @@ impl ProcessTracker {
         principal: &astrid_core::PrincipalId,
         _handle: &tokio::runtime::Handle,
     ) {
-        let pids: Vec<u32> = self
-            .active_pids
-            .lock()
-            .expect("process tracker lock poisoned")
-            .iter()
-            .filter_map(|(&pid, (creator, _))| (creator == principal).then_some(pid))
-            .collect();
+        let pids = super::tracker_registry::owned_pids(
+            &self
+                .active_pids
+                .lock()
+                .expect("process tracker lock poisoned"),
+            |creator| {
+                super::registry_keys::owned_by(
+                    principal.as_str().as_bytes(),
+                    creator.as_str().as_bytes(),
+                )
+            },
+        );
         // Principal deletion is a reclamation boundary, unlike cooperative
         // tool-call cancellation. Kill synchronously so filesystem/KV cleanup
         // cannot race a child during the ordinary SIGINT grace window.
         #[cfg(unix)]
-        for pid in pids {
-            super::managed::kill_process_group(pid);
-        }
+        super::process_batch::reap_batch(pids, &mut GroupKiller);
         #[cfg(not(unix))]
         let _ = pids;
     }
