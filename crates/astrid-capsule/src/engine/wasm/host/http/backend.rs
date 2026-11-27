@@ -664,20 +664,7 @@ impl HostState {
             read_timeout,
             audit: Arc::new(std::sync::Mutex::new(exchange)),
         };
-        let resource = self
-            .resource_table
-            .push(active.clone())
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
-        // Mirror the stream into `active_http_streams`, keyed by the resource
-        // rep, so the per-capsule concurrency quota (checked at the top of this
-        // fn) actually counts live streams. Without this the cap was dead — the
-        // resource table is not enumerable. The mirror shares the same
-        // `Arc<Mutex<Response>>`, so `read_chunk` via the resource table stays
-        // consistent; this copy is purely for counting and is removed in
-        // `stream_close` / `stream_drop`.
-        self.active_http_streams
-            .insert(u64::from(resource.rep()), active);
-        Ok(Resource::new_own(resource.rep()))
+        register_stream(self, active)
     }
 }
 
@@ -727,18 +714,38 @@ fn redirect_step(
 
 // ── Stream-method bodies (shared by both versions, keyed by resource rep) ──
 
-pub(super) fn stream_status(state: &mut HostState, rep: u32) -> u16 {
+/// The WIT method borrows its resource. Keep the slot reserved after close
+/// until the owned handle is dropped. Only live response bodies count for quota.
+struct HttpStreamSlot;
+
+pub(super) fn register_stream(
+    state: &mut HostState,
+    active: ActiveHttpStream,
+) -> Result<Resource<HttpStream>, ErrorCode> {
+    let slot = state
+        .resource_table
+        .push(HttpStreamSlot)
+        .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+    state
+        .active_http_streams
+        .insert(u64::from(slot.rep()), active);
+    Ok(Resource::new_own(slot.rep()))
+}
+
+fn live_stream(state: &HostState, rep: u32) -> Option<&ActiveHttpStream> {
     state
         .resource_table
-        .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
-        .map(|s| s.status)
-        .unwrap_or(0)
+        .get::<HttpStreamSlot>(&Resource::new_borrow(rep))
+        .ok()?;
+    state.active_http_streams.get(&u64::from(rep))
+}
+
+pub(super) fn stream_status(state: &mut HostState, rep: u32) -> u16 {
+    live_stream(state, rep).map(|s| s.status).unwrap_or(0)
 }
 
 pub(super) fn stream_headers(state: &mut HostState, rep: u32) -> Vec<KeyValuePair> {
-    state
-        .resource_table
-        .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
+    live_stream(state, rep)
         .map(|s| s.headers.clone())
         .unwrap_or_default()
 }
@@ -747,10 +754,7 @@ pub(super) async fn stream_read_chunk(
     state: &mut HostState,
     rep: u32,
 ) -> Result<Vec<u8>, ErrorCode> {
-    let stream = state
-        .resource_table
-        .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
-        .map_err(|_| ErrorCode::Closed)?;
+    let stream = live_stream(state, rep).ok_or(ErrorCode::Closed)?;
     let response_arc = stream.response.clone();
     let audit = Arc::clone(&stream.audit);
     let read_timeout = stream.read_timeout;
@@ -845,26 +849,29 @@ async fn complete_stream(
 }
 
 pub(super) fn stream_close(state: &mut HostState, rep: u32) -> Result<(), ErrorCode> {
-    if let Ok(stream) = state
-        .resource_table
-        .delete::<ActiveHttpStream>(Resource::new_own(rep))
-    {
-        close_stream_exchange(&stream);
-    }
-    // Release the quota slot (see the mirror insert in `http_stream_backend`).
-    state.active_http_streams.remove(&u64::from(rep));
+    release_response(state, rep);
     Ok(())
 }
 
-pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
-    if let Ok(stream) = state
-        .resource_table
-        .delete::<ActiveHttpStream>(Resource::new_own(rep))
-    {
+fn release_response(state: &mut HostState, rep: u32) {
+    if let Some(stream) = state.active_http_streams.remove(&u64::from(rep)) {
         close_stream_exchange(&stream);
     }
-    // Release the quota slot (see the mirror insert in `http_stream_backend`).
-    state.active_http_streams.remove(&u64::from(rep));
+}
+
+pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
+    // Wasmtime deletes the underlying entry before downcasting its value.
+    if state
+        .resource_table
+        .get::<HttpStreamSlot>(&Resource::new_borrow(rep))
+        .is_ok()
+        && state
+            .resource_table
+            .delete::<HttpStreamSlot>(Resource::new_own(rep))
+            .is_ok()
+    {
+        release_response(state, rep);
+    }
 }
 
 /// Classify a reqwest error into the typed `http::ErrorCode`.
