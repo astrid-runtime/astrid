@@ -21,7 +21,7 @@ use crate::capsule::{Capsule, CapsuleId};
 use crate::error::{CapsuleError, CapsuleResult};
 
 mod compatibility;
-mod generation;
+pub(crate) mod generation;
 mod replacement;
 mod runtime_id;
 mod uplinks;

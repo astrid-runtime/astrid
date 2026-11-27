@@ -15,6 +15,31 @@ def consumer_defects():
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
     yield from retirement.defects()
+    registration = Path("crates/astrid-capsule/src/engine/mcp_registration.rs")
+    for label, field, replacement in [
+        ("capsule", "registration(capsule@,", "registration(Seq::empty(),"),
+        ("server", "server@, match principal", "Seq::empty(), match principal"),
+        ("scope", "match principal { Some(uid) => Some(uid@), None => None }, generation),", "None, generation),"),
+        ("generation", "None => None }, generation),", "None => None }, 0),"),
+    ]:
+        yield (
+            f"MCP registration substitutes the {label}", registration,
+            lambda s, a=field, b=replacement: replace_once(s, a, b), registration,
+        )
+    yield (
+        "MCP lookup loses the zero generation registration", registration,
+        lambda s: replace_once(s, "ensures result@ == registration(", "ensures generation > 0 ==> result@ == registration("), registration,
+    )
+    yield (
+        "MCP lookup loses the registry generation", registration,
+        lambda s: replace_once(s, "ensures exists|c:&str, p:Option<String>|", "ensures runtime.identity().1 != 0 ==> exists|c:&str, p:Option<String>|"),
+        Path("verification/hosted_mcp_peer.rs"),
+    )
+    yield (
+        "MCP registration permits decimal suffix collisions", registration,
+        lambda s: replace_once(s, "ensures n == m,", "ensures true,"),
+        Path("verification/hosted_mcp_peer.rs"),
+    )
     peer = Path("crates/astrid-mcp/src/server/peer_selection.rs")
     for name, original, changed in [
         ("loses the requested registration", "k@ == requested@ && peer.ensures((&servers@[k],),Some(handle))", "peer.ensures((&servers@[k],),Some(handle))"),

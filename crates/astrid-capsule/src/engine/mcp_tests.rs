@@ -18,11 +18,33 @@ mod tests {
             crate::capsule::CapsuleId::from_static("multi-mcp"),
             7,
         );
-        let first = crate::engine::mcp::runtime_server_id("multi-mcp", "first", &runtime);
-        let second = crate::engine::mcp::runtime_server_id("multi-mcp", "second", &runtime);
+        let first = crate::engine::mcp::runtime_server_id("first", &runtime);
+        let second = crate::engine::mcp::runtime_server_id("second", &runtime);
         assert_ne!(first, second);
         assert!(first.ends_with("generation-7"));
         assert!(second.ends_with("generation-7"));
+    }
+
+    #[test]
+    fn mcp_registration_preserves_scope_and_decimal_generation() {
+        use crate::registry::{RuntimeId, RuntimeScope};
+        let uid = astrid_core::PrincipalUid::from_bytes([0xab; 32]);
+        for generation in [0, 9, 10, 99, 100, u64::MAX - 1] {
+            for (scope, label) in [
+                (RuntimeScope::SystemResident, "system".to_owned()),
+                (RuntimeScope::Principal(uid), format!("principal-{uid}")),
+            ] {
+                let runtime = RuntimeId::for_test_scope(
+                    crate::capsule::CapsuleId::from_static("multi-mcp"),
+                    generation,
+                    scope,
+                );
+                assert_eq!(
+                    crate::engine::mcp::runtime_server_id("local:tools", &runtime),
+                    format!("capsule:multi-mcp:server-local:tools:{label}:generation-{generation}")
+                );
+            }
+        }
     }
 
     fn dummy_manifest(command: &str, allowed_commands: Vec<&str>) -> CapsuleManifest {

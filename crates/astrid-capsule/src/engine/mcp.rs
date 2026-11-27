@@ -12,18 +12,20 @@ use crate::manifest::{CapsuleManifest, McpServerDef};
 
 use astrid_mcp::SecureMcpClient;
 
-pub(super) fn runtime_server_id(
-    capsule: &str,
-    server: &str,
-    runtime_id: &crate::registry::RuntimeId,
-) -> String {
-    let scope = match runtime_id.key().scope() {
-        crate::registry::RuntimeScope::Principal(uid) => format!("principal-{uid}"),
-        crate::registry::RuntimeScope::SystemResident => "system".to_string(),
-    };
-    format!(
-        "capsule:{capsule}:server-{server}:{scope}:generation-{}",
-        runtime_id.generation()
+use crate::registry::generation::RuntimeId as RegistryId;
+
+#[path = "mcp_registration.rs"]
+mod registration;
+
+pub(super) fn runtime_server_id(server: &str, runtime_id: &crate::registry::RuntimeId) -> String {
+    registration::runtime_name(
+        runtime_id,
+        server,
+        crate::capsule::CapsuleId::as_str,
+        |scope| match scope {
+            crate::registry::RuntimeScope::Principal(uid) => Some(uid.to_string()),
+            crate::registry::RuntimeScope::SystemResident => None,
+        },
     )
 }
 
@@ -203,8 +205,7 @@ impl ExecutionEngine for McpHostEngine {
                 "MCP host engine requires a preallocated runtime generation".to_string(),
             )
         })?;
-        let server_id =
-            runtime_server_id(&self.manifest.package.name, &self.server_def.id, runtime_id);
+        let server_id = runtime_server_id(&self.server_def.id, runtime_id);
 
         let config = astrid_mcp::ServerConfig {
             name: server_id.clone(),
