@@ -39,7 +39,7 @@ const SNAPSHOT_RECORD: u8 = 1;
 const DELTA_RECORD: u8 = 2;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 const TAGGED_IDENTITY_BYTES: usize = 40;
-const LOCATION_BYTES: usize = TAGGED_IDENTITY_BYTES + 8 + 8 + 32;
+const LOCATION_BYTES: usize = TAGGED_IDENTITY_BYTES + ArenaLocation::ENCODED_LEN;
 
 /// Recovered disposable object-location state.
 pub(super) struct IndexState<M = BTreeMap<ObjectId, ArenaLocation>> {
@@ -462,9 +462,7 @@ fn encode_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     // Borrow its entries directly instead of allocating another full vector.
     for (id, location) in objects {
         encode_identity(&mut bytes, scheme, *id);
-        bytes.extend_from_slice(&location.offset.to_le_bytes());
-        bytes.extend_from_slice(&location.payload_len.to_le_bytes());
-        bytes.extend_from_slice(&location.checksum);
+        location.encode(&mut bytes);
     }
     Ok(bytes)
 }
@@ -475,7 +473,7 @@ fn encode_delta(delta: &IndexDelta<'_>, scheme: IdentityScheme) -> Result<Vec<u8
     encode_scheme(&mut bytes, scheme);
     bytes.extend_from_slice(&delta.previous_arena_len.to_le_bytes());
     bytes.extend_from_slice(&delta.arena_len.to_le_bytes());
-    encode_location(&mut bytes, delta.arena_tail);
+    delta.arena_tail.encode(&mut bytes);
     encode_locations(&mut bytes, scheme, delta.objects.iter().copied())?;
     Ok(bytes)
 }
@@ -493,9 +491,7 @@ fn encode_locations(
     encode_len(bytes, locations.len())?;
     for (id, location) in locations {
         encode_identity(bytes, scheme, id);
-        bytes.extend_from_slice(&location.offset.to_le_bytes());
-        bytes.extend_from_slice(&location.payload_len.to_le_bytes());
-        bytes.extend_from_slice(&location.checksum);
+        location.encode(bytes);
     }
     Ok(())
 }
@@ -546,12 +542,8 @@ fn apply_delta(
     validation::validate_locations(additions.values(), arena_len, offset)?;
     validation::validate_tail(Some(arena_tail), arena_len, offset)?;
     for (id, location) in additions {
-        match state.objects.get(&id) {
-            Some(existing) if same_location(*existing, location) => {},
-            Some(_) => return Err(corrupt(offset, "index delta remaps an object identity")),
-            None => {
-                state.objects.insert(id, location);
-            },
+        if !super::arena_index::restore_location(&mut state.objects, id, location) {
+            return Err(corrupt(offset, "index delta remaps an object identity"));
         }
     }
     state.arena_len = arena_len;
@@ -564,15 +556,9 @@ fn encode_optional_location(bytes: &mut Vec<u8>, location: Option<ArenaLocation>
         None => bytes.push(0),
         Some(location) => {
             bytes.push(1);
-            encode_location(bytes, location);
+            location.encode(bytes);
         },
     }
-}
-
-fn encode_location(bytes: &mut Vec<u8>, location: ArenaLocation) {
-    bytes.extend_from_slice(&location.offset.to_le_bytes());
-    bytes.extend_from_slice(&location.payload_len.to_le_bytes());
-    bytes.extend_from_slice(&location.checksum);
 }
 
 fn decode_optional_location(
@@ -590,14 +576,10 @@ fn decode_location(
     reader: &mut WireReader<'_>,
     offset: u64,
 ) -> Result<ArenaLocation, DurableError> {
-    Ok(ArenaLocation {
-        offset: reader.u64().map_err(|detail| corrupt(offset, detail))?,
-        payload_len: reader.u64().map_err(|detail| corrupt(offset, detail))?,
-        checksum: reader
-            .take(32)
-            .and_then(|bytes| bytes.try_into().map_err(|_| "truncated checksum"))
-            .map_err(|detail| corrupt(offset, detail))?,
-    })
+    let bytes = reader
+        .take(ArenaLocation::ENCODED_LEN)
+        .map_err(|detail| corrupt(offset, detail))?;
+    ArenaLocation::decode(bytes).ok_or_else(|| corrupt(offset, "truncated index record"))
 }
 
 fn decode_locations(
@@ -626,14 +608,7 @@ fn decode_locations(
                 "index identities are not canonically ordered",
             ));
         }
-        let location = ArenaLocation {
-            offset: reader.u64().map_err(|detail| corrupt(offset, detail))?,
-            payload_len: reader.u64().map_err(|detail| corrupt(offset, detail))?,
-            checksum: reader
-                .take(32)
-                .and_then(|bytes| bytes.try_into().map_err(|_| "truncated checksum"))
-                .map_err(|detail| corrupt(offset, detail))?,
-        };
+        let location = decode_location(reader, offset)?;
         locations.insert(id, location);
         previous = Some(id);
     }
@@ -658,12 +633,6 @@ fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
     encode_scheme(bytes, scheme);
     bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
     bytes.extend_from_slice(id.as_bytes());
-}
-
-fn same_location(left: ArenaLocation, right: ArenaLocation) -> bool {
-    left.offset == right.offset
-        && left.payload_len == right.payload_len
-        && left.checksum == right.checksum
 }
 
 fn corrupt(offset: u64, detail: &'static str) -> DurableError {

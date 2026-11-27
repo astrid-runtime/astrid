@@ -97,9 +97,7 @@ impl PayloadReader<'_> {
         let entry = self.entry.get_mut();
         entry.clear();
         encode_identity(entry, self.scheme, *id);
-        entry.extend_from_slice(&location.offset.to_le_bytes());
-        entry.extend_from_slice(&location.payload_len.to_le_bytes());
-        entry.extend_from_slice(&location.checksum);
+        location.encode(entry);
         self.entry.set_position(0);
         true
     }

@@ -83,6 +83,20 @@ def consumer_defects():
             f"arena append {name}", source,
             lambda s, a=original, b=changed: replace_once(s, a, b), target,
         )
+    for name, source, original, changed, target in [
+        ("encodes offset in the length field", append, "little_endian(self.payload_len)", "little_endian(self.offset)", append),
+        ("reads the checksum one byte early", append, "checksum.copy_from_slice(&bytes[16..]);", "checksum.copy_from_slice(&bytes[15..47]);", append),
+        ("loses successful decode bytes", append, "loc.wire() == bytes@,", "true,", readback),
+        ("forgets the encoded placement", append, "final(bytes)@ == old(bytes)@ + self.wire(),", "true,", readback),
+        ("drops the header from the restored endpoint", append, "self.offset.checked_add(WIDTH as u64)?.checked_add(self.payload_len)", "self.offset.checked_add(self.payload_len)", append),
+        ("loses the endpoint relation", append, "(end matches Some(value) ==> value == e)", "true", readback),
+        ("accepts a conflicting restored identity", index, "previous.offset != loc.offset ||", "false ||", index),
+        ("forgets the replayed map", index, "final(index)@ == if accepted {old(index)@.insert(key,loc)} else {old(index)@},", "true,", readback),
+    ]:
+        yield (
+            f"checkpoint placement {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     for name, clause, weaker in [
         ("loses acceptance of equal frames", "out.is_ok() == ((*old(self).payload)@ == (*incoming.payload)@)", "out.is_ok() ==> ((*old(self).payload)@ == (*incoming.payload)@)"),
         ("loses the retained record", "final(self).record == old(self).record", "true"),

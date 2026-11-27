@@ -55,6 +55,31 @@ pub(super) fn publish_batch<K:Ord+Copy,L:Copy>(
     true
 }
 
+/// A replayed checkpoint delta may repeat a mapping but cannot move an existing name.
+pub(super) fn restore_location<K:Ord+Copy>(
+    index:&mut BTreeMap<K,super::arena_frame::ArenaLocation>, key:K, loc:super::arena_frame::ArenaLocation,
+) -> (accepted:bool)
+    requires btree_map_inv(old(index)), obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(),
+    ensures btree_map_inv(final(index)),
+        accepted == (!old(index)@.contains_key(key) || old(index)@[key] == loc),
+        final(index)@ == if accepted {old(index)@.insert(key,loc)} else {old(index)@},
+{
+    if let Some(previous) = index.get(&key) {
+        if previous.offset != loc.offset || previous.payload_len != loc.payload_len ||
+            previous.checksum.as_slice() != loc.checksum.as_slice() {
+            return false;
+        }
+        assert(previous.checksum@ =~= loc.checksum@);
+        assert(previous.checksum == loc.checksum);
+        assert(*previous == loc);
+        assert(index@ =~= old(index)@.insert(key,loc));
+        true
+    } else {
+        index.insert(key,loc);
+        true
+    }
+}
+
 /// Resolve both placement fields for the same immutable object name.
 pub(super) fn placement<'a,K:Ord+Copy,L:Copy,D>(
     key:K,index:&BTreeMap<K,L>,direct:&'a BTreeMap<K,D>,

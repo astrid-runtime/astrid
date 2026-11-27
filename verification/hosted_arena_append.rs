@@ -146,6 +146,7 @@ fn publish_selected<S:frame::Sink,K:Ord+Copy>(
             let f = frames@[row as int];
             &&& final(index)@.contains_key(key) && loc.offset == base as int + at
             &&& loc.payload_len == f.body().len() && loc.checksum == f.sum()
+            &&& final(delta).len() == old(delta).len() + frames.len()
             &&& final(delta)@[old(delta).len()+row] == (key,loc)
             &&& final(sink).sent().subrange(start as int,start as int+f.wire().len()) == f.wire()
         },
@@ -167,6 +168,67 @@ fn publish_selected<S:frame::Sink,K:Ord+Copy>(
         assert(sink.sent().subrange(start as int,start as int+width) =~= total.subrange(off,off+width));
     }
     Ok(())
+}
+
+/// Feed the persisted location from one delta row back into the recovery map.
+fn reload_row<K:Ord+Copy>(recovered:&mut std::collections::BTreeMap<K,frame::ArenaLocation>,
+    key:K, loc:frame::ArenaLocation, frontier:u64) -> (ok:bool)
+    requires vstd::std_specs::btree::btree_map_inv(old(recovered)),
+        vstd::laws_cmp::obeys_cmp::<K>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<K>(),
+    ensures ok == (loc.offset as int + frame::WIDTH + loc.payload_len <= frontier &&
+            (!old(recovered)@.contains_key(key) || old(recovered)@[key] == loc)),
+        final(recovered)@ == if ok {old(recovered)@.insert(key,loc)} else {old(recovered)@},
+{
+    let mut bytes = Vec::new();
+    loc.encode(&mut bytes);
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    let Some(parsed) = frame::ArenaLocation::decode(&bytes) else {assert(false);return false;};
+    proof {
+        assert(loc.wire().take(8) =~= vstd::bytes::spec_u64_to_le_bytes(loc.offset));
+        assert(parsed.wire().take(8) =~= vstd::bytes::spec_u64_to_le_bytes(parsed.offset));
+        assert(loc.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(loc.payload_len));
+        assert(parsed.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(parsed.payload_len));
+        assert(loc.wire().skip(16) =~= loc.checksum@);
+        assert(parsed.wire().skip(16) =~= parsed.checksum@);
+        assert(parsed.checksum == loc.checksum);
+        assert(parsed == loc);
+    }
+    let Some(end) = parsed.end() else {return false;};
+    if end > frontier {return false;}
+    crate::arena_index::restore_location(recovered,key,parsed)
+}
+
+/// Replay a selected row from the actual append delta. The restored position
+/// addresses the same submitted interval, even when the arena began nonempty.
+fn publish_and_reload<S:frame::Sink,K:Ord+Copy>(
+    sink:&mut S,frames:&[frame::PreparedFrame],ids:&[K],row:usize,base:u64,
+    live:&mut std::collections::BTreeMap<K,frame::ArenaLocation>,delta:&mut Vec<(K,frame::ArenaLocation)>,
+    recovered:&mut std::collections::BTreeMap<K,frame::ArenaLocation>,frontier:u64,
+) -> (out:Result<bool,frame::AppendError<S::Error>>)
+    requires ids.len() == frames.len(), row < ids.len(),
+        forall|i:int| row < i < ids.len() ==> #[trigger] ids@[i] != ids@[row as int],
+        vstd::std_specs::btree::btree_map_inv(old(live)),vstd::std_specs::btree::btree_map_inv(old(recovered)),
+        vstd::laws_cmp::obeys_cmp::<K>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<K>(),
+    ensures match out {
+        Ok(ok) => {
+            let key = ids@[row as int];
+            let loc = final(live)@[key];
+            let at = frame::prefix(frames@,row as nat).len();
+            let start = old(sink).sent().len() + at;
+            let f = frames@[row as int];
+            &&& ok == (base as int + at + frame::WIDTH + f.body().len() <= frontier &&
+                (!old(recovered)@.contains_key(key) || old(recovered)@[key] == loc))
+            &&& final(recovered)@ == if ok {old(recovered)@.insert(key,loc)} else {old(recovered)@}
+            &&& loc.offset == base as int + at && loc.payload_len == f.body().len() && loc.checksum == f.sum()
+            &&& final(sink).sent().subrange(start as int,start as int+f.wire().len()) == f.wire()
+        },
+        Err(_) => final(recovered)@ == old(recovered)@,
+    },
+{
+    let prior = delta.len();
+    publish_selected(sink,frames,ids,row,base,live,delta)?;
+    let (key,loc) = delta[prior.saturating_add(row)];
+    Ok(reload_row(recovered,key,loc,frontier))
 }
 
 /// Connect the production vector builder and partial-write driver. The native

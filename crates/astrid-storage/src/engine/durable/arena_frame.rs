@@ -13,6 +13,50 @@ pub(super) struct ArenaLocation {
     pub(super) checksum: [u8; 32],
 }
 
+impl ArenaLocation {
+    pub(super) const ENCODED_LEN:usize = 8 + 8 + 32;
+
+    pub(super) open spec fn wire(self) -> Seq<u8> {
+        vstd::bytes::spec_u64_to_le_bytes(self.offset) +
+            vstd::bytes::spec_u64_to_le_bytes(self.payload_len) + self.checksum@
+    }
+
+    pub(super) fn encode(&self, bytes:&mut Vec<u8>)
+        ensures final(bytes)@ == old(bytes)@ + self.wire(),
+    {
+        bytes.extend_from_slice(&root_wire::little_endian(self.offset));
+        bytes.extend_from_slice(&root_wire::little_endian(self.payload_len));
+        bytes.extend_from_slice(&self.checksum);
+        assert(bytes@ =~= old(bytes)@ + self.wire());
+    }
+
+    pub(super) fn decode(bytes:&[u8]) -> (out:Option<Self>)
+        ensures out.is_some() == (bytes.len() == Self::ENCODED_LEN),
+            out matches Some(loc) ==> loc.wire() == bytes@,
+    {
+        if bytes.len() != Self::ENCODED_LEN {return None;}
+        let mut offset = [0;8];
+        let mut size = [0;8];
+        let mut checksum = [0;32];
+        offset.copy_from_slice(&bytes[..8]);
+        size.copy_from_slice(&bytes[8..16]);
+        checksum.copy_from_slice(&bytes[16..]);
+        let loc = Self {offset:u64::from_le_bytes(offset),payload_len:u64::from_le_bytes(size),checksum};
+        proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+        assert(loc.wire() =~= bytes@);
+        Some(loc)
+    }
+
+    pub(super) fn end(&self) -> (end:Option<u64>)
+        ensures ({
+            let e = self.offset as int + WIDTH + self.payload_len;
+            end.is_some() == (e <= u64::MAX) && (end matches Some(value) ==> value == e)
+        }),
+    {
+        self.offset.checked_add(WIDTH as u64)?.checked_add(self.payload_len)
+    }
+}
+
 pub(super) open spec fn header_bytes(magic:[u8;8],version:u16,size:u64,sum:[u8;32]) -> Seq<u8> {
     magic@ + seq![version as u8,(version >> 8) as u8,0u8,0u8] +
         vstd::bytes::spec_u64_to_le_bytes(size) + sum@
