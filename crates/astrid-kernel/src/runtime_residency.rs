@@ -25,6 +25,15 @@ pub(super) fn classify(allowed: bool, uplinks: Uplinks, has_servers: bool)
     } else { Ok(RuntimeResidency::Principal) }
 }
 
+/// A live replacement may reserve only the scope already running.
+pub(super) fn replacement_scope<S: Eq>(running: &S, installed: S) -> (out: Result<S,S>)
+    requires vstd::laws_eq::obeys_concrete_eq::<S>(),
+    ensures out == if installed == *running { Ok(*running) } else { Err(installed) },
+{
+    proof { reveal(vstd::laws_eq::obeys_concrete_eq); }
+    if S::eq(running,&installed) { Ok(installed) } else { Err(installed) }
+}
+
 impl RuntimeResidency {
     pub(super) fn is_system(self) -> (yes: bool)
         ensures yes == (self == Self::SystemResident),

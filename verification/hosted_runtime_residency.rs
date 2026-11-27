@@ -48,6 +48,28 @@ fn issue_runtime(next: &mut u64, id: u64, artifact: [u8;32], allowed: bool, prov
     Some((*key.capsule_id(), *key.artifact(), issued_owner, issued.generation()))
 }
 
+
+fn reserve_replacement(next: &mut u64, package: u64, artifact: [u8;32],
+    running: RuntimeScope, observed_owner: Option<u64>)
+    -> (out: Option<crate::runtime_generation::RuntimeId<u64,[u8;32],RuntimeScope>>)
+    requires vstd::laws_eq::obeys_concrete_eq::<RuntimeScope>(),
+    ensures ({
+        let requested = match observed_owner {
+            Some(uid) => RuntimeScope::Principal(uid), None => RuntimeScope::SystemResident,
+        };
+        if requested != running || *old(next) == u64::MAX {
+            out.is_none() && *final(next) == *old(next)
+        } else {
+            out matches Some(id) && id.identity() == ((package,artifact,running),*old(next))
+                && *final(next) as int == *old(next) as int + 1
+        }
+    }),
+{
+    let requested = RuntimeScope::from_owner(observed_owner);
+    let admitted = crate::runtime_residency::replacement_scope(&running,requested).ok()?;
+    crate::runtime_generation::issue(next,package,artifact,admitted)
+}
+
 }
 
 verus! {

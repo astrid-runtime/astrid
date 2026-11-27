@@ -37,11 +37,34 @@ fn stable_wire_source_resolves_only_in_the_current_registry()
     let current = after
         .get_for(&principal, &name)
         .expect("reinstalled capsule");
+    assert!(matches!(
+        after.restart_snapshot_for(&principal, &name, Some(&prior_id)),
+        RestartSnapshot::Superseded
+    ));
+    for expected in [None, Some(&current_id)] {
+        let RestartSnapshot::Current(selected, handle) =
+            after.restart_snapshot_for(&principal, &name, expected)
+        else {
+            panic!("installed generation must be available for restart");
+        };
+        assert_eq!(selected, current_id);
+        assert!(Arc::ptr_eq(&handle, &current));
+    }
     let resolved = after
         .find_instance_by_uuid_for(&principal, &source)
         .expect("current source");
     assert!(Arc::ptr_eq(&resolved, &current));
     assert!(!Arc::ptr_eq(&resolved, &prior));
+
+    let mut same_owner = CapsuleRegistry::new();
+    let reissued = install(&mut same_owner, 1)?;
+    assert_eq!(reissued, prior_id);
+    let RestartSnapshot::Current(_, reloaded) =
+        same_owner.restart_snapshot_for(&principal, &name, Some(&prior_id))
+    else {
+        panic!("identical registry inputs reissue the identity");
+    };
+    assert!(!Arc::ptr_eq(&reloaded, &prior));
     Ok(())
 }
 
@@ -91,6 +114,10 @@ fn missing_scoped_instance_shadows_live_legacy_alias() -> Result<(), Box<dyn std
         .expect("registered source");
     registry.register_instance_uuid(source, artifact);
     registry.instances.remove(&scoped);
+    assert!(matches!(
+        registry.restart_snapshot_for(&principal, &CapsuleId::from_static("scoped"), Some(&scoped)),
+        RestartSnapshot::Missing
+    ));
     assert!(
         registry
             .find_instance_by_uuid_for(&principal, &source)

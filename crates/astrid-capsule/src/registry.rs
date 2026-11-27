@@ -58,6 +58,7 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
 mod instance_swap;
 mod source_lookup;
 mod view_lookup;
+pub use view_lookup::RestartSnapshot;
 mod viewers;
 type InstanceEntry = instance_swap::Entry<dyn Capsule, PrincipalId>;
 
@@ -668,6 +669,17 @@ impl CapsuleRegistry {
     #[must_use]
     pub fn get_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<Arc<dyn Capsule>> {
         view_lookup::capsule_for(&self.views, &self.instances, principal, id)
+    }
+
+    /// Capture the installed capsule and its generation together before restart preparation.
+    #[must_use]
+    pub fn restart_snapshot_for(
+        &self,
+        principal: &PrincipalId,
+        id: &CapsuleId,
+        expected: Option<&RuntimeId>,
+    ) -> RestartSnapshot<RuntimeId, dyn Capsule> {
+        view_lookup::snapshot(&self.views, &self.instances, principal, id, expected)
     }
 
     /// Runtime incarnation currently visible as `id` to `principal`.

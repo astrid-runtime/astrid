@@ -25,6 +25,16 @@ def defects():
             lambda s, a=original, b=weakened: replace_once(s, a, b),
             Path("verification/hosted_registry_lookup.rs"),
         )
+    for name, clause in [
+        ("loses the installed handle and identity", "_ => RestartSnapshot::Current(v,instances@[v].capsule),"),
+        ("admits a superseded caller", "Some(e) if *e != v => RestartSnapshot::Superseded,"),
+        ("cannot distinguish a missing instance", "_ => RestartSnapshot::Missing,"),
+    ]:
+        yield (
+            f"restart snapshot {name}", lookup,
+            lambda s, c=clause: replace_once(s, c, c.split("=>")[0] + "=> out,"),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
     yield (
         "restart viewer selection can ignore a matching slot", viewers,
@@ -67,6 +77,11 @@ def defects():
             lambda s, a=original, b=changed: replace_once(s, a, b),
             Path("verification/hosted_runtime_residency.rs"),
         )
+    yield (
+        "restart reservation scope can discard a mismatch", residency,
+        lambda s: replace_once(s, "ensures out == if installed == *running", "ensures installed == *running ==> out == if installed == *running"),
+        Path("verification/hosted_runtime_residency.rs"),
+    )
     yield (
         "runtime issuance loses the admitted scope mapping",
         Path("crates/astrid-capsule/src/registry/runtime_scope.rs"),

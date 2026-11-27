@@ -1,6 +1,7 @@
 //! Principal-scoped replacement with lifecycle admission.
 
 use super::{Kernel, RestartOutcome, capsule_audit, unload_replaced_runtime};
+use astrid_capsule::registry::RestartSnapshot;
 use astrid_core::PrincipalId;
 
 impl Kernel {
@@ -118,15 +119,14 @@ impl Kernel {
     ) -> Result<RestartOutcome, anyhow::Error> {
         let (source_dir, current_runtime) = {
             let registry = self.capsules.read().await;
-            let capsule = registry
-                .get_for(principal, id)
-                .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
-            let runtime_id = registry
-                .runtime_id_for(principal, id)
-                .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
-            if expected_runtime.is_some_and(|expected| expected != &runtime_id) {
-                return Ok(RestartOutcome::Superseded);
-            }
+            let (runtime_id, capsule) =
+                match registry.restart_snapshot_for(principal, id, expected_runtime) {
+                    RestartSnapshot::Missing => {
+                        anyhow::bail!("capsule '{id}' not found in registry")
+                    },
+                    RestartSnapshot::Superseded => return Ok(RestartOutcome::Superseded),
+                    RestartSnapshot::Current(runtime_id, capsule) => (runtime_id, capsule),
+                };
             let source_dir = capsule
                 .source_dir()
                 .map(std::path::Path::to_path_buf)

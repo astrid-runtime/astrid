@@ -58,4 +58,44 @@ pub(super) fn capsule_for<P: Eq + Hash,K: Eq + Hash,V: Eq + Hash,C: ?Sized,A>(
     let generation = resolve(views,principal,capsule)?;
     instance_swap::installed(instances,generation)
 }
+
+/// Result of capturing the installed incarnation for restart preparation.
+pub enum RestartSnapshot<V,C: ?Sized> {
+    /// No installed capsule occupies the requested view.
+    Missing,
+    /// The view no longer contains the caller's expected incarnation.
+    Superseded,
+    /// The installed handle and the identity under which it was found.
+    Current(V,Arc<C>),
+}
+
+/// Capture the installed capsule and its full incarnation from one view lookup.
+pub(super) fn snapshot<P: Eq + Hash,K: Eq + Hash,V: Eq + Hash + Clone,C: ?Sized,A>(
+    views: &HashMap<P,HashMap<K,V>>, instances: &HashMap<V,Entry<C,A>>, principal: &P, capsule: &K, expected: Option<&V>,
+) -> (out: RestartSnapshot<V,C>)
+    requires hash_map_inv(views), hash_map_inv(instances),
+        obeys_key_model::<P>(), obeys_concrete_eq::<P>(), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+        obeys_key_model::<V>(), obeys_concrete_eq::<V>(), vstd::pervasive::obeys_clone_eq::<V>(),
+        views@.contains_key(*principal) ==> hash_map_inv(&views@[*principal]),
+    ensures out == match slot(views@, *principal, *capsule) {
+        Some(v) if instances@.contains_key(v) => match expected {
+            Some(e) if *e != v => RestartSnapshot::Superseded,
+            _ => RestartSnapshot::Current(v,instances@[v].capsule),
+        },
+        _ => RestartSnapshot::Missing,
+    },
+{
+    let Some(selected) = resolve(views,principal,capsule) else { return RestartSnapshot::Missing; };
+    let Some(handle) = instance_swap::installed(instances,selected) else { return RestartSnapshot::Missing; };
+    proof { reveal(obeys_concrete_eq); }
+    match expected {
+        Some(captured) if !V::eq(selected,captured) => return RestartSnapshot::Superseded,
+        _ => {},
+    }
+    proof { reveal(vstd::pervasive::obeys_clone_eq); }
+    let id = V::clone(selected);
+    assert(vstd::pervasive::cloned(*selected,id));
+    RestartSnapshot::Current(id,handle)
+}
+
 }

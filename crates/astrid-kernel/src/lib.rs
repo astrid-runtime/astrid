@@ -2020,12 +2020,13 @@ impl Kernel {
             |owner, expected| self.principal_directory.bound_uid(owner, expected),
         )?;
         let actual_scope = astrid_capsule::registry::RuntimeScope::from_owner(principal_uid);
-        if actual_scope != expected_scope {
-            anyhow::bail!(
-                "capsule '{id}' cannot change runtime scope during live replacement: \
-                 running={expected_scope:?}, installed={actual_scope:?}"
-            );
-        }
+        let admitted_scope = runtime_residency::replacement_scope(&expected_scope, actual_scope)
+            .map_err(|installed| {
+                anyhow::anyhow!(
+                    "capsule '{id}' cannot change runtime scope during live replacement: \
+                 running={expected_scope:?}, installed={installed:?}"
+                )
+            })?;
         if let Some(bound) = bound.as_ref() {
             self.confirm_published_materialization(&runtime_dir, principal, &manifest, bound)?;
         }
@@ -2033,7 +2034,7 @@ impl Kernel {
             self.capsules
                 .write()
                 .await
-                .reserve_runtime_id(id.clone(), artifact, actual_scope)?;
+                .reserve_runtime_id(id.clone(), artifact, admitted_scope)?;
         let mut capsule = self
             .build_capsule_runtime(
                 manifest,

@@ -27,4 +27,23 @@ fn lookup<C: ?Sized, A>(views: &HashMap<u64,HashMap<u64,Id>>, instances: &HashMa
     let capsule = view_lookup::capsule_for(views, instances, &principal, &package);
     (current, capsule)
 }
+fn restart_snapshot<C: ?Sized,A>(views: &HashMap<u64,HashMap<u64,Id>>, instances: &HashMap<Id,Entry<C,A>>,
+    principal: u64, package: u64, expected: Option<&Id>) -> (out: view_lookup::RestartSnapshot<Id,C>)
+    requires hash_map_inv(views), hash_map_inv(instances), obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
+        vstd::pervasive::obeys_clone_eq::<Id>(),
+        views@.contains_key(principal) ==> hash_map_inv(&views@[principal]),
+    ensures ({
+        if views@.contains_key(principal) && views@[principal]@.contains_key(package)
+            && instances@.contains_key(views@[principal]@[package]) {
+            let id = views@[principal]@[package];
+            match expected {
+                Some(e) if *e != id => out == view_lookup::RestartSnapshot::Superseded,
+                _ => out == view_lookup::RestartSnapshot::Current(id,instances@[id].capsule),
+            }
+        } else { out == view_lookup::RestartSnapshot::Missing }
+    }),
+{
+    view_lookup::snapshot(views,instances,&principal,&package,expected)
+}
+
 }
