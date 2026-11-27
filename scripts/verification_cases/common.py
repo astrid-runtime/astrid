@@ -47,6 +47,7 @@ MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
     Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/host/io/dispatch.rs"),
     Path("verification/hosted_io_splice.rs"),
     Path("verification/hosted_pool_return.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs"),

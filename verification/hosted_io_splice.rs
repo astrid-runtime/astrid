@@ -56,4 +56,24 @@ fn rebound_transfer<'a>(request: Request, mode: Mode, admitted: bool, table: u64
         })?
 }
 
+// Include the operation itself in the bound tuple. The operands and result can
+// be any types, including a byte buffer or an error from the native table.
+fn stream_access<T,S,A,R,F:FnOnce(T,S,A)->R>(
+    alias:&[u8], uid:&[u8;32], forward:Option<&[u8;32]>, reverse:Option<&[u8]>,
+    cancelled:bool, retired:bool, table:T, stream:S, args:A, op:F,
+) -> (out:Option<R>)
+    requires !cancelled && !retired ==> op.requires((table,stream,args)),
+    ensures if !cancelled && !retired && (forward matches Some(f) && f@ == uid@)
+        && (reverse matches Some(r) && r@ == alias@) {
+        out matches Some(value) && op.ensures((table,stream,args),value)
+    } else { out.is_none() },
+{
+    crate::principal_binding::with_pair(alias,uid,forward,reverse,(stream,args,op),
+        |bound:(S,A,F)| -> (value:Option<R>)
+            requires !cancelled && !retired ==> bound.2.requires((table,bound.0,bound.1)),
+            ensures if cancelled || retired { value.is_none() }
+                else { value matches Some(v) && bound.2.ensures((table,bound.0,bound.1),v) },
+        { crate::io_dispatch::dispatch(cancelled,retired,table,bound) }).ok()?
+}
+
 }

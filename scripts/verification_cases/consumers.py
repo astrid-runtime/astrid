@@ -39,6 +39,16 @@ def consumer_defects():
             f"rebound splice {name}", splice_trace,
             lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
         )
+    dispatch = Path("crates/astrid-capsule/src/engine/wasm/host/io/dispatch.rs")
+    for name, original, changed in [
+        ("loses refusal on cancellation", "if cancelled || retired { out.is_none() }", "if cancelled || retired { !cancelled ==> out.is_none() }"),
+        ("loses refusal on retirement", "if cancelled || retired { out.is_none() }", "if cancelled || retired { !retired ==> out.is_none() }"),
+        ("loses the selected operation or operands", "out matches Some(r) && input.2.ensures((table,input.0,input.1),r)", "out.is_some()"),
+    ]:
+        yield (
+            f"immediate stream access {name}", dispatch,
+            lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
+        )
     pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
     pool_trace = Path("verification/hosted_pool_return.rs")
     for name, original, changed in [

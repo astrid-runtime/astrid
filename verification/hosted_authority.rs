@@ -269,4 +269,6 @@ mod hosted_pool_return;
 
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/io/splice.rs"]
 mod io_splice;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/io/dispatch.rs"]
+mod io_dispatch;
 mod hosted_io_splice;

@@ -14,6 +14,8 @@
 //! wait primitive. The WIT contract stays the same; capsules never see
 //! the underlying mechanism.
 
+mod authority;
+mod dispatch;
 mod splice;
 mod transfer;
 
@@ -295,10 +297,9 @@ mod astrid_streams_impl {
 
     impl HostInputStream for HostState {
         fn read(&mut self, self_: Resource<InputStream>, len: u64) -> StreamResult<Vec<u8>> {
-            cancel_guard(self)?;
             let started = Instant::now();
-            let stream = Resource::new_borrow(self_.rep());
-            let result = wasi_streams::HostInputStream::read(&mut self.resource_table, stream, len);
+            let result =
+                super::authority::access(self, self_, len, wasi_streams::HostInputStream::read);
             let bytes = result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             audit_io(
@@ -334,9 +335,7 @@ mod astrid_streams_impl {
         }
 
         fn skip(&mut self, self_: Resource<InputStream>, len: u64) -> StreamResult<u64> {
-            cancel_guard(self)?;
-            let stream = Resource::new_borrow(self_.rep());
-            wasi_streams::HostInputStream::skip(&mut self.resource_table, stream, len)
+            super::authority::access(self, self_, len, wasi_streams::HostInputStream::skip)
         }
 
         fn blocking_skip(&mut self, self_: Resource<InputStream>, len: u64) -> StreamResult<u64> {
@@ -361,18 +360,20 @@ mod astrid_streams_impl {
 
     impl HostOutputStream for HostState {
         fn check_write(&mut self, self_: Resource<OutputStream>) -> StreamResult<u64> {
-            cancel_guard(self)?;
-            let stream = Resource::new_borrow(self_.rep());
-            wasi_streams::HostOutputStream::check_write(&mut self.resource_table, stream)
+            super::authority::access(self, self_, (), |table, stream, ()| {
+                wasi_streams::HostOutputStream::check_write(table, stream)
+            })
         }
 
         fn write(&mut self, self_: Resource<OutputStream>, contents: Vec<u8>) -> StreamResult<()> {
-            cancel_guard(self)?;
             let started = Instant::now();
             let bytes = contents.len() as u64;
-            let stream = Resource::new_borrow(self_.rep());
-            let result =
-                wasi_streams::HostOutputStream::write(&mut self.resource_table, stream, contents);
+            let result = super::authority::access(
+                self,
+                self_,
+                contents,
+                wasi_streams::HostOutputStream::write,
+            );
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             audit_io(
                 self,
@@ -410,9 +411,9 @@ mod astrid_streams_impl {
         }
 
         fn flush(&mut self, self_: Resource<OutputStream>) -> StreamResult<()> {
-            cancel_guard(self)?;
-            let stream = Resource::new_borrow(self_.rep());
-            wasi_streams::HostOutputStream::flush(&mut self.resource_table, stream)
+            super::authority::access(self, self_, (), |table, stream, ()| {
+                wasi_streams::HostOutputStream::flush(table, stream)
+            })
         }
 
         fn blocking_flush(&mut self, self_: Resource<OutputStream>) -> StreamResult<()> {
@@ -428,9 +429,12 @@ mod astrid_streams_impl {
         }
 
         fn write_zeroes(&mut self, self_: Resource<OutputStream>, len: u64) -> StreamResult<()> {
-            cancel_guard(self)?;
-            let stream = Resource::new_borrow(self_.rep());
-            wasi_streams::HostOutputStream::write_zeroes(&mut self.resource_table, stream, len)
+            super::authority::access(
+                self,
+                self_,
+                len,
+                wasi_streams::HostOutputStream::write_zeroes,
+            )
         }
 
         fn blocking_write_zeroes_and_flush(
@@ -501,3 +505,6 @@ mod blocking_splice_tests;
 
 #[cfg(test)]
 mod splice_tests;
+
+#[cfg(test)]
+mod access_tests;

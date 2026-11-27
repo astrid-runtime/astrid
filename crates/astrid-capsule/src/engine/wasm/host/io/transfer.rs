@@ -1,19 +1,12 @@
 //! Native splice sinks. The admitted request owns the lifecycle guards until the call returns.
+use super::authority::Authority;
 use super::splice::{Admitted, Mode, Request};
 use crate::engine::wasm::bindings::astrid::io::streams::{InputStream, OutputStream};
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use astrid_core::profile::device_sessions::DeviceSession;
-use astrid_core::{PrincipalId, PrincipalUid};
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::StreamError;
-
-struct Authority {
-    principal: PrincipalId,
-    owner: PrincipalUid,
-    _invocation: Option<crate::engine::wasm::PrincipalInvocationGuard>,
-    device: Option<DeviceSession>,
-}
 
 fn admit(
     state: &HostState,
@@ -29,32 +22,14 @@ fn admit(
         length,
     };
     request.admit(|target| {
-        let invocation = state
-            .begin_host_operation()
-            .map_err(|()| StreamError::Closed)?;
-        let device = state
-            .begin_device_operation()
-            .map_err(|()| StreamError::Closed)?;
-        let principal = state.effective_principal();
-        let owner = state
-            .principal_directory
-            .bound_uid(
-                &principal,
-                state.invocation_storage_uid.or(state.runtime_owner_uid),
-            )
-            .map_err(|_| StreamError::Closed)?;
+        let authority = Authority::capture(state)?;
         state
             .resource_table
             .get(&Resource::<OutputStream>::new_borrow(target.destination))?;
         state
             .resource_table
             .get(&Resource::<InputStream>::new_borrow(target.source))?;
-        Ok(Authority {
-            principal,
-            owner,
-            _invocation: invocation,
-            device,
-        })
+        Ok(authority)
     })
 }
 
