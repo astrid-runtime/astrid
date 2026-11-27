@@ -311,7 +311,7 @@ impl CapsuleAccessResolver {
                         return None;
                     },
                 };
-                let Some(device) = profile.auth.device_by_typed_key_id(&key_id) else {
+                let Some(device) = profile.active_device(&key_id) else {
                     warn!(
                         security_event = true,
                         principal = %pid,
@@ -656,6 +656,40 @@ mod tests {
         write(&home, "root", &profile);
         cache.invalidate(&PrincipalId::new("root").unwrap());
         assert!(r.resolve_access(Some("root"), Some(&full_id)).is_none());
+    }
+
+    #[test]
+    fn retained_device_loses_capsule_access_when_keypair_is_disabled() {
+        let (_dir, home, cache, resolver) = fixture_with_cache();
+        let principal = PrincipalId::new("operator").unwrap();
+        let key = device('b', DeviceScope::Full);
+        let key_id = key.key_id.clone();
+        let mut profile = PrincipalProfile {
+            auth: AuthConfig {
+                methods: vec![AuthMethod::Keypair],
+                public_keys: vec![key],
+            },
+            ..PrincipalProfile::default()
+        };
+        write(&home, "operator", &profile);
+        assert!(
+            resolver
+                .resolve_access(Some("operator"), Some(&key_id))
+                .is_some()
+        );
+
+        profile
+            .auth
+            .methods
+            .retain(|method| *method != AuthMethod::Keypair);
+        write(&home, "operator", &profile);
+        cache.invalidate(&principal);
+        assert!(resolver.resolve_access(Some("operator"), None).is_some());
+        assert!(
+            resolver
+                .resolve_access(Some("operator"), Some(&key_id))
+                .is_none()
+        );
     }
 
     #[test]

@@ -58,6 +58,10 @@ async fn production_quota_denial_is_not_audited_as_success() {
                 1,
             );
             let id = key.key_id.clone();
+            profile
+                .auth
+                .methods
+                .push(astrid_core::profile::AuthMethod::Keypair);
             profile.auth.public_keys.push(key);
             id
         });
@@ -261,6 +265,10 @@ async fn operator_can_raise_quota_but_self_scoped_device_cannot() {
         1,
     );
     let key = device.key_id.clone();
+    profile
+        .auth
+        .methods
+        .push(astrid_core::profile::AuthMethod::Keypair);
     profile.auth.public_keys.push(device);
     profile
         .save_to_path(&principal_profile_path(&kernel, &caller))

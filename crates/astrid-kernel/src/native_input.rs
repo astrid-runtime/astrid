@@ -25,7 +25,7 @@ pub fn native_input_device_is_live(
     let Ok(profile) = cache.resolve(principal) else {
         return false;
     };
-    profile.enabled && profile.auth.device_by_typed_key_id(&key_id).is_some()
+    profile.active_device(&key_id).is_some()
 }
 
 impl crate::Kernel {
@@ -134,11 +134,16 @@ mod tests {
         assert!(kernel.native_input_device_is_live(&principal, &device_id));
 
         let mut profile = PrincipalProfile::load_from_path(&path).unwrap();
-        profile.auth.public_keys.clear();
         profile
             .auth
             .methods
             .retain(|method| *method != AuthMethod::Keypair);
+        profile.save_to_path(&path).unwrap();
+        kernel.profile_cache.invalidate(&principal);
+        assert!(!kernel.native_input_device_is_live(&principal, &device_id));
+
+        profile.auth.methods.push(AuthMethod::Keypair);
+        profile.auth.public_keys.clear();
         profile.save_to_path(&path).unwrap();
         kernel.profile_cache.invalidate(&principal);
         assert!(!kernel.native_input_device_is_live(&principal, &device_id));

@@ -53,6 +53,16 @@ pub(crate) async fn seed_operator(kernel: &Kernel) -> CreationDelegation {
     let path = PrincipalProfile::path_for(&kernel.astrid_home, &caller);
     let mut profile = PrincipalProfile::load_from_path(&path).unwrap_or_default();
     profile.groups = vec![astrid_core::groups::BUILTIN_ADMIN.into()];
+    if !profile
+        .auth
+        .methods
+        .contains(&astrid_core::profile::AuthMethod::Keypair)
+    {
+        profile
+            .auth
+            .methods
+            .push(astrid_core::profile::AuthMethod::Keypair);
+    }
     if profile.auth.device_by_pubkey(&"ab".repeat(32)).is_none() {
         profile
             .auth

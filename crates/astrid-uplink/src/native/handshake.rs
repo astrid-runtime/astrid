@@ -172,24 +172,10 @@ fn verify_signature(
 ) -> Result<String, String> {
     let profile = astrid_core::PrincipalProfile::load(home, principal)
         .map_err(|error| format!("cannot load principal profile: {error}"))?;
-    if !profile.enabled {
-        return Err(format!("principal {principal} is disabled"));
-    }
-    if !profile
-        .auth
-        .methods
-        .contains(&astrid_core::profile::AuthMethod::Keypair)
-    {
-        return Err(format!(
-            "principal {principal} has keypair authentication disabled"
-        ));
-    }
-    verify_signature_against_keys(
-        principal,
-        &profile.auth.public_keys,
-        nonce_hex,
-        signature_hex,
-    )
+    let keys = profile.active_keypair_keys().ok_or_else(|| {
+        format!("principal {principal} is disabled or has keypair authentication disabled")
+    })?;
+    verify_signature_against_keys(principal, keys, nonce_hex, signature_hex)
 }
 
 fn verify_signature_against_keys(

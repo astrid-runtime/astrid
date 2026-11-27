@@ -498,6 +498,28 @@ impl Default for PrincipalProfile {
 }
 
 impl PrincipalProfile {
+    /// Registered signing keys usable under this profile's current policy.
+    #[must_use]
+    pub fn active_keypair_keys(&self) -> Option<&[DeviceKey]> {
+        (self.enabled && self.auth.methods.contains(&AuthMethod::Keypair))
+            .then_some(self.auth.public_keys.as_slice())
+    }
+
+    /// Resolve a transport's device stamp under the current keypair policy.
+    /// Ambiguous fingerprints confer no device authority.
+    #[must_use]
+    pub fn active_device<S: AsRef<str>>(&self, id: &DeviceKeyId<S>) -> Option<&DeviceKey> {
+        let mut matches = self
+            .active_keypair_keys()?
+            .iter()
+            .filter(|key| key.key_id == id.as_str());
+        let device = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(device)
+    }
+
     /// Borrow the process-global default profile.
     ///
     /// Layer 3's `effective_profile()` accessor returns `&PrincipalProfile`,
