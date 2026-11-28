@@ -894,7 +894,7 @@ def journal_history_consumers():
         ("accepted principal", "decode.ensures((bytes,),Some(p)) && exists", "exists"),
         ("principal encoding", "encode.ensures((&p,),v) && v@ == bytes@", "encode.ensures((&p,),v)"),
         ("principal refusal", "encode.ensures((&p,),v) && v@ != bytes@", "encode.ensures((&p,),v)"),
-        ("acceptance", "out.is_ok() == (actual == expected", "out.is_ok() ==> (actual == expected"),
+        ("acceptance", "out.is_ok() == (actual == expected", "out.is_ok() <== (actual == expected"),
         ("replacement and offset", "old(history)@.insert(owner,(replacement,offset))", "final(history)@"),
         ("rejected history", "else {old(history)@}", "else {final(history)@}"),
         ("observed conflict", "seen == actual && seen != expected", "seen != expected"),
