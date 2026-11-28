@@ -192,7 +192,7 @@ def consumer_defects():
 
     for label, source, clause, weakness, consumer in [
         ("WAL root", named_batch, "let root=p.journal.replacement.commit;",
-         "let root=graph.component;", named_batch),
+         "let root=ObjectId::new([0;32]);", named_batch),
         ("walk refusal", named_batch, "Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(e)),",
          "Ok(rows)=>rows,Err(_)=>return Ok(table),", named_batch),
         ("owning path", publication, "owning_child(decoded.contents().3,i);",
