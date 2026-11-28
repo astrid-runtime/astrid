@@ -888,6 +888,24 @@ def hot_snapshot_consumers():
         )
 
 
+def journal_snapshot_consumers():
+    path = Path("crates/astrid-storage/src/engine/durable/journal_snapshot.rs")
+    for label, clause, weaker in [
+        ("error atomicity", "out.is_err() ==> final(history)@ == old(history)@", "true"),
+        ("initial position", "== (offset != 0 || !old(history)@.is_empty())", "==> (offset != 0 || !old(history)@.is_empty())"),
+        ("accepted payload", "Ok(wire)) && wire@ == payload@) &&", "Ok(wire))) &&"),
+        ("decoded identities", "&& decoded(rows@,ids,decode) && #[trigger] image", "&& #[trigger] image"),
+        ("owner domain", "history.dom() == ids.to_set()", "true"),
+        ("stored root", "Some((rows[i].1,0u64))", "history.get(ids[i])"),
+        ("duplicate evidence", "Err(SnapshotError::Duplicate) => exists", "Err(SnapshotError::Duplicate) => true || exists"),
+    ]:
+        yield (
+            f"journal snapshot loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_journal_history.rs"),
+        )
+
+
 def journal_history_consumers():
     path = Path("crates/astrid-storage/src/engine/durable/journal_history.rs")
     for label, clause, weaker in [
@@ -947,5 +965,6 @@ def checkpoint_decode_consumers():
     yield from resident_cache_consumers()
     yield from hot_point_consumers()
     yield from hot_snapshot_consumers()
+    yield from journal_snapshot_consumers()
     yield from journal_history_consumers()
     yield from point_fill_consumers()

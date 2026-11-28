@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::storage_model::{ModelError, ObjectId, RootState};
 
 use super::journal_history::{self, Rejection};
+use super::journal_snapshot::{self, SnapshotError};
 use super::root_wire::{self, TailError};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
@@ -157,33 +158,30 @@ where
             }
             apply_transition(recovered, codec, offset, &record)
         },
-        DecodedRootJournalRecord::Snapshot(entries) => {
-            if offset != 0 || !recovered.is_empty() {
-                return Err(corrupt(
-                    ROOT_FILE,
-                    offset,
-                    "root snapshot must be the first journal frame",
-                ));
-            }
-            if encode_root_snapshot(scheme, &entries)? != payload {
-                return Err(corrupt(
-                    ROOT_FILE,
-                    offset,
-                    "root snapshot frame is not canonical",
-                ));
-            }
-            for (principal_bytes, root) in entries {
-                let principal = decode_principal(codec, &principal_bytes, offset)?;
-                if recovered.insert(principal, (root, offset)).is_some() {
-                    return Err(corrupt(
-                        ROOT_FILE,
-                        offset,
-                        "root snapshot decodes duplicate principals",
-                    ));
-                }
-            }
-            Ok(())
-        },
+        DecodedRootJournalRecord::Snapshot(entries) => journal_snapshot::restore(
+            recovered,
+            offset,
+            payload,
+            entries,
+            |rows| encode_root_snapshot(scheme, rows),
+            |bytes| decode_principal(codec, bytes, offset),
+        )
+        .map_err(|error| match error {
+            SnapshotError::Position => corrupt(
+                ROOT_FILE,
+                offset,
+                "root snapshot must be the first journal frame",
+            ),
+            SnapshotError::Noncanonical => {
+                corrupt(ROOT_FILE, offset, "root snapshot frame is not canonical")
+            },
+            SnapshotError::Duplicate => corrupt(
+                ROOT_FILE,
+                offset,
+                "root snapshot decodes duplicate principals",
+            ),
+            SnapshotError::Codec(error) => error,
+        }),
     }
 }
 

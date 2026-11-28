@@ -75,4 +75,81 @@ fn journal_transition<K:Ord+Copy,F>(history:&mut BTreeMap<K,(RootState,u64)>,own
     }
 }
 
+
+/// Restore two distinct principals from a compacted journal, then advance just the fleet root.
+/// The snapshot encoder is supplied by the caller. Its codec and parser are separate obligations.
+fn compacted_transition<C>(system:RootState, fleet:RootState, replacement:RootState, id:[u8;32],
+    payload:&[u8], offset:u64, encode:C) -> (history:BTreeMap<u8,(RootState,u64)>)
+    where C:FnOnce(&Vec<(Vec<u8>,RootState)>)->Result<Vec<u8>,()>,
+    requires forall|rows:Vec<(Vec<u8>,RootState)>| #[trigger] encode.requires((&rows,)),
+        forall|rows:Vec<(Vec<u8>,RootState)>, r:Result<Vec<u8>,()>|
+            #[trigger] encode.ensures((&rows,),r) ==> (r matches Ok(w) && w@ == payload@),
+        replacement.generation.value() == fleet.generation.value() as int + 1,
+    ensures history@.dom() == set![0u8,2u8],
+        history@.get(0) == Some((system,0u64)), history@.get(2) == Some((replacement,offset)),
+{
+    use crate::journal_snapshot as snapshot;
+    let mut history = BTreeMap::new();
+    let rows = vec![(Owner::System.encode(),system),(Owner::Fleet(id).encode(),fleet)];
+    let decode = |name:&Vec<u8>| -> (r:Result<u8,()>)
+        ensures r == (if name@ == seq![0u8] {Ok(0u8)}
+            else if name.len() == 33 && name[0] == 2 {Ok(2u8)} else {Err(())}),
+    {
+        match owner_codec::decode(name) {
+            Some(Owner::System) => Ok(0),
+            Some(Owner::Fleet(key)) => {
+                assert((seq![2u8] + key@)[0] == 2 && key@.len() == 32);
+                Ok(2)
+            },
+            Some(Owner::Principal(key)) => {
+                assert((seq![1u8] + key@)[0] == 1 && key@.len() == 32);
+                Err(())
+            },
+            None => Err(()),
+        }
+    };
+    assert(rows@[0].0@ == seq![0u8]);
+    assert(rows@[1].0.len() == 33 && rows@[1].0[0] == 2);
+    match snapshot::restore(&mut history,0,payload,rows,encode,decode) {
+        Ok(()) => {
+            let ghost ids = choose|ids:Seq<u8>| ids.len() == rows.len() &&
+                snapshot::decoded(rows@,ids,decode) && #[trigger] snapshot::image(rows@,ids,history@);
+            assert(decode.ensures((&rows@[0].0,),Ok(ids[0])));
+            assert(decode.ensures((&rows@[1].0,),Ok(ids[1])));
+            assert(ids =~= seq![0u8,2u8]);
+            assert(ids.to_set() =~= set![0u8,2u8]) by {
+                assert forall|k:u8| ids.contains(k) implies k == 0 || k == 2 by {
+                    let i = ids.index_of(k); assert(ids[i] == k);
+                }
+            }
+            assert(history@.get(ids[0]) == Some((system,0u64)));
+            assert(history@.get(ids[1]) == Some((fleet,0u64)));
+        },
+        Err(snapshot::SnapshotError::Duplicate) => {
+            let ghost (i,j,p) = choose|i:int,j:int,p:u8| 0 <= i < j < rows.len() &&
+                #[trigger] decode.ensures((&rows@[i].0,),Ok(p)) && #[trigger] decode.ensures((&rows@[j].0,),Ok(p));
+            assert(i == 0 && j == 1); assert(false);
+        },
+        Err(_) => {assert(false);},
+    }
+    let result = crate::journal_history::apply(&mut history,2,Some(fleet),replacement,offset);
+    assert(result.is_ok());
+    assert(history@.dom() =~= set![0u8,2u8]);
+    history
+}
+
+
+/// A rejected snapshot cannot overwrite any previously recovered owner, even if rejection is late.
+fn restore_or_keep<P:Ord,E,C,D>(history:&mut BTreeMap<P,(RootState,u64)>, offset:u64,
+    payload:&[u8], rows:Vec<(Vec<u8>,RootState)>, encode:C,decode:D) -> (accepted:bool)
+    where C:FnOnce(&Vec<(Vec<u8>,RootState)>)->Result<Vec<u8>,E>, D:Fn(&Vec<u8>)->Result<P,E>,
+    requires btree_map_inv(old(history)),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        encode.requires((&rows,)),forall|i:int| 0 <= i < rows.len() ==> decode.requires((&rows@[i].0,)),
+    ensures !accepted ==> final(history)@ == old(history)@,
+        accepted ==> offset == 0 && old(history)@.is_empty() &&
+            exists|wire:Vec<u8>| #[trigger] encode.ensures((&rows,),Ok(wire)) && wire@ == payload@,
+{
+    crate::journal_snapshot::restore(history,offset,payload,rows,encode,decode).is_ok()
+}
+
 }

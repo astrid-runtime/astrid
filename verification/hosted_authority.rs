@@ -200,6 +200,8 @@ mod owner_codec;
 
 #[path = "../crates/astrid-storage/src/engine/durable/journal_history.rs"]
 mod journal_history;
+#[path = "../crates/astrid-storage/src/engine/durable/journal_snapshot.rs"]
+mod journal_snapshot;
 mod hosted_journal_history;
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;

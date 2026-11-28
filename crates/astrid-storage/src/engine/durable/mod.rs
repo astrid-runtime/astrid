@@ -825,6 +825,7 @@ mod frontier;
 mod group;
 mod index;
 mod journal_history;
+mod journal_snapshot;
 mod lifecycle;
 mod native_io;
 mod recovery;
