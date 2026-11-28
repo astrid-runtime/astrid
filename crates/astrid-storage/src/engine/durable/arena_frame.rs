@@ -154,13 +154,16 @@ pub(super) fn extend_batch<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
     encoded:&mut Vec<u8>, base:u64, magic:[u8;8], version:u16, payload:&[u8], hash:H,
 ) -> (out:Option<ArenaLocation>)
     requires hash.requires((magic,payload.len() as u64,payload)),
-    ensures out.is_some() == (base as int + old(encoded).len() <= u64::MAX && payload.len() <= u64::MAX),
+    ensures out.is_some() == (base as int + old(encoded).len() <= u64::MAX && payload.len() <= u64::MAX
+            && old(encoded).len() as int + WIDTH + payload.len() <= isize::MAX),
         out matches Some(loc) ==> loc.offset == base as int + old(encoded).len()
             && loc.payload_len == payload.len()
             && hash.ensures((magic,loc.payload_len,payload),loc.checksum)
             && final(encoded)@ == old(encoded)@ + header_bytes(magic,version,loc.payload_len,loc.checksum) + payload@,
         out.is_none() ==> final(encoded)@ == old(encoded)@,
 {
+    let length = encoded.len().checked_add(WIDTH)?.checked_add(payload.len())?;
+    if length > isize::MAX as usize {return None;}
     let payload_len = u64::try_from(payload.len()).ok()?;
     let checksum = hash(magic,payload_len,payload);
     let relative = u64::try_from(encoded.len()).ok()?;

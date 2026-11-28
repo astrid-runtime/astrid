@@ -88,9 +88,12 @@ fn legacy_journal_readback<H:Copy+Fn([u8;8],u64,&[u8])->[u8;32]>(
     let prefix = batch.len();
     let ghost original = batch@;
     let Some(location) = frame::extend_batch(&mut batch,base,magic,version,&payload,hash) else {
-        assert(base as int + prefix > u64::MAX && batch@ == original);
+        assert(base as int + prefix > u64::MAX || payload.len() > u64::MAX ||
+            prefix as int + frame::WIDTH + payload.len() > isize::MAX);
+        assert(batch@ == original);
         return;
     };
+    assert(prefix as int + frame::WIDTH + payload.len() <= isize::MAX);
     assert(location.offset == base as int + prefix && location.payload_len == payload.len());
     assert(location.checksum == (digest@)(magic,payload.len() as u64,payload@));
     proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}

@@ -83,6 +83,7 @@ fn replay_framed_transition<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(history:&mut BT
     observed_expected:Option<RootState>,observed_next:RootState,decoded:Option<u8>,recoded:Vec<u8>)
     requires btree_map_inv(old(history)),observed_name.len() < u64::MAX,
         base as int + batch.len() <= u64::MAX,
+        batch.len() as int + 52 + crate::journal_transition::wire(observed_name@,scheme,observed_expected,observed_next).len() <= isize::MAX,
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
 {
     use crate::journal_transition as transition;

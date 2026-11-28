@@ -28,6 +28,7 @@ def consumer_defects():
         ("batch length", frontier, "out.len() == group.len(), forall", "true, forall"),
         ("batch order", frontier, "forall|i:int| 0 <= i < group.len() ==>\n        #[trigger] select.ensures((&group@[i],),out@[i])", "true"),
         ("append refusal", frame, "out.is_some() == (base as int + old(encoded).len() <=", "out.is_some() ==> (base as int + old(encoded).len() <="),
+        ("capacity on success", frame, "out.is_some() == (base as int + old(encoded).len() <=", "out.is_some() <== (base as int + old(encoded).len() <="),
         ("refused prefix", frame, "out.is_none() ==> final(encoded)@ == old(encoded)@", "true"),
         ("address", frame, "loc.offset == base as int + old(encoded).len()", "true"),
         ("extent", frame, "&& loc.payload_len == payload.len()", "&& true"),
