@@ -452,17 +452,13 @@ fn valid_frame_follows<F: DurableIo>(
             .ok_or(DurableError::EncodingOverflow)?;
         let wanted = usize::try_from(remaining.min(buffer.len() as u64))
             .map_err(|_| DurableError::EncodingOverflow)?;
-        let read = file
-            .read(&mut buffer[..wanted])
+        // The measured extent bounds this window. Short reads are ordinary
+        // progress. Premature EOF must fail before repair can resize the file.
+        let window = &mut buffer[..wanted];
+        file.read_exact(window)
             .map_err(|source| io_error("read durable tail recovery scan", source))?;
-        if read < magic.len() {
-            return Ok(false);
-        }
-        for relative in 0..=read.saturating_sub(magic.len()) {
-            let candidate_end = relative
-                .checked_add(magic.len())
-                .ok_or(DurableError::EncodingOverflow)?;
-            if buffer.get(relative..candidate_end) != Some(magic.as_slice()) {
+        for (relative, bytes) in window.windows(magic.len()).enumerate() {
+            if bytes != magic.as_slice() {
                 continue;
             }
             let candidate = search_offset
@@ -472,13 +468,13 @@ fn valid_frame_follows<F: DurableIo>(
                 return Ok(true);
             }
         }
-        if read < wanted {
+        if remaining <= buffer.len() as u64 {
             return Ok(false);
         }
         let overlap = magic.len().saturating_sub(1);
         search_offset = search_offset
             .checked_add(
-                u64::try_from(read.saturating_sub(overlap))
+                u64::try_from(wanted.saturating_sub(overlap))
                     .map_err(|_| DurableError::EncodingOverflow)?,
             )
             .ok_or(DurableError::EncodingOverflow)?;
