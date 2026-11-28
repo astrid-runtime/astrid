@@ -349,6 +349,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/kv/tree/delta_header.rs"),
     Path("crates/astrid-storage/src/kv/tree/key_projection.rs"),
     Path("verification/hosted_token_recovery.rs"),
+    Path("verification/hosted_marker_append.rs"),
     Path("crates/astrid-capabilities/src/store/marker_batch.rs"),
     Path("crates/astrid-capabilities/src/store/marker_key.rs"),
     Path("crates/astrid-capsule-types/src/fuel_ledger/arithmetic.rs"),

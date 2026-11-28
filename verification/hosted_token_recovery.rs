@@ -5,6 +5,9 @@ use vstd::prelude::*;
 use vstd::string::StringSliceAdditionalSpecFns;
 use vstd::{laws_eq::obeys_concrete_eq, std_specs::hash::{hash_map_inv, obeys_key_model}};
 
+#[path = "hosted_marker_append.rs"]
+mod marker_append;
+
 verus! {
 
 type Id = [u8; 16];
@@ -756,99 +759,6 @@ fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
     assert(crate::projection_recovery::retained(&graph.owner,head,path,load,address@,true));
     decode_then_reopen(&graph.owner,head,kind,target,single_use,other,load,measure,start,values,translate,
         rev_read,used_read,legacy,Ghost(text@),Ghost(path))
-}
-
-enum MarkerRestart<M> {
-    AlreadyIndexed(crate::ObjectId), Unavailable(crate::ObjectId,crate::ArenaLocation), DifferentComponent(crate::ObjectId,crate::ArenaLocation),
-    Decision(M,crate::RootState,crate::ObjectId,crate::ArenaLocation,Admission),
-}
-
-enum MarkerRestartError<IO,E> { Append(crate::arena_frame::BatchError<IO>), Reopen(ReopenError<E>) }
-
-/// Write a fresh marker, install its returned location, read the recovered owner
-/// from that arena, and run admission if its KV edge selects the written object.
-fn append_then_reopen_marker<File:crate::arena_frame::BatchFile,Hasher,Identity,Media:crate::positional_read::Media,Open,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A,R,C,F>(
-    file:&mut File,batch:Vec<Vec<u8>>,selected:usize,previous:Option<crate::ObjectId>,depth:u64,used:u64,
-    totals:crate::checkpoint_totals::NodeTotals,hash:Hasher,identify:Identity,open:Open,media_id:Ghost<spec_fn(Media)->(int,Seq<u8>)>,version:crate::ObjectFormatVersion,
-    index:&mut std::collections::BTreeMap<crate::ObjectId,crate::ArenaLocation>,
-    history:&std::collections::BTreeMap<P,(crate::RootState,u64)>,candidate:std::collections::BTreeMap<P,crate::RootState>,
-    wave:u64,limit:u64,scheme:crate::root_wire::Scheme,
-    owner:P,kind:Marker,target:Id,single_use:bool,other:&(crate::memo_projection::Projection<B>,V),
-    select:Select,fail:Fail,measure:M,start:I,values:(K,D),translate:A,rev_read:R,used_read:C,legacy:F)
-    -> (out:Result<MarkerRestart<Media>,MarkerRestartError<File::Error,E>>)
-    where Hasher:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,Identity:Fn(&crate::ObjectRecord)->[u8;32]+Copy,
-        Open:FnOnce(&File)->Media,
-        Check:Fn(&[u8])->Option<KE>+Copy,Select:Fn(crate::ObjectId)->Check,Fail:Fn(crate::ObjectId)->E,
-        M:FnOnce(&P,Option<crate::ObjectId>)->Result<crate::projection_recovery::Measured<B,V>,E>,I:FnOnce(&P)->S,
-        K:Fn(S,Option<crate::ObjectId>,&Vec<u8>)->Result<(S,Option<Vec<u8>>),E>+Copy,
-        D:Fn(S,&crate::checkpoint_value::ValueSlot)->Result<(S,Vec<u8>),E>+Copy,A:Fn(crate::ObjectId,crate::delta_totals::ApplyError<E>)->E,
-        R:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,
-        C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
-    requires vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
-        selected<batch.len(),old(file).image().len()<=u64::MAX,depth<u64::MAX,used as int+65<=u64::MAX,
-        vstd::std_specs::btree::btree_map_inv(old(index)),vstd::std_specs::btree::btree_map_inv(history),
-        vstd::std_specs::btree::btree_map_inv(&candidate),
-        forall|magic:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
-        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
-        forall|f:&File| #[trigger] open.requires((f,)),
-        forall|f:&File,m:Media| #[trigger] open.ensures((f,),m) ==> m.image()==f.image() && (media_id@)(m)==f.target(),
-        forall|id:crate::ObjectId| #[trigger] select.requires((id,)),
-        forall|id:crate::ObjectId| #[trigger] fail.requires((id,)),
-        forall|id:crate::ObjectId,check:Check,b:&[u8]| #[trigger] select.ensures((id,),check) ==> #[trigger] check.requires((b,)),
-        vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
-        forall|p:&P,tree:Option<crate::ObjectId>| *p==owner ==> #[trigger] measure.requires((p,tree)),
-        forall|p:&P| *p==owner ==> #[trigger] start.requires((p,)),
-        forall|s:S,t:Option<crate::ObjectId>,key:&Vec<u8>| #[trigger] values.0.requires((s,t,key)),
-        forall|s:S,v:&crate::checkpoint_value::ValueSlot| #[trigger] values.1.requires((s,v)),
-        forall|id:crate::ObjectId,e:crate::delta_totals::ApplyError<E>| #[trigger] translate.requires((id,e)),
-        checkpoint::readable(rev_read),checkpoint::readable(used_read),other.0.overlay.ordered_snapshot(),
-        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
-        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
-    ensures final(file).target()==old(file).target(), vstd::std_specs::btree::btree_map_inv(final(index)),
-        out matches Err(MarkerRestartError::Append(_)) ==> final(index)@==old(index)@,
-        out matches Ok(MarkerRestart::AlreadyIndexed(id)) ==> old(index)@.contains_key(id) && final(index)@==old(index)@,
-        out matches Ok(MarkerRestart::Unavailable(id,loc)) ==> !old(index)@.contains_key(id) && final(index)@==old(index)@.insert(id,loc),
-        out matches Ok(MarkerRestart::DifferentComponent(id,loc)) ==> !old(index)@.contains_key(id) && final(index)@==old(index)@.insert(id,loc),
-        out matches Ok(MarkerRestart::Decision(media,root,id,loc,decision)) ==> {
-            &&& (media_id@)(media)==old(file).target() && media.image()==final(file).image()
-            &&& history@.contains_key(owner) && root==history@[owner].0 && !old(index)@.contains_key(id) && final(index)@==old(index)@.insert(id,loc)
-            &&& forall|spelling:Seq<u8>| #[trigger] marker_key::spells(target@,spelling) ==>
-                crate::hosted_delta_mutation::marker_bytes(crate::hosted_journal_history::component_bytes(media.image(),loc),
-                    ns_bytes(kind)+seq![0u8]+spelling)
-            &&& (kind is Revoked ==> decision is Revoked) && (single_use ==> !(decision is Allowed))
-        },
-{
-    let (name,text)=kind.address(marker_key::encode(&target));
-    let ns=name.as_bytes();
-    let address=crate::encoding::composite(ns,&text);
-    proof {
-        reveal_strlit("caps:used");reveal_strlit("caps:revoked");
-        vstd::string::is_ascii_spec_bytes("caps:used");vstd::string::is_ascii_spec_bytes("caps:revoked");
-        assert(ns@==ns_bytes(kind));
-    }
-    let object_id=|r:&crate::ObjectRecord| crate::ObjectId::new(identify(r));
-    let (id,loc)=match crate::hosted_arena_append::append_token_marker(file,scheme,address,previous,depth,used,
-        totals,batch,selected,object_id,hash) {
-        Ok(pair)=>pair,Err(e)=>return Err(MarkerRestartError::Append(e)),
-    };
-    if index.contains_key(&id) {return Ok(MarkerRestart::AlreadyIndexed(id));}
-    index.insert(id,loc);
-    let media=open(file);
-    let format=crate::indexed_frame::Format{magic:crate::arena_frame::ARENA_MAGIC,
-        version:crate::arena_frame::FRAME_VERSION,limit,scheme};
-    let Some(graph)=crate::hosted_recovered_header::recovered_header(index,history,&media,wave,format,hash,
-        identify,candidate,&owner,version) else {return Ok(MarkerRestart::Unavailable(id,loc))};
-    let Some(component)=graph.component else {return Ok(MarkerRestart::DifferentComponent(id,loc))};
-    if !component.same(&id) {return Ok(MarkerRestart::DifferentComponent(id,loc));}
-    proof {
-        assert forall|spelling:Seq<u8>| #[trigger] marker_key::spells(target@,spelling) implies
-            crate::hosted_delta_mutation::marker_bytes(crate::hosted_journal_history::component_bytes(file.image(),loc),
-                ns_bytes(kind)+seq![0u8]+spelling) by {marker_key::unique_text(target@,text@,spelling);}
-    }
-    match reopen_loaded_marker(&graph,version,Ghost(media.image()),Ghost(index@),scheme,kind,target,single_use,other,
-        select,fail,measure,start,values,translate,rev_read,used_read,legacy) {
-        Ok(a)=>Ok(MarkerRestart::Decision(media,graph.root,id,loc,a)),Err(e)=>Err(MarkerRestartError::Reopen(e)),
-    }
 }
 
 // A canonical marker delta followed by a physical delta for an unrelated key.

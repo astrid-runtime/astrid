@@ -57,13 +57,13 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
         )
 
-    append = Path("verification/hosted_arena_append.rs")
+    append = Path("verification/hosted_marker_append.rs")
     for label, source, clause, weaker, target in [
         ("canonical delta", marker, "ensures marker_bytes(out.0.contents().2,key@), out.1", "ensures true, out.1", append),
         ("submitted payload", append, "ensures out@==v@ {v.as_slice()}", "ensures true {v.as_slice()}", append),
-        ("physical contents", append, "&&& crate::hosted_delta_mutation::marker_bytes(\n        crate::hosted_journal_history::component_bytes(image,loc),address)", "&&& true", admission),
-        ("reopened file image", admission, "open.ensures((f,),m) ==> m.image()==f.image() &&", "open.ensures((f,),m) ==> true &&", admission),
-        ("indexed frame", admission, "index.insert(id,loc);", "let _discarded_location = loc;", admission),
+        ("physical contents", append, "&&& crate::hosted_delta_mutation::marker_bytes(\n        crate::hosted_journal_history::component_bytes(image,loc),address)", "&&& true", append),
+        ("reopened file image", append, "open.ensures((f,),m) ==> m.image()==f.image() &&", "open.ensures((f,),m) ==> true &&", append),
+        ("indexed frame", append, "index.insert(id,loc);", "let _discarded_location = loc;", append),
     ]:
         yield (
             f"appended token marker loses {label}", source,
