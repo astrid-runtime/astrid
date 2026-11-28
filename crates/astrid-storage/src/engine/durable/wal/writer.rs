@@ -313,7 +313,7 @@ where
             "WAL object requires an active transaction",
         ))?;
         let previous = active.previous_object;
-        if active.counts.roots != 0 || previous.is_some_and(|previous| previous >= id) {
+        if active.counts.roots != 0 || !id.follows(previous) {
             return Err(WalError::OrderingViolation);
         }
         let body_length = WalLength::new(

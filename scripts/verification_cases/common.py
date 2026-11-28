@@ -130,6 +130,7 @@ INPUTS = [
     Path("verification/hosted_wal_writer_trace.rs"),
     Path("verification/hosted_wal_object_root.rs"),
     Path("verification/hosted_wal_batch_writer.rs"),
+    Path("verification/hosted_wal_prepared_batch.rs"),
     Path("verification/hosted_closure_model.rs"),
     Path("verification/hosted_record_model.rs"),
     Path("crates/astrid-storage/src/engine/durable_cache/resident.rs"),

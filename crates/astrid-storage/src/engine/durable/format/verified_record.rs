@@ -61,6 +61,42 @@ pub(super) open spec fn wire(scheme:Scheme,id:[u8;32]) -> Seq<u8> {
     scheme.algorithm@ + scheme.construction@ + seq![32u8,0u8,0u8,0u8] + id@
 }
 
+pub(super) open spec fn declared(bytes:Seq<u8>,scheme:Scheme,id:ObjectId) -> bool {
+    &&& bytes.len()>=40
+    &&& bytes.subrange(0,2)==scheme.algorithm@ && bytes.subrange(2,4)==scheme.construction@
+    &&& bytes.subrange(4,8)==seq![32u8,0,0,0] && bytes.subrange(8,40)==id.digest()
+}
+
+#[inline]
+fn same_bytes(left:&[u8],right:&[u8]) -> (yes:bool)
+    ensures yes==(left@==right@),
+{
+    let yes=left==right;
+    if yes {assert(left@ =~= right@);}
+    yes
+}
+
+/// Compare the tagged identity without decoding or allocating the record body.
+pub(super) fn declares(bytes:&[u8],scheme:Scheme,id:ObjectId) -> (yes:bool)
+    ensures yes==declared(bytes@,scheme,id),
+{
+    if bytes.len()<40 {return false;}
+    let width=[32u8,0,0,0];
+    proof {assert(width@ =~= seq![32u8,0,0,0]);}
+    let algorithm=&bytes[..2];
+    let construction=&bytes[2..4];
+    let length=&bytes[4..8];
+    let digest=&bytes[8..40];
+    proof {
+        assert(algorithm@ =~= bytes@.subrange(0,2));
+        assert(construction@ =~= bytes@.subrange(2,4));
+        assert(length@ =~= bytes@.subrange(4,8));
+        assert(digest@ =~= bytes@.subrange(8,40));
+    }
+    same_bytes(algorithm,scheme.algorithm.as_slice()) && same_bytes(construction,scheme.construction.as_slice()) &&
+        same_bytes(length,width.as_slice()) && same_bytes(digest,id.as_bytes().as_slice())
+}
+
 /// Return only the canonical body after validating the identity scheme and tag.
 pub(super) fn canonical_suffix(bytes:&[u8],scheme:Scheme) -> (out:Result<&[u8],TagError>)
     ensures out.is_ok() == tag(bytes@,0,scheme),

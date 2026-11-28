@@ -14,10 +14,6 @@ use std::fs::OpenOptions;
 #[cfg(test)]
 use std::path::Path;
 
-const IDENTITY_PREFIX_BYTES: usize = 8;
-const CURRENT_DIGEST_BYTES: u32 = 32;
-const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
-
 #[cfg(test)]
 thread_local! {
     pub(super) static FRAME_CHECKSUM_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -537,12 +533,7 @@ pub(super) fn object_frame_declares_identity(
     scheme: IdentityScheme,
     id: ObjectId,
 ) -> bool {
-    const IDENTITY_BYTES: usize = IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE;
-    frame_payload.len() >= IDENTITY_BYTES
-        && frame_payload[..2] == scheme.algorithm().to_le_bytes()
-        && frame_payload[2..4] == scheme.construction().to_le_bytes()
-        && frame_payload[4..8] == CURRENT_DIGEST_BYTES.to_le_bytes()
-        && frame_payload[8..IDENTITY_BYTES] == *id.as_bytes()
+    verified_record::declares(frame_payload, scheme.into(), id)
 }
 
 pub(super) fn canonical_record_bytes(

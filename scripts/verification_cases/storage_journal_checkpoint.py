@@ -160,3 +160,21 @@ def consumer_defects():
             f"acknowledged variable batch loses {label}", batch_writer,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), batch_writer,
         )
+
+    named_batch = Path("verification/hosted_wal_prepared_batch.rs")
+    for label, source, clause, weakness, consumer in [
+        ("tagged identity", Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs"),
+         "ensures yes==declared(bytes@,scheme,id),", "ensures true,", named_batch),
+        ("object order", Path("crates/astrid-storage/src/storage_model/object_reference.rs"),
+         "ensures yes==match previous {None=>true,Some(p)=>Self::digest_before(p.digest(),self.digest())},", "ensures true,", named_batch),
+        ("full declaration set", publication, "out matches Ok(rows) ==> canonical_rows(g,rows@,scheme),", "out matches Ok(rows) ==> rows.len()==g.records.len(),", named_batch),
+        ("stored encoding", named_batch, "payload is Lz4 && payload.bytes()==vstd::bytes::spec_u64_to_le_bytes(canonical.len() as u64)+compression(canonical)", "payload is Lz4", named_batch),
+        ("closure refusal", publication, "out matches Err(crate::closure_walk::Failure::Source(k,e)) ==> k==e && !table@.contains_key(k),",
+         "out matches Err(crate::closure_walk::Failure::Source(k,e)) ==> k==e,", named_batch),
+        ("selected root payload", named_batch, "parse_written(&r.roots[0].body,&name,scheme,expected,replacement)",
+         "parse_written(begin,&name,scheme,expected,replacement)", named_batch),
+    ]:
+        yield (
+            f"fresh declaration batch loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
+        )

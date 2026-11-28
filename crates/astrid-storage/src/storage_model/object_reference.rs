@@ -143,6 +143,13 @@ impl ObjectId {
         order_transitive(a,b,c);
     }
 
+    /// WAL objects must follow the preceding digest in strict canonical order.
+    pub(crate) fn follows(&self,previous:Option<Self>) -> (yes:bool)
+        ensures yes==match previous {None=>true,Some(p)=>Self::digest_before(p.digest(),self.digest())},
+    {
+        match previous {Some(p)=>p.strictly_before(self),None=>true}
+    }
+
     pub(crate) fn strictly_before(&self, other:&Self) -> (yes:bool)
         ensures yes == Self::digest_before(self.digest(),other.digest()),
     {

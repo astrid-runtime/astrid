@@ -1,5 +1,7 @@
 //! Construct a scanner layout while emitting an arbitrary number of measured records.
 use super::*;
+#[path = "hosted_wal_prepared_batch.rs"]
+mod prepared;
 
 verus! {
 

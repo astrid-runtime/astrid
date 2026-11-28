@@ -2,6 +2,7 @@
 use crate::{header_graph,header_writer,root_declaration,root_transition,transaction_records,
     ObjectFormatVersion,ObjectId,ObjectRecord,ObjectReference,ReferenceKind,RootState};
 use std::collections::BTreeMap;
+use vstd::std_specs::iter::IteratorSpec;
 use vstd::{prelude::*,std_specs::btree::btree_map_inv,laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},laws_eq::obeys_concrete_eq};
 
 verus! {
@@ -220,12 +221,9 @@ fn prepare_graph_row<P,L:Copy,E,R>(g:&Graph<P>,id:ObjectId,table:&BTreeMap<Objec
                 (pending@.contains_key(id) && pending@[id]==row) ||
                 (!pending@.contains_key(id) && index@.contains_key(id) && read.ensures((id,index@[id]),Ok(row))),
             Ok(Prepared::Fresh(kind,bytes))=>{
-                let f=row.contents();
                 &&& !pending@.contains_key(id) && !index@.contains_key(id)
                 &&& (kind is Commit)==(id==root)
-                &&& bytes@==scheme.algorithm@+scheme.construction@+seq![32u8,0u8,0u8,0u8]+id.digest()+
-                    crate::verified_record::header_wire(f.0,f.1,f.5)+crate::verified_record::payload_wire(f.4,f.2,f.3.len() as usize)+
-                    crate::verified_record::reference_prefix(f.3,f.3.len(),scheme)
+                &&& bytes@==crate::recovered_record::encoding(scheme,id,row)
             },
             Err(PrepareError::Read(e))=>!pending@.contains_key(id) && index@.contains_key(id) && read.ensures((id,index@[id]),Err(e)),
             Err(PrepareError::Collision(k))=>k==id && ((pending@.contains_key(id) && pending@[id]!=row) ||
@@ -241,6 +239,89 @@ fn prepare_graph_row<P,L:Copy,E,R>(g:&Graph<P>,id:ObjectId,table:&BTreeMap<Objec
         Ok(Some(kind))=>Ok(Prepared::Fresh(kind,crate::verified_record::encode(scheme,id,row).unwrap())),
         Err(crate::closure_load::PlacementError::Collision(k))=>Err(PrepareError::Collision(k)),
         Err(crate::closure_load::PlacementError::Read(e))=>Err(PrepareError::Read(e)),
+    }
+}
+
+pub(crate) open spec fn canonical_rows<P>(g:&Graph<P>,rows:Seq<(ObjectId,Vec<u8>)>,scheme:crate::root_wire::Scheme) -> bool {
+    rows.len()==g.records.len() &&
+        (forall|i:int| 0<=i<rows.len() ==> {
+            let row=#[trigger] rows[i];
+            &&& g.records@.contains_key(row.0) && row.1@==crate::recovered_record::encoding(scheme,row.0,g.records@[row.0])
+        }) && (forall|id:ObjectId| #[trigger] g.records@.contains_key(id) ==> exists|i:int| 0<=i<rows.len() && #[trigger] rows[i].0==id)
+}
+
+/// Encode the complete fresh declaration set in the producer map's order.
+/// Retained dependencies may already be in the supplied graph, while every
+/// declared identity here is new to the pending overlay and arena index.
+pub(crate) fn fresh_rows<P>(g:&Graph<P>,table:&BTreeMap<ObjectId,ObjectRecord>,v:ObjectFormatVersion,scheme:crate::root_wire::Scheme)
+    -> (out:Result<Vec<(ObjectId,Vec<u8>)>,crate::closure_walk::Failure<ObjectId,ObjectId>>)
+    requires g.links(g.selected.binding().0,g.selected.binding().1,g.records@[g.component],v),
+        obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),obeys_concrete_eq::<ObjectRecord>(),
+        btree_map_inv(table),btree_map_inv(&g.records),
+        forall|id:ObjectId| #[trigger] g.records@.contains_key(id) ==> table@.contains_key(id) && table@[id]==g.records@[id],
+    ensures out matches Ok(rows) ==> canonical_rows(g,rows@,scheme),
+        out matches Err(crate::closure_walk::Failure::Source(k,e)) ==> k==e && !table@.contains_key(k),
+        out matches Err(crate::closure_walk::Failure::Cycle(k)) ==> crate::closure_walk::reaches(
+            table@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)),Set::empty(),k,k),
+        !(out matches Err(crate::closure_walk::Failure::Root(_))),
+{
+    use crate::closure_walk::Source;
+    let root=g.selected.replacement().commit;
+    let empty=std::collections::BTreeSet::new();
+    let pending:BTreeMap<ObjectId,ObjectRecord>=BTreeMap::new();
+    let index:BTreeMap<ObjectId,()>=BTreeMap::new();
+    let mut src=crate::closure_load::Preload(table);
+    let seen=crate::closure_walk::walk(&mut src,&empty,root)?;
+    proof {
+        let edges=src.edges();
+        assert(g.records@.contains_key(root) && g.records@.contains_key(g.state));
+        selected_child(table@[root],header_graph::STATE@,g.state);
+        selected_child(table@[g.state],header_graph::KV@,g.component);
+        assert(edges.contains_key(root) && edges.contains_key(g.state));
+        assert(edges[root].contains(g.state) && edges[g.state].contains(g.component));
+        assert(seen@.contains(root) && seen@.contains(g.state) && seen@.contains(g.component));
+        assert(g.records@.dom().subset_of(seen@));
+    }
+    let mut it=g.records.iter();
+    let ghost all=it.remaining();
+    let mut rows:Vec<(ObjectId,Vec<u8>)>=Vec::with_capacity(g.records.len());
+    loop
+        invariant obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),obeys_concrete_eq::<ObjectRecord>(),
+            btree_map_inv(&pending),btree_map_inv(&index),pending@.dom().is_empty(),index@.dom().is_empty(),
+            vstd::std_specs::btree::btree_set_inv(&seen),g.records@.dom().subset_of(seen@),
+            all.len()==g.records.len(),all.unref().to_set()==g.records@.kv_pairs(),
+            rows.len()<=all.len(),it.remaining()==all.skip(rows.len() as int),
+            forall|j:int| 0<=j<rows.len() ==> (#[trigger] rows@[j]).0==*all[j].0 &&
+                rows@[j].1@==crate::recovered_record::encoding(scheme,*all[j].0,*all[j].1),
+        decreases g.records.len()-rows.len(),
+    {
+        let ghost n=rows.len() as int;
+        let Some((id,record))=it.next() else {
+            assert(n==all.len());
+            assert forall|k:ObjectId| #[trigger] g.records@.contains_key(k) implies exists|i:int| 0<=i<rows.len() && #[trigger] rows@[i].0==k by {
+                let pair=(k,g.records@[k]);
+                assert(all.unref().to_set().contains(pair));
+                let i=all.unref().index_of(pair);
+                assert(all.unref()[i]==pair && *all[i].0==k && rows@[i].0==k);
+            }
+            assert forall|j:int| 0<=j<rows.len() implies {
+                let row=#[trigger] rows@[j];
+                &&& g.records@.contains_key(row.0) && row.1@==crate::recovered_record::encoding(scheme,row.0,g.records@[row.0])
+            } by {
+                assert(all.unref()[j]==(*all[j].0,*all[j].1));
+                assert(g.records@.kv_pairs().contains(all.unref()[j]));
+            }
+            return Ok(rows);
+        };
+        assert(all.unref()[n]==(*id,*record));
+        assert(g.records@.kv_pairs().contains((*id,*record)));
+        let route=crate::closure_load::placement(*id,root,&seen,&pending,&index);
+        let read=|_:ObjectId,_:()| -> (r:Result<ObjectRecord,()>) ensures r.is_err() {Err(())};
+        let choice=crate::closure_load::prepare_row(route,*id,record,borrowed,read);
+        let Ok(Some(_))=choice else {unreached()};
+        let bytes=crate::verified_record::encode(scheme,*id,record).unwrap();
+        rows.push((*id,bytes));
+        assert(it.remaining() =~= all.skip(n+1));
     }
 }
 }

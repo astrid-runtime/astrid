@@ -357,7 +357,7 @@ where
         }
         let (encoding, canonical) = decode_object_storage_body(body, flags, self.limits, offset)?;
         let (id, body_length) = decode_object_body(&canonical, scheme, &self.identity, offset)?;
-        if previous.is_some_and(|previous| previous >= id) {
+        if !id.follows(previous) {
             return Err(WalError::OrderingViolation);
         }
         let measured =
