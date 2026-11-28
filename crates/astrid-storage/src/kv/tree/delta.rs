@@ -20,16 +20,8 @@ use super::projection_record::DELTA;
 
 pub(super) use super::delta_mutation::Mutation;
 
-#[derive(Clone, Debug)]
-pub(super) struct Projection {
-    pub(super) head: Option<ObjectId>,
-    pub(super) tree: Option<ObjectId>,
-    pub(super) overlay: OverlayMap,
-    pub(super) depth: u64,
-    pub(super) delta_bytes: u64,
-    pub(super) totals: NodeTotals,
-    pub(super) boundary: Option<super::validation::ValidatedCheckpoint>,
-}
+pub(super) type Projection =
+    super::memo_projection::Projection<super::validation::ValidatedCheckpoint>;
 
 impl Projection {
     pub(super) fn empty() -> Self {

@@ -77,6 +77,7 @@ mod legacy_avl;
 mod maintenance;
 mod memo;
 mod memo_admission;
+mod memo_projection;
 mod mutation_ack;
 mod mutation_replay;
 mod node;
@@ -334,7 +335,8 @@ where
         // capture. A concurrent checkpoint may replace the shared cache while
         // this reader loads its captured commit/state. Head matching below
         // preserves that snapshot without retaining an extra owner history.
-        let captured_projection = self.validation.projections.lock().get(&owner).cloned();
+        let captured_projection =
+            memo_projection::capture(&self.validation.projections.lock(), &owner);
         let Some(root) = self
             .engine
             .current_kv_root(&owner)

@@ -117,4 +117,25 @@ fn owner_selection<F:Fn(&[u8])->Result<(),u8>+Copy>(
         |_id:ObjectId| -> (e:u8) ensures e == 2u8, {2u8},validate)
 }
 
+// The two maps may differ at every owner, including the selected owner. The
+// cold result carries the exact projection and certificate for that decode.
+fn projection_for_root(
+    before:&std::collections::BTreeMap<u64,crate::memo_projection::Projection<u64>>,
+    now:&std::collections::BTreeMap<u64,crate::memo_projection::Projection<u64>>,
+    owner:u64,head:ObjectId,cold:Result<(crate::memo_projection::Projection<u64>,u32),u8>,
+) -> (out:Result<(crate::memo_projection::Projection<u64>,Option<u32>),u8>)
+    requires vstd::std_specs::btree::btree_map_inv(before),vstd::std_specs::btree::btree_map_inv(now),
+    ensures if before@.contains_key(owner) && before@[owner].head==Some(head) {out == Ok((before@[owner],None))}
+        else if now@.contains_key(owner) && now@[owner].head==Some(head) {out == Ok((now@[owner],None))}
+        else {match cold {Ok((p,c)) => out==Ok((p,Some(c))),Err(e) => out==Err(e)}},
+{
+    let captured = crate::memo_projection::capture(before,&owner);
+    let lookup = |p:&u64,id:ObjectId| -> (r:Option<crate::memo_projection::Projection<u64>>)
+        ensures r == if now@.contains_key(*p) && now@[*p].head==Some(id) {Some(now@[*p])} else {None},
+    { crate::memo_projection::current(now,p,id) };
+    let decode = |p:&u64,id:ObjectId| -> (r:Result<(crate::memo_projection::Projection<u64>,u32),u8>)
+        requires *p==owner && id==head, ensures r==cold, {cold};
+    crate::memo_projection::resolve(&owner,head,captured,lookup,decode)
+}
+
 }

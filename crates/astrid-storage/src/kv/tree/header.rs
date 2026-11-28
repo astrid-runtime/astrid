@@ -83,23 +83,7 @@ where
     let (projection, checkpoint) = match head {
         None => (Projection::empty(), Some(TreeValidation::EMPTY)),
         Some(component) => {
-            let cached = captured_projection
-                .filter(|projection| projection.head == Some(component))
-                .or_else(|| {
-                    validation
-                        .projections
-                        .lock()
-                        .get(&owner)
-                        .filter(|projection| projection.head == Some(component))
-                        .cloned()
-                });
-            if let Some(cached) = cached {
-                (cached, None)
-            } else {
-                let (decoded, checkpoint) =
-                    decode_kv_component::<P, E>(engine, &owner, component, validation)?;
-                (decoded, Some(checkpoint))
-            }
+            resolve_projection(engine, &owner, component, captured_projection, validation)?
         },
     };
     let (preserved_state, other_quota_bytes) = decode_other_components(
@@ -164,17 +148,8 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let cached = validation
-        .projections
-        .lock()
-        .get(owner)
-        .filter(|projection| projection.head == Some(head))
-        .cloned();
-    if let Some(cached) = cached {
-        return Ok(cached);
-    }
-    let (decoded, checkpoint) = decode_kv_component(engine, owner, head, validation)?;
-    if let Some(root) = captured_root {
+    let (decoded, checkpoint) = resolve_projection(engine, owner, head, None, validation)?;
+    if let (Some(root), Some(checkpoint)) = (captured_root, checkpoint) {
         validation.publish_if_current(
             engine,
             owner.clone(),
@@ -185,6 +160,22 @@ where
         );
     }
     Ok(decoded)
+}
+
+fn resolve_projection<P: Clone + Ord, E: KvProjectionEngine<P>>(
+    engine: &E,
+    owner: &P,
+    head: ObjectId,
+    captured: Option<Projection>,
+    validation: &KvValidationCache<P>,
+) -> StorageResult<(Projection, Option<TreeValidation>)> {
+    super::memo_projection::resolve(
+        owner,
+        head,
+        captured,
+        |owner, id| super::memo_projection::current(&validation.projections.lock(), owner, id),
+        |owner, id| decode_kv_component(engine, owner, id, validation),
+    )
 }
 
 pub(crate) fn validated_projection_quota<P, E>(

@@ -3,12 +3,8 @@
 //! Nodes are immutable and reference-counted, so each published projection
 //! reuses the previous projection and copies only one balanced search path.
 
-use std::sync::Arc;
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct OverlayMap {
-    root: Option<Arc<Node>>,
-}
+mod snapshot;
+pub(super) use snapshot::OverlayMap;
 
 use super::{
     ObjectId, checkpoint_totals, checkpoint_value, delta_mutation, delta_totals, key_projection,

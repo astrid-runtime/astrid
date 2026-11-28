@@ -21,6 +21,8 @@ mod hot_snapshot;
 mod hot_lookup;
 #[path = "../crates/astrid-storage/src/kv/tree/memo_admission.rs"]
 mod memo_admission;
+#[path = "../crates/astrid-storage/src/kv/tree/memo_projection.rs"]
+mod memo_projection;
 #[path = "../crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs"]
 mod native_log_admission;
 #[path = "../crates/astrid-capsule/src/engine/wasm/native_logs/dispatch.rs"]
@@ -418,6 +420,8 @@ mod hosted_checkpoint_membership;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/traversal.rs"]
 mod traversal;
+#[path = "../crates/astrid-storage/src/kv/tree/overlay/snapshot.rs"]
+mod overlay;
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/range.rs"]
 mod overlay_range;
 mod hosted_overlay_range;

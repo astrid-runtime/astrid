@@ -318,6 +318,17 @@ def marker_batch_consumers():
             f"checkpoint membership loses {label}", membership,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), membership,
         )
+    projection = Path("crates/astrid-storage/src/kv/tree/memo_projection.rs")
+    for label, clause, weaker in [
+        ("captured snapshot", "out == Ok((captured.unwrap(),None))", "out.is_ok()"),
+        ("current snapshot", "p.head == Some(id) && lookup.ensures((owner,id),Some(p))", "p.head == Some(id)"),
+        ("cold projection", "decode.ensures((owner,id),Ok((p,c)))", "true"),
+        ("cold rejection", "&& decode.ensures((owner,id),Err(e))", ""),
+    ]:
+        yield (
+            f"KV projection selection loses {label}", projection,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_checkpoint_record.rs"),
+        )
     record = Path("crates/astrid-storage/src/kv/tree/checkpoint_record.rs")
     record_reader = Path("verification/hosted_checkpoint_record.rs")
     for label, clause, weaker in [
