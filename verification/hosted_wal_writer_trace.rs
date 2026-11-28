@@ -489,20 +489,28 @@ fn durable_journal_fold<J:crate::arena_frame::BatchFile,S:crate::group_frontier:
     Some(decision)
 }
 
+enum ColdGraph<V,P,E> {
+    Conflict, Unavailable,
+    Loaded(V,crate::hosted_recovered_header::RecoveredGraph<P>,Option<Result<crate::delta_chain::Head,crate::projection_record::Error<E>>>),
+}
+
 /// Replay one applicable root and retire its WAL against the canonical handles
 /// supplied by recovery. Joining those handles preserves the actual journal identity
 /// and its image after the writer has appended the frame.
 fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,
     Open:FnOnce(&S)->M,H,F,P:Ord+Copy,K:FnOnce(Owner)->P+Copy,N:FnOnce(&P)->Owner+Copy,
     A:crate::recovery_barrier::Files,Join:FnOnce(&J)->A,W:Copy,C:crate::group_frontier::ResizeWal,
-    Bind:FnOnce(W,&A)->C,R:FnOnce(C)->Result<C,C::Error>,U:crate::frame_repair::FrameReader,Roots:FnOnce(&C)->(U,u64)>(
+    Bind:FnOnce(W,&A)->C,R:FnOnce(C)->Result<C,C::Error>,U:crate::frame_repair::FrameReader,Roots:FnOnce(&C)->(U,u64),V:crate::positional_read::Media,Arena:FnOnce(&C)->V,I:Fn(&ObjectRecord)->[u8;32]+Copy,KE,Check:Fn(&[u8])->Option<KE>+Copy,Select:FnOnce(ObjectId)->Check>(
     sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,expected:Option<RootState>,replacement:RootState,
     chunk:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
     sink:S,base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,key_of:K,name_of:N,key:P,
     history:&mut BTreeMap<P,(RootState,u64)>,initial_journal:J,journal_digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
     join:Join,wal:W,bind:Bind,rewind:R,wal_target:Ghost<spec_fn(W)->(int,Seq<u8>)>,
-    start:u64,limit:u64,open_roots:Roots,restart:&mut BTreeMap<P,(RootState,u64)>)
-    -> (out:Option<Result<Result<(C,bool),crate::group_frontier::CheckpointError<C::Error>>,crate::recovery_barrier::Error<A::Error>>>)
+    start:u64,limit:u64,open_roots:Roots,restart:&mut BTreeMap<P,(RootState,u64)>,
+    arena_id:Ghost<(int,Seq<u8>)>,arena_bytes:Ghost<Seq<u8>>,open_arena:Arena,media_id:Ghost<spec_fn(V)->(int,Seq<u8>)>,
+    index:&BTreeMap<ObjectId,crate::ArenaLocation>,candidate:BTreeMap<P,RootState>,wave_bytes:u64,
+    object_limit:u64,identify:I,object_version:crate::ObjectFormatVersion,select:Select)
+    -> (out:Option<Result<Result<(C,ColdGraph<V,P,KE>),crate::group_frontier::CheckpointError<C::Error>>,crate::recovery_barrier::Error<A::Error>>>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
     requires sequence!=0,begin.len() as int+138+288<=usize::MAX,
         sink.at_end(),sink.buffered_image().len()==base,base as int+begin.len()+138+288<=u64::MAX,
@@ -525,18 +533,19 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
         forall|e:J::Error| !#[trigger] J::write_failed(initial_journal.target(),e),
         forall|b:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::arena_frame::ROOT_MAGIC,b.len() as u64,b),v) ==> v==(journal_digest@)(b@),
         initial_journal.target()!=sink.wal_target(),(wal_target@)(wal)==sink.wal_target(),
+        arena_id@!=initial_journal.target() && arena_id@!=sink.wal_target(),
         forall|j:&J| #[trigger] join.requires((j,)),
         forall|j:&J,a:A| #[trigger] join.ensures((j,),a) ==> a.roots_target()==j.target() &&
             a.pending().get(crate::recovery_barrier::Target::Roots)==Some(j.image()) &&
-            a.pending().contains_key(crate::recovery_barrier::Target::Arena) &&
+            a.arena_target()==arena_id@ && a.pending().get(crate::recovery_barrier::Target::Arena)==Some(arena_bytes@) &&
             (a.has_representations() ==> a.pending().contains_key(crate::recovery_barrier::Target::Representations)) &&
-            (a.volume_id() matches Some(id) ==> id==j.target().0),
+            (a.volume_id() matches Some(id) ==> id==j.target().0 && id==arena_id@.0),
         forall|a:&A| #[trigger] bind.requires((wal,a)),
         forall|a:&A,c:C| #[trigger] bind.ensures((wal,a),c) ==> c.wal_target()==(wal_target@)(wal) &&
-            c.roots_target()==a.roots_target() && c.volume_wal()==a.volume_id().is_some() && (a.volume_id() matches Some(id) ==> id==c.wal_target().0) &&
+            c.arena_target()==a.arena_target() && c.roots_target()==a.roots_target() && c.volume_wal()==a.volume_id().is_some() && (a.volume_id() matches Some(id) ==> id==c.wal_target().0) &&
             c.canonical_pending()==a.pending() && c.canonical_stable()==a.durable(),
         forall|c:C| #[trigger] rewind.requires((c,)),
-        forall|c:C,r:C| #[trigger] rewind.ensures((c,),Ok(r)) ==> r.wal_target()==c.wal_target() && r.roots_target()==c.roots_target() &&
+        forall|c:C,r:C| #[trigger] rewind.ensures((c,),Ok(r)) ==> r.wal_target()==c.wal_target() && r.arena_target()==c.arena_target() && r.roots_target()==c.roots_target() &&
             r.volume_wal()==c.volume_wal() && r.canonical_pending()==c.canonical_pending() &&
             r.canonical_stable()==c.canonical_stable() && r.buffered_image()==c.buffered_image(),
         btree_map_inv(old(restart)),start==initial_journal.image().len(),
@@ -550,6 +559,14 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
             pair.1==pair.0.image().len(),
         forall|r:U,e:U::Error| r.target()==initial_journal.target() ==> !#[trigger] r.failed(start as int,52,e),
         forall|r:U,e:U::Error| r.target()==initial_journal.target() ==> !#[trigger] r.failed(start as int+52,crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement).len() as u64,e),
+        forall|id:ObjectId| #[trigger] select.requires((id,)),
+        forall|id:ObjectId,check:Check,b:&[u8]| #[trigger] select.ensures((id,),check) ==> #[trigger] check.requires((b,)),
+        btree_map_inv(index),btree_map_inv(&candidate),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|record:&ObjectRecord| #[trigger] identify.requires((record,)),
+        forall|c:&C| c.arena_target()==arena_id@ && c.canonical_stable().get(crate::recovery_barrier::Target::Arena)==Some(arena_bytes@) ==>
+            #[trigger] open_arena.requires((c,)),
+        forall|c:&C,m:V| #[trigger] open_arena.ensures((c,),m) && open_arena.requires((c,)) ==>
+            (media_id@)(m)==c.arena_target() && Some(m.image())==c.canonical_stable().get(crate::recovery_barrier::Target::Arena),
     ensures ({
         let prior=old(history)@;
         let current=if prior.contains_key(key) {Some(prior[key].0)} else {None};
@@ -562,8 +579,17 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
         &&& out.is_some()==applied
         &&& final(history)@==if applied {prior.insert(key,(replacement,(base as int+72+begin.len()) as u64))} else {prior}
         &&& btree_map_inv(final(restart))
-        &&& final(restart)@==if out matches Some(Ok(Ok((_,true)))) {earlier.insert(key,(replacement,start))} else {earlier}
-        &&& out matches Some(Ok(Ok((c,accepted)))) ==> accepted==(cold==expected) && c.roots_target()==initial_journal.target() && c.wal_target()==sink.wal_target() && c.stable_image()==Seq::<u8>::empty() &&
+        &&& final(restart)@==if (out matches Some(Ok(Ok((_,state)))) && !(state is Conflict)) {earlier.insert(key,(replacement,start))} else {earlier}
+        &&& out matches Some(Ok(Ok((c,ColdGraph::Loaded(media,g,decoded))))) ==> {
+            &&& (media_id@)(media)==arena_id@ && media.image()==arena_bytes@ && g.owner==key && g.root==replacement
+            &&& g.from_arena(arena_bytes@,index@,scheme,object_version)
+            &&& decoded.is_some()==g.component.is_some()
+            &&& decoded matches Some(result) ==> g.component matches Some(id) &&
+                exists|check:Check| select.ensures((id,),check) &&
+                    #[trigger] crate::hosted_recovered_header::decoded_root(&g.records@[id],object_version,check,result)
+        }
+        &&& out matches Some(Ok(Ok((c,state)))) ==> (!(state is Conflict))==(cold==expected) &&
+            c.arena_target()==arena_id@ && c.canonical_stable().get(crate::recovery_barrier::Target::Arena)==Some(arena_bytes@) && c.roots_target()==initial_journal.target() && c.wal_target()==sink.wal_target() && c.stable_image()==Seq::<u8>::empty() &&
             c.canonical_stable().get(crate::recovery_barrier::Target::Roots)==Some(initial_journal.image()+header+wire)
     }),
 {
@@ -588,7 +614,19 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
                 }
                 let accepted=crate::hosted_acknowledged_root::read_recovered_root(&mut reader,start,end,limit,
                     owner,key,key_of,name_of,scheme,expected,replacement,hash,journal_digest,Ghost((journal_digest@)(payload)),restart).unwrap();
-                Some(Ok(Ok((c,accepted))))
+                let state=if accepted {
+                    let media=open_arena(&c);
+                    let format=crate::indexed_frame::Format{magic:crate::arena_frame::ARENA_MAGIC,version:crate::arena_frame::FRAME_VERSION,
+                        limit:object_limit,scheme};
+                    match crate::hosted_recovered_header::recovered_header(index,restart,&media,wave_bytes,format,hash,identify,candidate,&key,object_version) {
+                        Some(graph)=>{
+                            let decoded=graph.decode_component(object_version,select);
+                            ColdGraph::Loaded(media,graph,decoded)
+                        },
+                        None=>ColdGraph::Unavailable,
+                    }
+                } else {ColdGraph::Conflict};
+                Some(Ok(Ok((c,state))))
             },
         }
     } else { None }

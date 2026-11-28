@@ -734,6 +734,21 @@ pub(super) closed spec fn media_record(image:Seq<u8>,row:ReadRow,scheme:root_wir
     &&& row.0.digest()==body.subrange(8,40)
 }
 
+/// Canonical object bytes within the indexed physical arena frame. The length
+/// comes from the stored record header following the identity prefix.
+pub(crate) open spec fn component_bytes(image:Seq<u8>,location:crate::ArenaLocation) -> Seq<u8> {
+    let at=location.offset as int+crate::arena_frame::WIDTH;
+    let body=image.subrange(at,at+location.payload_len);
+    let record_start=40int;
+    let data=record_start+29;
+    body.subrange(data,data+crate::verified_record::u64_field(body,record_start+13))
+}
+
+pub(crate) proof fn component_contents(image:Seq<u8>,row:ReadRow,scheme:root_wire::Scheme,r:crate::ObjectRecord)
+    requires media_record(image,row,scheme,r),
+    ensures r.contents().2==component_bytes(image,row.1),
+{}
+
 /// Later spans preserve earlier installations, so the media relation established
 /// in the selected span still holds after the last positional read.
 proof fn dispatched_record<V:Fn(WaveState,&[ReadRow],u64,u64)->Result<WaveState,()>>(

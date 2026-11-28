@@ -36,3 +36,23 @@ def consumer_defects():
             f"cold journal replay loses {label}", source,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
         )
+
+    graph = Path("verification/hosted_recovered_header.rs")
+    journal = Path("verification/hosted_journal_history.rs")
+    marker = Path("verification/hosted_delta_mutation.rs")
+    admission = Path("verification/hosted_token_recovery.rs")
+    for label, source, clause, weaker, target in [
+        ("arena target", checkpoint, "&&& s.arena_target()==old(files).arena_target()", "&&& true", consumer),
+        ("stable arena bytes", checkpoint, "&&& stable.get(Target::Arena)==pending.get(Target::Arena)", "&&& true", consumer),
+        ("decoded owner", graph, "graph.owner==*owner && history@.contains_key(*owner)", "history@.contains_key(*owner)", consumer),
+        ("decoded component", graph, "ensures out.is_some()==self.component.is_some(),", "ensures true,", consumer),
+        ("indexed payload", journal, "ensures r.contents().2==component_bytes(image,row.1),", "ensures true,", admission),
+        ("decoded marker write", marker, """ensures head matches crate::delta_chain::Head::Delta{mutations,..} && mutations.len()==1 &&
+        mutations@[0].key@==address && (mutations@[0].value matches Some(ValueSlot::Inline(data)) && data@==seq![1u8]) &&
+        crate::overlay_batch::after_rows(mutations@,1,address,None)==Some(true),""", "ensures true,", admission),
+        ("exact token address", marker, "&&& bytes.subrange(41,tag)==address && bytes[tag]==delta::INLINE", "&&& bytes[tag]==delta::INLINE", marker),
+    ]:
+        yield (
+            f"recovered arena marker loses {label}", source,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
+        )

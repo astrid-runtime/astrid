@@ -142,6 +142,7 @@ pub(super) trait WalOutput {
 pub(super) type CanonicalImages = Map<super::recovery_barrier::Target, Seq<u8>>;
 
 pub(super) trait BufferedWal:WalOutput {
+    spec fn arena_target(&self) -> (int,Seq<u8>);
     spec fn roots_target(&self) -> (int,Seq<u8>);
     spec fn volume_wal(&self) -> bool;
     spec fn canonical_pending(&self) -> CanonicalImages;
@@ -153,7 +154,7 @@ pub(super) trait BufferedWal:WalOutput {
     spec fn sync_error(&self,e:Self::Error) -> bool;
     fn drain(&mut self) -> (out:Result<WalDrain,Self::Error>)
         ensures final(self).wal_target()==old(self).wal_target(),
-            final(self).roots_target()==old(self).roots_target(),
+            final(self).roots_target()==old(self).roots_target() && final(self).arena_target()==old(self).arena_target(),
             final(self).resizes()==old(self).resizes(),
             final(self).canonical_pending()==old(self).canonical_pending(),
             final(self).volume_wal()==old(self).volume_wal(),
@@ -163,7 +164,7 @@ pub(super) trait BufferedWal:WalOutput {
             out matches Err(e) ==> old(self).drain_error(e);
     fn sync_file(&mut self) -> (out:Result<(),Self::Error>)
         ensures final(self).wal_target()==old(self).wal_target(),
-            final(self).roots_target()==old(self).roots_target(),
+            final(self).roots_target()==old(self).roots_target() && final(self).arena_target()==old(self).arena_target(),
             out.is_ok() ==> final(self).stable_image()==old(self).file_image() && final(self).canonical_stable()==old(self).canonical_stable(),
             out matches Err(e) ==> old(self).sync_error(e);
 }
@@ -172,7 +173,7 @@ pub(super) fn publish_buffer<S:BufferedWal>(sink:&mut S) -> (out:Result<(),S::Er
     ensures final(sink).wal_target()==old(sink).wal_target(),
         out.is_ok() ==> final(sink).stable_image()==old(sink).buffered_image(),
         out.is_ok() ==> final(sink).canonical_stable()==(if old(sink).volume_wal() {old(sink).canonical_pending()} else {old(sink).canonical_stable()}),
-        final(sink).roots_target()==old(sink).roots_target(),
+        final(sink).roots_target()==old(sink).roots_target() && final(sink).arena_target()==old(sink).arena_target(),
         out matches Err(e) ==> old(sink).drain_error(e) ||
             exists|drained:S| drained.wal_target()==old(sink).wal_target() &&
                 drained.file_image()==old(sink).buffered_image() && #[trigger] drained.sync_error(e),
@@ -186,7 +187,7 @@ pub(super) fn publish_buffer<S:BufferedWal>(sink:&mut S) -> (out:Result<(),S::Er
 pub(super) trait ResizeWal:BufferedWal {
     fn resize_region(&mut self,length:u64) -> (out:Result<(),Self::Error>)
         ensures final(self).wal_target()==old(self).wal_target(),
-            final(self).roots_target()==old(self).roots_target(),
+            final(self).roots_target()==old(self).roots_target() && final(self).arena_target()==old(self).arena_target(),
             final(self).resizes()==old(self).resizes().push((length,old(self).canonical_stable())),
             out.is_ok() ==> final(self).volume_wal()==old(self).volume_wal() && final(self).canonical_pending()==old(self).canonical_pending(),
             out.is_ok() ==> final(self).canonical_stable()==old(self).canonical_stable() &&
@@ -199,7 +200,7 @@ pub(super) fn resize_buffered<S:ResizeWal>(sink:&mut S,length:u64) -> (out:Resul
     ensures final(sink).wal_target()==old(sink).wal_target(), ({
         let canonical=if old(sink).volume_wal() {old(sink).canonical_pending()} else {old(sink).canonical_stable()};
         let called=old(sink).resizes().push((length,canonical));
-        &&& final(sink).roots_target()==old(sink).roots_target()
+        &&& final(sink).roots_target()==old(sink).roots_target() && final(sink).arena_target()==old(sink).arena_target()
         &&& final(sink).resizes()==called || (out.is_err() && final(sink).resizes()==old(sink).resizes())
         &&& out.is_ok() ==> final(sink).volume_wal()==old(sink).volume_wal() && final(sink).canonical_pending()==old(sink).canonical_pending()
         &&& out.is_ok() ==> final(sink).canonical_stable()==canonical && final(sink).buffered_image().len()==length &&

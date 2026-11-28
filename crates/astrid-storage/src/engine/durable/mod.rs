@@ -38,7 +38,6 @@ const INDEX_FILE: &str = "objects.index";
 const LOCK_FILE: &str = "store.lock";
 const WAL_FILE: &str = "transactions.wal";
 const WAL_WRITE_BUFFER_BYTES: usize = 64 * 1024;
-const ARENA_MAGIC: [u8; 8] = *b"ASTOBJ1\0";
 const INDEX_MAGIC: [u8; 8] = *b"ASTIDX1\0";
 const FRAME_HEADER_LEN: u64 = arena_frame::WIDTH as u64;
 const FRAME_HEADER_LEN_USIZE: usize = arena_frame::WIDTH;
@@ -546,7 +545,7 @@ impl From<ContentError> for DurableError {
     }
 }
 
-use arena_frame::{ArenaLocation, FRAME_VERSION, PreparedFrame, ROOT_MAGIC};
+use arena_frame::{ARENA_MAGIC, ArenaLocation, FRAME_VERSION, PreparedFrame, ROOT_MAGIC};
 
 #[derive(Debug)]
 struct DurableInner<P: Ord> {

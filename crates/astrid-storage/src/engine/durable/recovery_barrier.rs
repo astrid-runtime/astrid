@@ -10,6 +10,7 @@ pub(super) trait Files {
     spec fn calls(&self) -> Seq<Target>;
     spec fn pending(&self) -> Map<Target,Seq<u8>>;
     spec fn durable(&self) -> Map<Target,Seq<u8>>;
+    spec fn arena_target(&self) -> (int,Seq<u8>);
     spec fn roots_target(&self) -> (int,Seq<u8>);
     spec fn volume_id(&self) -> Option<int>;
     spec fn has_representations(&self) -> bool;
@@ -17,7 +18,7 @@ pub(super) trait Files {
         ensures yes == self.has_representations();
     fn sync(&mut self,target:Target) -> (out:Result<(),Self::Error>)
         requires target == Target::Representations ==> old(self).has_representations(),
-        ensures final(self).roots_target()==old(self).roots_target(),
+        ensures final(self).roots_target()==old(self).roots_target() && final(self).arena_target()==old(self).arena_target(),
             final(self).volume_id()==old(self).volume_id(),
             final(self).calls() == old(self).calls().push(target),
             final(self).pending() == old(self).pending(), final(self).has_representations() == old(self).has_representations(),
@@ -43,7 +44,7 @@ pub(super) fn stabilize<M:Files,W>(files:&mut M,wal:W) -> (out:Result<Prepared<W
         let arena = old(files).calls().push(a); let roots = arena.push(r); let all = roots.push(x);
         let both = old(files).durable().insert(a,old(files).pending()[a]).insert(r,old(files).pending()[r]);
         &&& out matches Ok(stable) ==> stable.wal() == wal
-        &&& final(files).roots_target()==old(files).roots_target()
+        &&& final(files).roots_target()==old(files).roots_target() && final(files).arena_target()==old(files).arena_target()
         &&& final(files).volume_id()==old(files).volume_id()
         &&& final(files).pending() == old(files).pending()
         &&& match out {

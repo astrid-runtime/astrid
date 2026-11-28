@@ -4,6 +4,7 @@ use vstd::prelude::*;
 
 verus! {
 
+pub(super) const ARENA_MAGIC:[u8;8] = *b"ASTOBJ1\0";
 pub(super) const ROOT_MAGIC:[u8;8] = *b"ASTROOT\0";
 pub(super) const FRAME_VERSION:u16 = 1;
 

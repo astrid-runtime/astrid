@@ -8,6 +8,8 @@ use crate::storage_words::little_endian;
 use vstd::prelude::*;
 
 verus! {
+pub(super) const ROOT_LABEL:&[u8;4]=b"root";
+
 pub(super) const CHECKPOINT:u8 = 0;
 pub(super) const DELTA:u8 = 1;
 

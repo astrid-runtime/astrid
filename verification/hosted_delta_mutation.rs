@@ -265,8 +265,49 @@ proof fn header_equal(h:crate::delta_header::Header,read:crate::delta_header::He
     storage_words::unique_word32(h.count,read.count);
 }
 
+/// Inspect the serialized one-row write, independent of the recovered row or its decoder.
+pub(crate) open spec fn marker_bytes(bytes:Seq<u8>,address:Seq<u8>) -> bool {
+    let tag=41+address.len() as int;
+    &&& address.len()<=u32::MAX
+    &&& bytes.len()==51+address.len()
+    &&& bytes[0]==crate::projection_record::DELTA
+    &&& bytes.subrange(33,37)==storage_words::word32(1)
+    &&& bytes.subrange(37,41)==storage_words::word32(address.len() as u32)
+    &&& bytes.subrange(41,tag)==address && bytes[tag]==delta::INLINE
+    &&& bytes.subrange(tag+1,tag+9)==vstd::bytes::spec_u64_to_le_bytes(1)
+    &&& bytes.subrange(tag+9,bytes.len() as int)==seq![1u8]
+}
+
+pub(crate) proof fn decoded_marker<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecord,address:Seq<u8>,
+    v:crate::ObjectFormatVersion,label:&[u8],check:F,head:crate::delta_chain::Head)
+    requires marker_bytes(record.contents().2,address),crate::projection_record::valid(record,v,label,check,Ok(head)),
+    ensures head matches crate::delta_chain::Head::Delta{mutations,..} && mutations.len()==1 &&
+        mutations@[0].key@==address && (mutations@[0].value matches Some(ValueSlot::Inline(data)) && data@==seq![1u8]) &&
+        crate::overlay_batch::after_rows(mutations@,1,address,None)==Some(true),
+{
+    use crate::{delta_chain::Head,delta_recovery as recovery,delta_header::Header};
+    if let Head::Delta{previous,depth,delta_bytes,mutations,totals}=head {
+        let saved=recovery::Recovered{previous,depth,delta_bytes,rows:mutations,totals};
+        let (bs,rs,path)=choose|bs:&[u8],rs:&[ObjectReference],p:Seq<usize>| #[trigger] recovery::admitted(record,check,saved,bs,rs,p);
+        let h=Header{depth,delta_bytes,entries:totals.entries,quota_bytes:totals.quota_bytes,count:mutations.len() as u32};
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(h.wire().subrange(32,36) =~= storage_words::word32(h.count));
+        assert(bs@.subrange(33,37) =~= h.wire().subrange(32,36));
+        storage_words::unique_word32(h.count,1);
+        assert(delta::decoded(bs,37,path[1],rs,0,check,Ok(mutations@[0])));
+        let n=address.len() as int;
+        assert(bs@.subrange(37,41) =~= storage_words::word32(n as u32));
+        key::encoded_length(bs@,37,n as u32);
+        assert(bs@.subrange(41,41+n) =~= address);
+        assert(bs@[41+n]==delta::INLINE && bs@.subrange(42+n,50+n) =~= vstd::bytes::spec_u64_to_le_bytes(1));
+        assert(bs@.subrange(50+n,51+n) =~= seq![1u8]);
+        reveal_with_fuel(crate::overlay_batch::after_rows,2);
+    }
+}
+
 // Reopen the physical record produced for a single presence marker, including
 // the prior component edge. Its address and one-byte value survive the round trip.
+#[verifier::rlimit(10)]
 pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u64,prior_bytes:u64,totals:crate::checkpoint_totals::NodeTotals) -> (out:crate::delta_chain::Head)
     requires key.len()<=u32::MAX && key.len()+51<=isize::MAX && prior_depth<u64::MAX && prior_bytes+key.len()+1<=u64::MAX,
     ensures out matches crate::delta_chain::Head::Delta{previous:p,depth,delta_bytes,mutations,totals:t} && p==previous && depth==prior_depth+1 && delta_bytes==prior_bytes+key.len()+1 && t==totals && mutations.len()==1 &&
@@ -295,12 +336,14 @@ pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u
         reveal_with_fuel(crate::delta_writer::body_prefix,2);
         reveal_with_fuel(crate::delta_writer::edge_prefix,2);
         assert(bytes@.subrange(1,37) =~= header.wire());
+        assert(bytes@.subrange(33,37) =~= storage_words::word32(1));
         assert(bytes@.subrange(37,41) =~= storage_words::word32(width as u32));
         key::encoded_length(bytes@,37,width as u32);
         let tag=41+width;
         assert(bytes@.subrange(41,tag) =~= address);
         assert(bytes@[tag]==delta::INLINE && bytes@.subrange(tag+1,tag+9) =~= vstd::bytes::spec_u64_to_le_bytes(1));
         assert(bytes@.subrange(tag+9,bytes.len() as int) =~= seq![1u8]);
+        assert(marker_bytes(record.contents().2,address));
         assert(refs@.map_values(crate::delta_writer::ref_fields()).len()==refs.len());
         if previous.is_some() {
             assert(refs@.map_values(crate::delta_writer::ref_fields())[0]==refs@[0].fields());
