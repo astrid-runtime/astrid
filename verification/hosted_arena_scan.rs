@@ -150,7 +150,7 @@ fn recover_volume<R:FrameReader,M:Medium,I,C,H,V:crate::frontier::JournalContain
         out matches VolumeIndex::Persisted(at,(map,tail),v) ==> protected<=at<end && btree_map_inv(&map) && final(media).bytes()==v.durable_image() &&
             (v.container_id(),v.region_id())==old(reader).target() && v.durable_image()==old(reader).image().take(at as int) &&
             indexed(map@,tail,old(reader).image(),at,limit,scheme,identify,checksum,hash),
-        out matches VolumeIndex::Container(at,e) ==> protected<=at<end &&
+        out matches VolumeIndex::Container(at,e) ==> protected<=at<end && final(media).bytes()==old(reader).image().take(at as int) &&
             crate::hosted_journal_scan::container_failure::<V>(old(media).target(),old(reader).image().take(at as int),e),
 {
     match recover(reader,media,end,protected,limit,scheme,identify,checksum,hash) {
@@ -266,6 +266,8 @@ fn reopen_volume<S:FrameReader,T:Medium,A:crate::positional_read::Media,R:FrameR
         &&& final(backing).target()==old(scan).target() && final(journal).target()==old(reader).target()
         &&& final(backing).target().0==final(journal).target().0 && final(backing).target().1!=final(journal).target().1
         &&& arena_protected<=r.arena_end<=arena_end && protected<=r.loaded.end<=end
+        &&& (v.arena_fence.is_none() ==> final(backing).durable()==final(backing).bytes())
+        &&& (v.root_fence.is_none() ==> final(journal).durable()==final(journal).bytes())
         &&& stable_region(v.arena_fence,final(backing).target(),old(scan).image(),r.arena_end)
         &&& stable_region(v.root_fence,final(journal).target(),old(reader).image(),r.loaded.end)
         &&& final(backing).bytes()==old(scan).image().take(r.arena_end as int) && final(journal).bytes()==old(reader).image().take(r.loaded.end as int)

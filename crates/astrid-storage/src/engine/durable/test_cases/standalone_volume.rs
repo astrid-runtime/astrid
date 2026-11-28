@@ -7,6 +7,7 @@ pub(super) struct RecordingVolume {
     inner: Arc<HostedFileVolume>,
     syncs: AtomicUsize,
     remaining_failures: AtomicUsize,
+    fail_after_resize: std::sync::Mutex<Option<VolumeRegion>>,
 }
 
 impl RecordingVolume {
@@ -15,6 +16,7 @@ impl RecordingVolume {
             inner,
             syncs: AtomicUsize::new(0),
             remaining_failures: AtomicUsize::new(0),
+            fail_after_resize: std::sync::Mutex::default(),
         })
     }
 
@@ -61,7 +63,13 @@ impl AstridVolume for RecordingVolume {
     }
 
     fn set_region_len(&self, region: &VolumeRegion, length: u64) -> io::Result<()> {
-        self.inner.set_region_len(region, length)
+        self.inner.set_region_len(region, length)?;
+        let mut armed = self.fail_after_resize.lock().unwrap();
+        if armed.as_ref() == Some(region) {
+            *armed = None;
+            self.fail_next_syncs(1);
+        }
+        Ok(())
     }
 
     fn remove_region(&self, region: &VolumeRegion) -> io::Result<()> {
@@ -321,6 +329,53 @@ fn cold_volume_open_persists_both_repaired_regions_and_restores_the_owner() {
     for (region, len) in regions.iter().zip(lengths) {
         assert_eq!(stable.region_len(region).unwrap(), len);
     }
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert!(recovered.object(commit).unwrap().is_some());
+}
+
+#[test]
+fn cold_volume_open_refuses_a_failed_root_journal_repair_fence() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, volume, engine) = open_recording_engine(&directory);
+    let (commit, tx) = transaction("alice", None, b"retained");
+    let root = engine.commit(tx).unwrap().root();
+    engine.close().unwrap();
+    drop(engine);
+
+    let journal = VolumeRegion::new(ROOT_FILE).unwrap();
+    let end = volume.region_len(&journal).unwrap();
+    volume
+        .write_region_from(&journal, end, 5, &mut &[0; 5][..])
+        .unwrap();
+    volume.sync().unwrap();
+    *volume.fail_after_resize.lock().unwrap() = Some(journal.clone());
+    let reopen = || {
+        TestEngine::open_volume(
+            volume.clone(),
+            TestIdentity,
+            Utf8Codec,
+            limits(),
+            DurableEnginePolicy::default(),
+        )
+    };
+    assert!(matches!(
+        reopen(),
+        Err(DurableError::Io {
+            operation: "flush durable tail truncation",
+            ..
+        })
+    ));
+    assert_eq!(volume.region_len(&journal).unwrap(), end);
+    let recovered = reopen().unwrap();
+    let copy = directory.path().join("repaired-journal.volume");
+    std::fs::copy(path, &copy).unwrap();
+    assert_eq!(
+        HostedFileVolume::open(copy)
+            .unwrap()
+            .region_len(&journal)
+            .unwrap(),
+        end
+    );
     assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(root));
     assert!(recovered.object(commit).unwrap().is_some());
 }
