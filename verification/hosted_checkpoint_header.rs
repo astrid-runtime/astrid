@@ -99,8 +99,31 @@ fn malformed(bytes:&[u8],kind:Kind) -> (out:Result<(usize,Header),header::Error>
     }
     out
 }
+fn read_branch<F:Fn(&[u8])->Result<(),()>+Copy>(id:ObjectId,object:&crate::ObjectRecord,
+    version:crate::ObjectFormatVersion,accept:F) -> (out:Result<Branch<ObjectId,NodeTotals>,header::RecordError<()>>)
+    requires forall|k:&[u8]| #[trigger] accept.requires((k,)), object.contents().0 == crate::ObjectKind::KvBranch,
+        object.contents().1 == version.number(),object.contents().4 == 0,object.contents().5 == crate::ObjectClass::Metadata,
+        object.retained_cost() <= 4096,
+    ensures match out {
+        Err(header::RecordError::Prefix(e)) => header::prefix_error(object.contents().2,Kind::Branch,e),
+        Err(header::RecordError::Body(e)) => exists|h:Header,s:usize| #[trigger] header::present(object.contents().2,Kind::Branch,h,s) &&
+            h.field_outcome(object.contents().2,object.contents().3,s,accept,Err(e)),
+        Ok(b) => exists|h:Header,s:usize| #[trigger] header::present(object.contents().2,Kind::Branch,h,s) &&
+            h.field_outcome(object.contents().2,object.contents().3,s,accept,Ok(b)),
+    },
+{
+    match crate::checkpoint_record::read(id,object,version,accept) {
+        Ok(h) => { assert(h.object == id); match h.node {
+            crate::checkpoint_page::Node::Branch(b) => Ok(b),
+            crate::checkpoint_page::Node::Leaf(_) => { assert(false); unreachable!() },
+        }},
+        Err(crate::checkpoint_record::ReadError::Branch(e)) => Err(e),
+        Err(_) => { assert(false); unreachable!() },
+    }
+}
+
 #[verifier::rlimit(45)]
-fn complete(left:ObjectId,right:ObjectId) -> (out:Result<Branch<ObjectId,NodeTotals>,header::RecordError<()>>)
+fn complete(left:ObjectId,right:ObjectId,id:ObjectId,v:crate::ObjectFormatVersion,integrated:bool) -> (out:Result<Branch<ObjectId,NodeTotals>,header::RecordError<()>>)
     ensures out matches Ok(b) && b.children.len() == 2 && b.level == 1 && b.children@[0].object == left &&
         b.children@[1].object == right && b.totals.entries == 2,
 {
@@ -122,8 +145,24 @@ fn complete(left:ObjectId,right:ObjectId) -> (out:Result<Branch<ObjectId,NodeTot
     refs.push(ObjectReference::owns(label(Relation::Child,0).unwrap(),left));
     refs.push(ObjectReference::owns(label(Relation::Child,1).unwrap(),right));
     let accept = |_:&[u8]| -> (r:Result<(),()>) ensures r is Ok { Ok(()) };
-    let data = bytes.as_slice(); let edges = refs.as_slice();
-    let out = header::branch(data,edges,accept);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        let a = refs@[0].fields().0; let b = refs@[1].fields().0;
+        assert(a.take(7) =~= b.take(7));
+        assert(a[7] < b[7]);
+        assert(crate::ObjectRecord::label_before(a,b));
+        assert(crate::ObjectRecord::labels_ordered(refs@));
+        assert(h.totals.wire().len() == 24 && totals.wire().len() == 24);
+        assert(bytes.len() <= 256);
+    }
+    let ghost payload = bytes@;
+    let ghost links = refs@;
+    let object = crate::ObjectRecord::from_fields(crate::ObjectKind::KvBranch,v,bytes,refs,0,crate::ObjectClass::Metadata).unwrap();
+    assert(object.retained_cost() <= 4096) by {reveal_with_fuel(crate::ObjectRecord::reference_charge,3);}
+    let bytes = object.canonical_bytes(); let refs = object.references();
+    assert(bytes@ == payload && refs@ == links);
+    let data = bytes; let edges = refs;
+    let out = if integrated {read_branch(id,&object,v,accept)} else {header::branch(data,edges,accept)};
     proof {
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         let first = start as int; let second = middle as int;

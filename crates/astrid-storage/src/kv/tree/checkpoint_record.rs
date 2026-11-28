@@ -4,7 +4,7 @@ use super::{ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord
 use vstd::prelude::*;
 
 #[cfg(verus_keep_ghost)]
-use super::checkpoint_branch::{self, Header};
+use super::checkpoint_branch::Header;
 use super::{
     checkpoint_header as header, checkpoint_leaf_record as leaf, checkpoint_totals::NodeTotals,
     checkpoint_value::ValueSlot,
@@ -83,10 +83,33 @@ pub(super) open spec fn parsed<E,F:Fn(&[u8])->Result<(),E>>(
                 leaf::body(fields.2,fields.3,s,h,validate,Ok(l)),
         Node::Branch(b) => fields.0 == ObjectKind::KvBranch &&
             exists|h:Header,s:usize| #[trigger] header::present(fields.2,header::Kind::Branch,h,s) &&
-                h.valid(fields.3.len() as usize) && h.level == b.level && h.totals == b.totals &&
-                h.count == b.children.len() &&
-                exists|path:Seq<usize>| #[trigger] checkpoint_branch::layout(fields.2,fields.3,s,
-                    fields.2.len() as usize,b.level,b.children@,path,validate),
+                h.field_outcome(fields.2,fields.3,s,validate,Ok(b)),
+    }
+}
+
+pub(super) open spec fn refusal<E,F:Fn(&[u8])->Result<(),E>>(
+    record:&ObjectRecord, validate:F, reason:ReadError<E>,
+) -> bool {
+    let f = record.contents();
+    match reason {
+        ReadError::Envelope(_) => true,
+        ReadError::Leaf(e) => f.0 == ObjectKind::KvLeaf && match e {
+            leaf::Error::Prefix(p) => header::prefix_error(f.2,header::Kind::Leaf,p),
+            _ => exists|h:Header,s:usize| #[trigger] header::present(f.2,header::Kind::Leaf,h,s) &&
+                leaf::body(f.2,f.3,s,h,validate,Err(e)),
+        },
+        ReadError::Branch(e) => f.0 == ObjectKind::KvBranch && match e {
+            header::RecordError::Prefix(p) => header::prefix_error(f.2,header::Kind::Branch,p),
+            header::RecordError::Body(b) => exists|h:Header,s:usize| #[trigger] header::present(f.2,header::Kind::Branch,h,s) &&
+                h.field_outcome(f.2,f.3,s,validate,Err(b)),
+        },
+        ReadError::Size(e) => exists|n:DecodedNode| #[trigger] parsed(record,n,validate) && match e {
+            SizeError::Overflow => record.retained_cost() > u64::MAX,
+            SizeError::Oversize => NODE_MAX_RETAINED_BYTES < record.retained_cost() <= u64::MAX && match n {
+                Node::Leaf(l) => l.entries.len() > 1,
+                Node::Branch(b) => b.children.len() > 3,
+            },
+        },
     }
 }
 
@@ -99,6 +122,7 @@ pub(super) fn read<E,F:Fn(&[u8])->Result<(),E>+Copy>(
         (out matches Err(ReadError::Envelope(EnvelopeError::Kind))) ==
             (record.contents().1 == version.number() && record.contents().4 == 0 && record.contents().5 == ObjectClass::Metadata &&
             !(record.contents().0 is KvLeaf) && !(record.contents().0 is KvBranch)),
+        out matches Err(reason) ==> refusal(record,validate,reason),
         out matches Ok(handle) ==> ({
         let fields = record.contents();
         &&& fields.1 == version.number() && fields.4 == 0 && fields.5 == ObjectClass::Metadata
@@ -116,24 +140,30 @@ pub(super) fn read<E,F:Fn(&[u8])->Result<(),E>+Copy>(
     let node = match kind {
         PageKind::Leaf => match leaf::read(data,edges,validate) {
             Ok(l) => Node::Leaf(l),
-            Err(e) => return Err(ReadError::Leaf(e)),
+            Err(e) => { assert(refusal(record,validate,ReadError::Leaf(e))); return Err(ReadError::Leaf(e)); },
         },
         PageKind::Branch => match header::branch(data,edges,validate) {
             Ok(b) => {
                 proof {
                     let (h,s) = choose|h:Header,s:usize| #[trigger] header::present(data@,header::Kind::Branch,h,s)
                         && h.outcome(data,edges,s,validate,Ok(b));
-                    assert(h.valid(edges.len()));
-                    assert(h.count == b.children.len() && h.level == b.level && h.totals == b.totals);
-                    let path = choose|p:Seq<usize>| #[trigger] checkpoint_branch::layout(data@,edges@,s,data.len(),b.level,b.children@,p,validate);
-                    let f = record.contents();
-                    assert(header::present(f.2,header::Kind::Branch,h,s));
-                    assert(checkpoint_branch::layout(f.2,f.3,s,f.2.len() as usize,b.level,b.children@,path,validate));
+                    assert(h.field_outcome(record.contents().2,record.contents().3,s,validate,Ok(b)));
                     assert(parsed(record,Node::Branch(b),validate));
                 }
                 Node::Branch(b)
             },
-            Err(e) => return Err(ReadError::Branch(e)),
+            Err(e) => {
+                proof {
+                    if let header::RecordError::Body(b_ref) = &e {
+                        let b = *b_ref;
+                        let (h,s) = choose|h:Header,s:usize| #[trigger] header::present(data@,header::Kind::Branch,h,s) &&
+                            h.outcome(data,edges,s,validate,Err(b));
+                        assert(h.field_outcome(record.contents().2,record.contents().3,s,validate,Err(b)));
+                    }
+                    assert(refusal(record,validate,ReadError::Branch(e)));
+                }
+                return Err(ReadError::Branch(e));
+            },
         },
     };
     assert(parsed(record,node,validate));

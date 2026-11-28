@@ -115,27 +115,46 @@ impl Header {
 
     pub(super) open spec fn outcome<E,F:Fn(&[u8])->Result<(),E>>(self,bytes:&[u8],refs:&[ObjectReference],start:usize,validate:F,
         out:Result<checkpoint_page::Branch<ObjectId,NodeTotals>,DecodeError<E>>) -> bool {
-        &&& (out matches Err(DecodeError::Header)) == !self.valid(refs.len())
+        self.field_outcome(bytes@,refs@,start,validate,out)
+    }
+
+    pub(super) open spec fn field_outcome<E,F:Fn(&[u8])->Result<(),E>>(self,bytes:Seq<u8>,refs:Seq<ObjectReference>,start:usize,validate:F,
+        out:Result<checkpoint_page::Branch<ObjectId,NodeTotals>,DecodeError<E>>) -> bool {
+        &&& (out matches Err(DecodeError::Header)) == !self.valid(refs.len() as usize)
         &&& out matches Err(DecodeError::Rows(reason)) ==> exists|prior:Seq<Child<ObjectId,NodeTotals>>,pos:Seq<usize>,s:usize,end:usize|
-                prior.len() < self.count && #[trigger] layout(bytes@,refs@,start,s,self.level,prior,pos,validate) &&
-                #[trigger] rejected_row(bytes@,refs@,prior.len() as usize,s,end,validate,reason)
+                prior.len() < self.count && #[trigger] layout(bytes,refs,start,s,self.level,prior,pos,validate) &&
+                #[trigger] rejected_row(bytes,refs,prior.len() as usize,s,end,validate,reason)
         &&& out matches Err(DecodeError::Finish(reason)) ==> exists|rows:Vec<Child<ObjectId,NodeTotals>>,pos:Seq<usize>,end:usize|
-                rows.len() == self.count && #[trigger] layout(bytes@,refs@,start,end,self.level,rows@,pos,validate) &&
-                checkpoint_summary::finished(end,bytes.len(),self.level,rows,self.totals) == Err(reason)
+                rows.len() == self.count && #[trigger] layout(bytes,refs,start,end,self.level,rows@,pos,validate) &&
+                checkpoint_summary::finished(end,bytes.len() as usize,self.level,rows,self.totals) == Err(reason)
         &&& out matches Ok(b) ==> ({
                 &&& b.level == self.level && b.totals == self.totals && b.children.len() == self.count
                 &&& checkpoint_summary::ordered(b.children@,self.count as nat)
                 &&& checkpoint_summary::counts(b.children@,self.count as nat) ==
                     (b.totals.entries as nat,b.totals.logical_bytes as nat,b.totals.quota_bytes as nat)
-                &&& exists|pos:Seq<usize>| #[trigger] layout(bytes@,refs@,start,bytes.len(),b.level,b.children@,pos,validate)
+                &&& exists|pos:Seq<usize>| #[trigger] layout(bytes,refs,start,bytes.len() as usize,b.level,b.children@,pos,validate)
             })
     }
 
+    proof fn accepted_fields<E,F:Fn(&[u8])->Result<(),E>>(self,bytes:Seq<u8>,refs:Seq<ObjectReference>,
+        start:usize,validate:F,b:checkpoint_page::Branch<ObjectId,NodeTotals>,pos:Seq<usize>)
+        requires self.valid(refs.len() as usize), b.level == self.level, b.totals == self.totals,
+            b.children.len() == self.count, checkpoint_summary::ordered(b.children@,self.count as nat),
+            checkpoint_summary::counts(b.children@,self.count as nat) ==
+                (b.totals.entries as nat,b.totals.logical_bytes as nat,b.totals.quota_bytes as nat),
+            layout(bytes,refs,start,bytes.len() as usize,b.level,b.children@,pos,validate),
+        ensures self.field_outcome(bytes,refs,start,validate,Ok(b)),
+    {
+        assert(exists|p:Seq<usize>| #[trigger] layout(bytes,refs,start,bytes.len() as usize,b.level,b.children@,p,validate));
+    }
+
+    #[verifier::rlimit(20)]
     pub(super) fn decode<E,F:Fn(&[u8])->Result<(),E>+Copy>(self,bytes:&[u8],refs:&[ObjectReference],start:usize,validate:F)
         -> (out:Result<checkpoint_page::Branch<ObjectId,NodeTotals>,DecodeError<E>>)
         requires forall|k:&[u8]| #[trigger] validate.requires((k,)),
         ensures self.outcome(bytes,refs,start,validate,out),
     {
+        assert(bytes@.len() as usize == bytes.len() && refs@.len() as usize == refs.len());
         if self.level == 0 || self.level > MAX_TREE_LEVEL || self.count < 2 ||
             self.count > NODE_MAX_ENTRIES || self.count != refs.len() { return Err(DecodeError::Header); }
         let (end,children) = match read(bytes,refs,self.level,self.count,start,validate) {
@@ -144,6 +163,7 @@ impl Header {
                     r.len() < self.count && #[trigger] layout(bytes@,refs@,start,s,self.level,r,p,validate) &&
                     (reason matches RowsError::Child(e) && checkpoint_child::failure(bytes@,refs@,r.len() as usize,s as int,_end as int,validate,e));
                 assert(rejected_row(bytes@,refs@,prior.len() as usize,s,_end,validate,reason));
+                assert(self.field_outcome(bytes@,refs@,start,validate,Err(DecodeError::Rows(reason))));
                 return Err(DecodeError::Rows(reason));
             },
         };
@@ -154,10 +174,15 @@ impl Header {
                 assert(branch == checkpoint_page::Branch {level:self.level,children,totals:self.totals});
                 assert(checkpoint_summary::ordered(children@,self.count as nat));
                 assert(layout(bytes@,refs@,start,bytes.len(),branch.level,branch.children@,pos,validate));
+                assert(checkpoint_summary::counts(branch.children@,self.count as nat) ==
+                    (self.totals.entries as nat,self.totals.logical_bytes as nat,self.totals.quota_bytes as nat));
+                assert(layout(bytes@,refs@,start,bytes@.len() as usize,branch.level,branch.children@,pos,validate));
+                proof { self.accepted_fields(bytes@,refs@,start,validate,branch,pos); }
                 Ok(branch)
             },
             Err(e) => {
                 assert(checkpoint_summary::finished(end,bytes.len(),self.level,children,self.totals) == Err(e));
+                assert(self.field_outcome(bytes@,refs@,start,validate,Err(DecodeError::Finish(e))));
                 Err(DecodeError::Finish(e))
             },
         }

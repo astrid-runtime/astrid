@@ -1,4 +1,6 @@
 //! Assemble the persisted leaf only after every byte, owning reference and advertised total agrees.
+#[cfg(verus_keep_ghost)]
+use super::checkpoint_entries::Row;
 use super::{
     ObjectReference,
     checkpoint_branch::{Header, NODE_MAX_ENTRIES},
@@ -9,8 +11,6 @@ use super::{
     checkpoint_totals::NodeTotals,
     checkpoint_value::ValueSlot,
 };
-#[cfg(verus_keep_ghost)]
-use super::checkpoint_entries::Row;
 use vstd::prelude::*;
 
 verus! {

@@ -6,8 +6,35 @@ use vstd::prelude::*;
 
 verus! {
 
+fn read_leaf<F:Fn(&[u8])->Result<(),()>+Copy>(id:crate::ObjectId,object:&crate::ObjectRecord,
+    version:crate::ObjectFormatVersion,accept:F) -> (out:Result<record::DecodedLeaf,Error<()>>)
+    requires forall|k:&[u8]| #[trigger] accept.requires((k,)), object.contents().0 == crate::ObjectKind::KvLeaf,
+        object.contents().1 == version.number(),object.contents().4 == 0,object.contents().5 == crate::ObjectClass::Metadata,
+        object.retained_cost() <= 4096,
+    ensures match out {
+        Err(Error::Prefix(e)) => header::prefix_error(object.contents().2,Kind::Leaf,e),
+        _ => exists|h:Header,s:usize| #[trigger] header::present(object.contents().2,Kind::Leaf,h,s) &&
+            record::body(object.contents().2,object.contents().3,s,h,accept,out),
+    },
+{
+    let got = crate::checkpoint_record::read(id,object,version,accept);
+    match got {
+        Ok(handle) => {
+            assert(handle.object == id);
+            match handle.node {
+                crate::checkpoint_page::Node::Leaf(l) => Ok(l),
+                crate::checkpoint_page::Node::Branch(_) => { assert(false); unreachable!() },
+            }
+        },
+        Err(crate::checkpoint_record::ReadError::Leaf(e)) => Err(e),
+        Err(_) => {
+            assert(false); unreachable!()
+        },
+    }
+}
+
 #[verifier::rlimit(30)]
-fn written(claim:u64) -> (out:Result<record::DecodedLeaf,Error<()>>)
+fn written(claim:u64,id:crate::ObjectId,version:crate::ObjectFormatVersion,integrated:bool) -> (out:Result<record::DecodedLeaf,Error<()>>)
     ensures if claim != 4 { out == Err(Error::Summary(summary::Error::NonCanonical)) }
         else { out matches Ok(leaf) && leaf.entries.len() == 1 && leaf.totals.quota_bytes == 4 &&
             leaf.entries@[0].key@ == seq![110u8,0u8,97u8] &&
@@ -21,8 +48,20 @@ fn written(claim:u64) -> (out:Result<record::DecodedLeaf,Error<()>>)
     let wrote = key::append(&mut bytes,&k); assert(wrote);
     let wrote = value::append(&mut bytes,&mut refs,0,&ValueSlot::Inline(v)); assert(wrote is Ok);
     let accept = |_:&[u8]| -> (r:Result<(),()>) ensures r is Ok { Ok(()) };
-    let data = bytes.as_slice(); let edges = refs.as_slice();
-    let out = record::read(data,edges,accept);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(h.totals.wire().len() == 24);
+        assert(first == 24+2+24);
+        assert(bytes.len() == first+17);
+        assert(refs.len() == 0);
+    }
+    let ghost payload = bytes@;
+    let ghost links = refs@;
+    let object = crate::ObjectRecord::from_fields(crate::ObjectKind::KvLeaf,version,bytes,refs,0,crate::ObjectClass::Metadata).unwrap();
+    assert(object.retained_cost() <= 4096) by {reveal_with_fuel(crate::ObjectRecord::reference_charge,1);}
+    let bytes = object.canonical_bytes(); let refs = object.references();
+    let out = if integrated {read_leaf(id,&object,version,accept)} else {record::read(bytes,refs,accept)};
+    assert(bytes@ == payload && refs@ == links);
     proof {
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         let start = first as int;

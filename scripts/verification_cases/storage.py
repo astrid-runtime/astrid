@@ -671,7 +671,7 @@ def checkpoint_summary_consumers():
     for label, path, clause, weaker in [
         ("finish result", finish, "ensures out == finished(end,length,level,children,totals)", "ensures out.is_err() ==> out == finished(end,length,level,children,totals)"),
         ("finish rejection", finish, "ensures out == finished(end,length,level,children,totals)", "ensures out.is_ok() ==> out == finished(end,length,level,children,totals)"),
-        ("header rejection", branch, "(out matches Err(DecodeError::Header)) == !self.valid(refs.len())", "(out matches Err(DecodeError::Header)) ==> !self.valid(refs.len())"),
+        ("header rejection", branch, "(out matches Err(DecodeError::Header)) == !self.valid(refs.len() as usize)", "(out matches Err(DecodeError::Header)) ==> !self.valid(refs.len() as usize)"),
         ("ordered fences", branch, "&&& checkpoint_summary::ordered(b.children@,self.count as nat)", "&&& true"),
         ("accounted totals", branch, "&&& checkpoint_summary::counts(b.children@,self.count as nat) ==", "&&& false ==> checkpoint_summary::counts(b.children@,self.count as nat) =="),
     ]:
@@ -757,6 +757,18 @@ def checkpoint_record_consumers():
             f"checkpoint envelope loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
             Path("verification/hosted_checkpoint_record.rs"),
+        )
+
+    for label, clause, weaker, consumer in [
+        ("leaf refusal", "leaf::body(f.2,f.3,s,h,validate,Err(e))", "true", "leaf_record"),
+        ("branch refusal", "h.field_outcome(f.2,f.3,s,validate,Err(b))", "true", "header"),
+        ("overflow cause", "SizeError::Overflow => record.retained_cost() > u64::MAX", "SizeError::Overflow => true", "leaf_record"),
+        ("oversize cause", "NODE_MAX_RETAINED_BYTES < record.retained_cost() <= u64::MAX && match n", "match n", "header"),
+    ]:
+        yield (
+            f"checkpoint envelope loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path(f"verification/hosted_checkpoint_{consumer}.rs"),
         )
 
 
