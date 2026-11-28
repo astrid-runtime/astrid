@@ -27,6 +27,10 @@ use tempfile::TempDir;
 use super::handlers;
 use crate::Kernel;
 
+#[cfg(any(unix, windows))]
+#[path = "mount_lifecycle_tests.rs"]
+mod mount_lifecycle_tests;
+
 async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
