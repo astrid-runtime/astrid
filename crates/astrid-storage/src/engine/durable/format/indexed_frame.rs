@@ -167,7 +167,10 @@ pub(super) open spec fn visit_failed<S,E,V:Fn(S,&[Row],u64,u64)->Result<S,E>>(
 /// Select each range before invoking the positional reader for that range.
 pub(super) fn dispatch<S,E,V:Fn(S,&[Row],u64,u64)->Result<S,E>>(rows:&[Row],target:u64,limit:u64,
     initial:S,visit:V) -> (out:Result<S,DispatchError<E>>)
-    requires forall|s:S,p:&[Row],base:u64,n:u64| #[trigger] visit.requires((s,p,base,n)),
+    requires forall|lo:int,hi:int,s:S,p:&[Row],n:u64| #[trigger] batch(rows@,lo,hi,limit) &&
+            #[trigger] dispatched(rows@,lo,initial,s,limit,visit) && p@ == rows@.subrange(lo,hi) &&
+            n as int == frame_end(rows@[hi-1].1)-rows@[lo].1.offset ==>
+            #[trigger] visit.requires((s,p,rows@[lo].1.offset,n)),
     ensures match out {
         Ok(s) => dispatched(rows@,rows.len() as int,initial,s,limit,visit),
         Err(e) => exists|lo:int,state:S| 0 <= lo < rows.len() &&
@@ -182,7 +185,10 @@ pub(super) fn dispatch<S,E,V:Fn(S,&[Row],u64,u64)->Result<S,E>>(rows:&[Row],targ
     let mut state = initial;
     while first < rows.len()
         invariant first <= rows.len(), dispatched(rows@,first as int,initial,state,limit,visit),
-            forall|s:S,p:&[Row],base:u64,n:u64| #[trigger] visit.requires((s,p,base,n)),
+            forall|lo:int,hi:int,s:S,p:&[Row],n:u64| #[trigger] batch(rows@,lo,hi,limit) &&
+            #[trigger] dispatched(rows@,lo,initial,s,limit,visit) && p@ == rows@.subrange(lo,hi) &&
+            n as int == frame_end(rows@[hi-1].1)-rows@[lo].1.offset ==>
+            #[trigger] visit.requires((s,p,rows@[lo].1.offset,n)),
         decreases rows.len()-first,
     {
         let loc = rows[first].1;
@@ -191,6 +197,7 @@ pub(super) fn dispatch<S,E,V:Fn(S,&[Row],u64,u64)->Result<S,E>>(rows:&[Row],targ
         let part = &rows[first..end];
         let ghost prior = state;
         assert(batch(rows@,first as int,end as int,limit));
+        assert(visit.requires((state,part,loc.offset,size)));
         state = match visit(state,part,loc.offset,size) {
             Ok(next) => next,
             Err(error) => {

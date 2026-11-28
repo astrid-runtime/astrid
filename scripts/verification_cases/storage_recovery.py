@@ -118,6 +118,15 @@ def consumer_defects():
         )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
+        ("installed record", "final(loaded)@ == old(loaded)@.insert(id,record)", "final(loaded)@.dom() == old(loaded)@.dom().insert(id)"),
+        ("pending children", "final(next)@ == old(next)@.union(children(record.contents().3).difference(old(loaded)@.dom()))", "old(next)@.subset_of(final(next)@)"),
+    ]:
+        yield (
+            f"coalesced preload installation loses {label}", preload,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_journal_history.rs"),
+        )
+    for label, clause, weaker in [
         ("request uniqueness", "rows@.map(|_,row:(ObjectId,ArenaLocation)| row.0).no_duplicates() &&", "true &&"),
         ("missing identity", "Err(Error::Missing(k)) => missing_failure(roots@,index@,k)", "Err(Error::Missing(k)) => !index@.contains_key(k)"),
     ]:
