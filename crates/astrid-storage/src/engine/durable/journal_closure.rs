@@ -211,6 +211,30 @@ pub(super) fn matching<P:Ord,A,B,F:Fn(&A,&B)->bool>(history:&BTreeMap<P,A>,roots
     }
 }
 
+/// Extend a private copy only when its old entries still name the same slots.
+pub(super) fn extend<P:Ord,S,F:Fn(&S,&S)->bool>(
+    slots:&BTreeMap<P,S>,mut candidate:BTreeMap<P,S>,owner:&P,key:P,fresh:S,same:F,
+) -> (out:Option<BTreeMap<P,S>>)
+    requires btree_map_inv(slots),btree_map_inv(&candidate),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        forall|a:&S,b:&S| #[trigger] same.requires((a,b)),
+    ensures out.is_none() ==> key != *owner || candidate@.contains_key(*owner) || candidate@.dom() != slots@.dom() ||
+        exists|p:P| slots@.contains_key(p) && candidate@.contains_key(p) &&
+            #[trigger] same.ensures((&slots@[p],&candidate@[p]),false),
+        out matches Some(table) ==> btree_map_inv(&table) && key == *owner && !slots@.contains_key(*owner) &&
+        candidate@.dom() == slots@.dom() &&
+        (forall|p:P| #[trigger] slots@.contains_key(p) ==> same.ensures((&slots@[p],&candidate@[p]),true)) &&
+        table@.dom() == slots@.dom().insert(*owner) && table@[*owner] == fresh &&
+        forall|p:P| #[trigger] slots@.contains_key(p) ==> same.ensures((&slots@[p],&table@[p]),true),
+{
+    proof { reveal(vstd::laws_cmp::obeys_cmp_ord); reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties); }
+    if !matches!(P::cmp(owner,&key),std::cmp::Ordering::Equal) || candidate.contains_key(owner) {
+        return None;
+    }
+    if !matching(slots,&candidate,same) {return None;}
+    candidate.insert(key,fresh);
+    Some(candidate)
+}
+
 /// Check fresh live slots while the candidate still belongs exclusively to its builder.
 pub(super) fn install<P:Ord,S,T,F:Fn(&S)->RootState+Copy,W:FnOnce(BTreeMap<P,S>)->T>(roots:&BTreeMap<P,RootState>,candidate:BTreeMap<P,S>,read:F,write:W)
     -> (out:Option<T>)

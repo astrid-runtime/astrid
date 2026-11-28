@@ -120,7 +120,7 @@ where
             _direct_objects: std::mem::take(&mut inner.pending_direct_objects),
             _locations: std::mem::take(&mut inner.pending_index_locations),
             _wal: inner.pending_wal.take(),
-            _published_roots: self.published_roots.entries.swap(Arc::new(BTreeMap::new())),
+            _published_roots: self.published_roots.entries.swap(None),
         }
     }
 
@@ -548,7 +548,7 @@ struct RetiredMetadata<P: Ord> {
     _direct_objects: BTreeMap<ObjectId, super::representations::DirectArenaObject>,
     _locations: Vec<(ObjectId, super::ArenaLocation)>,
     _wal: super::wal::PendingWalOverlay<P>,
-    _published_roots: Arc<BTreeMap<P, Arc<super::PublishedRoot>>>,
+    _published_roots: Option<Arc<BTreeMap<P, Arc<super::PublishedRoot>>>>,
 }
 
 #[cfg(test)]

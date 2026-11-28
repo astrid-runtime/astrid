@@ -20,7 +20,7 @@ fn assert_metadata_released(engine: &DurableEngine<String, TestIdentity, Utf8Cod
     assert!(inner.pending_direct_objects.is_empty());
     assert_eq!(inner.pending_index_locations.capacity(), 0);
     assert!(inner.pending_wal.is_empty());
-    assert!(engine.published_roots.entries.load().is_empty());
+    assert!(engine.published_roots.entries.load().is_none());
     assert!(engine.root_if_ready(&"alice".to_owned()).is_none());
 }
 
@@ -47,7 +47,14 @@ fn retained_closed_engine_releases_history_and_reopens_identical_authority() {
     }
     let count = engine.object_count().unwrap();
     assert!(!engine.inner.lock().validated.is_empty());
-    assert!(!engine.published_roots.entries.load().is_empty());
+    assert!(
+        engine
+            .published_roots
+            .entries
+            .load()
+            .as_ref()
+            .is_some_and(|slots| !slots.is_empty())
+    );
 
     engine.close().unwrap();
     assert_metadata_released(&retained);

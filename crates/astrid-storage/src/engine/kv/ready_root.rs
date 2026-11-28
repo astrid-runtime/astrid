@@ -31,16 +31,16 @@ impl ReadyKvRoot {
     /// Bracket the owner's published-root load with both lifecycle observations.
     /// An unavailable sample triggers fallback. A wrapped empty root is usable.
     pub(crate) fn sample_ready<P,B,L,A>(owner:&P,before:B,load:L,after:A) -> (out:Option<Self>)
-        where B:FnOnce()->bool,L:FnOnce(&P)->Option<RootState>,A:FnOnce()->bool,
+        where B:FnOnce()->bool,L:FnOnce(&P)->Option<Self>,A:FnOnce()->bool,
         requires before.requires(()),before.ensures((),true) ==> load.requires((owner,)) && after.requires(()),
         ensures match out {
-            Some(root) => before.ensures((),true) && load.ensures((owner,),root.sampled()) && after.ensures((),true),
-            None => before.ensures((),false) || after.ensures((),false),
+            Some(root) => before.ensures((),true) && load.ensures((owner,),Some(root)) && after.ensures((),true),
+            None => before.ensures((),false) || after.ensures((),false) || load.ensures((owner,),None),
         },
     {
         if !before() {return None;}
         let root = load(owner);
-        if after() {Some(Self::new(root))} else {None}
+        if after() {root} else {None}
     }
 }
 }

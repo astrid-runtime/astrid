@@ -828,7 +828,7 @@ def hot_point_consumers():
     for path, label, clause, weaker in [
         (root, "entry observation", "Some(root) => before.ensures((),true) &&", "Some(root) =>"),
         (root, "final observation", " && after.ensures((),true),", ","),
-        (root, "published root", " && load.ensures((owner,),root.sampled())", ""),
+        (root, "published root", " && load.ensures((owner,),Some(root))", ""),
         (root, "readiness refusal", "before.ensures((),false) || after.ensures((),false)", "true"),
         (cache, "stored bytes", "final(rows).deep_view() == old(rows).deep_view().insert(key@,value.bytes_view())", "final(rows).deep_view().dom() == old(rows).deep_view().dom().insert(key@)"),
         (cache, "other keys", "final(rows).deep_view() == old(rows).deep_view().insert(key@,value.bytes_view())", "final(rows).deep_view().get(key@) == Some(value.bytes_view())"),

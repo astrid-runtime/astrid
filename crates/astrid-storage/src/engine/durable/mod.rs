@@ -24,7 +24,7 @@ use crate::storage_model::{
     ObjectKind, ObjectRecord, ObjectReference, PhysicalModelError, PrincipalUsage, ReferenceKind,
     ReferenceLabel, RootGeneration, RootState,
 };
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use fs2::FileExt;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -589,7 +589,7 @@ impl PublishedRoot {
 }
 
 struct PublishedRoots<P: Ord> {
-    entries: ArcSwap<BTreeMap<P, Arc<PublishedRoot>>>,
+    entries: ArcSwapOption<BTreeMap<P, Arc<PublishedRoot>>>,
 }
 
 impl<P> PublishedRoots<P>
@@ -598,7 +598,7 @@ where
 {
     fn new(roots: &BTreeMap<P, RootState>) -> Result<Self, DurableError> {
         Self::install(roots, |slots| Self {
-            entries: ArcSwap::from_pointee(slots),
+            entries: ArcSwapOption::from_pointee(slots),
         })
     }
 
@@ -614,26 +614,47 @@ where
             .ok_or(DurableError::InvalidRootProjection)
     }
 
-    fn get(&self, principal: &P) -> Option<RootState> {
-        root_transition::sample(&self.entries.load(), principal, |slot| **slot.value.load())
+    fn get(&self, principal: &P) -> Option<crate::engine::ReadyKvRoot> {
+        let snapshot = self.entries.load();
+        let slots = snapshot.as_ref()?;
+        Some(crate::engine::ReadyKvRoot::new(root_transition::sample(
+            slots,
+            principal,
+            |slot| **slot.value.load(),
+        )))
     }
 
     fn publish(&self, principal: &P, root: RootState) {
+        let snapshot = self.entries.load();
+        let Some(slots) = snapshot.as_ref() else {
+            return;
+        };
         root_transition::publish_slot(
-            &self.entries.load(),
+            slots,
             principal,
             root,
             |slot, replacement| slot.value.store(Arc::new(replacement)),
             |current, owner, replacement| {
-                let mut next = current.clone();
-                next.insert(owner.clone(), Arc::new(PublishedRoot::new(replacement)));
-                self.entries.store(Arc::new(next));
+                let candidate = current
+                    .iter()
+                    .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
+                    .collect();
+                let next = journal_closure::extend(
+                    current,
+                    candidate,
+                    owner,
+                    owner.clone(),
+                    Arc::new(PublishedRoot::new(replacement)),
+                    Arc::ptr_eq,
+                );
+                // A rejected copy makes even absence untrustworthy until a full replacement.
+                self.entries.store(next.map(Arc::new));
             },
         );
     }
 
     fn replace(&self, roots: &BTreeMap<P, RootState>) -> Result<(), DurableError> {
-        Self::install(roots, |slots| self.entries.store(Arc::new(slots)))
+        Self::install(roots, |slots| self.entries.store(Some(Arc::new(slots))))
     }
 }
 

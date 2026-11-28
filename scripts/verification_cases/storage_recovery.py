@@ -169,6 +169,17 @@ def consumer_defects():
             Path("verification/hosted_batch_slots.rs"),
         )
     for label, clause, weaker in [
+        ("refusal", "out.is_none() ==> key != *owner", "out.is_none() ==> true || key != *owner"),
+        ("new slot", " && table@[*owner] == fresh", ""),
+        ("surviving slots", "same.ensures((&slots@[p],&table@[p]),true)", "true"),
+        ("result domain", "table@.dom() == slots@.dom().insert(*owner)", "table@.contains_key(*owner)"),
+    ]:
+        yield (
+            f"slot extension loses {label}", Path("crates/astrid-storage/src/engine/durable/journal_closure.rs"),
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_batch_slots.rs"),
+        )
+    for label, clause, weaker in [
         ("existing owner slot", "update.ensures((&slots@[*owner],root),out)", "exists|s:&S| #[trigger] update.ensures((s,root),out)"),
         ("existing slot root", "update.ensures((&slots@[*owner],root),out)", "exists|r:RootState| #[trigger] update.ensures((&slots@[*owner],r),out)"),
         ("new owner", "new.ensures((slots,owner,root),out)", "exists|p:&P| #[trigger] new.ensures((slots,p,root),out)"),

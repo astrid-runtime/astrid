@@ -255,9 +255,9 @@ fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published
     crate::hot_lookup::store_row(&mut rows,stored_key,copy);
     assert(rows.deep_view().get(stored@) == Some(value.bytes_view()));
     assert(rows.deep_view().dom() =~= set![stored@]);
-    let select = |p:&u64| -> (r:Option<crate::RootState>)
-        ensures r == if *p == owner {published} else {None},
-        {if *p == owner {published} else {None}};
+    let select = |p:&u64| -> (r:Option<crate::ready_root::ReadyKvRoot>)
+        ensures r matches Some(sample) && sample.sampled() == (if *p == owner {published} else {None}),
+        {Some(crate::ready_root::ReadyKvRoot::new(if *p == owner {published} else {None}))};
     let root = crate::ready_root::ReadyKvRoot::sample_ready(&requester,
         || -> (ready:bool) ensures ready == before {before},select,
         || -> (ready:bool) ensures ready == after {after})?.get();
@@ -283,16 +283,35 @@ fn published_sample<P:Ord,S,F:Fn(&S)->crate::RootState>(slots:&std::collections:
         out matches Some(sample) ==> sample.sampled().is_some() == slots@.contains_key(*owner) &&
             (sample.sampled() matches Some(root) ==> observe.ensures((&slots@[*owner],),root)),
 {
-    let load = |p:&P| -> (r:Option<crate::RootState>)
-        ensures r.is_some() == slots@.contains_key(*p),
-            r matches Some(root) ==> observe.ensures((&slots@[*p],),root),
+    let load = |p:&P| -> (r:Option<crate::ready_root::ReadyKvRoot>)
+        ensures r matches Some(sample) && sample.sampled().is_some() == slots@.contains_key(*p) &&
+            (sample.sampled() matches Some(root) ==> observe.ensures((&slots@[*p],),root)),
     {
-        crate::root_transition::sample(slots,p,|slot:&S| -> (root:crate::RootState)
-            ensures observe.ensures((slot,),root), {observe(slot)})
+        Some(crate::ready_root::ReadyKvRoot::new(crate::root_transition::sample(slots,p,|slot:&S| -> (root:crate::RootState)
+            ensures observe.ensures((slot,),root), {observe(slot)})))
     };
     crate::ready_root::ReadyKvRoot::sample_ready(owner,
         || -> (ok:bool) ensures ok == before, {before},load,
         || -> (ok:bool) ensures ok == after, {after})
+}
+
+/// A slot token denotes an allocation; the native comparison uses Arc::ptr_eq.
+fn extended_slots<P:Ord>(slots:&std::collections::BTreeMap<P,u64>,candidate:std::collections::BTreeMap<P,u64>,
+    owner:&P,key:P,fresh:u64) -> (out:Option<std::collections::BTreeMap<P,u64>>)
+    requires vstd::std_specs::btree::btree_map_inv(slots),vstd::std_specs::btree::btree_map_inv(&candidate),
+        vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
+    ensures out.is_some() == (key == *owner && !slots@.contains_key(*owner) && candidate@ == slots@),
+        out matches Some(table) ==> table@ == slots@.insert(*owner,fresh),
+{
+    let same = |a:&u64,b:&u64| -> (ok:bool) ensures ok == (*a == *b), {*a == *b};
+    let result = crate::journal_closure::extend(slots,candidate,owner,key,fresh,same);
+    proof {
+        if let Some(table) = &result {
+            assert(candidate@ =~= slots@);
+            assert(table@ =~= slots@.insert(*owner,fresh));
+        }
+    }
+    result
 }
 
 /// Follow an unpublished candidate through the installation callback and
