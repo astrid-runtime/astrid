@@ -57,6 +57,39 @@ pub(super) fn current<P:Ord,B:Copy>(map:&BTreeMap<P,Projection<B>>,owner:&P,id:O
     if item.matches(id) {Some(item.snapshot())} else {None}
 }
 
+pub(super) open spec fn at_component<P,G,T,E,L,Z,D>(owner:&P,root:super::RootState,graph:L,empty:Z,resolve:D,g:G,t:T) -> bool
+    where L:FnOnce(&P,super::RootState)->Result<(G,Option<ObjectId>),E>,
+        Z:FnOnce()->T,D:FnOnce(&P,ObjectId)->Result<T,E>,
+{
+    (graph.ensures((owner,root),Ok((g,None))) && empty.ensures((),t)) ||
+    exists|id:ObjectId| #[trigger] graph.ensures((owner,root),Ok((g,Some(id)))) &&
+        #[trigger] resolve.ensures((owner,id),Ok(t))
+}
+
+/// Select the projection using the component in this owner's captured graph.
+pub(super) fn read_root<P,G,T,E,L,Z,D>(owner:&P,root:super::RootState,graph:L,empty:Z,resolve:D)
+    -> (out:Result<(G,T),E>)
+    where L:FnOnce(&P,super::RootState)->Result<(G,Option<ObjectId>),E>,
+        Z:FnOnce()->T,D:FnOnce(&P,ObjectId)->Result<T,E>,
+    requires graph.requires((owner,root)),empty.requires(()),
+        forall|id:ObjectId| #[trigger] resolve.requires((owner,id)),
+    ensures out matches Ok((g,t)) ==> at_component(owner,root,graph,empty,resolve,g,t),
+        out matches Err(e) ==> graph.ensures((owner,root),Err(e)) ||
+            exists|g:G,id:ObjectId| #[trigger] graph.ensures((owner,root),Ok((g,Some(id)))) &&
+                resolve.ensures((owner,id),Err(e)),
+{
+    let (g,component)=graph(owner,root)?;
+    let t=match component {
+        Some(id)=>{
+            assert(graph.ensures((owner,root),Ok((g,Some(id)))));
+            resolve(owner,id)?
+        },
+        None=>empty(),
+    };
+    assert(at_component(owner,root,graph,empty,resolve,g,t));
+    Ok((g,t))
+}
+
 /// Prefer the already captured projection, then query the current owner memo,
 /// then decode the addressed component. Only decoding produces a certificate.
 pub(super) fn resolve<P,B,C,E,L,D>(owner:&P,id:ObjectId,captured:Option<Projection<B>>,lookup:L,decode:D)

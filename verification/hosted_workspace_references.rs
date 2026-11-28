@@ -78,6 +78,36 @@ fn kv_from_canonical_rows<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectF
     captured_kv(owner,root,v,commit,state_id,state,load,table)
 }
 
+// Bind the real header dispatch to the physical component row, including resolver errors.
+fn projection_from_canonical_root<P,T,E,L,D>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersion,
+    commit:std::sync::Arc<crate::ObjectRecord>,state_id:ObjectId,state:std::sync::Arc<crate::ObjectRecord>,
+    head:ObjectId,load:L,table:Ghost<spec_fn(P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>>,
+    Ghost(ci):Ghost<int>,Ghost(si):Ghost<int>,empty:T,resolve:D)
+    -> (out:Result<(crate::header_graph::Graph,T),crate::header_graph::KvError<E>>)
+    where L:Fn(&P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>,
+        D:FnOnce(&P,ObjectId)->Result<T,crate::header_graph::KvError<E>>,
+    requires forall|id:ObjectId| #[trigger] resolve.requires((owner,id)), forall|id:ObjectId| #[trigger] load.requires((owner,id)),
+        forall|id:ObjectId,x:Result<std::sync::Arc<crate::ObjectRecord>,E>|
+            #[trigger] load.ensures((owner,id),x) ==> x == (table@)(*owner,id),
+        (table@)(*owner,root.commit)==Ok(commit), (table@)(*owner,state_id)==Ok(state),
+        crate::header_graph::structural(*commit,crate::ObjectKind::Commit,v),
+        crate::header_graph::structural(*state,crate::ObjectKind::PrincipalState,v),
+        crate::ObjectRecord::labels_ordered(commit.contents().3),crate::ObjectRecord::labels_ordered(state.contents().3),
+        0<=ci<commit.contents().3.len(),commit.contents().3[ci].fields()==(b"state"@,state_id,ReferenceKind::Owns),
+        0<=si<state.contents().3.len(),state.contents().3[si].fields()==(b"kv"@,head,ReferenceKind::Owns),
+    ensures match out {
+        Ok((g,t)) => g.commit==commit && g.state==state && g.state_id==state_id &&
+            resolve.ensures((owner,head),Ok(t)),
+        Err(e) => resolve.ensures((owner,head),Err(e)),
+    },
+{
+    let read=|p:&P,r:crate::RootState| -> (out:Result<(crate::header_graph::Graph,Option<ObjectId>),crate::header_graph::KvError<E>>)
+        requires *p==*owner && r==root,
+        ensures out matches Ok((g,Some(id))) && id==head && g.commit==commit && g.state==state && g.state_id==state_id,
+    { kv_from_canonical_rows(p,r,v,commit,state_id,state,head,load,table,Ghost(ci),Ghost(si)) };
+    crate::memo_projection::read_root(owner,root,read,||empty,resolve)
+}
+
 fn find_canonical_state(refs:&[ObjectReference],i:Ghost<int>) -> (out:Option<&ObjectReference>)
     requires crate::ObjectRecord::labels_ordered(refs@), 0 <= i@ < refs.len(), refs@[i@].fields().0 == b"state"@,
     ensures out matches Some(r) && *r == refs@[i@],

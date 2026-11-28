@@ -76,18 +76,26 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let (graph, head) = read_kv_graph(engine, &owner, root)?;
+    let (graph, (projection, checkpoint)) = super::memo_projection::read_root(
+        &owner,
+        root,
+        |principal, root| read_kv_graph(engine, principal, root),
+        || (Projection::empty(), Some(TreeValidation::EMPTY)),
+        |principal, component| {
+            resolve_projection(
+                engine,
+                principal,
+                component,
+                captured_projection,
+                validation,
+            )
+        },
+    )?;
     let crate::storage_model::header_graph::Graph {
         commit,
         state_id,
         state,
     } = graph;
-    let (projection, checkpoint) = match head {
-        None => (Projection::empty(), Some(TreeValidation::EMPTY)),
-        Some(component) => {
-            resolve_projection(engine, &owner, component, captured_projection, validation)?
-        },
-    };
     let (preserved_state, other_quota_bytes) = decode_other_components(
         engine,
         &owner,

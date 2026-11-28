@@ -123,6 +123,20 @@ def defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), trace,
         )
 
+    projection = Path("crates/astrid-storage/src/kv/tree/memo_projection.rs")
+    for label, clause, weaker in [
+        ("success address", "#[trigger] resolve.ensures((owner,id),Ok(t))",
+         "true"),
+        ("error origin", "resolve.ensures((owner,id),Err(e)),",
+         "true,"),
+        ("empty graph selection", "graph.ensures((owner,root),Ok((g,None))) && empty.ensures((),t)",
+         "empty.ensures((),t)"),
+    ]:
+        yield (
+            f"captured header projection loses {label}", projection,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), trace,
+        )
+
     yield (
         "captured KV graph loses canonical row identity", Path("crates/astrid-storage/src/storage_model/reference_lookup.rs"),
         lambda s: replace_once(s, "ensures selected(refs,refs[i].fields().0,lo,hi) == Some(refs[i])",
