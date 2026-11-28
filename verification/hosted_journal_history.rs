@@ -1,4 +1,5 @@
 //! Root-journal transitions at restart, from canonical owner and root bytes to the recovered index.
+use crate::closure_walk::Source;
 use crate::{RootState, owner_codec::{self, Owner}, root_wire};
 use std::collections::BTreeMap;
 use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},std_specs::btree::btree_map_inv,prelude::*};
@@ -114,6 +115,61 @@ fn replay_framed_transition<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(history:&mut BT
             if result.is_ok() {assert(history@ == before.insert(p,(record.replacement,(base as int + prefix) as u64)));}
         }
         if result.is_err() {assert(history@ == before);}
+    }
+}
+
+/// Replay the canonical first root and validate exactly the owning closure
+/// reached through its commit. A reachable reference never authorizes unrelated
+/// preload entries, and a failed walk retains the root's physical frame offset.
+fn replay_then_validate(table:&BTreeMap<crate::ObjectId,crate::ObjectRecord>,owner:u8,root:RootState,
+    scheme:root_wire::Scheme,offset:u64,child:crate::ObjectId,scope:Ghost<Set<crate::ObjectId>>)
+    requires crate::closure_load::Preload(table).valid(),root.generation.value() == 0,
+        crate::closure_walk::closed(root.commit,Set::empty(),crate::closure_load::Preload(table).edges(),scope@),
+{
+    use crate::{journal_transition as tr,journal_closure as gate,closure_load::Preload,closure_walk::{self as walk,Source}};
+    let record = tr::Record {principal:vec![owner],expected:None,replacement:root};
+    assert(record.principal@ =~= seq![owner]);
+    let bytes = tr::encode(&record.principal,scheme,None,root).unwrap();
+    let mut history = BTreeMap::new();
+    let decoded = |name:&[u8]| -> (p:Option<u8>)
+        requires name@ == seq![owner], ensures p == Some(owner), {Some(name[0])};
+    let encoded = |p:&u8| -> (v:Vec<u8>) ensures v@ == seq![*p], {let v = vec![*p]; assert(v@ =~= seq![*p]); v};
+    let r = record.replay(&mut history,scheme,offset,&bytes,decoded,encoded);
+    assert(r.is_ok());
+    assert(history@ == Map::<u8,(RootState,u64)>::empty().insert(owner,(root,offset)));
+    assert(history@.contains_key(owner) && history@[owner] == (root,offset));
+    let ghost graph = Preload(table).edges();
+    match gate::validate(&history,table) {
+        Ok(known)=>{
+            assert(exists|s:Set<crate::ObjectId>| #[trigger] gate::admitted(table,history@[owner].0.commit,s) && s.subset_of(known@));
+            let ghost nodes = choose|s:Set<crate::ObjectId>| #[trigger] gate::admitted(table,root.commit,s) && s.subset_of(known@);
+            assert(table@.contains_key(root.commit) && table@[root.commit].contents().0 is Commit);
+            assert(known@.contains(root.commit));
+            assert(graph[root.commit].contains(child) ==> known@.contains(child));
+            assert forall|k:crate::ObjectId| #[trigger] known@.contains(k) implies nodes.contains(k) by {
+                let (p,s) = choose|p:u8,s:Set<crate::ObjectId>| history@.contains_key(p) &&
+                    #[trigger] gate::admitted(table,history@[p].0.commit,s) && s.contains(k);
+                assert(p == owner && s.subset_of(nodes));
+            }
+            assert(known@ =~= nodes);
+            assert(known@.subset_of(scope@) && known@.subset_of(table@.dom()));
+            assert(exists|rank:Map<crate::ObjectId,nat>| rank.dom() == known@ && #[trigger] walk::ranked(graph,Set::empty(),rank));
+        },
+        Err(e)=>{
+            assert(gate::refused(table,root.commit,offset,e));
+            match e {
+                gate::Failure::Walk(pos,walk::Failure::Cycle(id))=>{
+                    assert(pos == offset && scope@.contains(id) && walk::reaches(graph,Set::empty(),id,id));
+                },
+                gate::Failure::Walk(pos,walk::Failure::Source(id,missing))=>{
+                    assert(pos == offset && missing == id && scope@.contains(id) && !table@.contains_key(id));
+                },
+                gate::Failure::Commit(pos,id,crate::closure_load::CommitError::WrongKind(k))=>{
+                    assert(pos == offset && id == root.commit && table@[id].contents().0 == k && !(k is Commit));
+                },
+                _=>{assert(false);},
+            }
+        },
     }
 }
 

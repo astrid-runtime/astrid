@@ -824,6 +824,7 @@ mod format;
 mod frontier;
 mod group;
 mod index;
+mod journal_closure;
 mod journal_history;
 mod journal_snapshot;
 mod journal_transition;

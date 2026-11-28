@@ -6,6 +6,24 @@ from .common import replace_once
 
 
 def consumer_defects():
+    closures = Path("crates/astrid-storage/src/engine/durable/journal_closure.rs")
+    for label, clause, weaker in [
+        ("commit kind", "table@.contains_key(root) && table@[root].contents().0 is Commit", "table@.contains_key(root)"),
+        ("preloaded identities", "&&& nodes.subset_of(table@.dom())", "&&& true"),
+        ("owning edges", "&&& walk::closed(root,Set::empty(),graph,nodes)", "&&& nodes.contains(root)"),
+        ("least closure", "==> nodes.subset_of(scope)", "==> true"),
+        ("acyclicity", "rank.dom() == nodes && #[trigger] walk::ranked(graph,Set::empty(),rank)", "#[trigger] walk::ranked(graph,Set::empty(),rank)"),
+        ("cycle attribution", "at == pos && walk::reaches(graph,Set::empty(),id,id)", "at == pos"),
+        ("missing object", "missing == id && !table@.contains_key(id)", "missing == id"),
+        ("kind attribution", "at == pos && id == root &&", "at == pos &&"),
+        ("validated membership", "s.subset_of(known@)\n        ) &&", "true\n        ) &&"),
+        ("extra identities", "s.contains(k)),\n        Err(e)", "true),\n        Err(e)"),
+    ]:
+        yield (
+            f"journal closure validation loses {label}", closures,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_journal_history.rs"),
+        )
     transition = Path("crates/astrid-storage/src/engine/durable/journal_transition.rs")
     for label, clause, weaker in [
         ("encoded fields", "bytes@ == wire(name@,scheme,expected,replacement)", "true"),

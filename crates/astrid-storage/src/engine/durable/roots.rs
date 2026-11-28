@@ -111,34 +111,28 @@ pub(super) fn validate_preloaded<P: Ord>(
     recovered: &BTreeMap<P, (RootState, u64)>,
     preload: &BTreeMap<ObjectId, ObjectRecord>,
 ) -> Result<BTreeSet<ObjectId>, DurableError> {
-    super::recovered_closure::check_all(
-        recovered,
-        |commit, at| {
-            use super::closure_walk::Failure;
-            super::closure_load::materialize(preload, commit).map_err(|failure| {
-                let source = match failure {
-                    Failure::Cycle(id) => ModelError::ObjectCycle(id),
-                    Failure::Root(id) | Failure::Source(_, id) => ModelError::MissingObject(id),
-                };
-                recovery_closure_error(source.into(), at)
-            })
+    use super::closure_walk::Failure;
+    use super::journal_closure;
+    journal_closure::validate(recovered, preload).map_err(|failure| match failure {
+        journal_closure::Failure::Walk(at, failure) => {
+            let source = match failure {
+                Failure::Cycle(id) => ModelError::ObjectCycle(id),
+                Failure::Root(id) | Failure::Source(_, id) => ModelError::MissingObject(id),
+            };
+            recovery_closure_error(source.into(), at)
         },
-        |records, commit, at| {
-            super::closure_load::commit_kind(records, commit).map_err(|kind| {
-                DurableError::RecoveryModel {
-                    file: ROOT_FILE,
-                    offset: at,
-                    source: match kind {
-                        CommitError::WrongKind(actual) => ModelError::RootNotCommit {
-                            object: commit,
-                            actual,
-                        },
-                        CommitError::Missing => ModelError::MissingObject(commit),
-                    },
-                }
-            })
+        journal_closure::Failure::Commit(offset, commit, kind) => DurableError::RecoveryModel {
+            file: ROOT_FILE,
+            offset,
+            source: match kind {
+                CommitError::WrongKind(actual) => ModelError::RootNotCommit {
+                    object: commit,
+                    actual,
+                },
+                CommitError::Missing => ModelError::MissingObject(commit),
+            },
         },
-    )
+    })
 }
 
 fn apply_root_journal_record<P, C>(
