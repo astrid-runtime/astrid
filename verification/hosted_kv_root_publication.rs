@@ -115,31 +115,52 @@ proof fn selected_child(record:ObjectRecord,label:Seq<u8>,id:ObjectId)
     owning_child(refs,choose|i:int| 0<=i<refs.len() && refs[i]==edge);
 }
 
+pub(crate) open spec fn owning_edges(table:Map<ObjectId,ObjectRecord>) -> Map<ObjectId,Set<ObjectId>> {
+    table.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3))
+}
+
+proof fn recovered_child(source:ObjectRecord,decoded:ObjectRecord,label:Seq<u8>,id:ObjectId)
+    requires crate::hosted_record_roundtrip::same_fields(decoded,source),
+        crate::reference_lookup::selected(source.contents().3,label,0,source.contents().3.len() as int)
+            matches Some(e) && e.fields()==(label,id,ReferenceKind::Owns),
+    ensures crate::closure_walk::children(decoded.contents().3).contains(id),
+{
+    let refs=source.contents().3;
+    let edge=crate::reference_lookup::selected(refs,label,0,refs.len() as int).unwrap();
+    selected_member(refs,label,0,refs.len() as int,edge);
+    let i=choose|i:int| 0<=i<refs.len() && refs[i]==edge;
+    assert(decoded.contents().3[i].fields()==edge.fields());
+    owning_child(decoded.contents().3,i);
+}
+
 /// Run the recovery materializer on a preloaded table. Other retained references
 /// can lead outside the declaration. A successful closure must include the
 /// selected marker even when those references lead to additional records.
-pub(crate) fn materialize<'a,P>(g:&Graph<P>,table:&'a BTreeMap<ObjectId,ObjectRecord>,v:ObjectFormatVersion)
+pub(crate) fn materialize<'a,P>(g:&Graph<P>,table:&'a BTreeMap<ObjectId,ObjectRecord>,root:ObjectId,v:ObjectFormatVersion)
     -> (out:Result<Vec<(ObjectId,&'a ObjectRecord)>,crate::closure_walk::Failure<ObjectId,ObjectId>>)
-    requires g.links(g.selected.binding().0,g.selected.binding().1,g.records@[g.component],v),
+    requires root==g.selected.binding().2.commit,g.links(g.selected.binding().0,g.selected.binding().1,g.records@[g.component],v),
         obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),btree_map_inv(table),
-        forall|id:ObjectId| #[trigger] g.records@.contains_key(id) ==> table@.contains_key(id) && table@[id]==g.records@[id],
+        forall|id:ObjectId| #[trigger] g.records@.contains_key(id) ==> table@.contains_key(id) && crate::hosted_record_roundtrip::same_fields(table@[id],g.records@[id]),
     ensures out matches Ok(rows) ==> {
         let ids=crate::closure_load::row_ids(rows@).to_set();
+        &&& crate::closure_walk::closed(root,Set::empty(),owning_edges(table@),ids)
+        &&& exists|rank:Map<ObjectId,nat>| rank.dom()==ids && #[trigger] crate::closure_walk::ranked(
+            owning_edges(table@),Set::empty(),rank)
+        &&& ids.subset_of(table@.dom())
         &&& ids.contains(g.selected.binding().2.commit) && ids.contains(g.state) && ids.contains(g.component)
         &&& forall|i:int| 0<=i<rows.len() ==> (#[trigger] rows@[i]).1.contents()==table@[rows@[i].0].contents()
     },
+    out matches Err(crate::closure_walk::Failure::Source(id,missing)) ==> id==missing && !table@.contains_key(id),
+    out matches Err(crate::closure_walk::Failure::Cycle(k)) ==> crate::closure_walk::reaches(
+        owning_edges(table@),Set::empty(),k,k),
+    !(out matches Err(crate::closure_walk::Failure::Root(_))),
 {
-    let root=g.selected.replacement().commit;
     let rows=crate::closure_load::materialize(table,root)?;
     proof {
         assert(g.records@.dom().contains(root));
         assert(g.records@.dom().contains(g.state));
-        assert(table@[root]==g.records@[root]);
-        assert(table@[g.state]==g.records@[g.state]);
-        let commit=table@[root];
-        let state=table@[g.state];
-        selected_child(commit,header_graph::STATE@,g.state);
-        selected_child(state,header_graph::KV@,g.component);
+        recovered_child(g.records@[root],table@[root],header_graph::STATE@,g.state);
+        recovered_child(g.records@[g.state],table@[g.state],header_graph::KV@,g.component);
         let ids=crate::closure_load::row_ids(rows@).to_set();
         use crate::closure_walk::Source;
         let edges=crate::closure_load::Preload(table).edges();
@@ -148,6 +169,10 @@ pub(crate) fn materialize<'a,P>(g:&Graph<P>,table:&'a BTreeMap<ObjectId,ObjectRe
         assert(edges[g.state].contains(g.component));
         assert(ids.contains(g.state));
         assert(ids.contains(g.component));
+        assert forall|k:ObjectId| ids.contains(k) implies table@.contains_key(k) by {
+            let i=choose|i:int| 0<=i<rows.len() && crate::closure_load::row_ids(rows@)[i]==k;
+            assert(rows@[i].0==k);
+        }
     }
     Ok(rows)
 }
@@ -262,7 +287,7 @@ pub(crate) fn fresh_rows<P>(g:&Graph<P>,table:&BTreeMap<ObjectId,ObjectRecord>,v
     ensures out matches Ok(rows) ==> canonical_rows(g,rows@,scheme),
         out matches Err(crate::closure_walk::Failure::Source(k,e)) ==> k==e && !table@.contains_key(k),
         out matches Err(crate::closure_walk::Failure::Cycle(k)) ==> crate::closure_walk::reaches(
-            table@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)),Set::empty(),k,k),
+            owning_edges(table@),Set::empty(),k,k),
         !(out matches Err(crate::closure_walk::Failure::Root(_))),
 {
     use crate::closure_walk::Source;

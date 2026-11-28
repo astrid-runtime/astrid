@@ -318,10 +318,24 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
     Ok(Publication{group:r,journal,rows})
 }
 
-enum RecoveryError<E> { Compression(usize,E), References(usize) }
+enum RecoveryError<E> { Compression(usize,E), References(usize), Closure(crate::closure_walk::Failure<ObjectId,ObjectId>) }
 
 spec fn codec_failure<E,D:Fn(&[u8],usize)->Result<Vec<u8>,E>>(block:Seq<u8>,size:usize,decode:D,error:E) -> bool {
     exists|b:&[u8]| b@==block && #[trigger] decode.ensures((b,size),Err(error))
+}
+
+proof fn same_children(a:Seq<crate::ObjectReference>,b:Seq<crate::ObjectReference>)
+    requires a.len()==b.len(),forall|i:int| 0<=i<a.len() ==> #[trigger] a[i].fields()==b[i].fields(),
+    ensures crate::closure_walk::children(a)==crate::closure_walk::children(b),
+    decreases a.len(),
+{
+    if a.len()>0 {
+        assert(a[0].fields()==b[0].fields());
+        assert forall|i:int| 0<=i<a.skip(1).len() implies #[trigger] a.skip(1)[i].fields()==b.skip(1)[i].fields() by {
+            assert(a.skip(1)[i]==a[i+1] && b.skip(1)[i]==b[i+1]);
+        }
+        same_children(a.skip(1),b.skip(1));
+    }
 }
 
 /// Reconstruct the freshly declared part of the object table from the bodies
@@ -329,12 +343,14 @@ spec fn codec_failure<E,D:Fn(&[u8],usize)->Result<Vec<u8>,E>>(block:Seq<u8>,size
 #[verifier::spinoff_prover]
 #[verifier::rlimit(35)]
 #[verifier::loop_isolation(false)]
-fn recover_table<M:crate::positional_read::Media,E,D,H>(
+fn recover_closure<M:crate::positional_read::Media,E,D,H>(
     p:&Publication<M>,graph:&crate::hosted_kv_root_publication::Graph<Vec<u8>>,
-    scheme:root_wire::Scheme,limit:u64,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,
+    version:crate::ObjectFormatVersion,scheme:root_wire::Scheme,limit:u64,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,
     decode:D,hash:H) -> (out:Result<BTreeMap<ObjectId,ObjectRecord>,RecoveryError<E>>)
     where D:Fn(&[u8],usize)->Result<Vec<u8>,E>,H:Fn(&ObjectRecord)->[u8;32]+Copy,
-    requires crate::hosted_kv_root_publication::canonical_rows(graph,p.rows@,scheme),
+    requires p.journal.replacement==graph.selected.binding().2,
+        graph.links(graph.selected.binding().0,graph.selected.binding().1,graph.records@[graph.component],version),
+        crate::hosted_kv_root_publication::canonical_rows(graph,p.rows@,scheme),
         p.group.objects.len()==p.rows.len(),btree_map_inv(&graph.records),
         obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
         scheme.algorithm@!=seq![0u8,0u8],scheme.construction@!=seq![0u8,0u8],
@@ -346,8 +362,16 @@ fn recover_table<M:crate::positional_read::Media,E,D,H>(
         forall|b:&[u8],n:usize| #[trigger] decode.requires((b,n)),
         forall|i:int,b:&[u8],v:Vec<u8>| 0<=i<p.rows.len() && b@==(compression@)(p.rows@[i].1@) &&
             #[trigger] decode.ensures((b,p.rows@[i].1.len()),Ok(v)) ==> v@==p.rows@[i].1@,
-    ensures out matches Ok(t) ==> t@.dom()==graph.records@.dom() &&
+    ensures out matches Ok(t) ==> crate::closure_walk::closed(p.journal.replacement.commit,Set::empty(),
+            crate::hosted_kv_root_publication::owning_edges(t@),t@.dom()) &&
+        (exists|rank:Map<ObjectId,nat>| rank.dom()==t@.dom() && #[trigger] crate::closure_walk::ranked(
+            crate::hosted_kv_root_publication::owning_edges(t@),Set::empty(),rank)) &&
+        t@.dom()==graph.records@.dom() &&
         forall|k:ObjectId| #[trigger] t@.contains_key(k) ==> crate::hosted_record_roundtrip::same_fields(t@[k],graph.records@[k]),
+        out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Source(k,e))) ==> k==e && !graph.records@.contains_key(k),
+        out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Cycle(k))) ==> crate::closure_walk::reaches(
+            graph.records@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)),Set::empty(),k,k),
+        !(out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Root(_)))),
         out matches Err(RecoveryError::References(i)) ==> i<p.rows.len() && graph.records@[p.rows@[i as int].0].contents().3.len()>0,
         out matches Err(RecoveryError::Compression(i,e)) ==> i<p.rows.len() && p.group.objects@[i as int].flags==1 &&
             codec_failure((compression@)(p.rows@[i as int].1@),p.rows@[i as int].1.len(),decode,e),
@@ -400,6 +424,22 @@ fn recover_table<M:crate::positional_read::Media,E,D,H>(
         i+=1;
     }
     assert(table@.dom() =~= graph.records@.dom());
+    let root=p.journal.replacement.commit;
+    let ghost edges=table@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3));
+    proof {
+        assert forall|k:ObjectId| #[trigger] table@.contains_key(k) implies
+            crate::closure_walk::children(table@[k].contents().3)==crate::closure_walk::children(graph.records@[k].contents().3) by {
+            same_children(table@[k].contents().3,graph.records@[k].contents().3);
+        }
+        assert(edges =~= graph.records@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)));
+    }
+    let rows=match crate::hosted_kv_root_publication::materialize(graph,&table,root,version) {
+        Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(e)),
+    };
+    proof {
+        let ids=crate::closure_load::row_ids(rows@).to_set();
+        assert(ids =~= table@.dom());
+    }
     Ok(table)
 }
 }

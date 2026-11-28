@@ -189,3 +189,18 @@ def consumer_defects():
             f"fresh table recovery loses {label}", named_batch,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), named_batch,
         )
+
+    for label, source, clause, weakness, consumer in [
+        ("WAL root", named_batch, "let root=p.journal.replacement.commit;",
+         "let root=graph.component;", named_batch),
+        ("walk refusal", named_batch, "Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(e)),",
+         "Ok(rows)=>rows,Err(_)=>return Ok(table),", named_batch),
+        ("owning path", publication, "owning_child(decoded.contents().3,i);",
+         "owning_child(source.contents().3,i);", publication),
+        ("acyclicity", publication, "rank.dom()==ids && #[trigger] crate::closure_walk::ranked(",
+         "rank.dom().subset_of(ids) && #[trigger] crate::closure_walk::ranked(", named_batch),
+    ]:
+        yield (
+            f"recovered publication walk loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
+        )
