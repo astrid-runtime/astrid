@@ -1,5 +1,5 @@
 //! Admission after enumerating the two durable token marker namespaces.
-use crate::{marker_batch, marker_key, token_authority::{self, Admission, Marker}};
+use crate::{checkpoint_range::Page, checkpoint_walk::Contents, hosted_checkpoint_walk as checkpoint, marker_batch, marker_key, token_authority::{self, Admission, Marker}};
 use std::collections::HashMap;
 use vstd::prelude::*;
 use vstd::string::StringSliceAdditionalSpecFns;
@@ -343,7 +343,7 @@ spec fn snapshot_refusal<E,F:Fn(&[u8])->Result<Id,E>>(revoked:Map<Seq<u8>,bool>,
 
 /// Each namespace can have its own captured header. State explicitly which
 /// immutable checkpoint and overlay determine the initial admission.
-fn reopen_with_overlays<E,F:Fn(&[u8])->Result<Id,E>+Copy>(mut revoked:Presence,mut consumed:Presence,
+fn reopen_with_overlays<E,F:Fn(&[u8])->Result<Id,E>+Copy>(revoked:Presence,consumed:Presence,
     rev_root:Option<&std::sync::Arc<crate::traversal::Node>>,used_root:Option<&std::sync::Arc<crate::traversal::Node>>,
     target:Id,single_use:bool,legacy:F) -> (out:Result<Admission,E>)
     requires vstd::std_specs::btree::btree_map_inv(&revoked),vstd::std_specs::btree::btree_map_inv(&consumed),
@@ -364,19 +364,184 @@ fn reopen_with_overlays<E,F:Fn(&[u8])->Result<Id,E>+Copy>(mut revoked:Presence,m
     assert(rev_ns@ == "caps:revoked".spec_bytes() && used_ns@ == "caps:used".spec_bytes());
     let ghost rev_before = revoked.deep_view();
     let ghost used_before = consumed.deep_view();
-    apply_marker_overlay(&mut revoked,rev_root,rev_ns);
-    apply_marker_overlay(&mut consumed,used_root,used_ns);
-    let result = mixed_image_fence(&revoked,&consumed,target,single_use,legacy);
+    let mut rev_image = revoked;
+    let mut used_image = consumed;
+    apply_marker_overlay(&mut rev_image,rev_root,rev_ns);
+    apply_marker_overlay(&mut used_image,used_root,used_ns);
+    let result = mixed_image_fence(&rev_image,&used_image,target,single_use,legacy);
     proof {
         if let Err(e) = &result {
-            let k = choose|k:&[u8]| #[trigger] failed_key(&revoked,&consumed,legacy,*e,k);
-            assert(revoked.deep_view().get("caps:revoked".spec_bytes()+seq![0u8]+k@) == Some(true) ||
-                consumed.deep_view().get("caps:used".spec_bytes()+seq![0u8]+k@) == Some(true));
+            let k = choose|k:&[u8]| #[trigger] failed_key(&rev_image,&used_image,legacy,*e,k);
+            assert(rev_image.deep_view().get("caps:revoked".spec_bytes()+seq![0u8]+k@) == Some(true) ||
+                used_image.deep_view().get("caps:used".spec_bytes()+seq![0u8]+k@) == Some(true));
             assert(snapshot_refusal(rev_before,used_before,crate::traversal::deref_option(rev_root),
                 crate::traversal::deref_option(used_root),legacy,*e));
         }
     }
     result
+}
+
+enum RecoveryError<E> {
+    Page(Marker,E),
+    Decoder(Marker,E),
+}
+
+spec fn marker_visible<I,T>(root:Option<I>,has:spec_fn(Page<I,T>)->bool,
+    overlay:Option<std::sync::Arc<crate::traversal::Node>>,address:Seq<u8>) -> bool {
+    match crate::traversal::lookup_spec(overlay,address) {
+        Some(value) => value.is_some(),
+        None => root matches Some(id) && has(Page::Root(id)),
+    }
+}
+
+spec fn page_membership<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read:R,
+    has:spec_fn(Page<I,T>)->bool,ns:Seq<u8>,text:Seq<u8>) -> bool {
+    checkpoint::image(read,has,ns+seq![0u8]+text,ns+seq![0u8],ns+seq![1u8])
+}
+
+spec fn ns_bytes(kind:Marker) -> Seq<u8> {
+    match kind {Marker::Revoked => "caps:revoked".spec_bytes(), Marker::Consumed => "caps:used".spec_bytes()}
+}
+
+spec fn read_failed<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read:R,e:E) -> bool {
+    exists|p:Page<I,T>| #[trigger] read.ensures((p,),Err(e))
+}
+
+spec fn decoder_failed<E,F:Fn(&[u8])->Result<Id,E>>(legacy:F,e:E) -> bool {
+    exists|k:&[u8]| #[trigger] legacy.ensures((k,),Err(e))
+}
+
+spec fn marker_in_snapshot<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(kind:Marker,target:Id,root:Option<I>,
+    read:R,overlay:Option<std::sync::Arc<crate::traversal::Node>>) -> bool {
+    exists|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) && ({
+        let ns = ns_bytes(kind);
+        let address = ns+seq![0u8]+text;
+        ||| crate::traversal::lookup_spec(overlay,address) matches Some(Some(_))
+        ||| exists|h:spec_fn(Page<I,T>)->bool| #[trigger] page_membership(read,h,ns,text) && marker_visible(root,h,overlay,address)
+    })
+}
+
+fn restore_namespace<I,T,V,E,R,F>(groups:&mut HashMap<Id,Vec<Marker>>,kind:Marker,target:Id,root:Option<I>,read:R,
+    overlay:Option<&std::sync::Arc<crate::traversal::Node>>,legacy:F) -> (out:Result<(),RecoveryError<E>>)
+    where R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
+    requires checkpoint::readable(read),hash_map_inv(old(groups)),obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        crate::traversal::ordered(crate::traversal::deref_option(overlay)),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+    ensures hash_map_inv(final(groups)), match out {
+        Ok(()) => {
+            &&& forall|m:Marker| marker_batch::has(old(groups)@,target,m) ==> #[trigger] marker_batch::has(final(groups)@,target,m)
+            &&& marker_in_snapshot(kind,target,root,read,crate::traversal::deref_option(overlay)) ==> marker_batch::has(final(groups)@,target,kind)
+        },
+        Err(RecoveryError::Page(m,e)) => m == kind && read_failed(read,e),
+        Err(RecoveryError::Decoder(m,e)) => m == kind && decoder_failed(legacy,e),
+    },
+{
+    let ns = kind.namespace().as_bytes();
+    assert(ns@ == ns_bytes(kind));
+    let mut table = match checkpoint::scan(root,ns,read) {
+        Ok(t) => t, Err(e) => return Err(RecoveryError::Page(kind,e)),
+    };
+    let ghost base = table.deep_view();
+    let key = marker_key::encode(&target);
+    apply_marker_overlay(&mut table,overlay,ns);
+    let rows = crate::hosted_key_projection::namespace_keys(&table,ns,&key);
+    if let Err(e) = collect_mixed(groups,&rows,kind,target,legacy) {
+        proof {
+            let (i,k) = choose|i:int,k:&[u8]| 0 <= i < rows.len() && #[trigger] rows@[i]@ == k@ && #[trigger] legacy.ensures((k,),Err(e));
+            assert(decoder_failed(legacy,e));
+        }
+        return Err(RecoveryError::Decoder(kind,e));
+    }
+    proof {
+        let tree = crate::traversal::deref_option(overlay);
+        if marker_in_snapshot(kind,target,root,read,tree) {
+            let text = choose|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) && ({
+                let address = ns_bytes(kind)+seq![0u8]+text;
+                ||| crate::traversal::lookup_spec(tree,address) matches Some(Some(_))
+                ||| exists|h:spec_fn(Page<I,T>)->bool| #[trigger] page_membership(read,h,ns_bytes(kind),text) && marker_visible(root,h,tree,address)
+            });
+            marker_key::unique_text(target@,text,key@);
+            let address = ns@+seq![0u8]+key@;
+            if !(crate::traversal::lookup_spec(tree,address) matches Some(Some(_))) {
+                let h = choose|h:spec_fn(Page<I,T>)->bool| #[trigger] page_membership(read,h,ns_bytes(kind),text) && marker_visible(root,h,tree,address);
+                assert(checkpoint::image(read,h,address,ns@+seq![0u8],ns@+seq![1u8]));
+                assert((base.get(address) == Some(true)) == (root matches Some(id) && h(Page::Root(id))));
+            }
+            assert(current_presence(base,crate::traversal::deref_option(overlay),address));
+            assert(table.deep_view().get(address) == Some(true));
+            let i = choose|i:int| 0 <= i < rows.len() && rows@[i]@ == key@;
+            assert(marker_key::spells(target@,rows@[i]@));
+            assert(listed(rows@,target));
+        }
+    }
+    Ok(())
+}
+
+/// Run both namespace scans from their captured checkpoint root IDs. For each
+/// target, the page model relates membership to the actual decoded leaves and
+/// selected child pages. The captured overlays can mask either checkpoint.
+fn reopen_from_pages<I,T,V,E,R,C,F>(rev_id:Option<I>,used_id:Option<I>,rev_read:R,used_read:C,
+    rev_overlay:Option<&std::sync::Arc<crate::traversal::Node>>,used_overlay:Option<&std::sync::Arc<crate::traversal::Node>>,
+    target:Id,single_use:bool,legacy:F) -> (out:Result<Admission,RecoveryError<E>>)
+    where R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>, C:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>,
+        F:Fn(&[u8])->Result<Id,E>+Copy,
+    requires checkpoint::readable(rev_read),checkpoint::readable(used_read),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        crate::traversal::ordered(crate::traversal::deref_option(rev_overlay)),crate::traversal::ordered(crate::traversal::deref_option(used_overlay)),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+    ensures match out {
+        Ok(decision) => {
+            &&& marker_in_snapshot(Marker::Revoked,target,rev_id,rev_read,crate::traversal::deref_option(rev_overlay)) ==> decision is Revoked
+            &&& single_use && marker_in_snapshot(Marker::Consumed,target,used_id,used_read,crate::traversal::deref_option(used_overlay)) ==> !(decision is Allowed)
+        },
+        Err(RecoveryError::Page(Marker::Revoked,e)) => read_failed(rev_read,e),
+        Err(RecoveryError::Page(Marker::Consumed,e)) => read_failed(used_read,e),
+        Err(RecoveryError::Decoder(_,e)) => decoder_failed(legacy,e),
+    },
+{
+    let kinds = Marker::recovery_order();
+    let mut groups = HashMap::new();
+    restore_namespace(&mut groups,kinds[0],target,rev_id,rev_read,rev_overlay,legacy)?;
+    let ghost revoked = marker_batch::has(groups@,target,Marker::Revoked);
+    restore_namespace(&mut groups,kinds[1],target,used_id,used_read,used_overlay,legacy)?;
+    assert(revoked ==> marker_batch::has(groups@,target,Marker::Revoked));
+    Ok(recovered_admission(groups,target,single_use))
+}
+
+/// Instantiate the page evidence for an actual decoded leaf and recover its
+/// marker with the full walker, merger and store replay.
+fn checkpoint_revocation(target:Id) -> (out:Result<Admission,RecoveryError<()>>)
+    requires vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),
+    ensures out matches Ok(decision) && decision is Revoked,
+{
+    let ns = Marker::Revoked.namespace().as_bytes();
+    let text = marker_key::encode(&target);
+    let address = crate::encoding::composite(ns,&text);
+    let end = crate::encoding::prefix_end(ns,&[]);
+    let read = |_:Page<u64,()>| -> (r:Result<Contents<u64,(),()>,()>)
+        ensures r matches Ok(Contents::Leaf(rows)) && rows.len() == 1 && rows@[0].key@ == address@,
+    {
+        let key = crate::encoding::composite(ns,&text);
+        Ok(Contents::Leaf(vec![crate::checkpoint_leaf::Entry {key,value:()}]))
+    };
+    let empty = |_:Page<u64,()>| -> (r:Result<Contents<u64,(),()>,()>)
+        ensures r matches Ok(Contents::Leaf(rows)) && rows.len() == 0, {Ok(Contents::Leaf(Vec::new()))};
+    let legacy = |_:&[u8]| -> (r:Result<Id,()>) ensures r == Ok(target), {Ok(target)};
+    proof {
+        let h = |_:Page<u64,()>| true;
+        let start = ns@ + seq![0u8];
+        assert(crate::encoding::matches_prefix(address@,start));
+        assert(crate::encoding::range_contains(start,end@,address@));
+        assert forall|p:Page<u64,()>,rows:Vec<crate::checkpoint_leaf::Entry<()>>| #[trigger] read.ensures((p,),Ok(Contents::Leaf(rows))) implies
+            checkpoint::contains(rows@,rows@.len(),address@,start,end@) by {
+            assert(rows@[0].key@ == address@);
+        }
+        assert(page_membership(read,h,ns@,text@));
+        assert(marker_visible(Some(1u64),h,None,address@));
+        assert(marker_in_snapshot(Marker::Revoked,target,Some(1u64),read,None));
+    }
+    reopen_from_pages(Some(1u64),None,read,empty,None,None,target,true,legacy)
 }
 
 /// If a canceled CAS installed its marker, the next attempt reads that entry

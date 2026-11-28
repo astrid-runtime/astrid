@@ -37,6 +37,7 @@ pub(super) open spec fn exact_interval(start: Seq<u8>, end: Seq<u8>) -> bool {
 
 pub(super) fn prefix_end(namespace: &[u8], prefix: &[u8]) -> (end: Vec<u8>)
     ensures exact_interval(namespace@ + seq![0u8] + prefix@, end@),
+        prefix.len() == 0 ==> end@ == namespace@ + seq![1u8],
 {
     let mut end = composite(namespace, prefix);
     let ghost start = end@;
@@ -45,7 +46,7 @@ pub(super) fn prefix_end(namespace: &[u8], prefix: &[u8]) -> (end: Vec<u8>)
     loop
         invariant
             start == namespace@ + seq![0u8] + prefix@,
-            separator < end.len() <= start.len(),
+            separator == namespace.len(), separator < end.len() <= start.len(),
             start[separator as int] == 0,
             end@ == start.take(end.len() as int),
             forall|i: int| end.len() <= i < start.len() ==> #[trigger] start[i] == 255,
@@ -57,7 +58,13 @@ pub(super) fn prefix_end(namespace: &[u8], prefix: &[u8]) -> (end: Vec<u8>)
             end[pivot] = byte.saturating_add(1);
             assert(end@.take(pivot as int) =~= start.take(pivot as int));
             assert(successor_at(start, end@, pivot as int));
-            proof { all_prefix_interval(start, end@, pivot as int); }
+            proof {
+                all_prefix_interval(start, end@, pivot as int);
+                if prefix.len() == 0 {
+                    assert(pivot == separator);
+                    assert(end@ =~= namespace@ + seq![1u8]);
+                }
+            }
             return end;
         }
         end.pop();

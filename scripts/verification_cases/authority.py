@@ -306,6 +306,22 @@ def live_token_consumers():
 
 
 def marker_batch_consumers():
+    walk = Path("verification/hosted_checkpoint_walk.rs")
+    replay = Path("verification/hosted_token_recovery.rs")
+    for label, path, clause, weaker, consumer in [
+        ("namespace boundary", Path("crates/astrid-storage/src/kv/encoding.rs"),
+         "prefix.len() == 0 ==> end@ == namespace@ + seq![1u8]", "prefix.len() == 0 ==> end.len() == namespace.len()+1", walk),
+        ("range confinement", walk, "==> #[trigger] encoding::matches_prefix(k,ns@ + seq![0u8])",
+         "==> (#[trigger] encoding::matches_prefix(k,ns@ + seq![0u8]) || true)", replay),
+        ("root membership", walk, "(table.deep_view().get(k) == Some(true)) == (root matches Some(id) && h(Page::Root(id)))",
+         "(table.deep_view().get(k) == Some(true)) ==> (root matches Some(id) && h(Page::Root(id)))", replay),
+        ("reopened revocation", replay, "marker_in_snapshot(Marker::Revoked,target,rev_id,rev_read,crate::traversal::deref_option(rev_overlay)) ==> decision is Revoked",
+         "true", replay),
+    ]:
+        yield (
+            f"checkpoint marker scan loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), consumer,
+        )
     mixed = Path("verification/hosted_token_recovery.rs")
     for label, clause, weaker in [
         ("earlier namespace", "marker_batch::has(old(groups)@,target,m) ||", "false ||"),

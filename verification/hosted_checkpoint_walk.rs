@@ -8,7 +8,7 @@ use crate::{checkpoint_leaf::{self,Entry,visited},checkpoint_range::{Child,Page,
 type Keys = BTreeMap<Vec<u8>,bool>;
 verus! {
 
-spec fn contains<V>(rows:Seq<Entry<V>>,n:nat,key:Seq<u8>,start:Seq<u8>,end:Seq<u8>) -> bool {
+pub(super) open spec fn contains<V>(rows:Seq<Entry<V>>,n:nat,key:Seq<u8>,start:Seq<u8>,end:Seq<u8>) -> bool {
     encoding::range_contains(start,end,key) &&
         exists|i:int| 0 <= i < n && (#[trigger] rows[i]).key@ == key
 }
@@ -31,7 +31,7 @@ proof fn leaf_target<V>(rows:Seq<Entry<V>>,n:nat,key:Seq<u8>,base:Map<Seq<u8>,bo
     }
 }
 
-spec fn pending<I,T>(s:Seq<Page<I,T>>,has:spec_fn(Page<I,T>)->bool) -> bool {
+pub(super) open spec fn pending<I,T>(s:Seq<Page<I,T>>,has:spec_fn(Page<I,T>)->bool) -> bool {
     exists|i:int| 0 <= i < s.len() && has(#[trigger] s[i])
 }
 proof fn combine<I,T>(a:Seq<Page<I,T>>,b:Seq<Page<I,T>>,has:spec_fn(Page<I,T>)->bool)
@@ -55,7 +55,7 @@ spec fn final_value<I,T>(keys:Keys,s:Seq<Page<I,T>>,key:Seq<u8>,has:spec_fn(Page
     if pending(s,has) { Some(true) } else { keys.deep_view().get(key) }
 }
 
-spec fn image<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read:R,has:spec_fn(Page<I,T>)->bool,
+pub(super) open spec fn image<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read:R,has:spec_fn(Page<I,T>)->bool,
     key:Seq<u8>,start:Seq<u8>,end:Seq<u8>) -> bool {
     &&& forall|p:Page<I,T>,rows:Vec<Entry<V>>| #[trigger] read.ensures((p,),Ok(Contents::Leaf(rows))) ==>
         has(p) == contains(rows@,rows@.len(),key,start,end)
@@ -114,6 +114,13 @@ proof fn preserve<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>,F:Fn(Keys,E
 }
 
 verus! {
+/// An out-of-range key has no leaf or scheduled descendant that can supply it.
+proof fn excluded<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read:R,key:Seq<u8>,start:Seq<u8>,end:Seq<u8>)
+    requires !encoding::range_contains(start,end,key),
+    ensures image(read,|_:Page<I,T>| false,key,start,end),
+{
+}
+
 // For each physical address, relate the decoded contents of each page to its
 // membership in that page's requested subrange. A successful traversal has
 // exactly the presence bit of the root, combined with the caller's input map.
@@ -128,9 +135,15 @@ fn enumerate<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(
             h > 0 && (p matches Page::Child(child) ==> child.level == h) &&
             forall|i:int| 0 <= i < c.len() ==> (#[trigger] c@[i]).level as nat+1 == h,
     ensures match out {
-        Ok(after) => btree_map_inv(&after) && after.deep_view().get(key) == if root matches Some(id) && has(Page::Root(id)) {
-            Some(true)
-        } else { keys.deep_view().get(key) },
+        Ok(after) => {
+            &&& btree_map_inv(&after)
+            &&& after.deep_view().get(key) == (if root matches Some(id) && has(Page::Root(id)) {
+                Some(true)
+            } else { keys.deep_view().get(key) })
+            &&& forall|k:Seq<u8>,h:spec_fn(Page<I,T>)->bool| #[trigger] image(read,h,k,start@,end@) ==>
+                after.deep_view().get(k) == (if root matches Some(id) && h(Page::Root(id)) {Some(true)} else {keys.deep_view().get(k)})
+            &&& forall|k:Seq<u8>| !encoding::range_contains(start@,end@,k) ==> #[trigger] after.deep_view().get(k) == keys.deep_view().get(k)
+        },
         Err(e) => exists|history:History<I,T,Keys>,stack:Seq<Page<I,T>>,s:Keys|
             #[trigger] reached(history,root,keys,stack,s,start@,end@,read,checkpoint_leaf::mark::<V,E>) &&
             stack.len()>0 && read.ensures((stack.last(),),Err(e)),
@@ -155,6 +168,16 @@ fn enumerate<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(
                 let n = choose|n:History<I,T,Keys>| #[trigger] reached(n,root,keys,Seq::empty(),after,start@,end@,read,f);
                 preserve(n,root,keys,Seq::empty(),after,start@,end@,read,f,key,has);
                 if let Some(id) = origin { assert(initial::<I,T>(origin)[0] == Page::Root(id)); }
+                assert forall|k:Seq<u8>,h:spec_fn(Page<I,T>)->bool| #[trigger] image(read,h,k,start@,end@) implies
+                    after.deep_view().get(k) == (if origin matches Some(id) && h(Page::Root(id)) {Some(true)} else {keys.deep_view().get(k)}) by {
+                    preserve(n,root,keys,Seq::empty(),after,start@,end@,read,f,k,h);
+                }
+                assert forall|k:Seq<u8>| !encoding::range_contains(start@,end@,k) implies
+                    #[trigger] after.deep_view().get(k) == keys.deep_view().get(k) by {
+                    let never = |_:Page<I,T>| false;
+                    excluded(read,k,start@,end@);
+                    assert(image(read,never,k,start@,end@));
+                }
             }
             Err(e) => {
                 let (n,stack,s) = choose|n:History<I,T,Keys>,stack:Seq<Page<I,T>>,s:Keys|
@@ -178,4 +201,60 @@ fn enumerate<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(
     }
     out
 }
+/// Structural facts required of the authenticated page decoder for termination.
+pub(super) open spec fn readable<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read:R) -> bool {
+    &&& forall|p:Page<I,T>| #[trigger] read.requires((p,))
+    &&& forall|p:Page<I,T>,h:u16,c:Vec<Child<I,T>>| #[trigger] read.ensures((p,),Ok(Contents::Branch(h,c))) ==>
+        h > 0 && (p matches Page::Child(child) ==> child.level == h) &&
+        forall|i:int| 0 <= i < c.len() ==> (#[trigger] c@[i]).level as nat+1 == h
+}
+
+/// Enumerate one namespace from an empty presence map. Keys outside its range
+/// cannot appear even when no logical page-membership model is supplied.
+pub(super) fn scan<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(root:Option<I>,ns:&[u8],read:R)
+    -> (out:Result<Keys,E>)
+    requires readable(read),obeys_cmp::<Vec<u8>>(),obeys_cmp_deep_eq::<Vec<u8>>(),
+    ensures match out {
+        Ok(table) => {
+            &&& btree_map_inv(&table)
+            &&& forall|k:Seq<u8>| table.deep_view().get(k) == Some(true) ==> #[trigger] encoding::matches_prefix(k,ns@ + seq![0u8])
+            &&& forall|k:Seq<u8>,h:spec_fn(Page<I,T>)->bool| #[trigger] image(read,h,k,ns@ + seq![0u8],ns@ + seq![1u8]) ==>
+                (table.deep_view().get(k) == Some(true)) == (root matches Some(id) && h(Page::Root(id)))
+        },
+        Err(e) => exists|p:Page<I,T>| #[trigger] read.ensures((p,),Err(e)),
+    },
+{
+    let start = encoding::composite(ns,&[]);
+    let end = encoding::prefix_end(ns,&[]);
+    let keys = BTreeMap::new();
+    let ghost never = |_:Page<I,T>| false;
+    proof {
+        reveal(vstd::std_specs::btree::btree_map_deep_view_impl);
+        assert(keys.deep_view() =~= Map::empty());
+        assert(!encoding::matches_prefix(Seq::empty(),start@));
+        assert(!encoding::range_contains(start@,end@,Seq::empty()));
+        excluded(read,Seq::empty(),start@,end@);
+    }
+    let out = enumerate(root,&start,&end,keys,read,Ghost(Seq::empty()),Ghost(never));
+    proof {
+        match &out {
+            Ok(table) => {
+                assert forall|k:Seq<u8>| table.deep_view().get(k) == Some(true) implies #[trigger] encoding::matches_prefix(k,ns@ + seq![0u8]) by {
+                    if !encoding::matches_prefix(k,start@) {
+                        assert(!encoding::range_contains(start@,end@,k));
+                        assert(table.deep_view().get(k) == keys.deep_view().get(k));
+                    }
+                }
+            },
+            Err(e) => {
+                let (n,stack,s) = choose|n:History<I,T,Keys>,stack:Seq<Page<I,T>>,s:Keys|
+                    #[trigger] reached(n,root,keys,stack,s,start@,end@,read,checkpoint_leaf::mark::<V,E>) &&
+                    stack.len()>0 && read.ensures((stack.last(),),Err(*e));
+                assert(read.ensures((stack.last(),),Err(*e)));
+            },
+        }
+    }
+    out
+}
+
 }
