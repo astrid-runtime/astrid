@@ -588,6 +588,70 @@ fn closure_prefers_incoming_then_pending_then_the_indexed_record() {
 }
 
 #[test]
+fn indexed_preload_reaches_shared_descendants_and_ignores_nonowning_targets() {
+    use crate::engine::durable::{
+        ARENA_MAGIC, DurableError, File, format::append_frame, preload_indexed_closures,
+    };
+    use crate::storage_model::{ModelError, ObjectReference, ReferenceKind, ReferenceLabel};
+    use std::collections::BTreeMap;
+
+    let mut arena = File::Native(tempfile::tempfile().unwrap());
+    let mut index = BTreeMap::new();
+    let mut stored = BTreeMap::new();
+    let mut save = |tag: u64, links: &[(ObjectId, ReferenceKind)]| {
+        let refs = links
+            .iter()
+            .enumerate()
+            .map(|(i, (id, kind))| {
+                ObjectReference::new(
+                    ReferenceLabel::new(vec![u8::try_from(i).unwrap()]),
+                    *id,
+                    *kind,
+                )
+            })
+            .collect();
+        let object = ObjectRecord::new(
+            ObjectKind::Commit,
+            ObjectFormatVersion::V1,
+            tag.to_le_bytes().to_vec(),
+            refs,
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let id = TestIdentity.identify(&object);
+        let payload = encode_object_frame(scheme(), id, &object).unwrap();
+        let location = append_frame(&mut arena, ARENA_MAGIC, &payload).unwrap();
+        index.insert(id, location);
+        stored.insert(id, object);
+        id
+    };
+    let unrelated = save(1, &[]);
+    let leaf = save(2, &[]);
+    let shared = save(
+        3,
+        &[
+            (leaf, ReferenceKind::Owns),
+            (unrelated, ReferenceKind::Evidence),
+        ],
+    );
+    let first = save(4, &[(shared, ReferenceKind::Owns)]);
+    let second = save(5, &[(shared, ReferenceKind::Owns)]);
+    let limits = RecoveryLimits::process_addressable();
+    let roots = [first, second, first];
+    stored.remove(&unrelated);
+    assert_eq!(
+        preload_indexed_closures(&arena, &index, roots, &TestIdentity, limits).unwrap(),
+        stored
+    );
+    index.remove(&leaf);
+    assert!(
+        matches!(preload_indexed_closures(&arena,&index,roots,&TestIdentity,limits),
+        Err(DurableError::Model(ModelError::MissingObject(id))) if id == leaf)
+    );
+}
+
+#[test]
 fn single_and_batched_arena_reads_bind_the_frame_and_canonical_record_to_the_request() {
     use crate::engine::durable::{
         ARENA_FILE, ARENA_MAGIC, DurableError, File,

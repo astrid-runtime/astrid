@@ -111,30 +111,30 @@ pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
-    let mut loaded = BTreeMap::new();
-    let mut frontier = roots.into_iter().collect::<BTreeSet<_>>();
-    while !frontier.is_empty() {
-        let requested = super::journal_preload::requests(&frontier, &loaded, index)
-            .map_err(ModelError::MissingObject)?;
-        drop(frontier);
-        if requested.is_empty() {
-            break;
-        }
-        let mut next = BTreeSet::new();
-        visit_indexed_objects(
-            arena,
-            &requested,
-            RECOVERY_CLOSURE_READ_TARGET_BYTES,
-            identity,
-            limits,
-            |id, _location, record, _payload| {
-                super::journal_preload::accept(&mut loaded, &mut next, id, record);
-                Ok(())
-            },
-        )?;
-        frontier = next;
-    }
-    Ok(loaded)
+    use super::journal_preload::{Error, accept, preload};
+    preload(
+        index,
+        roots.into_iter().collect(),
+        |mut loaded, requested| {
+            let mut next = BTreeSet::new();
+            visit_indexed_objects(
+                arena,
+                requested,
+                RECOVERY_CLOSURE_READ_TARGET_BYTES,
+                identity,
+                limits,
+                |id, _location, record, _payload| {
+                    accept(&mut loaded, &mut next, id, record);
+                    Ok(())
+                },
+            )?;
+            Ok((loaded, next))
+        },
+    )
+    .map_err(|error| match error {
+        Error::Missing(id) => ModelError::MissingObject(id).into(),
+        Error::Read(error) => error,
+    })
 }
 
 pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(

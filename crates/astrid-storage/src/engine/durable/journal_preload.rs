@@ -101,4 +101,157 @@ pub(super) fn accept(loaded:&mut BTreeMap<ObjectId,ObjectRecord>,next:&mut BTree
     assert(next@ =~= old(next)@.union(children(refs@).difference(loaded@.dom())));
     loaded.insert(id,record);
 }
+type Table = BTreeMap<ObjectId,ObjectRecord>;
+type Frontier = BTreeSet<ObjectId>;
+type Row = (ObjectId,ArenaLocation);
+pub(super) enum Error<E> { Missing(ObjectId), Read(E) }
+
+pub(super) open spec fn selected(rows:Seq<Row>) -> Set<ObjectId> {
+    rows.map(|_,row:Row| row.0).to_set()
+}
+
+pub(super) open spec fn outgoing(table:Map<ObjectId,ObjectRecord>,id:ObjectId) -> Set<ObjectId> {
+    children(table[id].contents().3)
+}
+
+pub(super) open spec fn wave(before:Map<ObjectId,ObjectRecord>,keys:Set<ObjectId>,
+    after:Map<ObjectId,ObjectRecord>,next:Set<ObjectId>) -> bool {
+    &&& before.submap_of(after)
+    &&& after.dom() == before.dom().union(keys)
+    &&& forall|k:ObjectId| keys.contains(k) ==> #[trigger] outgoing(after,k).subset_of(after.dom().union(next))
+    &&& forall|c:ObjectId| #[trigger] next.contains(c) ==> exists|k:ObjectId|
+        keys.contains(k) && #[trigger] outgoing(after,k).contains(c)
+}
+
+pub(super) open spec fn closed_on(table:Map<ObjectId,ObjectRecord>,scope:Set<ObjectId>) -> bool {
+    forall|k:ObjectId| table.contains_key(k) && scope.contains(k) ==> #[trigger] outgoing(table,k).subset_of(scope)
+}
+
+pub(super) open spec fn reachable_only(roots:Set<ObjectId>,table:Map<ObjectId,ObjectRecord>,next:Set<ObjectId>) -> bool {
+    forall|scope:Set<ObjectId>| roots.subset_of(scope) && #[trigger] closed_on(table,scope) ==>
+        table.dom().union(next).subset_of(scope)
+}
+
+pub(super) open spec fn covered(roots:Set<ObjectId>,table:Map<ObjectId,ObjectRecord>,next:Set<ObjectId>) -> bool {
+    &&& roots.subset_of(table.dom().union(next))
+    &&& forall|k:ObjectId| table.contains_key(k) ==> #[trigger] outgoing(table,k).subset_of(table.dom().union(next))
+}
+
+proof fn advance(roots:Set<ObjectId>,before:Map<ObjectId,ObjectRecord>,current:Set<ObjectId>,
+    after:Map<ObjectId,ObjectRecord>,next:Set<ObjectId>)
+    requires covered(roots,before,current), reachable_only(roots,before,current),
+        wave(before,current.difference(before.dom()),after,next),
+    ensures covered(roots,after,next), reachable_only(roots,after,next),
+{
+    let keys = current.difference(before.dom());
+    assert(before.dom().union(current) =~= after.dom());
+    assert forall|k:ObjectId| after.contains_key(k) implies #[trigger] outgoing(after,k).subset_of(after.dom().union(next)) by {
+        if before.contains_key(k) { assert(before[k] == after[k]); assert(outgoing(before,k).subset_of(after.dom())); }
+        else { assert(keys.contains(k)); }
+    }
+    assert forall|scope:Set<ObjectId>| roots.subset_of(scope) && #[trigger] closed_on(after,scope)
+        implies after.dom().union(next).subset_of(scope) by {
+        assert forall|k:ObjectId| before.contains_key(k) && scope.contains(k) implies #[trigger] outgoing(before,k).subset_of(scope) by {
+            assert(after.contains_key(k) && after[k] == before[k]);
+            assert(outgoing(after,k).subset_of(scope));
+        }
+        assert(closed_on(before,scope));
+        assert(after.dom().subset_of(scope));
+        assert forall|c:ObjectId| next.contains(c) implies scope.contains(c) by {
+            let k = choose|k:ObjectId| keys.contains(k) && #[trigger] outgoing(after,k).contains(c);
+            assert(outgoing(after,k).subset_of(scope));
+        }
+    }
+}
+
+pub(super) open spec fn pending_failure(roots:Set<ObjectId>,index:Map<ObjectId,ArenaLocation>,
+    t:Map<ObjectId,ObjectRecord>,frontier:Set<ObjectId>) -> bool {
+    t.dom().subset_of(index.dom()) && covered(roots,t,frontier) && reachable_only(roots,t,frontier)
+}
+
+pub(super) open spec fn read_failure<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
+    roots:Set<ObjectId>,index:Map<ObjectId,ArenaLocation>,read:V,e:E) -> bool {
+    exists|t:Table,r:&[Row],f:Set<ObjectId>| #[trigger] pending_failure(roots,index,t@,f) && r.len()>0 &&
+        selected(r@) == f.difference(t@.dom()) &&
+        (forall|i:int| 0 <= i < r.len() ==> index.contains_key(#[trigger] r@[i].0) && index[r@[i].0] == r@[i].1) &&
+        #[trigger] read.ensures((t,r),Err(e))
+}
+
+/// Continue until every owning edge is resident. A successful read of a
+/// nonempty frontier must strictly increase the resident subset of the index.
+pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
+    index:&BTreeMap<ObjectId,ArenaLocation>,roots:Frontier,read:V) -> (out:Result<Table,Error<E>>)
+    requires btree_map_inv(index), btree_set_inv(&roots), obeys_cmp::<ObjectId>(), obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|t:Table,r:&[Row]| btree_map_inv(&t) && t@.dom().disjoint(selected(r@)) ==> #[trigger] read.requires((t,r)),
+        forall|t:Table,r:&[Row],u:Table,n:Frontier| #[trigger] read.ensures((t,r),Ok((u,n))) ==>
+            btree_map_inv(&u) && btree_set_inv(&n) && wave(t@,selected(r@),u@,n@),
+    ensures match out {
+        Ok(t) => btree_map_inv(&t) && t@.dom().subset_of(index@.dom()) &&
+            covered(roots@,t@,Set::empty()) && reachable_only(roots@,t@,Set::empty()),
+        Err(Error::Missing(k)) => !index@.contains_key(k),
+        Err(Error::Read(e)) => read_failure(roots@,index@,read,e),
+    },
+{
+    let mut table = Table::new();
+    let mut pending = roots;
+    loop
+        invariant btree_map_inv(index),btree_map_inv(&table),btree_set_inv(&pending),
+            obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+            table@.dom().subset_of(index@.dom()),covered(roots@,table@,pending@),reachable_only(roots@,table@,pending@),
+            forall|t:Table,r:&[Row]| btree_map_inv(&t) && t@.dom().disjoint(selected(r@)) ==> #[trigger] read.requires((t,r)),
+            forall|t:Table,r:&[Row],u:Table,n:Frontier| #[trigger] read.ensures((t,r),Ok((u,n))) ==>
+                btree_map_inv(&u) && btree_set_inv(&n) && wave(t@,selected(r@),u@,n@),
+        decreases index@.dom().len() as int - table@.dom().len(),
+    {
+        let ghost frontier = pending@;
+        let rows = {
+            let current = pending;
+            match requests(&current,&table,index) {Ok(r)=>r,Err(k)=>return Err(Error::Missing(k))}
+        };
+        let ghost keys = selected(rows@);
+        let ghost earlier = table@;
+        assert(keys == frontier.difference(earlier.dom()));
+        assert(earlier.dom().disjoint(keys));
+        if rows.is_empty() {
+            assert(keys =~= Set::empty());
+            assert(frontier.subset_of(earlier.dom())) by {
+                assert forall|k:ObjectId| frontier.contains(k) implies earlier.contains_key(k) by {
+                    if !earlier.contains_key(k) {assert(keys.contains(k));}
+                }
+            }
+            assert(earlier.dom().union(frontier) =~= earlier.dom().union(Set::empty()));
+            assert(covered(roots@,earlier,Set::empty()));
+            assert(reachable_only(roots@,earlier,Set::empty()));
+            return Ok(table);
+        }
+        let batch = rows.as_slice();
+        let (updated,next) = match read(table,batch) {
+            Ok(pair)=>pair,
+            Err(e)=>{
+                assert(read.ensures((table,batch),Err(e)) && batch.len()>0);
+                assert(pending_failure(roots@,index@,table@,frontier));
+                assert(read_failure(roots@,index@,read,e));
+                return Err(Error::Read(e));
+            },
+        };
+        table = updated;
+        pending = next;
+        proof {
+            let ids = rows@.map(|_,r:Row| r.0);
+            ids.to_set_ensures();
+            assert forall|k:ObjectId| keys.contains(k) implies index@.contains_key(k) by {
+                assert(ids.contains(k));
+                let j = choose|j:int| 0 <= j < ids.len() && ids[j]==k;
+                assert(index@.contains_key(rows@[j].0));
+            }
+            assert(wave(earlier,keys,table@,pending@));
+            advance(roots@,earlier,frontier,table@,pending@);
+            assert(ids[0] == rows@[0].0 && ids.contains(rows@[0].0));
+            assert(keys.contains(rows@[0].0));
+            earlier.dom().lemma_subset_not_in_lt(table@.dom(),rows@[0].0);
+            vstd::set_lib::lemma_len_subset(table@.dom(),index@.dom());
+        };
+    }
+}
+
 }

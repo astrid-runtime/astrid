@@ -118,6 +118,19 @@ def consumer_defects():
         )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
+        ("indexed domain", "btree_map_inv(&t) && t@.dom().subset_of(index@.dom()) &&", "btree_map_inv(&t) &&"),
+        ("root coverage", "covered(roots@,t@,Set::empty()) && reachable_only(roots@,t@,Set::empty())", "closed_on(t@,t@.dom()) && reachable_only(roots@,t@,Set::empty())"),
+        ("owning coverage", "covered(roots@,t@,Set::empty()) && reachable_only(roots@,t@,Set::empty())", "roots@.subset_of(t@.dom()) && reachable_only(roots@,t@,Set::empty())"),
+        ("least closure", "reachable_only(roots@,t@,Set::empty()),", "true,"),
+        ("missing index entry", "Err(Error::Missing(k)) => !index@.contains_key(k)", "Err(Error::Missing(k)) => true"),
+        ("batch read error", "Err(Error::Read(e)) => read_failure(roots@,index@,read,e)", "Err(Error::Read(e)) => true"),
+    ]:
+        yield (
+            f"multiwave preload loses {label}", preload,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_journal_history.rs"),
+        )
+    for label, clause, weaker in [
         ("frontier coverage", "frontier@.difference(loaded@.dom()) &&", "rows@.map(|_, row:(ObjectId,ArenaLocation)| row.0).to_set() &&"),
         ("indexed membership", "index@.contains_key(#[trigger] rows@[i].0) &&", "#[trigger] rows@[i].0 == rows@[i].0 &&"),
         ("physical location", "index@[rows@[i].0] == rows@[i].1", "true"),

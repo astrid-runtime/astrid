@@ -393,4 +393,115 @@ fn restore_or_keep<P:Ord,E,C,D>(history:&mut BTreeMap<P,(RootState,u64)>, offset
     crate::journal_snapshot::restore(history,offset,payload,rows,encode,decode).is_ok()
 }
 
+type PreloadTable = BTreeMap<crate::ObjectId,crate::ObjectRecord>;
+type PendingIds = std::collections::BTreeSet<crate::ObjectId>;
+type ReadRow = (crate::ObjectId,crate::ArenaLocation);
+
+/// Install the next new ID using the production callback. The callback's
+/// before/after maps and scheduled children imply the aggregate wave law.
+proof fn extend_wave(start:Map<crate::ObjectId,crate::ObjectRecord>,seen:Set<crate::ObjectId>,
+    before:Map<crate::ObjectId,crate::ObjectRecord>,pending:Set<crate::ObjectId>,id:crate::ObjectId,
+    record:crate::ObjectRecord)
+    requires crate::journal_preload::wave(start,seen,before,pending),!before.contains_key(id),
+    ensures crate::journal_preload::wave(start,seen.insert(id),before.insert(id,record),
+        pending.union(crate::closure_walk::children(record.contents().3).difference(before.dom()))),
+{
+    use crate::journal_preload::outgoing;
+    let after = before.insert(id,record);
+    let added = crate::closure_walk::children(record.contents().3).difference(before.dom());
+    let next = pending.union(added);
+    assert(after.dom() =~= start.dom().union(seen.insert(id)));
+    assert forall|k:crate::ObjectId| seen.insert(id).contains(k) implies
+        #[trigger] outgoing(after,k).subset_of(after.dom().union(next)) by {
+        if k == id { assert(after[k] == record); }
+        else { assert(outgoing(before,k).subset_of(before.dom().union(pending))); }
+    }
+    assert forall|c:crate::ObjectId| #[trigger] next.contains(c) implies exists|k:crate::ObjectId|
+        seen.insert(id).contains(k) && #[trigger] outgoing(after,k).contains(c) by {
+        if added.contains(c) {assert(outgoing(after,id).contains(c));}
+        else {
+            let k = choose|k:crate::ObjectId| seen.contains(k) && #[trigger] outgoing(before,k).contains(c);
+            assert(k != id && outgoing(after,k).contains(c));
+        }
+    }
+}
+
+/// Model-independent reader witness. Each success uses the real accept
+/// operation on a fresh row. Errors discard the partial private table.
+fn read_wave<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::ObjectRecord>>(
+    initial:PreloadTable,rows:&[ReadRow],decode:D) -> (out:Result<(PreloadTable,PendingIds),()>)
+    requires btree_map_inv(&initial),obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
+    ensures out matches Ok((t,n)) ==> btree_map_inv(&t) && vstd::std_specs::btree::btree_set_inv(&n) &&
+        crate::journal_preload::wave(initial@,crate::journal_preload::selected(rows@),t@,n@),
+{
+    use crate::journal_preload::{accept,wave,selected};
+    let mut table = initial;
+    let mut next = PendingIds::new();
+    let mut n = 0usize;
+    assert(selected(rows@.take(0)) =~= Set::empty());
+    assert(next@ =~= Set::empty());
+    assert(initial@.dom().union(Set::empty()) =~= table@.dom());
+    assert(initial@.submap_of(table@));
+    assert(wave(initial@,Set::empty(),table@,Set::empty()));
+    while n < rows.len()
+        invariant n <= rows.len(), btree_map_inv(&table), vstd::std_specs::btree::btree_set_inv(&next),
+            obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
+            forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
+            wave(initial@,selected(rows@.take(n as int)),table@,next@),
+        decreases rows.len()-n,
+    {
+        let (id,loc) = rows[n];
+        if table.contains_key(&id) {return Err(());}
+        let Some(r) = decode(id,loc) else {return Err(());};
+        proof { extend_wave(initial@,selected(rows@.take(n as int)),table@,next@,id,r); }
+        accept(&mut table,&mut next,id,r);
+        proof {
+            let keys = rows@.take(n as int).map(|_,row:ReadRow|row.0);
+            assert(rows@.take(n as int+1).map(|_,row:ReadRow|row.0) =~= keys.push(id));
+            keys.push(id).to_set_ensures();
+            keys.to_set_ensures();
+            assert forall|k:crate::ObjectId| keys.push(id).to_set().contains(k) == keys.to_set().insert(id).contains(k) by {
+                vstd::seq_lib::lemma_seq_contains_after_push(keys,id,k);
+            }
+            assert(keys.push(id).to_set() =~= keys.to_set().insert(id));
+        }
+        n = n.saturating_add(1);
+    }
+    assert(rows@.take(n as int) =~= rows@);
+    Ok((table,next))
+}
+
+fn preload_closure<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::ObjectRecord>+Copy>(
+    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,roots:PendingIds,decode:D)
+    requires btree_map_inv(index),vstd::std_specs::btree::btree_set_inv(&roots),
+        obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
+{
+    use crate::journal_preload::{preload,closed_on,selected,wave,outgoing,Error};
+    let read = |t:PreloadTable,r:&[ReadRow]| -> (out:Result<(PreloadTable,PendingIds),()>)
+        requires btree_map_inv(&t),
+        ensures out matches Ok((u,n)) ==> btree_map_inv(&u) && vstd::std_specs::btree::btree_set_inv(&n) &&
+            wave(t@,selected(r@),u@,n@),
+    { read_wave(t,r,decode) };
+    match preload(index,roots,read) {
+        Ok(table) => {
+            assert(table@.dom().union(Set::empty()) =~= table@.dom());
+            assert(crate::journal_preload::covered(roots@,table@,Set::empty()));
+            assert(roots@.subset_of(table@.dom()));
+            assert(table@.dom().subset_of(index@.dom()));
+            assert forall|k:crate::ObjectId| table@.contains_key(k) implies #[trigger] outgoing(table@,k).subset_of(table@.dom()) by {};
+            assert forall|scope:Set<crate::ObjectId>| roots@.subset_of(scope) && #[trigger] closed_on(table@,scope)
+                implies table@.dom().subset_of(scope) by {};
+        },
+        Err(Error::Missing(id)) => {assert(!index@.contains_key(id));},
+        Err(Error::Read(e)) => {
+            assert(crate::journal_preload::read_failure(roots@,index@,read,e));
+            assert(exists|t:PreloadTable,r:&[ReadRow]| r.len()>0 &&
+                (forall|i:int| 0 <= i < r.len() ==> index@.contains_key(#[trigger] r@[i].0) &&
+                    index@[r@[i].0] == r@[i].1) && #[trigger] read.ensures((t,r),Err(e)));
+        },
+    }
+}
+
 }
