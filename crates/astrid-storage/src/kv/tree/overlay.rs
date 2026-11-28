@@ -10,8 +10,12 @@ pub(super) struct OverlayMap {
     root: Option<Arc<Node>>,
 }
 
-use super::{checkpoint_totals, checkpoint_value, delta_mutation, delta_totals, key_projection};
+use super::{
+    ObjectId, checkpoint_totals, checkpoint_value, delta_mutation, delta_totals, key_projection,
+    mutation_replay, replay_values,
+};
 use crate::kv::encoding;
+mod batch;
 mod range;
 mod traversal;
 mod update;
@@ -26,17 +30,24 @@ impl OverlayMap {
         update::put(&mut self.root, key, value);
     }
 
-    pub(super) fn apply<E>(
-        &mut self,
-        totals: &mut checkpoint_totals::NodeTotals,
-        row: &delta_mutation::Mutation,
-        load: impl FnOnce(
-            &Vec<u8>,
-            &Option<checkpoint_value::ValueSlot>,
-            bool,
-        ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), E>,
-    ) -> Result<(), delta_totals::ApplyError<E>> {
-        update::apply(&mut self.root, totals, row, load)
+    pub(super) fn recover<C, E>(
+        self,
+        initial: (C, checkpoint_totals::NodeTotals),
+        tree: Option<ObjectId>,
+        id: ObjectId,
+        rows: &[delta_mutation::Mutation],
+        lookup: impl Fn(C, Option<ObjectId>, &Vec<u8>) -> Result<(C, Option<Vec<u8>>), E> + Copy,
+        value: impl Fn(C, &checkpoint_value::ValueSlot) -> Result<(C, Vec<u8>), E> + Copy,
+    ) -> Result<(C, Self, checkpoint_totals::NodeTotals), batch::Failure<E>> {
+        let (context, root, totals) = batch::run(
+            (initial.0, self.root, initial.1),
+            tree,
+            id,
+            rows,
+            lookup,
+            value,
+        )?;
+        Ok((context, Self { root }, totals))
     }
 
     pub(super) fn stage<E>(

@@ -392,15 +392,9 @@ where
                 OverlayMap::default(),
             )
         },
-        |(mut context, mut overlay), base, object, mutations, mut totals| {
-            apply_validated_mutations(
-                object,
-                &mut context,
-                base,
-                &mut overlay,
-                &mut totals,
-                mutations,
-            )?;
+        |(mut context, overlay), base, object, mutations, totals| {
+            let (overlay, totals) =
+                apply_validated_mutations(object, &mut context, base, overlay, totals, mutations)?;
             Ok(((context, overlay), totals))
         },
     )
@@ -444,49 +438,40 @@ fn apply_validated_mutations<P, E>(
     object: ObjectId,
     context: &mut TreeContext<'_, P, E>,
     tree: Option<ObjectId>,
-    overlay: &mut OverlayMap,
-    totals: &mut NodeTotals,
+    overlay: OverlayMap,
+    totals: NodeTotals,
     mutations: &[Mutation],
-) -> StorageResult<()>
+) -> StorageResult<(OverlayMap, NodeTotals)>
 where
     P: Ord,
     E: KvProjectionEngine<P>,
 {
-    super::mutation_replay::run(
-        (context, overlay, totals),
-        tree,
-        object,
-        mutations,
-        |(context, overlay, totals), tree, object, mutation| {
-            use super::delta_totals::ApplyError;
-            overlay
-                .apply(totals, mutation, |key, slot, needs_checkpoint| {
-                    super::replay_values::resolve(
-                        &mut *context,
-                        tree,
-                        key,
-                        slot.as_ref(),
-                        needs_checkpoint,
-                        |context, base, address| {
-                            let prior = context.get(base, address)?;
-                            Ok((context, prior))
-                        },
-                        |context, value| context.value_bytes(value),
-                    )
-                })
-                .map_err(|error| match error {
-                    ApplyError::Load(e) => e,
-                    ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
-                        invalid(object, "KV delta contains a no-op mutation")
-                    },
-                    ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
-                        replay_accounting_error(e)
-                    },
-                })?;
-            Ok((context, overlay, totals))
-        },
-    )
-    .map(|_| ())
+    use super::delta_totals::ApplyError;
+    let (_, overlay, totals) = overlay
+        .recover(
+            (context, totals),
+            tree,
+            object,
+            mutations,
+            |context, base, key| {
+                let old = context.get(base, key)?;
+                Ok((context, old))
+            },
+            |context, slot| {
+                let data = context.value_bytes(slot)?;
+                Ok((context, data))
+            },
+        )
+        .map_err(|(_, (object, error))| match error {
+            ApplyError::Load(e) => e,
+            ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
+                invalid(object, "KV delta contains a no-op mutation")
+            },
+            ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
+                replay_accounting_error(e)
+            },
+        })?;
+    Ok((overlay, totals))
 }
 
 fn replay_accounting_error(error: super::delta_totals::Error) -> StorageError {

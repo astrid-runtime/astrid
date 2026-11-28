@@ -413,6 +413,10 @@ mod hosted_overlay_range;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/update.rs"]
 mod overlay_update;
+use overlay_update as update;
+#[path = "../crates/astrid-storage/src/kv/tree/overlay/batch.rs"]
+mod overlay_batch;
+mod hosted_overlay_batch;
 
 #[path = "../crates/astrid-kernel/src/kernel_router/principal_scope.rs"]
 mod principal_scope;

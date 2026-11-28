@@ -14,12 +14,12 @@ fn validated_mutations_compare_payloads_and_preserve_same_length_changes() {
         .build_sorted(vec![(key.clone(), before.clone())])
         .unwrap();
     let validated = context.validate_tree(tree).unwrap();
-    let mut totals = NodeTotals {
+    let totals = NodeTotals {
         entries: validated.entries,
         logical_bytes: validated.logical_bytes,
         quota_bytes: validated.quota_bytes,
     };
-    let mut overlay = OverlayMap::default();
+    let overlay = OverlayMap::default();
     let replacement_tree = context
         .build_sorted(vec![(key.clone(), after.clone())])
         .unwrap()
@@ -38,12 +38,12 @@ fn validated_mutations_compare_payloads_and_preserve_same_length_changes() {
             tree.unwrap(),
             &mut context,
             tree,
-            &mut overlay,
-            &mut totals,
+            overlay,
+            totals,
             &mutations,
         )
     });
-    result.unwrap();
+    let (overlay, totals) = result.unwrap();
     assert_eq!(overlay.get(&key), Some(&Some(after)));
     assert_eq!(totals.logical_bytes, validated.logical_bytes);
     assert_eq!(
@@ -56,8 +56,8 @@ fn validated_mutations_compare_payloads_and_preserve_same_length_changes() {
             tree.unwrap(),
             &mut context,
             tree,
-            &mut overlay,
-            &mut totals,
+            overlay,
+            totals,
             &mutations
         )
         .unwrap_err()

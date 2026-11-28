@@ -225,6 +225,21 @@ def consumer_defects():
             f"staged record source loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_record_source.rs"),
         )
+    batch = Path("crates/astrid-storage/src/kv/tree/overlay/batch.rs")
+    for label, clause, weaker in [
+        ("initial context", "&& states[0]==initial", ""),
+        ("all successful mutations", "Ok(s) => h.len()==rows.len()+1 && h.last()==s", "Ok(s) => h.last()==s"),
+        ("failure position", "i<rows.len() && h.len()==i+1 && transition", "i<rows.len() && transition"),
+        ("containing object", "k==id && match e", "match e"),
+        ("successful checkpoint resolution", "&&& replay_values::resolved(before.0,tree,&row.key,", "&&& true || replay_values::resolved(before.0,tree,&row.key,"),
+        ("installed overlay", "&&& update::changed(before.1,next.1,row,before.2,next.2,pair,Ok(()))", "&&& true"),
+        ("refused lookup", "ApplyError::Load(e) => replay_values::resolved", "ApplyError::Load(e) => true || replay_values::resolved"),
+        ("refused change", "&& update::changed(before.1,before.1,row,before.2,before.2,p,Err(e))", "&& true"),
+    ]:
+        yield (
+            f"addressed batch replay loses {label}", batch,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_overlay_batch.rs"),
+        )
     reservations = Path("crates/astrid-storage/src/ownership/reservation_validation.rs")
     for label, clause, weaker in [
         ("retired owner exclusion", "rows@.contains_key(k) ==> !owners@.contains_key(k) &&", "rows@.contains_key(k) ==> true &&"),

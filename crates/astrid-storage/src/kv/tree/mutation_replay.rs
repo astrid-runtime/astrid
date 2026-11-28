@@ -12,6 +12,7 @@ pub(super) open spec fn prefix<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Mutation)->
         f.ensures(((#[trigger] states[i]),tree,id,&rows[i]),Ok(states[i+1]))
 }
 
+#[cfg(verus_keep_ghost)]
 pub(super) fn run<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Mutation)->Result<S,E>>(
     initial:S,tree:Option<ObjectId>,id:ObjectId,rows:&[Mutation],apply:F,
 ) -> (out:Result<S,E>)
@@ -20,6 +21,19 @@ pub(super) fn run<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Mutation)->Result<S,E>>(
     ensures exists|states:Seq<S>| #[trigger] prefix(initial,tree,id,rows@,states,apply) && match out {
         Ok(s) => states.len() == rows.len()+1 && states.last() == s,
         Err(e) => states.len() <= rows.len() && apply.ensures((states.last(),tree,id,&rows@[states.len()-1]),Err(e)),
+    },
+{
+    match run_at(initial,tree,id,rows,apply) {Ok(s)=>Ok(s),Err((_,e))=>Err(e)}
+}
+
+pub(super) fn run_at<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Mutation)->Result<S,E>>(
+    initial:S,tree:Option<ObjectId>,id:ObjectId,rows:&[Mutation],apply:F,
+) -> (out:Result<S,(usize,E)>)
+    requires forall|states:Seq<S>| #[trigger] prefix(initial,tree,id,rows@,states,apply) && states.len() <= rows.len() ==>
+            apply.requires((states.last(),tree,id,&rows@[states.len()-1])),
+    ensures exists|states:Seq<S>| #[trigger] prefix(initial,tree,id,rows@,states,apply) && match out {
+        Ok(s) => states.last() == s && states.len() == rows.len()+1,
+        Err((i,e)) => states.len()==i+1 && i < rows.len() && apply.ensures((states.last(),tree,id,&rows@[i as int]),Err(e)),
     },
 {
     let mut state = initial;
@@ -33,7 +47,9 @@ pub(super) fn run<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Mutation)->Result<S,E>>(
         decreases rows.len()-i,
     {
         assert(apply.requires((state,tree,id,&rows@[i as int])));
-        state = apply(state,tree,id,&rows[i])?;
+        let ghost prior = state;
+        state = match apply(state,tree,id,&rows[i]) {Ok(s)=>s,Err(e)=>return Err((i,e))};
+        assert(apply.ensures((prior,tree,id,&rows@[i as int]),Ok(state)));
         let ghost before = states;
         proof {
             states = before.push(state);
