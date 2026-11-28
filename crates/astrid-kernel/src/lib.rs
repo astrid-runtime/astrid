@@ -376,6 +376,7 @@ pub struct Kernel {
     local_egress: std::sync::RwLock<Option<std::collections::HashMap<String, Vec<String>>>>,
     #[cfg(not(target_family = "wasm"))]
     native_secret_inputs: OnceLock<Arc<astrid_capsule::elicitation::PendingSecretElicits>>,
+    device_sessions: astrid_core::profile::device_sessions::DeviceSessions,
     /// Operator-declared capsule IDs permitted to run as explicit system
     /// singletons. Manifest fields can request uplink behavior but cannot grant
     /// this cross-principal authority themselves.
@@ -1341,6 +1342,7 @@ impl Kernel {
             local_egress: std::sync::RwLock::new(None),
             #[cfg(not(target_family = "wasm"))]
             native_secret_inputs: OnceLock::new(),
+            device_sessions: astrid_core::profile::device_sessions::DeviceSessions::default(),
             system_capsules: RwLock::new(std::collections::HashSet::new()),
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
@@ -3454,6 +3456,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         local_egress: std::sync::RwLock::new(None),
         #[cfg(not(target_family = "wasm"))]
         native_secret_inputs: OnceLock::new(),
+        device_sessions: astrid_core::profile::device_sessions::DeviceSessions::default(),
         system_capsules: RwLock::new(std::collections::HashSet::new()),
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),

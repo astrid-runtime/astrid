@@ -3,7 +3,8 @@
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_core::local_transport::{self, LocalStream};
-use astrid_core::profile::DeviceKey;
+use astrid_core::profile::device_sessions::{DeviceSession, DeviceSessions};
+use astrid_core::profile::{DeviceKey, DeviceKeyId};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
     principal_auth_challenge_message,
@@ -45,28 +46,30 @@ pub async fn authenticate(
     stream: &mut LocalStream,
     expected_token: &SessionToken,
     home: &AstridHome,
-) -> Result<AuthenticatedIdentity, String> {
+    sessions: &DeviceSessions,
+) -> Result<(AuthenticatedIdentity, Option<DeviceSession>), String> {
     verify_peer_credentials(stream)?;
-    let verified = validate_handshake(stream, expected_token, home).await?;
-    Ok(match verified {
-        Some((principal, device_key_id)) => AuthenticatedIdentity {
+    let verified = validate_handshake(stream, expected_token, home, sessions).await?;
+    let (principal, device_key_id, session) = match verified {
+        Some((principal, key, session)) => (principal, Some(key), Some(session)),
+        None => (PrincipalId::anonymous(), None, None),
+    };
+    Ok((
+        AuthenticatedIdentity {
             principal,
-            device_key_id: Some(device_key_id),
+            device_key_id,
             request_owner: RequestOwnerId::generate(),
         },
-        None => AuthenticatedIdentity {
-            principal: PrincipalId::anonymous(),
-            device_key_id: None,
-            request_owner: RequestOwnerId::generate(),
-        },
-    })
+        session,
+    ))
 }
 
 async fn validate_handshake<S>(
     stream: &mut S,
     expected_token: &SessionToken,
     home: &AstridHome,
-) -> Result<Option<(PrincipalId, String)>, String>
+    sessions: &DeviceSessions,
+) -> Result<Option<(PrincipalId, String, DeviceSession)>, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -90,7 +93,7 @@ where
     }
 
     let verified = match request.claimed_principal.as_deref() {
-        Some(claimed) => Some(run_principal_challenge(stream, claimed, home).await?),
+        Some(claimed) => Some(run_principal_challenge(stream, claimed, home, sessions).await?),
         None => None,
     };
     send_response(stream, &HandshakeResponse::ok())
@@ -130,7 +133,8 @@ async fn run_principal_challenge<S>(
     stream: &mut S,
     claimed: &str,
     home: &AstridHome,
-) -> Result<(PrincipalId, String), String>
+    sessions: &DeviceSessions,
+) -> Result<(PrincipalId, String, DeviceSession), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -141,6 +145,9 @@ where
             return Err(format!("invalid claimed principal: {error}"));
         },
     };
+    let admission = sessions
+        .challenge(principal.clone())
+        .map_err(|e| e.to_string())?;
     let nonce_hex = generate_nonce_hex()?;
     send_response(stream, &HandshakeResponse::challenge(nonce_hex.clone()))
         .await
@@ -156,7 +163,17 @@ where
         return Err("missing signature in second handshake frame".to_string());
     };
     match verify_signature(&principal, &nonce_hex, &signature_hex, home) {
-        Ok(key_id) => Ok((principal, key_id)),
+        Ok(key_id) => {
+            let key = DeviceKeyId::new(key_id.clone())?;
+            let session = match admission.bind(key) {
+                Ok(session) => session,
+                Err(error) => {
+                    send_auth_failed(stream).await;
+                    return Err(error.to_string());
+                },
+            };
+            Ok((principal, key_id, session))
+        },
         Err(reason) => {
             send_auth_failed(stream).await;
             Err(reason)
@@ -317,14 +334,26 @@ mod tests {
 
     #[tokio::test]
     async fn signed_handshake_returns_principal_and_device() {
+        signed_handshake(false).await;
+    }
+
+    #[tokio::test]
+    async fn retirement_during_signed_challenge_refuses_the_old_nonce() {
+        signed_handshake(true).await;
+    }
+
+    async fn signed_handshake(retire_during_challenge: bool) {
         let principal = PrincipalId::new("alice").expect("principal");
         let keypair = astrid_crypto::KeyPair::generate();
         let (_temp, home) = home_with_key(&principal, &keypair);
         let token = SessionToken::generate();
         let token_hex = token.to_hex();
         let (mut server, mut client) = tokio::io::duplex(16 * 1024);
-        let task =
-            tokio::spawn(async move { validate_handshake(&mut server, &token, &home).await });
+        let sessions = DeviceSessions::default();
+        let listener_sessions = sessions.clone();
+        let task = tokio::spawn(async move {
+            validate_handshake(&mut server, &token, &home, &listener_sessions).await
+        });
 
         let first = HandshakeRequest {
             token: token_hex.clone(),
@@ -337,6 +366,12 @@ mod tests {
             .await
             .challenge
             .expect("challenge");
+        if retire_during_challenge {
+            // Leave the profile key present to model re-pairing before the
+            // signed response arrives; this nonce belongs to the earlier grant.
+            let key = DeviceKeyId::new(full_device(&keypair).key_id).unwrap();
+            sessions.retire(&principal, &key).await.unwrap();
+        }
         let signed_message = principal_auth_challenge_message(principal.as_str(), &challenge);
         let second = HandshakeRequest {
             token: token_hex,
@@ -345,9 +380,21 @@ mod tests {
             claimed_principal: Some(principal.to_string()),
             signature: Some(keypair.sign(signed_message.as_bytes()).to_hex()),
         };
-        assert!(exchange(&mut client, &second).await.is_ok());
+        let response = exchange(&mut client, &second).await;
+        if retire_during_challenge {
+            assert!(!response.is_ok());
+            assert_eq!(
+                task.await.unwrap().unwrap_err(),
+                "device retired during handshake"
+            );
+            return;
+        }
+        assert!(response.is_ok());
         let identity = task.await.expect("server task").expect("valid handshake");
-        assert_eq!(identity, Some((principal, full_device(&keypair).key_id)));
+        assert_eq!(
+            identity.map(|(p, k, _)| (p, k)),
+            Some((principal, full_device(&keypair).key_id))
+        );
     }
 
     #[tokio::test]
@@ -358,8 +405,9 @@ mod tests {
         let token = SessionToken::generate();
         let token_hex = token.to_hex();
         let (mut server, mut client) = tokio::io::duplex(16 * 1024);
-        let task =
-            tokio::spawn(async move { validate_handshake(&mut server, &token, &home).await });
+        let task = tokio::spawn(async move {
+            validate_handshake(&mut server, &token, &home, &DeviceSessions::default()).await
+        });
         let first = HandshakeRequest {
             token: token_hex.clone(),
             protocol_version: PROTOCOL_VERSION,

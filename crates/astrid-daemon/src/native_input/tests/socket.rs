@@ -156,6 +156,48 @@ fn spawn_private(
     (server, token, shutdown, observed)
 }
 
+#[tokio::test]
+async fn device_retirement_drains_the_signed_native_socket() {
+    let native = signed_native();
+    let token = Arc::new(SessionToken::generate());
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let sessions = astrid_core::profile::device_sessions::DeviceSessions::default();
+    let bus = Arc::new(EventBus::new());
+    let mut connected = bus.subscribe_topic(Topic::client_connect().as_str());
+    let mut disconnected = bus.subscribe_topic(Topic::client_disconnect().as_str());
+    let server = NativeUplink {
+        listener: Arc::new(tokio::sync::Mutex::new(
+            local_transport::bind(&native.home.socket_path()).unwrap(),
+        )),
+        session_token: token.clone(),
+        home: native.home.clone(),
+        event_bus: bus,
+        shutdown: rx,
+    }
+    .spawn_with_device_sessions(
+        astrid_core::kernel_api::CapsuleTopicProbe::new(|_| Box::pin(async { false })),
+        None,
+        sessions.clone(),
+    );
+    let mut socket = connect_signed(&native, &token).await;
+    let key = astrid_core::profile::DeviceKeyId::new(native.device.key_id.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        connected.recv().await.unwrap();
+        sessions
+            .retire(native.identity.principal(), &key)
+            .await
+            .unwrap();
+        disconnected.recv().await.unwrap();
+        tokio::io::copy(&mut socket, &mut tokio::io::sink())
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("revocation must release the serving task and close the peer");
+    shutdown.send_replace(true);
+    server.await.unwrap();
+}
+
 async fn connect_signed(native: &SignedNative, token: &SessionToken) -> LocalStream {
     let mut stream = local_transport::connect(&native.home.socket_path())
         .await

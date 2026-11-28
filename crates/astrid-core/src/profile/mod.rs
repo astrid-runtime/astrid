@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod device;
+pub mod device_sessions;
 mod field;
 mod io_impl;
 mod validation;
