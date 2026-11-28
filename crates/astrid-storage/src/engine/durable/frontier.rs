@@ -55,6 +55,30 @@ pub(super) trait JournalContainer {
 
 #[derive(Debug)]
 pub(super) enum JournalFlush<C> { StableFile, AwaitingContainer(C) }
+/// Concrete storage backing selected by the durable engine.
+#[derive(Debug)]
+pub(super) enum Backing<N,V> { Native(N), Volume(V) }
+
+impl<N,V> Backing<N,V> {
+    pub(super) fn flush_with<C,E,F:FnOnce(&N)->Result<(),E>,G:FnOnce(&V)->C>(
+        &self,fsync:F,capture:G) -> (out:Result<JournalFlush<C>,E>)
+        requires self matches Self::Native(n) ==> fsync.requires((n,)),
+            self matches Self::Volume(v) ==> capture.requires((v,)),
+        ensures match self {
+            Self::Native(n)=>match out {
+                Ok(JournalFlush::StableFile)=>fsync.ensures((n,),Ok(())),
+                Err(e)=>fsync.ensures((n,),Err(e)),
+                _=>false,
+            },
+            Self::Volume(v)=>out matches Ok(JournalFlush::AwaitingContainer(c)) && capture.ensures((v,),c),
+        },
+    {
+        match self {
+            Self::Native(file)=>{fsync(file)?;Ok(JournalFlush::StableFile)}
+            Self::Volume(region)=>Ok(JournalFlush::AwaitingContainer(capture(region))),
+        }
+    }
+}
 #[cfg(verus_keep_ghost)]
 pub(super) ghost enum JournalCall<C,E> { Write(Seq<u8>,Result<(),E>), Sync(Result<JournalFlush<C>,E>) }
 

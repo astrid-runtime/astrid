@@ -6,7 +6,7 @@
 //! owner roots, and publishes the canonical arena/root files before the WAL is
 //! truncated.
 
-use super::super::File;
+use super::super::{File, arena_frame, frontier::JournalFlush};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufWriter, Read, Seek, SeekFrom};
 
@@ -31,9 +31,9 @@ use crate::engine::durable::{
     RecoveryLimits, SharedIdentity, SharedPrincipalCodec,
 };
 
-impl crate::engine::durable::arena_frame::ReplayArena for File {
-    fn sync_replayed(&mut self) -> std::io::Result<()> {
-        self.sync_data()
+impl arena_frame::ReplayArena for File {
+    fn sync_replayed(&mut self) -> std::io::Result<JournalFlush<()>> {
+        self.flush_with(std::fs::File::sync_data, |_| ())
     }
 }
 
@@ -294,7 +294,7 @@ where
     // Even an idempotent object fold may publish a missing direct
     // representation for an already-indexed frame. Make the entire arena
     // source durable before any representation StateCas/flush is published.
-    let locations = crate::engine::durable::arena_frame::release_replayed(arena, locations)
+    let (locations, _) = arena_frame::release_replayed(arena, locations)
         .map_err(|source| io_error("flush WAL-replayed object arena", source))?;
     for ((id, _payload), location) in new_objects.into_iter().zip(locations) {
         index.insert(id, location);

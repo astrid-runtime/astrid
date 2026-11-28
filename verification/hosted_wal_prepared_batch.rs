@@ -323,7 +323,7 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
     Ok(Publication{wal_target:Ghost(wal_target),group:r,journal,rows:Ghost(rows@)})
 }
 
-enum RecoveryError<E,A> { Arena(ArenaError<A>), Compression(usize,E), References(usize), Closure(crate::closure_walk::Failure<ObjectId,ObjectId>) }
+enum RecoveryError<E,A> { Arena(ArenaError<A>), Compression(usize,E), References(usize), Closure(crate::frontier::JournalFlush<()>,crate::closure_walk::Failure<ObjectId,ObjectId>) }
 
 spec fn codec_failure<E,D:Fn(&[u8],usize)->Result<Vec<u8>,E>>(block:Seq<u8>,size:usize,decode:D,error:E) -> bool {
     exists|b:&[u8]| b@==block && #[trigger] decode.ensures((b,size),Err(error))
@@ -352,7 +352,7 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::R
     p:&Publication<M>,Ghost(graph):Ghost<&crate::hosted_kv_root_publication::Graph<Vec<u8>>>,
     version:crate::ObjectFormatVersion,scheme:root_wire::Scheme,limit:u64,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,
     decode:D,hash:H,arena:&mut A,checksum:F)
-    -> (out:Result<(BTreeMap<ObjectId,ObjectRecord>,BTreeMap<ObjectId,crate::ArenaLocation>),RecoveryError<E,A::Error>>)
+    -> (out:Result<(BTreeMap<ObjectId,ObjectRecord>,BTreeMap<ObjectId,crate::ArenaLocation>,crate::frontier::JournalFlush<()>),RecoveryError<E,A::Error>>)
     where D:Fn(&[u8],usize)->Result<Vec<u8>,E>,H:Fn(&ObjectRecord)->[u8;32]+Copy,
     requires old(arena).image().len()<=u64::MAX,old(arena).target()!=p.wal_target@,
         ordered(p.rows@,p.rows@.len()),
@@ -373,8 +373,8 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::R
             #[trigger] decode.ensures((b,p.rows@[i].1.len()),Ok(v)) ==> v@==p.rows@[i].1@,
     ensures final(arena).target()==old(arena).target(),
         out matches Err(RecoveryError::Arena(ArenaError::Sync(e))) ==> A::sync_failed(old(arena).target(),e),
-        (out.is_ok() || (out matches Err(RecoveryError::Closure(_)))) && A::independent(old(arena).target()) ==> final(arena).stable()==final(arena).image(),
-        out matches Ok((t,index)) ==> index@.dom()==t@.dom() &&
+        ((out matches Ok((_,_,crate::frontier::JournalFlush::StableFile))) || (out matches Err(RecoveryError::Closure(crate::frontier::JournalFlush::StableFile,_)))) ==> final(arena).stable()==final(arena).image(),
+        out matches Ok((t,index,_)) ==> index@.dom()==t@.dom() &&
         (forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] arena_entry(index@[p.rows@[i].0],p.rows@[i].1@,final(arena).image(),old(arena).image().len())) &&
         final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
         crate::closure_walk::closed(p.journal.replacement.commit,Set::empty(),
@@ -384,16 +384,16 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::R
         t@.dom()==graph.records@.dom() &&
         forall|k:ObjectId| #[trigger] t@.contains_key(k) ==> crate::hosted_record_roundtrip::same_fields(t@[k],graph.records@[k]),
         ((out matches Err(RecoveryError::References(_))) || (out matches Err(RecoveryError::Compression(_,_)))) ==> final(arena).image()==old(arena).image(),
-        out matches Err(RecoveryError::Closure(_)) ==> final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
+        out matches Err(RecoveryError::Closure(_,_)) ==> final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
             forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] arena_contains(p.rows@[i].1@,final(arena).image(),old(arena).image().len()),
         out matches Err(RecoveryError::Arena(ArenaError::Append(crate::arena_frame::BatchError::Write(e)))) ==> A::write_failed(old(arena).target(),e),
         out matches Err(RecoveryError::Arena(ArenaError::Append(crate::arena_frame::BatchError::Seek(e)))) ==> old(arena).seek_failed(e) && final(arena).image()==old(arena).image(),
         out matches Err(RecoveryError::Arena(ArenaError::Append(crate::arena_frame::BatchError::Overflow))) ==> final(arena).image()==old(arena).image() &&
             (raw_extent(p.rows@,p.rows@.len())>isize::MAX || old(arena).image().len()+raw_extent(p.rows@,p.rows@.len())>u64::MAX),
-        out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Source(k,e))) ==> k==e && !graph.records@.contains_key(k),
-        out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Cycle(k))) ==> crate::closure_walk::reaches(
+        out matches Err(RecoveryError::Closure(_,crate::closure_walk::Failure::Source(k,e))) ==> k==e && !graph.records@.contains_key(k),
+        out matches Err(RecoveryError::Closure(_,crate::closure_walk::Failure::Cycle(k))) ==> crate::closure_walk::reaches(
             graph.records@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)),Set::empty(),k,k),
-        !(out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Root(_)))),
+        !(out matches Err(RecoveryError::Closure(_,crate::closure_walk::Failure::Root(_)))),
         out matches Err(RecoveryError::References(i)) ==> i<p.rows@.len() && graph.records@[p.rows@[i as int].0].contents().3.len()>0,
         out matches Err(RecoveryError::Compression(i,e)) ==> i<p.rows@.len() && p.group.objects@[i as int].flags==1 &&
             codec_failure((compression@)(p.rows@[i as int].1@),p.rows@[i as int].1.len(),decode,e),
@@ -457,7 +457,7 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::R
         }
     }
     proof {same_extent(payloads@,p.rows@,p.rows@.len());}
-    let index=match append_fresh_arena(arena,&payloads,checksum) {Ok(index)=>index,Err(e)=>return Err(RecoveryError::Arena(e))};
+    let (index,flush)=match append_fresh_arena(arena,&payloads,checksum) {Ok(index)=>index,Err(e)=>return Err(RecoveryError::Arena(e))};
     proof {
         assert forall|k:ObjectId| #[trigger] index@.contains_key(k) == table@.contains_key(k) by {
             if index@.contains_key(k) {
@@ -486,12 +486,12 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::R
         assert(edges =~= graph.records@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)));
     }
     let rows=match crate::hosted_kv_root_publication::materialize::<Vec<u8>>(Ghost(graph),&table,root,version) {
-        Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(e)),
+        Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(flush,e)),
     };
     proof {
         let ids=crate::closure_load::row_ids(rows@).to_set();
         assert(ids =~= table@.dom());
     }
-    Ok((table,index))
+    Ok((table,index,flush))
 }
 }

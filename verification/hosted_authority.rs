@@ -297,6 +297,7 @@ mod hosted_closure_model;
 mod group_receipt;
 #[path = "../crates/astrid-storage/src/engine/durable/frontier.rs"]
 mod group_frontier;
+use group_frontier as frontier;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"]
 mod commit_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/transaction.rs"]

@@ -60,14 +60,14 @@ pub(super) open spec fn arena_entry(loc:crate::ArenaLocation,raw:Seq<u8>,image:S
 #[verifier::loop_isolation(false)]
 pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
     arena:&mut A,rows:&[(ObjectId,Vec<u8>)],hash:H)
-    -> (out:Result<BTreeMap<ObjectId,crate::ArenaLocation>,ArenaError<A::Error>>)
+    -> (out:Result<(BTreeMap<ObjectId,crate::ArenaLocation>,crate::frontier::JournalFlush<()>),ArenaError<A::Error>>)
     requires old(arena).image().len()<=u64::MAX,obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
         forall|i:int,j:int| 0<=i<j<rows.len() ==> (#[trigger] rows@[i].0)!=(#[trigger] rows@[j].0),
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((crate::arena_frame::ARENA_MAGIC,n,b)),
     ensures final(arena).target()==old(arena).target(),
         out matches Err(ArenaError::Sync(e)) ==> A::sync_failed(old(arena).target(),e),
-        out matches Ok(index) ==> {
-            &&& A::independent(old(arena).target()) ==> final(arena).stable()==final(arena).image()
+        out matches Ok((index,flush)) ==> {
+            &&& flush is StableFile ==> final(arena).stable()==final(arena).image()
             &&& btree_map_inv(&index)
             &&& final(arena).image().take(old(arena).image().len() as int)==old(arena).image()
             &&& forall|i:int| 0<=i<rows.len() ==> {
@@ -102,7 +102,7 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
     };
     let ghost packed=choose|s:Seq<u8>| arena.image()==prior+s &&
         #[trigger] frame::packed(rows,payload_of,hash,base,frame::ARENA_MAGIC,frame::FRAME_VERSION,Seq::empty(),s,written@);
-    let locations=match frame::release_replayed(arena,written) {
+    let (locations,flush)=match frame::release_replayed(arena,written) {
         Ok(locations)=>locations,Err(e)=>return Err(ArenaError::Sync(e)),
     };
     assert(arena.image().take(prior.len() as int) =~= prior);
@@ -128,6 +128,6 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
         index.insert(rows[i].0,loc);
         i+=1;
     }
-    Ok(index)
+    Ok((index,flush))
 }
 }

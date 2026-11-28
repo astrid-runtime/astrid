@@ -46,11 +46,7 @@ pub(in crate::engine::durable) enum StoreLock {
 /// Native files remain available for legacy import and format tests. Runtime
 /// layout two opens the same engine over [`VolumeFile`], so object and root
 /// authority no longer depends on a host directory namespace.
-#[derive(Debug)]
-pub(in crate::engine::durable) enum File {
-    Native(NativeFile),
-    Volume(VolumeFile),
-}
+pub(in crate::engine::durable) type File = super::frontier::Backing<NativeFile, VolumeFile>;
 
 /// Common random-access durable byte stream used by both legacy host files and
 /// Astrid volume regions.
@@ -114,12 +110,7 @@ impl File {
     }
 
     pub(super) fn flush_region(&self) -> io::Result<super::frontier::JournalFlush<VolumeFile>> {
-        use super::frontier::JournalFlush;
-        match self {
-            Self::Native(file) => file.sync_data().map(|()| JournalFlush::StableFile),
-            // ASTVOL1 durability is one container fsync via AstridVolume::sync.
-            Self::Volume(file) => Ok(JournalFlush::AwaitingContainer(file.clone())),
-        }
+        self.flush_with(NativeFile::sync_data, Clone::clone)
     }
 
     pub(in crate::engine::durable) fn set_len(&self, length: u64) -> io::Result<()> {

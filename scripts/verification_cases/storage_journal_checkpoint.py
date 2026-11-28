@@ -193,8 +193,8 @@ def consumer_defects():
     for label, source, clause, weakness, consumer in [
         ("WAL root", named_batch, "let root=p.journal.replacement.commit;",
          "let root=ObjectId::new([0;32]);", named_batch),
-        ("walk refusal", named_batch, "Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(e)),",
-         "Ok(rows)=>rows,Err(_)=>return Ok((table,index)),", named_batch),
+        ("walk refusal", named_batch, "Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(flush,e)),",
+         "Ok(rows)=>rows,Err(_)=>return Ok((table,index,flush)),", named_batch),
         ("owning path", publication, "owning_child(decoded.contents().3,i);",
          "owning_child(source.contents().3,i);", publication),
         ("acyclicity", publication, "rank.dom()==ids && #[trigger] crate::closure_walk::ranked(",
@@ -236,13 +236,16 @@ def consumer_defects():
 
     sync_source = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     for label, source, clause, weakness, consumer in [
-        ("required flush", sync_source, "file.sync_replayed()?;", "/* skip arena flush */", sync_source),
+        ("volume receipt", Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+         "Self::Volume(region)=>Ok(JournalFlush::AwaitingContainer(capture(region)))",
+         "Self::Volume(_)=>Ok(JournalFlush::StableFile)", Path("crates/astrid-storage/src/engine/durable/frontier.rs")),
+        ("required flush", sync_source, "let flush=file.sync_replayed()?;", "let flush=JournalFlush::StableFile;", sync_source),
         ("stable image", sync_source,
-         "v@==locations@ && (S::independent(old(file).target()) ==> final(file).stable()==old(file).image())",
+         "v@==locations@ && (flush is StableFile ==> final(file).stable()==old(file).image())",
          "v@==locations@", arena_batch),
         ("release on success", arena_batch,
          "Ok(locations)=>locations,Err(e)=>return Err(ArenaError::Sync(e)),",
-         "Ok(locations)=>locations,Err(_)=>Vec::new(),", arena_batch),
+         "Ok(locations)=>locations,Err(_)=>(Vec::new(),crate::frontier::JournalFlush::StableFile),", arena_batch),
     ]:
         yield (
             f"arena sync loses {label}", source,

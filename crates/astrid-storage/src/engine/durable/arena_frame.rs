@@ -1,5 +1,5 @@
 //! Encode physical arena frame headers and assign contiguous append locations.
-use super::root_wire;
+use super::{frontier::JournalFlush, root_wire};
 use vstd::prelude::*;
 
 verus! {
@@ -261,25 +261,24 @@ pub(super) trait BatchFile {
 /// Native files synchronize independently. A region of a shared volume
 /// reaches stable media when its container is synchronized.
 pub(super) trait ReplayArena:BatchFile {
-    spec fn independent(target:(int,Seq<u8>)) -> bool;
     spec fn stable(&self) -> Seq<u8>;
     spec fn sync_failed(target:(int,Seq<u8>),e:Self::Error) -> bool;
 
-    fn sync_replayed(&mut self) -> (out:Result<(),Self::Error>)
+    fn sync_replayed(&mut self) -> (out:Result<JournalFlush<()>,Self::Error>)
         ensures final(self).target()==old(self).target(),final(self).image()==old(self).image(),
             out matches Err(e) ==> Self::sync_failed(old(self).target(),e),
-            out.is_ok() && Self::independent(old(self).target()) ==> final(self).stable()==old(self).image();
+            out matches Ok(JournalFlush::StableFile) ==> final(self).stable()==old(self).image();
 }
 
 /// Release the locations for indexing only after synchronizing the arena.
 pub(super) fn release_replayed<S:ReplayArena>(file:&mut S,locations:Vec<ArenaLocation>)
-    -> (out:Result<Vec<ArenaLocation>,S::Error>)
+    -> (out:Result<(Vec<ArenaLocation>,JournalFlush<()>),S::Error>)
     ensures final(file).target()==old(file).target(),final(file).image()==old(file).image(),
-        out matches Ok(v) ==> v@==locations@ && (S::independent(old(file).target()) ==> final(file).stable()==old(file).image()),
+        out matches Ok((v,flush)) ==> v@==locations@ && (flush is StableFile ==> final(file).stable()==old(file).image()),
         out matches Err(e) ==> S::sync_failed(old(file).target(),e),
 {
-    file.sync_replayed()?;
-    Ok(locations)
+    let flush=file.sync_replayed()?;
+    Ok((locations,flush))
 }
 
 pub(super) type FrameBatch = (Vec<u8>,Vec<ArenaLocation>);
