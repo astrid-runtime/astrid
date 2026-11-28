@@ -75,6 +75,22 @@ fn collect_namespace(
     }
 }
 
+fn recovered_admission(recorded:HashMap<Id,Vec<Marker>>,target:Id,single_use:bool) -> (out:Admission)
+    requires hash_map_inv(&recorded),obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),
+    ensures ({
+        let revoked = marker_batch::has(recorded@,target,Marker::Revoked);
+        let used = marker_batch::has(recorded@,target,Marker::Consumed);
+        &&& (out is Revoked) == revoked
+        &&& (out is AlreadyUsed) == (!revoked && used && single_use)
+        &&& (out is Allowed) == (!revoked && (!used || !single_use))
+    }),
+{
+    let ghost history = if recorded@.contains_key(target) { recorded@[target]@ } else { Seq::empty() };
+    proof { token_authority::replay_keeps_markers(history); }
+    let live = token_authority::recover_authority(recorded);
+    token_authority::status(&live,&target).admit(single_use)
+}
+
 /// Both namespaces replay into a single store. One token may be present in both.
 fn reopen(revoked: &[Key], consumed: &[Key], target: Id, single_use: bool) -> (decision: Admission)
     requires obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
@@ -97,13 +113,7 @@ fn reopen(revoked: &[Key], consumed: &[Key], target: Id, single_use: bool) -> (d
     collect_namespace(&mut recorded,consumed,kinds[1]);
     assert(marker_batch::has(recorded@,target,Marker::Revoked) == listed(revoked@,target));
     assert(marker_batch::has(recorded@,target,Marker::Consumed) == listed(consumed@,target));
-    let ghost history = if recorded@.contains_key(target) { recorded@[target]@ } else { Seq::empty() };
-    proof { token_authority::replay_keeps_markers(history); }
-    let live = token_authority::recover_authority(recorded);
-    let decision = token_authority::status(&live,&target).admit(single_use);
-    assert((decision is Revoked) == listed(revoked@,target));
-    assert((decision is AlreadyUsed) == (!listed(revoked@,target) && single_use && listed(consumed@,target)));
-    decision
+    recovered_admission(recorded,target,single_use)
 }
 
 type Presence = std::collections::BTreeMap<Vec<u8>,bool>;
@@ -161,6 +171,125 @@ fn admission_from_images(revoked:&Presence,consumed:&Presence,target:Id,single_u
     let revoked_keys = projected_markers(revoked,order[0].namespace().as_bytes(),&target);
     let consumed_keys = projected_markers(consumed,order[1].namespace().as_bytes(),&target);
     reopen(&revoked_keys,&consumed_keys,target,single_use)
+}
+
+/// A successful mixed enumeration cannot erase a canonical marker, even
+/// when the legacy decoder supplies unrelated IDs or repeats an existing ID.
+fn collect_mixed<E,F:Fn(&[u8])->Result<Id,E>+Copy>(groups:&mut HashMap<Id,Vec<Marker>>,
+    rows:&[Key],kind:Marker,target:Id,legacy:F) -> (out:Result<(),E>)
+    requires hash_map_inv(old(groups)),obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),
+        forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+    ensures hash_map_inv(final(groups)),
+        out.is_ok() ==> forall|m:Marker| marker_batch::has(old(groups)@,target,m) ||
+            (kind == m && listed(rows@,target)) ==> #[trigger] marker_batch::has(final(groups)@,target,m),
+        out matches Err(e) ==> exists|i:int,k:&[u8]| 0 <= i < rows.len() && #[trigger] rows@[i]@ == k@ &&
+            #[trigger] legacy.ensures((k,),Err(e)),
+{
+    let decode = |key:&Key| -> (r:Result<Id,E>)
+        ensures marker_key::spells(target@,key@) ==> r == Ok(target),
+            r matches Err(e) ==> exists|k:&[u8]| k@ == key@ && #[trigger] legacy.ensures((k,),Err(e)),
+    {
+        let slice = key.as_slice();
+        let fallback = |k:&[u8]| -> (v:Result<Id,E>) ensures legacy.ensures((k,),v), {legacy(k)};
+        let result = marker_key::decode_compatible(slice,fallback);
+        proof {
+            if let Err(e) = &result {
+                assert(!(exists|id:Id| #[trigger] marker_key::spells(id@,key@)));
+                assert(fallback.ensures((slice,),Err(*e)));
+            }
+        }
+        result
+    };
+    let result = marker_batch::group(groups,rows,kind,decode);
+    let ghost ids = choose|ids:Seq<Id>| marker_batch::grouped(old(groups)@,groups@,ids,kind) &&
+        marker_batch::decoded(rows@,ids,decode) && match result {
+            Ok(()) => ids.len() == rows.len(),
+            Err(e) => ids.len() < rows.len() && decode.ensures((&rows@[ids.len() as int],),Err(e)),
+        };
+    proof {
+        if result.is_ok() {
+            if listed(rows@,target) {
+                let i = choose|i:int| 0 <= i < rows.len() && marker_key::spells(target@,rows@[i]@);
+                assert(decode.ensures((&rows@[i],),Ok(ids[i])));
+                assert(marker_key::spells(target@,rows@[i]@));
+                assert(ids[i] == target);
+                assert(ids.contains(target));
+            }
+        } else if let Err(e) = &result {
+            let i = ids.len() as int;
+            assert(decode.ensures((&rows@[i],),Err(*e)));
+            let k = choose|k:&[u8]| k@ == rows@[i]@ && #[trigger] legacy.ensures((k,),Err(*e));
+        }
+    }
+    result
+}
+
+spec fn failed_key<E,F:Fn(&[u8])->Result<Id,E>>(revoked:&Presence,consumed:&Presence,legacy:F,e:E,key:&[u8]) -> bool {
+    legacy.ensures((key,),Err(e)) &&
+        (revoked.deep_view().get("caps:revoked".spec_bytes() + seq![0u8] + key@) == Some(true) ||
+         consumed.deep_view().get("caps:used".spec_bytes() + seq![0u8] + key@) == Some(true))
+}
+
+spec fn failed_image<E,F:Fn(&[u8])->Result<Id,E>>(revoked:&Presence,consumed:&Presence,legacy:F,e:E) -> bool {
+    exists|key:&[u8]| #[trigger] failed_key(revoked,consumed,legacy,e,key)
+}
+
+/// A target with a canonical marker stays fenced in an image containing
+/// arbitrary legacy keys. Any rejected row prevents startup from admitting.
+fn mixed_image_fence<E,F:Fn(&[u8])->Result<Id,E>+Copy>(revoked:&Presence,consumed:&Presence,target:Id,single_use:bool,
+    legacy:F) -> (out:Result<Admission,E>)
+    requires vstd::std_specs::btree::btree_map_inv(revoked),vstd::std_specs::btree::btree_map_inv(consumed),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(), forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+        forall|k:Vec<u8>| revoked@.get(k) == Some(true) ==> #[trigger] crate::encoding::matches_prefix(k@,"caps:revoked".spec_bytes() + seq![0u8]),
+        forall|k:Vec<u8>| consumed@.get(k) == Some(true) ==> #[trigger] crate::encoding::matches_prefix(k@,"caps:used".spec_bytes() + seq![0u8]),
+    ensures out matches Ok(decision) ==> forall|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) ==> ({
+        &&& revoked.deep_view().get("caps:revoked".spec_bytes() + seq![0u8] + text) == Some(true) ==> decision is Revoked
+        &&& single_use && consumed.deep_view().get("caps:used".spec_bytes() + seq![0u8] + text) == Some(true) ==> !(decision is Allowed)
+    }),
+        match out { Err(e) => failed_image(revoked,consumed,legacy,e), _ => true },
+{
+    let key = marker_key::encode(&target);
+    let kinds = Marker::recovery_order();
+    let mut groups = HashMap::new();
+    let r = crate::hosted_key_projection::namespace_keys(revoked,kinds[0].namespace().as_bytes(),&key);
+    if let Err(e) = collect_mixed(&mut groups,&r,kinds[0],target,legacy) {
+        proof {
+            let (i,k) = choose|i:int,k:&[u8]| 0 <= i < r.len() && #[trigger] r@[i]@ == k@ && #[trigger] legacy.ensures((k,),Err(e));
+            assert(revoked.deep_view().get("caps:revoked".spec_bytes() + seq![0u8] + r@[i]@) == Some(true));
+            assert(legacy.ensures((k,),Err(e)));
+            assert(revoked.deep_view().get("caps:revoked".spec_bytes() + seq![0u8] + k@) == Some(true));
+            assert(failed_key(revoked,consumed,legacy,e,k));
+            assert(failed_image(revoked,consumed,legacy,e));
+        }
+        return Err(e);
+    }
+    let c = crate::hosted_key_projection::namespace_keys(consumed,kinds[1].namespace().as_bytes(),&key);
+    if let Err(e) = collect_mixed(&mut groups,&c,kinds[1],target,legacy) {
+        proof {
+            let (i,k) = choose|i:int,k:&[u8]| 0 <= i < c.len() && #[trigger] c@[i]@ == k@ && #[trigger] legacy.ensures((k,),Err(e));
+            assert(consumed.deep_view().get("caps:used".spec_bytes() + seq![0u8] + c@[i]@) == Some(true));
+            assert(legacy.ensures((k,),Err(e)));
+            assert(consumed.deep_view().get("caps:used".spec_bytes() + seq![0u8] + k@) == Some(true));
+            assert(failed_key(revoked,consumed,legacy,e,k));
+            assert(failed_image(revoked,consumed,legacy,e));
+        }
+        return Err(e);
+    }
+    proof {
+        if exists|i:int| 0 <= i < r.len() && #[trigger] r@[i]@ == key@ {
+            let i = choose|i:int| 0 <= i < r.len() && r@[i]@ == key@;
+            assert(marker_key::spells(target@,r@[i]@));
+        }
+        if exists|i:int| 0 <= i < c.len() && #[trigger] c@[i]@ == key@ {
+            let i = choose|i:int| 0 <= i < c.len() && c@[i]@ == key@;
+            assert(marker_key::spells(target@,c@[i]@));
+        }
+        assert forall|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) implies text == key@ by {
+            marker_key::unique_text(target@,text,key@);
+        }
+    }
+    Ok(recovered_admission(groups,target,single_use))
 }
 
 /// If a canceled CAS installed its marker, the next attempt reads that entry

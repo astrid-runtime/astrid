@@ -306,6 +306,17 @@ def live_token_consumers():
 
 
 def marker_batch_consumers():
+    mixed = Path("verification/hosted_token_recovery.rs")
+    for label, clause, weaker in [
+        ("earlier namespace", "marker_batch::has(old(groups)@,target,m) ||", "false ||"),
+        ("canonical row", "(kind == m && listed(rows@,target)) ==>", "false ==>"),
+        ("rejected row address", "0 <= i < rows.len() && #[trigger] rows@[i]@ == k@ &&",
+         "0 <= i < rows.len() && #[trigger] rows@[i]@.len() >= 0 &&"),
+    ]:
+        yield (
+            f"mixed marker recovery loses {label}", mixed,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), mixed,
+        )
     for label, path, clause, weaker in [
         ("canonical encoding", "crates/astrid-capabilities/src/store/marker_key.rs", "ensures a == b,", "ensures true,"),
         ("physical source", "verification/hosted_key_projection.rs",
