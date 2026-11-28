@@ -33,9 +33,9 @@ def defects():
             ),
         ),
         (
-            "recover_markers drops its last marker",
+            "recover_markers skips a recorded marker",
             AUTHORITY,
-            lambda text: replace_once(text, "status.restore(*last);", "let _ = last;"),
+            lambda text: replace_once(text, "status.restore(markers[i]);", "let _ = markers[i];"),
         ),
         (
             "recovery forgets an acknowledged revocation",

@@ -20,6 +20,15 @@ fn bob() -> PrincipalId {
     PrincipalId::new("bob").expect("valid")
 }
 
+#[test]
+fn marker_recovery_folds_duplicate_rows_with_bounded_stack() {
+    let mut markers = vec![Marker::Consumed; 65_536];
+    markers.push(Marker::Revoked);
+    let status = TokenStatus::recover_markers(&markers);
+    assert!(status.is_used());
+    assert!(status.is_revoked());
+}
+
 #[tokio::test]
 async fn test_in_memory_store() {
     let store = CapabilityStore::in_memory();

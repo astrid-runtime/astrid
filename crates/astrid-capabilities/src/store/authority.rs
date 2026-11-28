@@ -221,24 +221,22 @@ impl TokenStatus {
         admitted
     }
 
-    /// Replay the durable markers recorded for one token. Startup calls this
-    /// for each token it reads, so neither the order nor a duplicate record
-    /// can reopen authority. A token has at most one marker in each of the
-    /// two namespaces, so the list is short.
+    /// Restore every recorded marker, including duplicate legacy spellings.
     pub(super) fn recover_markers(markers: &[Marker]) -> (status: Self)
-        ensures
-            (status.revoked(), status.used()) == replay(markers@),
-        decreases markers.len(),
+        ensures (status.revoked(), status.used()) == replay(markers@),
     {
-        let Some(last) = markers.last() else {
-            return Self::recover(false, false);
-        };
-        let (prefix, _) = markers.split_at(markers.len().saturating_sub(1));
-        let mut status = Self::recover_markers(prefix);
-        proof {
-            markers@.lemma_add_last_back();
+        let mut status = Self::recover(false, false);
+        let mut i = 0usize;
+        while i < markers.len()
+            invariant i <= markers.len(),
+                (status.revoked(), status.used()) == replay(markers@.take(i as int)),
+            decreases markers.len() - i,
+        {
+            status.restore(markers[i]);
+            assert(markers@.take(i as int + 1) =~= markers@.take(i as int).push(markers@[i as int]));
+            i += 1;
         }
-        status.restore(*last);
+        assert(markers@.take(i as int) =~= markers@);
         status
     }
 
