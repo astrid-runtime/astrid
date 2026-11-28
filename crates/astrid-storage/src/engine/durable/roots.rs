@@ -72,24 +72,24 @@ where
     R: DurableIo,
 {
     let recovered = recover_root_history(roots, codec, identity.scheme(), limits)?;
-    validate_recovered_roots(recovered, arena, index, identity, limits)
+    validate_recovered_roots(&recovered, arena, index, identity, limits)
 }
 
 fn validate_recovered_roots<P, I>(
-    recovered: BTreeMap<P, (RootState, u64)>,
+    recovered: &BTreeMap<P, (RootState, u64)>,
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>
 where
-    P: Ord,
+    P: Clone + Ord,
     I: PersistentObjectIdentity,
 {
     let preload = preload_indexed_closures(
         arena,
         index,
-        super::journal_closure::commits(&recovered),
+        super::journal_closure::commits(recovered),
         identity,
         limits,
     )
@@ -97,12 +97,9 @@ where
         let root_offset = recovered.values().next().map_or(0, |(_, offset)| *offset);
         recovery_closure_error(error, root_offset)
     })?;
-    let validated = validate_preloaded(&recovered, &preload)?;
+    let validated = validate_preloaded(recovered, &preload)?;
     Ok((
-        recovered
-            .into_iter()
-            .map(|(principal, (root, _))| (principal, root))
-            .collect(),
+        super::journal_closure::project(recovered, P::clone),
         validated,
     ))
 }

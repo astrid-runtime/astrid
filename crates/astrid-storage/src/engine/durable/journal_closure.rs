@@ -117,6 +117,44 @@ pub(super) fn commits<P:Ord>(history:&BTreeMap<P,(RootState,u64)>) -> (ids:BTree
     }
 }
 
+/// Drop journal offsets while preserving every principal's complete root state.
+pub(super) fn project<P:Ord,C:Fn(&P)->P>(history:&BTreeMap<P,(RootState,u64)>,copy:C) -> (roots:BTreeMap<P,RootState>)
+    requires btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        forall|p:&P| #[trigger] copy.requires((p,)),
+        forall|p:&P,q:P| #[trigger] copy.ensures((p,),q) ==> *p == q,
+    ensures btree_map_inv(&roots), roots@ == history@.map_values(|entry:(RootState,u64)| entry.0),
+{
+    let mut roots = BTreeMap::new();
+    let mut it = history.iter();
+    let ghost all = it.remaining();
+    let ghost mut n:int = 0;
+    loop
+        invariant all.len() == history.len(),0 <= n <= all.len(),it.remaining() == all.skip(n),
+            all.unref().to_set() == history@.kv_pairs(),btree_map_inv(&roots),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+            forall|p:&P| #[trigger] copy.requires((p,)),
+            forall|p:&P,q:P| #[trigger] copy.ensures((p,),q) ==> *p == q,
+            forall|p:P| #[trigger] roots@.contains_key(p) ==> history@.contains_key(p) && roots@[p] == history@[p].0,
+            forall|i:int| 0 <= i < n ==> roots@.contains_key(#[trigger] *all[i].0),
+        decreases history.len()-n,
+    {
+        let Some((owner,entry)) = it.next() else {
+            assert(n == all.len());
+            assert forall|p:P| #[trigger] history@.contains_key(p) implies roots@.contains_key(p) by {
+                let pair = (p,history@[p]);
+                assert(all.unref().to_set().contains(pair));
+                let i = all.unref().index_of(pair);
+                assert(all.unref()[i]==pair && *all[i].0==p);
+            }
+            assert(roots@ =~= history@.map_values(|entry:(RootState,u64)| entry.0));
+            return roots;
+        };
+        assert(all.unref()[n]==(*owner,*entry));
+        assert(history@.kv_pairs().contains((*owner,*entry)));
+        roots.insert(copy(owner),entry.0);
+        proof { n=n+1; };
+    }
+}
+
 pub(super) fn validate<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,table:&BTreeMap<ObjectId,ObjectRecord>)
     -> (out:Result<BTreeSet<ObjectId>,Failure>)
     requires btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),load::Preload(table).valid(),

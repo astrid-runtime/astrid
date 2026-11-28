@@ -802,13 +802,15 @@ fn install_buffer<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRec
     out
 }
 
-fn preload_closure<P:Ord,M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
-    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,history:&BTreeMap<P,(RootState,u64)>,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I) -> (out:Option<WaveState>)
-    requires btree_map_inv(index),btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+fn preload_closure<P:Ord,C:Fn(&P)->P,M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,history:&BTreeMap<P,(RootState,u64)>,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I,copy:C) -> (out:Option<(BTreeMap<P,RootState>,WaveState)>)
+    requires (forall|p:&P| #[trigger] copy.requires((p,))),
+        (forall|p:&P,q:P| #[trigger] copy.ensures((p,),q) ==> *p == q),btree_map_inv(index),btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
         obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
         forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
-    ensures out matches Some((table,known)) ==> known@ == table@.dom() && known@.subset_of(index@.dom()) &&
+    ensures out matches Some((roots,(table,known))) ==> roots@.dom() == history@.dom() &&
+        (forall|p:P| #[trigger] history@.contains_key(p) ==> roots@[p] == history@[p].0) && known@ == table@.dom() && known@.subset_of(index@.dom()) &&
         (forall|k:crate::ObjectId| table@.contains_key(k) ==> #[trigger] media_record(media.image(),(k,index@[k]),format.scheme,table@[k])) &&
         (forall|p:P| #[trigger] history@.contains_key(p) ==> exists|s:Set<crate::ObjectId>|
             #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,s) && s.subset_of(known@)),
@@ -930,7 +932,10 @@ fn preload_closure<P:Ord,M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])-
                             #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,s) && s.contains(k);
                     }
                     assert(known@ =~= table@.dom());
-                } Some((table,known)) },
+                }
+                    let projected = crate::journal_closure::project(history,copy);
+                    Some((projected,(table,known)))
+                },
                 Err(e) => {
                     assert(exists|p:P| history@.contains_key(p) &&
                         #[trigger] crate::journal_closure::refused(&table,history@[p].0.commit,history@[p].1,e));

@@ -134,6 +134,16 @@ def consumer_defects():
             lambda s, a=clause: replace_once(s, a, "true," + ("\n{" if a.endswith("{") else "")),
             Path("verification/hosted_journal_history.rs"),
         )
+    projection = "roots@ == history@.map_values(|entry:(RootState,u64)| entry.0)"
+    for label, weaker in [
+        ("root state", "roots@.dom() == history@.dom()"),
+        ("owner domain", "(forall|p:P| #[trigger] roots@.contains_key(p) ==> history@.contains_key(p) && roots@[p] == history@[p].0)"),
+    ]:
+        yield (
+            f"restart root projection loses {label}", Path("crates/astrid-storage/src/engine/durable/journal_closure.rs"),
+            lambda s, b=weaker: replace_once(s, projection, b),
+            Path("verification/hosted_journal_history.rs"),
+        )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
         ("installed record", "final(loaded)@ == old(loaded)@.insert(id,record)", "final(loaded)@.dom() == old(loaded)@.dom().insert(id)"),

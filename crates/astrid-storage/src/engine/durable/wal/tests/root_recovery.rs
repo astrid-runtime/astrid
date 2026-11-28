@@ -647,6 +647,11 @@ fn indexed_preload_reaches_shared_descendants_and_ignores_nonowning_targets() {
             (owner, (root, 100 + owner))
         }),
     );
+    let projected = crate::engine::durable::journal_closure::project(&history, |owner| *owner);
+    assert_eq!(projected.len(), history.len());
+    for (owner, (root, _)) in &history {
+        assert_eq!(projected.get(owner), Some(root));
+    }
     let roots = crate::engine::durable::journal_closure::commits(&history);
     stored.remove(&unrelated);
     assert_eq!(
