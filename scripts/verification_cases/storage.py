@@ -888,6 +888,26 @@ def hot_snapshot_consumers():
         )
 
 
+def journal_history_consumers():
+    path = Path("crates/astrid-storage/src/engine/durable/journal_history.rs")
+    for label, clause, weaker in [
+        ("accepted principal", "decode.ensures((bytes,),Some(p)) && exists", "exists"),
+        ("principal encoding", "encode.ensures((&p,),v) && v@ == bytes@", "encode.ensures((&p,),v)"),
+        ("principal refusal", "encode.ensures((&p,),v) && v@ != bytes@", "encode.ensures((&p,),v)"),
+        ("acceptance", "out.is_ok() == (actual == expected", "out.is_ok() ==> (actual == expected"),
+        ("replacement and offset", "old(history)@.insert(owner,(replacement,offset))", "final(history)@"),
+        ("rejected history", "else {old(history)@}", "else {final(history)@}"),
+        ("observed conflict", "seen == actual && seen != expected", "seen != expected"),
+        ("generation exhaustion", "actual == expected && next > u64::MAX", "true"),
+        ("wrong generation", "actual == expected && next <= u64::MAX && replacement.generation.value() != next", "true"),
+    ]:
+        yield (
+            f"journal history loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_journal_history.rs"),
+        )
+
+
 def resident_cache_consumers():
     path = Path("crates/astrid-storage/src/engine/durable_cache/resident.rs")
     for label, clause, weaker in [
@@ -927,4 +947,5 @@ def checkpoint_decode_consumers():
     yield from resident_cache_consumers()
     yield from hot_point_consumers()
     yield from hot_snapshot_consumers()
+    yield from journal_history_consumers()
     yield from point_fill_consumers()

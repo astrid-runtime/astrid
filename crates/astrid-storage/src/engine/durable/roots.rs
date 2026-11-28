@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
+use crate::storage_model::{ModelError, ObjectId, RootState};
 
+use super::journal_history::{self, Rejection};
 use super::root_wire::{self, TailError};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
@@ -24,19 +25,13 @@ impl From<IdentityScheme> for super::root_wire::Scheme {
 
 impl From<RootState> for super::root_wire::Root {
     fn from(root: RootState) -> Self {
-        Self {
-            generation: root.generation.get().to_le_bytes(),
-            commit: *root.commit.as_bytes(),
-        }
+        journal_history::to_wire(root)
     }
 }
 
 impl From<super::root_wire::Root> for RootState {
     fn from(root: super::root_wire::Root) -> Self {
-        Self {
-            generation: RootGeneration::new(u64::from_le_bytes(root.generation)),
-            commit: ObjectId::new(root.commit),
-        }
+        journal_history::from_wire(root)
     }
 }
 
@@ -203,52 +198,41 @@ where
     C: PrincipalCodec<P>,
 {
     let principal = decode_principal(codec, &record.principal, offset)?;
-    let actual = recovered.get(&principal).map(|(root, _)| *root);
-    let generation = match super::root_transition::advance(
-        actual.map(Into::into),
-        record.expected.map(Into::into),
-    ) {
-        super::root_transition::Advance::Conflict => {
-            return Err(DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source: ModelError::RootConflict {
-                    expected: record.expected,
-                    actual,
-                },
-            });
+    journal_history::apply(
+        recovered,
+        principal,
+        record.expected,
+        record.replacement,
+        offset,
+    )
+    .map_err(|error| match error {
+        Rejection::Conflict(actual) => DurableError::RecoveryModel {
+            file: ROOT_FILE,
+            offset,
+            source: ModelError::RootConflict {
+                expected: record.expected,
+                actual,
+            },
         },
-        super::root_transition::Advance::Overflow => {
-            return Err(DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source: ModelError::ArithmeticOverflow,
-            });
+        Rejection::Overflow => DurableError::RecoveryModel {
+            file: ROOT_FILE,
+            offset,
+            source: ModelError::ArithmeticOverflow,
         },
-        super::root_transition::Advance::Next(next) => RootGeneration::new(next),
-    };
-    if record.replacement.generation != generation {
-        return Err(corrupt(
+        Rejection::Generation => corrupt(
             ROOT_FILE,
             offset,
             "replacement generation does not match journal history",
-        ));
-    }
-    recovered.insert(principal, (record.replacement, offset));
-    Ok(())
+        ),
+    })
 }
 
 fn decode_principal<P, C>(codec: &C, bytes: &[u8], offset: u64) -> Result<P, DurableError>
 where
     C: PrincipalCodec<P>,
 {
-    let principal = codec
-        .decode(bytes)
-        .ok_or(DurableError::InvalidPrincipal { offset })?;
-    if codec.encode(&principal) != bytes {
-        return Err(DurableError::InvalidPrincipal { offset });
-    }
-    Ok(principal)
+    journal_history::principal(bytes, |key| codec.decode(key), |owner| codec.encode(owner))
+        .ok_or(DurableError::InvalidPrincipal { offset })
 }
 
 pub(super) fn encode_root_record(

@@ -181,6 +181,16 @@ pub(super) fn admit_current<P:Ord>(pending:&BTreeMap<P,RootState>,published:&BTr
         },
 {
     let actual = current(pending,published,owner);
+    (actual,compare(actual,expected))
+}
+
+pub(super) fn compare(actual:Option<RootState>,expected:Option<RootState>) -> (decision:Advance)
+    ensures (decision is Conflict) == (actual != expected),
+        (decision is Overflow) == (actual == expected && (expected matches Some(r) && r.generation.value() == u64::MAX)),
+        decision matches Advance::Next(next) ==> actual == expected && match expected {
+            None => next == 0, Some(r) => next as int == r.generation.value() as int + 1,
+        },
+{
     let a = optional(actual);
     let e = optional(expected);
     let decision = advance(a,e);
@@ -192,7 +202,7 @@ pub(super) fn admit_current<P:Ord>(pending:&BTreeMap<P,RootState>,published:&BTr
             }
         }
     }
-    (actual,decision)
+    decision
 }
 
 /// A WAL descriptor must name the successor permitted at preparation.

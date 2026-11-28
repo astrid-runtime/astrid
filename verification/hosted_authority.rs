@@ -198,6 +198,9 @@ mod guest_authority;
 #[path = "../crates/astrid-storage/src/principal_state/owner_codec.rs"]
 mod owner_codec;
 
+#[path = "../crates/astrid-storage/src/engine/durable/journal_history.rs"]
+mod journal_history;
+mod hosted_journal_history;
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/root_history.rs"]

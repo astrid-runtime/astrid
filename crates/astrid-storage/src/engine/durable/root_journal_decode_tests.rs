@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage_model::RootGeneration;
 
 #[test]
 fn journal_reader_preserves_field_boundaries_and_scheme_diagnostics() {
