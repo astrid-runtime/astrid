@@ -37,10 +37,7 @@ impl NodeTotals {
 
 impl ValueSlot {
     pub(super) fn length(&self) -> StorageResult<u64> {
-        match self {
-            Self::Inline(bytes) => u64::try_from(bytes.len()).map_err(|_| arithmetic_overflow()),
-            Self::Spilled { length, .. } => Ok(*length),
-        }
+        super::checkpoint_leaf_summary::length(self).ok_or_else(arithmetic_overflow)
     }
 }
 
@@ -48,19 +45,12 @@ pub(super) type LeafEntry = super::checkpoint_leaf::Entry<ValueSlot>;
 
 impl LeafEntry {
     pub(super) fn totals(&self) -> StorageResult<NodeTotals> {
-        let key = u64::try_from(self.key.len()).map_err(|_| arithmetic_overflow())?;
-        let value = self.value.length()?;
-        Ok(NodeTotals {
-            entries: 1,
-            logical_bytes: value,
-            quota_bytes: key.checked_add(value).ok_or_else(arithmetic_overflow)?,
-        })
+        super::checkpoint_leaf_summary::charge(self).ok_or_else(arithmetic_overflow)
     }
 }
 
 pub(super) type ChildPointer = super::checkpoint_range::Child<ObjectId, NodeTotals>;
 
-pub(super) type LeafNode = super::checkpoint_page::Leaf<ValueSlot, NodeTotals>;
 pub(super) type Node = super::checkpoint_page::Node<ObjectId, NodeTotals, ValueSlot>;
 
 impl Node {
@@ -241,51 +231,45 @@ pub(super) fn spilled_opaque_payload(
 }
 
 fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
+    use super::checkpoint_entries::Error;
+    use super::checkpoint_key_field::KeyError;
     use super::checkpoint_value::Error as ValueError;
 
-    let bytes = record.canonical_bytes();
-    let (offset, Header { count, totals, .. }) =
-        checkpoint_header::read(bytes, Kind::Leaf).map_err(|e| header_error(id, e))?;
-    let mut cursor = Cursor { id, bytes, offset };
-    if count == 0 || count > NODE_MAX_ENTRIES {
-        return Err(invalid(id, "invalid KV leaf entry count"));
-    }
-    let mut entries = Vec::with_capacity(count);
-    let mut reference_index = 0_usize;
-    for entry_index in 0..count {
-        let key = cursor.key()?.to_vec();
-        validate_composite_key(id, &key)?;
-        let value = super::checkpoint_value::read(
-            bytes,
-            &mut cursor.offset,
-            record.references(),
-            &mut reference_index,
-            entry_index,
-        )
-        .map_err(|reason| match reason {
-            ValueError::Field(e) => page_read_error(id, e),
-            ValueError::Length => invalid(id, "KV value too large"),
-            ValueError::Oversized => invalid(id, "oversized inline KV value"),
-            ValueError::SmallSpill => invalid(id, "small KV value was not inlined"),
-            ValueError::Tag => invalid(id, "invalid KV value storage tag"),
-            ValueError::Reference(Rejection::Missing) => {
-                invalid(id, "spilled KV value reference is missing")
+    use super::checkpoint_leaf_record::{self, Error as RecordError};
+    use super::checkpoint_leaf_summary::Error as SummaryError;
+    let leaf = checkpoint_leaf_record::read(record.canonical_bytes(), record.references(), |k| {
+        validate_composite_key(id, k)
+    })
+    .map_err(|reason| match reason {
+        RecordError::Prefix(e) => header_error(id, e),
+        RecordError::Count => invalid(id, "invalid KV leaf entry count"),
+        RecordError::Summary(SummaryError::Overflow) => arithmetic_overflow(),
+        RecordError::Summary(SummaryError::NonCanonical) => {
+            invalid(id, "non-canonical persistent KV leaf")
+        },
+        RecordError::Entries(reason) => match reason {
+            Error::Key(KeyError::Field(e)) => page_read_error(id, e),
+            Error::Key(KeyError::Length) => invalid(id, "persistent KV length is too large"),
+            Error::Invalid(e) => e,
+            Error::References => invalid(id, "non-canonical persistent KV leaf"),
+            Error::Trailing => invalid(id, "trailing persistent KV page bytes"),
+            Error::Value(reason) => match reason {
+                ValueError::Field(e) => page_read_error(id, e),
+                ValueError::Length => invalid(id, "KV value too large"),
+                ValueError::Oversized => invalid(id, "oversized inline KV value"),
+                ValueError::SmallSpill => invalid(id, "small KV value was not inlined"),
+                ValueError::Tag => invalid(id, "invalid KV value storage tag"),
+                ValueError::Reference(Rejection::Missing) => {
+                    invalid(id, "spilled KV value reference is missing")
+                },
+                ValueError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
+                ValueError::Reference(Rejection::Mismatch) => {
+                    invalid(id, "invalid spilled KV value reference")
+                },
             },
-            ValueError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
-            ValueError::Reference(Rejection::Mismatch) => {
-                invalid(id, "invalid spilled KV value reference")
-            },
-        })?;
-        entries.push(LeafEntry { key, value });
-    }
-    cursor.done()?;
-    if reference_index != record.references().len()
-        || entries.windows(2).any(|pair| pair[0].key >= pair[1].key)
-        || leaf_totals(&entries)? != totals
-    {
-        return Err(invalid(id, "non-canonical persistent KV leaf"));
-    }
-    Ok(Node::Leaf(LeafNode { entries, totals }))
+        },
+    })?;
+    Ok(Node::Leaf(leaf))
 }
 
 fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
@@ -330,18 +314,7 @@ fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
 }
 
 fn leaf_totals(entries: &[LeafEntry]) -> StorageResult<NodeTotals> {
-    sum_totals(
-        entries
-            .iter()
-            .map(LeafEntry::totals)
-            .collect::<Result<Vec<_>, _>>()?,
-    )
-}
-
-fn sum_totals(totals: impl IntoIterator<Item = NodeTotals>) -> StorageResult<NodeTotals> {
-    totals
-        .into_iter()
-        .try_fold(NodeTotals::default(), NodeTotals::add)
+    super::checkpoint_leaf_summary::sum(entries).ok_or_else(arithmetic_overflow)
 }
 
 fn arithmetic_overflow() -> StorageError {
@@ -367,30 +340,6 @@ fn header_error(id: ObjectId, e: checkpoint_header::Error) -> StorageError {
     match e {
         checkpoint_header::Error::Field(error) => page_read_error(id, error),
         checkpoint_header::Error::Magic => invalid(id, "invalid persistent KV page magic"),
-    }
-}
-
-struct Cursor<'a> {
-    id: ObjectId,
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn key(&mut self) -> StorageResult<&'a [u8]> {
-        use super::checkpoint_key_field::{self, KeyError};
-
-        checkpoint_key_field::read(self.bytes, &mut self.offset).map_err(|reason| match reason {
-            KeyError::Field(error) => page_read_error(self.id, error),
-            KeyError::Length => invalid(self.id, "persistent KV length is too large"),
-        })
-    }
-
-    fn done(self) -> StorageResult<()> {
-        if self.offset != self.bytes.len() {
-            return Err(invalid(self.id, "trailing persistent KV page bytes"));
-        }
-        Ok(())
     }
 }
 

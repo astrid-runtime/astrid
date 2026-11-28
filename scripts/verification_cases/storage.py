@@ -715,6 +715,30 @@ def checkpoint_value_consumers():
         )
 
 
+def checkpoint_entries_consumers():
+    entries = Path("crates/astrid-storage/src/kv/tree/checkpoint_entries.rs")
+    record = Path("crates/astrid-storage/src/kv/tree/checkpoint_leaf_record.rs")
+    for label, path, name, clause, weaker in [
+        ("declared count", entries, "entries", "Ok(rows) => rows.len() == count && exists", "Ok(rows) => exists"),
+        ("initial cursors", entries, "entries", " && path[0] == (start,0usize)", ""),
+        ("final cursors", entries, "entries", " && path.last() == end", ""),
+        ("key acceptance", entries, "entries", "k@ == row.key@ && r is Ok", "k@ == row.key@"),
+        ("value error evidence", entries, "entries", "body <= bytes.len() && value::failure(bytes,body,end as int,refs,start.1,i,e) &&", "body <= bytes.len() &&"),
+        ("leaf finish evidence", Path("crates/astrid-storage/src/kv/tree/checkpoint_leaf_summary.rs"), "leaf_record", "ensures out == outcome(rows,totals)", "ensures out.is_ok() ==> out == outcome(rows,totals)"),
+        ("key association", entries, "entries", " && row.key@ == bytes.subrange(start.0 as int+4,body)", ""),
+        ("value association", entries, "entries", "&&& value::decoded(bytes,body,end.0 as int", "&&& false ==> value::decoded(bytes,body,end.0 as int"),
+        ("trailing byte evidence", entries, "entries", "rows.len() == count && s.0 != bytes.len()", "rows.len() == count"),
+        ("remaining references", entries, "entries", "&& s.1 != refs.len()", ""),
+        ("accepted charge", record, "leaf_record", "&&& summary::usage(leaf.entries@,h.count as nat) ==", "&&& false ==> summary::usage(leaf.entries@,h.count as nat) =="),
+        ("failure provenance", record, "leaf_record", "&& summary::outcome(rows,h.totals) == Err(e),", "&& true,"),
+    ]:
+        yield (
+            f"checkpoint leaf decode loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path(f"verification/hosted_checkpoint_{name}.rs"),
+        )
+
+
 def checkpoint_decode_consumers():
     yield from checkpoint_page_consumers()
     yield from checkpoint_reference_consumers()
@@ -725,3 +749,4 @@ def checkpoint_decode_consumers():
     yield from checkpoint_summary_consumers()
     yield from checkpoint_header_consumers()
     yield from checkpoint_value_consumers()
+    yield from checkpoint_entries_consumers()

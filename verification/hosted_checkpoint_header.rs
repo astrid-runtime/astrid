@@ -13,7 +13,7 @@ proof fn unique_word(a:u16,b:u16)
         requires (a&255) as u8 == (b&255) as u8, (a>>8) as u8 == (b>>8) as u8;
 }
 
-proof fn unique(kind:Kind,a:Header,b:Header)
+pub(super) proof fn unique(kind:Kind,a:Header,b:Header)
     requires header::wire(kind,a) == header::wire(kind,b), a.count <= u16::MAX,b.count <= u16::MAX,
     ensures a.count == b.count && a.totals == b.totals && (kind is Branch ==> a.level == b.level),
 {
