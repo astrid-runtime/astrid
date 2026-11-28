@@ -343,7 +343,7 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    use super::delta_chain::{self, Step};
+    use super::{delta_chain, delta_recovery::CounterError, delta_replay};
     let validated_trees = &validation_cache.trees;
     let chain = delta_chain::walk(owner, head_id, |principal, object| {
         use super::projection_record::{self, LoadError};
@@ -385,54 +385,48 @@ where
     {
         return Err(invalid(head_id, "KV checkpoint accounting totals disagree"));
     }
-    let mut context = TreeContext::<P, E>::new(engine, owner);
-    let mut overlay = OverlayMap::default();
-    let mut totals = checkpoint_totals;
-    let mut prior_depth = 0_u64;
-    let mut prior_delta_bytes = 0_u64;
-    for Step {
-        object,
-        depth,
-        delta_bytes,
-        mutations,
-        totals: declared,
-    } in chain.newest_first.into_iter().rev()
-    {
-        use super::delta_recovery::{self, CounterError};
-        delta_recovery::counters(
-            prior_depth,
-            prior_delta_bytes,
-            depth,
-            delta_bytes,
-            &mutations,
-        )
-        .map_err(|error| match error {
-            CounterError::Disagree => invalid(object, "KV delta chain counters disagree"),
-            CounterError::RowOverflow => super::delta::arithmetic_overflow(),
-            CounterError::ChainOverflow => invalid(object, "KV delta byte total overflow"),
-        })?;
-        apply_validated_mutations(
-            object,
-            &mut context,
-            tree,
-            &mut overlay,
-            &mut totals,
-            &mutations,
-        )?;
-        if totals != declared {
-            return Err(invalid(object, "KV delta accounting totals disagree"));
-        }
-        prior_depth = depth;
-        prior_delta_bytes = delta_bytes;
-    }
+    let replay = delta_replay::run(
+        (
+            TreeContext::<P, E>::new(engine, owner),
+            OverlayMap::default(),
+        ),
+        checkpoint_totals,
+        tree,
+        chain.newest_first,
+        |(mut context, mut overlay), base, object, mutations, mut totals| {
+            apply_validated_mutations(
+                object,
+                &mut context,
+                base,
+                &mut overlay,
+                &mut totals,
+                mutations,
+            )?;
+            Ok(((context, overlay), totals))
+        },
+    )
+    .map_err(|error| match error {
+        delta_replay::Error::Counter(id, CounterError::Disagree) => {
+            invalid(id, "KV delta chain counters disagree")
+        },
+        delta_replay::Error::Counter(_, CounterError::RowOverflow) => {
+            super::delta::arithmetic_overflow()
+        },
+        delta_replay::Error::Counter(id, CounterError::ChainOverflow) => {
+            invalid(id, "KV delta byte total overflow")
+        },
+        delta_replay::Error::Apply(error) => error,
+        delta_replay::Error::Totals(id) => invalid(id, "KV delta accounting totals disagree"),
+    })?;
+    let (_, overlay) = replay.state;
     Ok((
         Projection {
             head: Some(head_id),
             tree,
             overlay,
-            depth: prior_depth,
-            delta_bytes: prior_delta_bytes,
-            totals,
+            depth: replay.depth,
+            delta_bytes: replay.bytes,
+            totals: replay.totals,
             boundary: Some(validation.certificate()),
         },
         validation,

@@ -59,6 +59,7 @@ mod delta_chain;
 mod delta_header;
 mod delta_mutation;
 mod delta_recovery;
+mod delta_replay;
 mod delta_totals;
 mod handoff;
 mod header;

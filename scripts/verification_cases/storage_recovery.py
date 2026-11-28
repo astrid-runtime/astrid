@@ -209,6 +209,23 @@ def consumer_defects():
             f"delta chain loses {label}", chain,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_chain.rs"),
         )
+    fold = Path("crates/astrid-storage/src/kv/tree/delta_replay.rs")
+    for label, clause, weaker in [
+        ("success history", "out matches Ok(c) ==> replayed(initial,base,tree,input@,0,apply,c)", "out matches Ok(c) ==> true"),
+        ("error prefix", "out matches Err(e) ==> failed(initial,base,tree,input@,apply,e)", "out matches Err(e) ==> true"),
+        ("final depth", "end.depth == row.depth && end.bytes", "end.bytes"),
+        ("final bytes", "end.bytes == row.delta_bytes && end.totals", "end.totals"),
+        ("totals agreement", "end.totals == row.totals", "true"),
+        ("counter admission", "&&& counter(prior,row).is_none()", "&&& true"),
+        ("mutation result", "&&& apply.ensures((prior.state,tree,row.object,&row.mutations,prior.totals),Ok((end.state,end.totals)))", "&&& true"),
+        ("counter refusal address", "id == row.object && counter(prior,row) == Some(c)", "counter(prior,row) == Some(c)"),
+        ("apply refusal", "apply.ensures(args,Err(e))", "true"),
+        ("totals refusal address", "Error::Totals(id) => id == row.object &&", "Error::Totals(id) =>"),
+    ]:
+        yield (
+            f"chronological replay loses {label}", fold,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_replay.rs"),
+        )
     envelope = Path("crates/astrid-storage/src/kv/tree/projection_record.rs")
     for label, clause, weaker, target in [
         ("checkpoint physical bytes", "f.2 == checkpoint_bytes(totals) && f.4", "f.4", "hosted_projection_record"),
