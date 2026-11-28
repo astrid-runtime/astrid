@@ -7,6 +7,7 @@ use super::FORMAT_VERSION;
 use super::checkpoint_branch::Header;
 use super::checkpoint_header::{self, Kind};
 use super::checkpoint_reference::{self, Rejection, Relation};
+#[cfg(test)]
 use super::validation::validate_composite_key;
 use crate::error::{StorageError, StorageResult};
 
@@ -156,6 +157,7 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
     .map_err(|error| model_error(&error))
 }
 
+#[cfg(test)]
 pub(super) fn decode_node(id: ObjectId, record: &ObjectRecord) -> StorageResult<NodeHandle> {
     super::checkpoint_record::read(id, record, FORMAT_VERSION, |k| {
         validate_composite_key(id, k)

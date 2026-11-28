@@ -56,4 +56,23 @@ fn read<E,F:Fn(&[u8])->Result<(),E>+Copy>(id:ObjectId, record:&ObjectRecord, v:O
     }),
 { checkpoint_record::read(id,record,v,validate) }
 
+// The production range reader must discharge the walker's rank precondition from
+// the requested record even when its source is adversarial or unreadable.
+fn range_reader<E,F:Fn(&[u8])->Result<(),E>+Copy,L:FnOnce(ObjectId)->Result<ObjectRecord,E>>(
+    page:&crate::checkpoint_range::Page<ObjectId,crate::checkpoint_totals::NodeTotals>,
+    v:ObjectFormatVersion,load:L,validate:F,
+) -> (out:Result<crate::checkpoint_walk::Contents<ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>,
+    checkpoint_record::ScheduledError<E>>)
+    requires load.requires((crate::checkpoint_page::object(*page),)),
+        forall|k:&[u8]| #[trigger] validate.requires((k,)),
+        vstd::laws_eq::obeys_concrete_eq::<ObjectId>(),vstd::laws_eq::obeys_concrete_eq::<crate::checkpoint_totals::NodeTotals>(),
+    ensures out matches Ok(crate::checkpoint_walk::Contents::Branch(level,children)) ==> level > 0 &&
+        (*page matches crate::checkpoint_range::Page::Child(child) ==> child.level == level) &&
+        forall|i:int| 0 <= i < children.len() ==> (#[trigger] children@[i]).level as nat + 1 == level,
+        out matches Ok(body) ==> exists|record:ObjectRecord| #[trigger] load.ensures((crate::checkpoint_page::object(*page),),Ok(record)) &&
+            record.contents().1 == v.number() && exists|node:Node<ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>|
+                #[trigger] checkpoint_record::parsed(&record,node,validate) && node.contents() == body,
+        out matches Err(checkpoint_record::ScheduledError::Source(e)) ==> load.ensures((crate::checkpoint_page::object(*page),),Err(e)),
+{ checkpoint_record::load_scheduled(page,v,load,validate) }
+
 }

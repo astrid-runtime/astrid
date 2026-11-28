@@ -14,7 +14,7 @@ use super::delta::{
 use super::header::TreeHeader;
 use super::node::{
     ChildPointer, INLINE_VALUE_MAX, LeafEntry, NODE_MAX_ENTRIES, NODE_MAX_RETAINED_BYTES, Node,
-    NodeHandle, NodeTotals, ValueSlot, branch_record, decode_node, leaf_record,
+    NodeHandle, NodeTotals, ValueSlot, branch_record, leaf_record,
 };
 use super::{FORMAT_VERSION, KV_LABEL, PARENT_LABEL, STATE_LABEL};
 use crate::error::{StorageError, StorageResult};
