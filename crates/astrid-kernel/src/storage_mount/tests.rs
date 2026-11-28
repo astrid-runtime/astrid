@@ -213,8 +213,8 @@ impl<F: CallbackFilesystem> CallbackFilesystem for ReadBoundarySpy<F> {
 #[tokio::test]
 async fn elapsed_idle_deadline_denies_callback_status_and_sync_despite_renewal() {
     let root = tempfile::tempdir().unwrap();
-    let kernel =
-        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
     let caller = PrincipalId::default();
     let lease = issue_lease(
         &kernel,
