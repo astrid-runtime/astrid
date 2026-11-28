@@ -35,6 +35,21 @@ def consumer_defects():
             Path("verification/hosted_retirement_recovery.rs"),
         )
     reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
+    for label, clause, weaker in [
+        ("forward progress", "&&& first < end <= rows.len()", "&&& first <= end <= rows.len()"),
+        ("table boundary", "&&& first < end <= rows.len()", "&&& first < end"),
+        ("physical extent", "len as int == frame_end(rows@[end as int-1].1)-base &&", "true &&"),
+        ("coalescing target", "&& len <= cap", "&& true"),
+        ("frame containment", "frame_end(rows@[i].1) <= base as int + len <= u64::MAX", "true"),
+        ("adjacency", "rows@[i].1.offset == frame_end(rows@[i-1].1)\n", "rows@[i].1.offset >= frame_end(rows@[i-1].1)\n"),
+        ("maximal prefix", "end < rows.len() ==> rows@[end as int].1.offset", "false ==> rows@[end as int].1.offset"),
+        ("representable input", "None => exists|i:int| first <= i < rows.len() &&", "None => exists|i:int|"),
+    ]:
+        yield (
+            f"coalesced read partition loses {label}", reader,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs"),
+        )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
         ("frontier coverage", "frontier@.difference(loaded@.dom()) &&", "rows@.map(|_, row:(ObjectId,ArenaLocation)| row.0).to_set() &&"),

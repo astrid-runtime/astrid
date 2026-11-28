@@ -33,6 +33,64 @@ pub(super) struct Format {
     pub(super) magic:[u8;8], pub(super) version:u16, pub(super) limit:u64, pub(super) scheme:Scheme,
 }
 
+pub(super) open spec fn frame_end(loc:ArenaLocation) -> int {
+    loc.offset as int + super::arena_frame::WIDTH + loc.payload_len
+}
+
+/// Pick the maximal contiguous prefix starting at first. A single frame may
+/// exceed the coalescing target. Overflow on an adjacent candidate is fatal.
+pub(super) fn coalesced(rows:&[(ObjectId,ArenaLocation)],first:usize,target:u64)
+    -> (out:Option<(usize,u64)>)
+    requires first < rows.len(),
+    ensures ({
+        let base = rows@[first as int].1.offset;
+        let cap = if target as int > frame_end(rows@[first as int].1)-base {
+            target as int
+        } else {frame_end(rows@[first as int].1)-base};
+        match out {
+            Some((end,len)) => {
+                &&& first < end <= rows.len()
+                &&& len as int == frame_end(rows@[end as int-1].1)-base && len <= cap
+                &&& forall|i:int| first <= i < end ==> base <= #[trigger] rows@[i].1.offset &&
+                    frame_end(rows@[i].1) <= base as int + len <= u64::MAX
+                &&& forall|i:int| first < i < end ==> #[trigger] rows@[i].1.offset == frame_end(rows@[i-1].1)
+                &&& end < rows.len() ==> rows@[end as int].1.offset != base as int + len ||
+                    frame_end(rows@[end as int].1)-base > cap
+            },
+            None => exists|i:int| first <= i < rows.len() && #[trigger] frame_end(rows@[i].1) > u64::MAX &&
+                (i == first || rows@[i].1.offset == frame_end(rows@[i-1].1)),
+        }
+    }),
+{
+    let initial = rows[first].1;
+    let start = initial.offset;
+    let Some(mut stop) = initial.end() else {
+        assert(frame_end(rows@[first as int].1) > u64::MAX);
+        return None;
+    };
+    let cap = target.max(stop.saturating_sub(start));
+    let mut end = first.saturating_add(1);
+    loop
+        invariant first < end <= rows.len(), start == rows@[first as int].1.offset,
+            stop == frame_end(rows@[end as int-1].1), start <= stop, stop-start <= cap,
+            cap == if target as int > frame_end(rows@[first as int].1)-start {target as int} else {frame_end(rows@[first as int].1)-start},
+            forall|i:int| first <= i < end ==> start <= #[trigger] rows@[i].1.offset && frame_end(rows@[i].1) <= stop,
+            forall|i:int| first < i < end ==> #[trigger] rows@[i].1.offset == frame_end(rows@[i-1].1),
+        decreases rows.len()-end,
+    {
+        if end == rows.len() {return Some((end,stop.saturating_sub(start)));}
+        let loc = rows[end].1;
+        if loc.offset != stop {return Some((end,stop.saturating_sub(start)));}
+        let Some(candidate) = loc.end() else {
+            assert(frame_end(rows@[end as int].1) > u64::MAX);
+            return None;
+        };
+        if candidate.saturating_sub(start) > cap {return Some((end,stop.saturating_sub(start)));}
+        stop = candidate;
+        end = end.saturating_add(1);
+    }
+}
+
 pub(super) fn read<H:FnOnce([u8;8],u64,&[u8])->[u8;32],I:FnOnce(&ObjectRecord)->[u8;32]>(
     data:&[u8],base:u64,loc:ArenaLocation,id:ObjectId,format:Format,hash:H,identify:I) -> (out:Result<(ObjectRecord,&[u8]),Error>)
     requires forall|n:u64,p:&[u8]| #[trigger] hash.requires((format.magic,n,p)),

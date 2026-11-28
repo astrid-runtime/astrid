@@ -112,31 +112,13 @@ pub(in crate::engine::durable) fn visit_indexed_objects<
                 limit: limits.max_frame_bytes,
             });
         }
-        let max_span_bytes = target_span_bytes.max(frame_len(first_location)?);
+        let (end, span_len) = super::indexed_frame::coalesced(&ordered, first, target_span_bytes)
+            .ok_or(DurableError::EncodingOverflow)?;
         #[cfg(test)]
         {
             spans = spans.saturating_add(1);
         }
         let span_start = first_location.offset;
-        let mut span_end = frame_end(first_location)?;
-        let mut end = first.saturating_add(1);
-        while let Some((_, location)) = ordered.get(end) {
-            if location.offset != span_end {
-                break;
-            }
-            let candidate_end = frame_end(*location)?;
-            let candidate_len = candidate_end
-                .checked_sub(span_start)
-                .ok_or(DurableError::EncodingOverflow)?;
-            if candidate_len > max_span_bytes {
-                break;
-            }
-            span_end = candidate_end;
-            end = end.saturating_add(1);
-        }
-        let span_len = span_end
-            .checked_sub(span_start)
-            .ok_or(DurableError::EncodingOverflow)?;
         let span_len = usize::try_from(span_len).map_err(|_| DurableError::EncodingOverflow)?;
         let mut span = Vec::new();
         span.try_reserve_exact(span_len)
@@ -245,17 +227,4 @@ fn record_error(
             Error::Identity => "indexed object identity does not match its canonical record",
         },
     )
-}
-
-fn frame_len(location: ArenaLocation) -> Result<u64, DurableError> {
-    FRAME_HEADER_LEN
-        .checked_add(location.payload_len)
-        .ok_or(DurableError::EncodingOverflow)
-}
-
-fn frame_end(location: ArenaLocation) -> Result<u64, DurableError> {
-    location
-        .offset
-        .checked_add(frame_len(location)?)
-        .ok_or(DurableError::EncodingOverflow)
 }

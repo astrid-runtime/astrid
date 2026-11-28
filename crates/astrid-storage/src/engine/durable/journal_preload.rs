@@ -62,7 +62,7 @@ pub(super) fn requests(frontier: &BTreeSet<ObjectId>, loaded: &BTreeMap<ObjectId
             requested.push((id,location));
             assert(requested@.map(|_,row:(ObjectId,ArenaLocation)| row.0) =~=
                 prefix.map(|_,row:(ObjectId,ArenaLocation)| row.0) + seq![id]);
-            proof { vstd::seq_lib::seq_to_set_distributes_over_add(prefix.map(|_,row:(ObjectId,ArenaLocation)| row.0),seq![id]); }
+            proof { vstd::seq_lib::seq_to_set_distributes_over_add(prefix.map(|_,row:(ObjectId,ArenaLocation)| row.0),seq![id]); };
         }
         assert(requested@.map(|_,row:(ObjectId,ArenaLocation)| row.0).to_set().union(
             iter.remaining().unref().to_set().difference(loaded@.dom())) =~= frontier@.difference(loaded@.dom()));

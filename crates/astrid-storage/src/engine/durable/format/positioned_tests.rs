@@ -309,6 +309,40 @@ fn malformed_frames_and_limits_fail_closed() {
 }
 
 #[test]
+fn coalesced_read_checks_overflow_only_after_confirming_adjacency() {
+    use crate::engine::durable::tests::TestIdentity;
+    let source = ObservedSource::new();
+    let id = ObjectId::new([0x51; 32]);
+    let first = ArenaLocation {
+        offset: 0,
+        payload_len: 0,
+        checksum: [0; 32],
+    };
+    let read = |offset| {
+        let later = ArenaLocation {
+            offset,
+            payload_len: u64::MAX,
+            ..first
+        };
+        visit_indexed_objects(
+            &source,
+            &[(id, later), (id, first)],
+            FRAME_HEADER_LEN,
+            &TestIdentity,
+            RecoveryLimits::process_addressable(),
+            |_, _, _, _| panic!("empty arena cannot deliver a record"),
+        )
+    };
+    assert!(matches!(
+        read(FRAME_HEADER_LEN),
+        Err(DurableError::EncodingOverflow)
+    ));
+    assert!(source.reads.borrow().is_empty());
+    assert!(read(FRAME_HEADER_LEN + 1).is_err());
+    assert_eq!(*source.reads.borrow(), vec![(0, FRAME_HEADER_LEN_USIZE)]);
+}
+
+#[test]
 fn indexed_object_hashes_frame_once_and_still_checks_index_and_object_identity() {
     use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
     use crate::storage_model::ObjectIdentity;

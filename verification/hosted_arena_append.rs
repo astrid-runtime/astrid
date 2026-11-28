@@ -283,6 +283,37 @@ fn read_leaf<H:Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]
     record::confirmed(p,scheme,id,identify).ok()
 }
 
+/// Each successful positional read can cover exactly the next range of
+/// frame indices. Induct across those ranges for any representable table.
+fn partition_reads(rows:&[(crate::ObjectId,frame::ArenaLocation)],target:u64)
+    requires forall|i:int| 0 <= i < rows.len() ==> #[trigger] crate::indexed_frame::frame_end(rows@[i].1) <= u64::MAX,
+{
+    use crate::indexed_frame::{coalesced,frame_end};
+    let mut first = 0;
+    while first < rows.len()
+        invariant first <= rows.len(),
+            forall|i:int| 0 <= i < rows.len() ==> #[trigger] frame_end(rows@[i].1) <= u64::MAX,
+        decreases rows.len()-first,
+    {
+        let batch = coalesced(rows,first,target);
+        assert(batch.is_some());
+        let (end,len) = batch.unwrap();
+        let base = rows[first].1.offset;
+        assert(first < end <= rows.len());
+        assert(base as int + len == frame_end(rows@[end as int-1].1));
+        assert forall|i:int| first <= i < end implies base <= #[trigger] rows@[i].1.offset &&
+            frame_end(rows@[i].1) <= base as int + len by {};
+        assert forall|i:int| first < i < end implies #[trigger] rows@[i].1.offset == frame_end(rows@[i-1].1) by {};
+        let ghost cap = if target as int > frame_end(rows@[first as int].1)-base {target as int} else {frame_end(rows@[first as int].1)-base};
+        assert(len <= cap);
+        proof { if end < rows.len() && rows@[end as int].1.offset == base as int + len {
+            assert(frame_end(rows@[end as int].1)-base > cap);
+        } }
+        first = end;
+    }
+    assert(first == rows.len());
+}
+
 /// The native preload loop exits on an empty batch. Every pending object
 /// must then already be resident. Every nonempty batch selects only the
 /// indexed locations for unresolved members of this exact frontier.
