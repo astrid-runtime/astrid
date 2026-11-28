@@ -278,6 +278,57 @@ pub(crate) open spec fn marker_bytes(bytes:Seq<u8>,address:Seq<u8>) -> bool {
     &&& bytes.subrange(tag+9,bytes.len() as int)==seq![1u8]
 }
 
+/// Cursor movement uses the operation tag and skips an inline value's entire payload.
+pub(crate) open spec fn row_end(bytes:Seq<u8>,at:usize) -> int {
+    let tag=at as int+4+key::length(bytes,at as int);
+    if bytes[tag]==delta::DELETE {tag+1} else if bytes[tag]==delta::INLINE {
+        tag+9+crate::checkpoint_value::value_length(bytes,tag+1)
+    } else {tag+9}
+}
+
+pub(crate) open spec fn spans(bytes:Seq<u8>,offsets:Seq<usize>) -> bool {
+    &&& offsets.len()>0 && offsets[0]==37 && offsets.last()==bytes.len()
+    &&& forall|i:int| 0<=i<offsets.len()-1 ==> offsets[i]<bytes.len() && offsets[i+1]==row_end(bytes,#[trigger] offsets[i])
+}
+
+pub(crate) open spec fn untouched_link(record:&ObjectRecord,next:ObjectId,address:Seq<u8>) -> bool {
+    let bytes=record.contents().2;
+    let refs=record.contents().3;
+    &&& bytes.len()>=37 && bytes[0]==crate::projection_record::DELTA
+    &&& reference_lookup::selected(refs,crate::delta_header::PREVIOUS@,0,refs.len() as int) matches Some(edge) &&
+        edge.fields().1==next && edge.fields().2==ReferenceKind::Owns
+    &&& forall|offsets:Seq<usize>,i:int| #[trigger] spans(bytes,offsets) && 0<=i<offsets.len()-1 ==>
+        bytes.subrange((#[trigger] offsets[i]) as int+4,offsets[i] as int+4+key::length(bytes,offsets[i] as int))!=address
+}
+
+proof fn absent_rows(rows:Seq<Mutation>,n:nat,address:Seq<u8>)
+    requires n<=rows.len(),forall|i:int| 0<=i<n ==> (#[trigger] rows[i]).key@!=address,
+    ensures crate::overlay_batch::after_rows(rows,n,address,None).is_none(),
+    decreases n,
+{
+    if n>0 {absent_rows(rows,(n-1) as nat,address);}
+}
+
+pub(crate) proof fn decoded_link<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecord,next:ObjectId,address:Seq<u8>,
+    v:crate::ObjectFormatVersion,label:&[u8],check:F,head:crate::delta_chain::Head)
+    requires untouched_link(record,next,address),crate::projection_record::valid(record,v,label,check,Ok(head)),
+    ensures head matches crate::delta_chain::Head::Delta{previous,mutations,..} && previous==Some(next) &&
+        crate::overlay_batch::after_rows(mutations@,mutations.len() as nat,address,None).is_none(),
+{
+    if let crate::delta_chain::Head::Delta{previous,depth,delta_bytes,mutations,totals}=head {
+        let saved=crate::delta_recovery::Recovered{previous,depth,delta_bytes,rows:mutations,totals};
+        let (bs,rs,path)=choose|bs:&[u8],rs:&[ObjectReference],p:Seq<usize>| #[trigger] crate::delta_recovery::admitted(record,check,saved,bs,rs,p);
+        assert forall|i:int| 0<=i<path.len()-1 implies path[i]<bs.len() && path[i+1]==row_end(bs@,#[trigger] path[i]) by {
+            assert(delta::decoded(bs,path[i] as int,path[i+1],rs,i as usize,check,Ok(mutations@[i])));
+        }
+        assert(spans(bs@,path));
+        assert forall|i:int| 0<=i<mutations.len() implies (#[trigger] mutations@[i]).key@!=address by {
+            assert(delta::decoded(bs,path[i] as int,path[i+1],rs,i as usize,check,Ok(mutations@[i])));
+        }
+        absent_rows(mutations@,mutations.len() as nat,address);
+    }
+}
+
 pub(crate) proof fn decoded_marker<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecord,address:Seq<u8>,
     v:crate::ObjectFormatVersion,label:&[u8],check:F,head:crate::delta_chain::Head)
     requires marker_bytes(record.contents().2,address),crate::projection_record::valid(record,v,label,check,Ok(head)),
@@ -314,7 +365,9 @@ pub(crate) proof fn decoded_marker<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecor
 #[verifier::rlimit(40)]
 pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u64,prior_bytes:u64,totals:crate::checkpoint_totals::NodeTotals) -> (out:(crate::ObjectRecord,crate::delta_chain::Head))
     requires key.len()<=u32::MAX && key.len()+51<=isize::MAX && prior_depth<u64::MAX && prior_bytes+key.len()+1<=u64::MAX,
-    ensures marker_bytes(out.0.contents().2,key@), out.1 matches crate::delta_chain::Head::Delta{previous:p,depth,delta_bytes,mutations,totals:t} && p==previous && depth==prior_depth+1 && delta_bytes==prior_bytes+key.len()+1 && t==totals && mutations.len()==1 &&
+    ensures previous matches Some(id) ==> (out.0.contents().3.len()==1 &&
+        out.0.contents().3[0].fields()==(crate::delta_header::PREVIOUS@,id,ReferenceKind::Owns)),
+        marker_bytes(out.0.contents().2,key@), out.1 matches crate::delta_chain::Head::Delta{previous:p,depth,delta_bytes,mutations,totals:t} && p==previous && depth==prior_depth+1 && delta_bytes==prior_bytes+key.len()+1 && t==totals && mutations.len()==1 &&
         mutations@[0].key@==key@ && (mutations@[0].value matches Some(ValueSlot::Inline(v)) && v@==seq![1u8]),
 {
     use crate::{delta_recovery as recovery,delta_batch as batch,projection_record as format,delta_chain::Head,delta_header::Header};
@@ -352,6 +405,8 @@ pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u
         if previous.is_some() {
             assert(refs@.map_values(crate::delta_writer::ref_fields())[0]==refs@[0].fields());
             assert(reference_lookup::selected(refs@,crate::delta_header::PREVIOUS@,0,1)==Some(refs@[0]));
+
+
         }
         assert forall|bs:&[u8],rs:&[ObjectReference],end:usize,out:Result<Mutation,delta::DecodeError<u8>>|
             bs@==bytes@ && rs@==refs@ && #[trigger] delta::decoded(bs,37,end,rs,0,check,out)
@@ -383,6 +438,43 @@ pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u
         }
     }
     match decoded {Ok(h)=>(record,h),Err(_)=>{assert(false);unreached()}}
+}
+
+/// A real one-row record distinguishes a changed key from an unrelated key and
+/// its owning predecessor from another object, even when both names exist.
+fn link_boundaries(previous:ObjectId,other:ObjectId,totals:crate::checkpoint_totals::NodeTotals)
+    requires previous!=other,
+{
+    let key=vec![97u8,0,98];
+    let ghost changed=key@;
+    let ghost untouched=seq![97u8,0,99];
+    let (record,_)=written_marker(key,Some(previous),0,0,totals);
+    let ghost bytes=record.contents().2;
+    let ghost path=seq![37usize,54usize];
+    proof {
+        assert(changed[2]==98 && untouched[2]==99 && changed!=untouched);
+        assert(reference_lookup::selected(record.contents().3,crate::delta_header::PREVIOUS@,0,1)==Some(record.contents().3[0]));
+        key::encoded_length(bytes,37,3);
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(row_end(bytes,37)==54);
+        assert(spans(bytes,path)) by {
+            assert forall|i:int| 0<=i<path.len()-1 implies path[i]<bytes.len() && path[i+1]==row_end(bytes,#[trigger] path[i]) by {
+                assert(i==0);
+            }
+        }
+        assert forall|offsets:Seq<usize>,i:int| #[trigger] spans(bytes,offsets) && 0<=i<offsets.len()-1 implies
+            bytes.subrange((#[trigger] offsets[i]) as int+4,offsets[i] as int+4+key::length(bytes,offsets[i] as int))==changed by {
+            assert(offsets[1]==54);
+            if offsets.len()>2 {assert(offsets[1]<bytes.len());}
+        }
+        assert(untouched_link(&record,previous,untouched));
+        assert(!untouched_link(&record,previous,changed)) by {
+            if untouched_link(&record,previous,changed) {
+                assert(bytes.subrange(path[0] as int+4,path[0] as int+4+key::length(bytes,path[0] as int))!=changed);
+            }
+        }
+        assert(!untouched_link(&record,other,untouched));
+    }
 }
 
 /// The same fixed header is used by the KV delta record writer and the replay reader.

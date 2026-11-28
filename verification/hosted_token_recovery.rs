@@ -700,7 +700,7 @@ fn reopen_captured_root<'a,P,S,B,V,T,W,E,L,M,I,K,D,A,R,C,F,G>(owner:&'a P,head:c
 /// Derive the marker write from the canonical component bytes recovered for
 /// this owner. Every predecessor read uses the same validated object table.
 fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A,R,C,F>(
-    graph:&'a crate::hosted_recovered_header::RecoveredGraph<P>,version:crate::ObjectFormatVersion,
+    graph:&'a crate::hosted_recovered_header::RecoveredGraph<P>,path:Ghost<Seq<crate::ObjectId>>,version:crate::ObjectFormatVersion,
     image:Ghost<Seq<u8>>,index:Ghost<Map<crate::ObjectId,crate::ArenaLocation>>,scheme:crate::root_wire::Scheme,
     kind:Marker,target:Id,single_use:bool,other:&(crate::memo_projection::Projection<B>,V),
     select:Select,fail:Fail,measure:M,start:I,values:(K,D),translate:A,rev_read:R,used_read:C,legacy:F)
@@ -713,8 +713,11 @@ fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
         C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
     requires vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
         graph.from_arena(image@,index@,scheme,version),graph.component.is_some(),
+        path@.len()>0 && path@[0]==graph.component.unwrap() && graph.records@.contains_key(path@.last()),
         forall|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) ==> crate::hosted_delta_mutation::marker_bytes(
-            crate::hosted_journal_history::component_bytes(image@,index@[graph.component.unwrap()]),ns_bytes(kind)+seq![0u8]+text),
+            crate::hosted_journal_history::component_bytes(image@,index@[path@.last()]),ns_bytes(kind)+seq![0u8]+text),
+        forall|i:int,text:Seq<u8>| 0<=i<path@.len()-1 && #[trigger] marker_key::spells(target@,text) ==>
+            crate::hosted_delta_mutation::untouched_link(&graph.records@[#[trigger] path@[i]],path@[i+1],ns_bytes(kind)+seq![0u8]+text),
         forall|id:crate::ObjectId| #[trigger] select.requires((id,)),
         forall|id:crate::ObjectId| #[trigger] fail.requires((id,)),
         forall|id:crate::ObjectId,check:Check,b:&[u8]| #[trigger] select.ensures((id,),check) ==> #[trigger] check.requires((b,)),
@@ -729,17 +732,20 @@ fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
     ensures out matches Ok(decision) ==> (kind is Revoked ==> decision is Revoked) && (single_use ==> !(decision is Allowed)),
 {
     let head=graph.component.unwrap();
+    let ghost writer=path@.last();
     let text=marker_key::encode(&target);
     let address=Ghost(ns_bytes(kind)+seq![0u8]+text@);
     proof {
-        crate::hosted_journal_history::component_contents(image@,(head,index@[head]),scheme,graph.records@[head]);
-        assert(crate::hosted_delta_mutation::marker_bytes(graph.records@[head].contents().2,address@));
+        crate::hosted_journal_history::component_contents(image@,(writer,index@[writer]),scheme,graph.records@[writer]);
+        assert(crate::hosted_delta_mutation::marker_bytes(graph.records@[writer].contents().2,address@));
     }
     let owner=graph.owner;
     let load=|p:&P,id:crate::ObjectId| -> (out:Result<crate::delta_chain::Head,E>)
-        ensures out matches Ok(h) ==> *p==owner && graph.records@.contains_key(id) && (id==head ==>
+        ensures out matches Ok(h) ==> *p==owner && graph.records@.contains_key(id) && (id==writer ==>
             (h matches crate::delta_chain::Head::Delta{mutations,..} &&
-            crate::overlay_batch::after_rows(mutations@,mutations.len() as nat,address@,None)==Some(true))),
+            crate::overlay_batch::after_rows(mutations@,mutations.len() as nat,address@,None)==Some(true))) &&
+            (forall|i:int| 0<=i<path@.len()-1 && id==#[trigger] path@[i] ==> (h matches crate::delta_chain::Head::Delta{previous,mutations,..} &&
+                previous==Some(path@[i+1]) && crate::overlay_batch::after_rows(mutations@,mutations.len() as nat,address@,None).is_none())),
     {
         proof {reveal(vstd::laws_cmp::obeys_cmp_ord);reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);}
         if !matches!(P::cmp(p,&owner),std::cmp::Ordering::Equal) {return Err(fail(id));}
@@ -749,22 +755,28 @@ fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
         let label=crate::projection_record::ROOT_LABEL.as_slice();
         match crate::projection_record::decode(record,version,label,check) {
             Ok(h)=>{
-                proof {if id==head {crate::hosted_delta_mutation::decoded_marker(record,address@,version,label,check,h);}}
+                proof {if id==writer {crate::hosted_delta_mutation::decoded_marker(record,address@,version,label,check,h);}
+                    assert forall|i:int| 0<=i<path@.len()-1 && id==#[trigger] path@[i] implies
+                        h matches crate::delta_chain::Head::Delta{previous,mutations,..} && previous==Some(path@[i+1]) &&
+                        crate::overlay_batch::after_rows(mutations@,mutations.len() as nat,address@,None).is_none() by {
+                        crate::hosted_delta_mutation::decoded_link(record,path@[i+1],address@,version,label,check,h);
+                    }
+                }
                 Ok(h)
             },
             Err(_)=>Err(fail(id)),
         }
     };
-    let ghost path=seq![head];
-    assert(crate::projection_recovery::retained(&graph.owner,head,path,load,address@,true));
+
+    assert(crate::projection_recovery::retained(&graph.owner,head,path@,load,address@,true));
     decode_then_reopen(&graph.owner,head,kind,target,single_use,other,load,measure,start,values,translate,
-        rev_read,used_read,legacy,Ghost(text@),Ghost(path))
+        rev_read,used_read,legacy,Ghost(text@),path)
 }
 
 /// Follow the owner in a physically retained restart table to its marker and run admission.
 /// A missing owner, unreadable header or different component yields no decision.
 fn decide_recovered_marker<P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A,R,C,F>(
-    loaded:crate::hosted_recovered_roots::Loaded<P>,owner:P,marker:crate::ObjectId,version:crate::ObjectFormatVersion,
+    loaded:crate::hosted_recovered_roots::Loaded<P>,owner:P,newest:crate::ObjectId,path:Ghost<Seq<crate::ObjectId>>,version:crate::ObjectFormatVersion,
     image:Ghost<Seq<u8>>,index:Ghost<Map<crate::ObjectId,crate::ArenaLocation>>,scheme:crate::root_wire::Scheme,
     kind:Marker,target:Id,single_use:bool,other:&(crate::memo_projection::Projection<B>,V),
     select:Select,fail:Fail,measure:M,start:I,values:(K,D),translate:A,rev_read:R,used_read:C,legacy:F)
@@ -776,9 +788,12 @@ fn decide_recovered_marker<P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
         R:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,
         C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
     requires vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
-        crate::hosted_recovered_roots::retained(&loaded,image@,index@,scheme),index@.contains_key(marker),
+        crate::hosted_recovered_roots::retained(&loaded,image@,index@,scheme),path@.len()>0 && path@[0]==newest && loaded.records@.contains_key(path@.last()),
         forall|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) ==> crate::hosted_delta_mutation::marker_bytes(
-            crate::hosted_journal_history::component_bytes(image@,index@[marker]),ns_bytes(kind)+seq![0u8]+text),
+            crate::hosted_journal_history::component_bytes(image@,index@[path@.last()]),ns_bytes(kind)+seq![0u8]+text),
+        forall|i:int| 0<=i<path@.len() ==> loaded.records@.contains_key(#[trigger] path@[i]),
+        forall|i:int,text:Seq<u8>| 0<=i<path@.len()-1 && #[trigger] marker_key::spells(target@,text) ==>
+            crate::hosted_delta_mutation::untouched_link(&loaded.records@[#[trigger] path@[i]],path@[i+1],ns_bytes(kind)+seq![0u8]+text),
         forall|id:crate::ObjectId| #[trigger] select.requires((id,)),
         forall|id:crate::ObjectId| #[trigger] fail.requires((id,)),
         forall|id:crate::ObjectId,check:Check,b:&[u8]| #[trigger] select.ensures((id,),check) ==> #[trigger] check.requires((b,)),
@@ -792,13 +807,13 @@ fn decide_recovered_marker<P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
         vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
         obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
     ensures out matches Some((root,result)) ==> loaded.history@.contains_key(owner) && root==loaded.history@[owner].0 &&
-        loaded.records@.contains_key(marker) && (result matches Ok(decision) ==>
+        loaded.records@.contains_key(newest) && (result matches Ok(decision) ==>
             (kind is Revoked ==> decision is Revoked) && (single_use ==> !(decision is Allowed))),
 {
     let graph=crate::hosted_recovered_header::loaded_header(loaded,&owner,version,image,index,scheme)?;
     let component=graph.component?;
-    if !component.same(&marker) {return None;}
-    let result=reopen_loaded_marker(&graph,version,image,index,scheme,kind,target,single_use,other,
+    if !component.same(&newest) {return None;}
+    let result=reopen_loaded_marker(&graph,path,version,image,index,scheme,kind,target,single_use,other,
         select,fail,measure,start,values,translate,rev_read,used_read,legacy);
     Some((graph.root,result))
 }

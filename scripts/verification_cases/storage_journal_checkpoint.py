@@ -41,9 +41,18 @@ def consumer_defects():
     journal = Path("verification/hosted_journal_history.rs")
     marker = Path("verification/hosted_delta_mutation.rs")
     admission = Path("verification/hosted_token_recovery.rs")
+    for label, before, after in [
+        ("physical predecessor", "edge.fields().1==next && edge.fields().2==ReferenceKind::Owns", "edge.fields().2==ReferenceKind::Owns"),
+        ("row key", "as int))!=address", "as int))==address"),
+        ("inline payload width", "tag+9+crate::checkpoint_value::value_length(bytes,tag+1)", "tag+9"),
+    ]:
+        yield (
+            f"physical marker history loses {label}", marker,
+            lambda s, a=before, b=after: replace_once(s, a, b), marker,
+        )
     for label, source, before, after in [
         ("owner", graph, "g.owner==*owner && loaded.history@", "loaded.history@"),
-        ("component", admission, "if !component.same(&marker) {return None;}", ""),
+        ("component", admission, "if !component.same(&newest) {return None;}", ""),
         ("decision", admission, "Some((graph.root,result))", "Some((graph.root,Ok(Admission::Allowed)))"),
     ]:
         yield (
@@ -68,7 +77,7 @@ def consumer_defects():
 
     append = Path("verification/hosted_marker_append.rs")
     for label, source, clause, weaker, target in [
-        ("canonical delta", marker, "ensures marker_bytes(out.0.contents().2,key@), out.1", "ensures true, out.1", append),
+        ("canonical delta", marker, "marker_bytes(out.0.contents().2,key@), out.1", "true, out.1", append),
         ("submitted payload", append, "ensures out@==v@ {v.as_slice()}", "ensures true {v.as_slice()}", append),
         ("physical contents", append, "&&& crate::hosted_delta_mutation::marker_bytes(\n        crate::hosted_journal_history::component_bytes(image,loc),address)", "&&& true", append),
         ("reopened file image", append, "open.ensures((f,),m) ==> m.image()==f.image() &&", "open.ensures((f,),m) ==> true &&", append),

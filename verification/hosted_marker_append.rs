@@ -229,7 +229,8 @@ fn append_then_reopen_marker<File:crate::arena_frame::BatchFile,Hasher,Identity,
     let Some(component)=graph.component else {return Ok((id,loc,MarkerRestart::DifferentComponent))};
     if !component.same(&id) {return Ok((id,loc,MarkerRestart::DifferentComponent));}
     proof {crate::hosted_journal_history::component_contents(media.image(),(id,loc),scheme,graph.records@[id]);}
-    let decision=reopen_loaded_marker(&graph,version,Ghost(media.image()),Ghost(index@),scheme,kind,target,single_use,other,
+    let ghost path=seq![id];
+    let decision=reopen_loaded_marker(&graph,Ghost(path),version,Ghost(media.image()),Ghost(index@),scheme,kind,target,single_use,other,
         select,fail,measure,start,values,translate,rev_read,used_read,legacy);
     Ok((id,loc,MarkerRestart::Recovered(media,graph,decision)))
 }
