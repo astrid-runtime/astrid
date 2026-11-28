@@ -577,17 +577,16 @@ where
         Option<crate::kv::RetiredKvProjection>,
     ) {
         inner.validated.extend(prepared.validated.iter().copied());
-        prepared.root.publish(|owner, replacement| {
-            inner.roots_by_principal.insert(owner.clone(), replacement);
-            // Publish validation before the lock-free root. The caller drops
-            // evicted value buffers after releasing the engine writer.
-            let retired = prepared
-                .kv_checkpoint_publication
-                .take()
-                .and_then(|publication| publication.try_publish(replacement));
-            self.published_roots.publish(owner, replacement);
-            retired
-        })
+        prepared.root.publish(
+            &mut inner.roots_by_principal,
+            |_, _, replacement| {
+                prepared
+                    .kv_checkpoint_publication
+                    .take()
+                    .and_then(|publication| publication.try_publish(replacement))
+            },
+            |owner, replacement, _| self.published_roots.publish(owner, replacement),
+        )
     }
 
     fn publish_commit_frontier(

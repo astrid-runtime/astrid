@@ -287,15 +287,24 @@ impl<P,R: Copy> PreparedRoot<P,R> {
         write(&self.owner,self.expected,self.replacement,&self.journal)
     }
 
-    /// Return the acknowledged root after passing this entry's owner and
-    /// replacement to the engine's publication operation.
-    pub(super) fn publish<T,F>(&self, publish: F) -> (result: (R,T)) where F: FnOnce(&P,R) -> T,
-        requires publish.requires((&self.binding().0,self.binding().2)),
-        ensures result.0 == self.binding().2,
-            publish.ensures((&self.binding().0,self.binding().2),result.1),
+    /// Install the writer root before publishing its optional memo and visible root.
+    pub(super) fn publish<T,F,V>(&self,writer:&mut BTreeMap<P,R>,memo:F,visible:V) -> (result:(R,T))
+        where P:Ord+Clone,F:FnOnce(&BTreeMap<P,R>,&P,R)->T,V:FnOnce(&P,R,&T),
+        requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), obeys_clone_eq::<P>(), btree_map_inv(old(writer)),
+            forall|w:&BTreeMap<P,R>| w@ == old(writer)@.insert(self.binding().0,self.binding().2)
+                ==> #[trigger] memo.requires((w,&self.binding().0,self.binding().2)),
+            forall|w:&BTreeMap<P,R>,t:&T| w@ == old(writer)@.insert(self.binding().0,self.binding().2) &&
+                #[trigger] memo.ensures((w,&self.binding().0,self.binding().2),*t)
+                ==> visible.requires((&self.binding().0,self.binding().2,t)),
+        ensures result.0 == self.binding().2, btree_map_inv(final(writer)),
+            final(writer)@ == old(writer)@.insert(self.binding().0,self.binding().2),
+            memo.ensures((&*final(writer),&self.binding().0,self.binding().2),result.1),
+            visible.ensures((&self.binding().0,self.binding().2,&result.1),()),
     {
-        let outcome = publish(&self.owner,self.replacement);
-        (self.replacement,outcome)
+        self.stage(writer);
+        let retired = memo(writer,&self.owner,self.replacement);
+        visible(&self.owner,self.replacement,&retired);
+        (self.replacement,retired)
     }
 }
 

@@ -889,7 +889,7 @@ def consumer_defects():
     )
     for name, clause in [
         ("encoder omits the prepared journal postcondition", "&&& encode.ensures((&owner,expected,replacement), Ok(bytes))"),
-        ("root publication loses the matching acknowledgement", "publish.ensures((&self.binding().0,self.binding().2),result.1)"),
+        ("root publication loses the matching acknowledgement", "memo.ensures((&*final(writer),&self.binding().0,self.binding().2),result.1)"),
         ("WAL append loses the matching journal postcondition", "write.ensures((&self.binding().0,self.binding().1,self.binding().2,&self.binding().3),result)"),
     ]:
         yield (

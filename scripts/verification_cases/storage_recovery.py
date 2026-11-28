@@ -39,6 +39,17 @@ def consumer_defects():
             f"group receipt loses {label}", receipt,
             lambda s, a=original, b=weaker: replace_once(s, a, b), Path("verification/hosted_kv_model.rs"),
         )
+    transition = Path("crates/astrid-storage/src/engine/durable/root_transition.rs")
+    for label, clause in [
+        ("writer map", "final(writer)@ == old(writer)@.insert(self.binding().0,self.binding().2),"),
+        ("visible receipt", "visible.ensures((&self.binding().0,self.binding().2,&result.1),()),"),
+        ("writer invariant", "result.0 == self.binding().2, btree_map_inv(final(writer)),"),
+    ]:
+        weaker = "result.0 == self.binding().2," if label == "writer invariant" else ""
+        yield (
+            f"root publication loses {label}", transition,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_kv_model.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

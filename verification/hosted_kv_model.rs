@@ -4,6 +4,10 @@ use crate::{guest_authority, guest_kv_dispatch, principal_invocation_state::Prin
 use crate::owner_codec::{self, Owner};
 use crate::root_transition::{Advance, PreparedRoot, Replay, Version, advance, replay};
 use crate::root_wire;
+use std::collections::BTreeMap;
+use vstd::laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq};
+use vstd::pervasive::obeys_clone_eq;
+use vstd::std_specs::btree::btree_map_inv;
 use vstd::prelude::*;
 
 verus! {
@@ -138,23 +142,29 @@ spec fn recorded<R: Copy,E,U,W,A>(admitted: [u8;32], expected: Option<R>, replac
 
 /// Compose pinned selection with the checked callbacks. Concrete encoder,
 /// append and publication semantics are obligations of this model’s caller.
-fn guest_publication<R: Copy, E, U, T, W, A, F>(scope: &[u8], requested: &[u8], admitted: [u8;32],
-    observed: [u8;32], expected: Option<R>, replacement: R, encode: W, append: A, publish: F)
+fn guest_publication<R: Copy, E, U, T, W, A, F, V>(scope: &[u8], requested: &[u8], admitted: [u8;32],
+    observed: [u8;32], expected: Option<R>, replacement: R, encode: W, append: A, writer:&mut BTreeMap<[u8;32],R>, memo:F, visible:V)
     -> (outcome: Option<Result<(R,U,T), E>>)
     where W: FnOnce(&[u8;32],Option<R>,R) -> Result<Vec<u8>,E>,
           A: FnOnce(&[u8;32], Option<R>, R, &Vec<u8>) -> Result<U,E>,
-          F: FnOnce(&[u8;32],R) -> T,
+          F: FnOnce(&BTreeMap<[u8;32],R>,&[u8;32],R) -> T, V:FnOnce(&[u8;32],R,&T),
     requires encode.requires((&admitted, expected, replacement)),
-        publish.requires((&admitted, replacement)),
+        obeys_cmp::<[u8;32]>(), obeys_cmp_concrete_eq::<[u8;32]>(), obeys_clone_eq::<[u8;32]>(), btree_map_inv(old(writer)),
+        forall|w:&BTreeMap<[u8;32],R>| w@ == old(writer)@.insert(admitted,replacement) ==> #[trigger] memo.requires((w,&admitted,replacement)),
+        forall|w:&BTreeMap<[u8;32],R>,t:&T| w@ == old(writer)@.insert(admitted,replacement) && #[trigger] memo.ensures((w,&admitted,replacement),*t)
+            ==> visible.requires((&admitted,replacement,t)),
         forall|j: &Vec<u8>| encode.ensures((&admitted, expected, replacement), Ok(*j))
             ==> #[trigger] append.requires((&admitted,expected,replacement,j)),
     ensures
+        btree_map_inv(final(writer)),
+        final(writer)@ == if outcome matches Some(Ok(_)) {old(writer)@.insert(admitted,replacement)} else {old(writer)@},
         outcome.is_some() == (scope@ == requested@ && admitted@ == observed@),
         outcome matches Some(Err(e)) ==> encode.ensures((&admitted, expected, replacement), Err(e))
             || recorded(admitted, expected, replacement, encode, append, Err(e)),
         outcome matches Some(Ok((ack, written, receipt))) ==> {
             &&& ack == replacement
-            &&& publish.ensures((&admitted, ack), receipt)
+            &&& memo.ensures((&*final(writer),&admitted, ack), receipt)
+            &&& visible.ensures((&admitted,ack,&receipt),())
             &&& recorded(admitted, expected, replacement, encode, append, Ok(written))
         },
 {
@@ -174,9 +184,9 @@ fn guest_publication<R: Copy, E, U, T, W, A, F>(scope: &[u8], requested: &[u8], 
     match written {
         Ok(staged) => {
             assert(recorded(admitted, expected, replacement, encode, append, Ok(staged)));
-            let (ack, receipt) = prepared.publish(publish);
+            let (ack, receipt) = prepared.publish(writer,memo,visible);
             assert(ack == replacement);
-            assert(publish.ensures((&admitted, ack), receipt));
+
             Some(Ok((ack,staged,receipt)))
         },
         Err(e) => Some(Err(e)),
