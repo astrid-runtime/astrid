@@ -93,6 +93,7 @@ pub(super) enum FrameError<E> {
     Io(E), Header(super::arena_frame::HeaderError), Overflow, Tail(TailError),
 }
 
+#[derive(Clone,Copy)]
 pub(super) enum TailError {
     HeaderShort, Magic, Oversize {size:u64,interior:bool}, PayloadShort, Checksum,
 }
@@ -185,28 +186,51 @@ pub(super) fn next_frame<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
 #[derive(Clone,Copy)]
 pub(super) enum Damage { Incomplete, Suspect { known_interior:bool } }
 
+impl TailError {
+    pub(super) open spec fn classification(self) -> Damage {
+        match self {
+            Self::HeaderShort | Self::PayloadShort => Damage::Incomplete,
+            Self::Oversize {interior,..} => Damage::Suspect {known_interior:interior},
+            Self::Checksum | Self::Magic => Damage::Suspect {known_interior:false},
+        }
+    }
+    pub(super) fn damage(self) -> (result:Damage)
+        ensures result==self.classification(),
+    {
+        match self {
+            Self::HeaderShort | Self::PayloadShort => Damage::Incomplete,
+            Self::Oversize {interior,..} => Damage::Suspect {known_interior:interior},
+            Self::Checksum | Self::Magic => Damage::Suspect {known_interior:false},
+        }
+    }
+}
+
 #[cfg(verus_keep_ghost)]
 pub(super) enum Event { Probe(u64), Resize(u64), Flush }
 
 pub(super) trait Medium {
     type Error;
+    spec fn target(&self) -> (int,Seq<u8>);
+    /// Set only for backings whose file flush synchronizes the physical medium.
+    spec fn syncs_file(&self) -> bool;
     spec fn calls(&self) -> Seq<Event>;
     spec fn bytes(&self) -> Seq<u8>;
     spec fn durable(&self) -> Seq<u8>;
     spec fn probe_result(&self, offset:u64, result:Result<bool,Self::Error>) -> bool;
 
     fn later_frame(&mut self,offset:u64) -> (out:Result<bool,Self::Error>)
-        ensures final(self).calls() == old(self).calls().push(Event::Probe(offset)),
+        ensures final(self).syncs_file()==old(self).syncs_file(),final(self).target()==old(self).target(),final(self).calls() == old(self).calls().push(Event::Probe(offset)),
             final(self).bytes() == old(self).bytes(), final(self).durable() == old(self).durable(),
             old(self).probe_result(offset,out);
 
     fn resize(&mut self,offset:u64) -> (out:Result<(),Self::Error>)
-        ensures final(self).calls() == old(self).calls().push(Event::Resize(offset)),
+        ensures final(self).syncs_file()==old(self).syncs_file(),final(self).target()==old(self).target(),final(self).calls() == old(self).calls().push(Event::Resize(offset)),
             out.is_ok() && offset <= old(self).bytes().len() ==> final(self).bytes() == old(self).bytes().take(offset as int);
 
     fn flush(&mut self) -> (out:Result<(),Self::Error>)
-        ensures final(self).calls() == old(self).calls().push(Event::Flush),
-            out.is_ok() ==> final(self).durable() == old(self).bytes() && final(self).bytes() == old(self).bytes();
+        ensures final(self).syncs_file()==old(self).syncs_file(),final(self).target()==old(self).target(),final(self).calls() == old(self).calls().push(Event::Flush),
+            out.is_ok() ==> final(self).bytes() == old(self).bytes() &&
+                (old(self).syncs_file() ==> final(self).durable() == old(self).bytes());
 }
 
 pub(super) enum Outcome { Reject, Repaired }
@@ -214,7 +238,7 @@ pub(super) enum Error<E> { Probe(E), Resize(E), Flush(E) }
 
 pub(super) fn repair<M:Medium>(media:&mut M,offset:u64,end:u64,protected:u64,damage:Damage)
     -> (out:Result<Outcome,Error<M::Error>>)
-    ensures ({
+    ensures final(media).syncs_file()==old(media).syncs_file(),final(media).target()==old(media).target(), ({
         let before = old(media).calls();
         let blocked = offset < protected || offset >= end || (damage matches Damage::Suspect {known_interior:true});
         let probe = !blocked && (damage matches Damage::Suspect {known_interior:false});
@@ -233,7 +257,7 @@ pub(super) fn repair<M:Medium>(media:&mut M,offset:u64,end:u64,protected:u64,dam
                 },
         }
         &&& out matches Ok(Outcome::Repaired) ==> (offset <= old(media).bytes().len() ==>
-            final(media).bytes() == old(media).bytes().take(offset as int) && final(media).durable() == final(media).bytes())
+            final(media).bytes() == old(media).bytes().take(offset as int) && (old(media).syncs_file() ==> final(media).durable() == final(media).bytes()))
     }),
 {
     if offset < protected || offset >= end {return Ok(Outcome::Reject);}

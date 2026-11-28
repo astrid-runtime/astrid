@@ -20,10 +20,45 @@ pub(super) open spec fn tag(bytes:Seq<u8>) -> u64 {
     if bytes.len()>=8 {vstd::bytes::spec_u64_from_le_bytes(bytes.take(8))} else {0u64}
 }
 
+pub(super) open spec fn decoded(r:Record,data:Seq<u8>,scheme:root_wire::Scheme) -> bool {
+    match r {
+        Record::Transition(t)=>data.len()>=8 && tag(data)!=snapshot::SENTINEL && 8+tag(data) as int<=data.len() &&
+            t.principal@==data.subrange(8,8+tag(data) as int) &&
+            exists|prior:Option<root_wire::Root>,next:root_wire::Root| #[trigger] root_wire::tail(data,8+tag(data) as int,scheme,prior,next) &&
+                history::represents(next,t.replacement) && match (prior,t.expected) {(None,None)=>true,(Some(a),Some(b))=>history::represents(a,b),_=>false},
+        Record::Snapshot(rows)=>snapshot_header(data,rows.len()) && snapshot::ordered(rows@) &&
+            exists|ends:Seq<usize>| ends[0]==17 && ends[rows.len() as int]==data.len() && #[trigger] snapshot::spans(data,rows@,ends,scheme),
+    }
+}
+
+pub(super) open spec fn decode_failure(data:Seq<u8>,cursor:usize,scheme:root_wire::Scheme,e:Error) -> bool {
+    let first=tag(data);
+    match e {
+        Error::Header(h)=>match h {
+            snapshot::HeaderError::Read(_)=>data.len()<8 || first==snapshot::SENTINEL && (data.len()<9 || data[8]==snapshot::RECORD && data.len()<17),
+            snapshot::HeaderError::UnknownRecord=>data.len()>=9 && first==snapshot::SENTINEL && data[8]!=snapshot::RECORD,
+            snapshot::HeaderError::Length=>data.len()>=17 && first==snapshot::SENTINEL && data[8]==snapshot::RECORD &&
+                vstd::bytes::spec_u64_from_le_bytes(data.subrange(9,17))>usize::MAX,
+        },
+        Error::Transition(_)=>data.len()>=8 && first!=snapshot::SENTINEL &&
+            (first<=usize::MAX ==> forall|prior:Option<root_wire::Root>,next:root_wire::Root| !(#[trigger] root_wire::tail(data,8+first as int,scheme,prior,next))),
+        Error::Snapshot(e)=>exists|n:usize| #[trigger] snapshot_header(data,n) && (
+            e is Capacity ==> n>0 && cursor==17) && forall|rows:snapshot::WireRows,ends:Seq<usize>|
+            #[trigger] snapshot::layout(data,17,n,scheme,rows,ends) ==> match e {
+                snapshot::CompleteError::Capacity=>n>0,
+                snapshot::CompleteError::Row(_)=>false,
+                snapshot::CompleteError::End(reason)=>cursor==ends[n as int] &&
+                    exists|v:Seq<(Vec<u8>,RootState)>| v.len()==n && #[trigger] snapshot::matches_rows(v,rows) && match reason {
+                        snapshot::EndError::Order=>!snapshot::ordered(v),snapshot::EndError::Trailing=>snapshot::ordered(v) && cursor!=data.len()},
+            },
+    }
+}
+
 #[verifier::spinoff_prover]
 pub(super) fn decode(bytes:&[u8],cursor:&mut usize,scheme:root_wire::Scheme) -> (out:Result<Record,Error>)
     requires *old(cursor)==0,
-    ensures
+    ensures out matches Ok(r) ==> decoded(r,bytes@,scheme),
+        out matches Err(e) ==> decode_failure(bytes@,*final(cursor),scheme,e),
         out matches Ok(Record::Transition(r)) ==> bytes.len()>=8 && tag(bytes@)!=snapshot::SENTINEL &&
             *final(cursor)==bytes.len() && 8+tag(bytes@) as int<=bytes.len() && r.principal@==bytes@.subrange(8,8+tag(bytes@) as int) &&
             exists|e:Option<root_wire::Root>,n:root_wire::Root| #[trigger] root_wire::tail(bytes@,8+tag(bytes@) as int,scheme,e,n) &&
@@ -64,7 +99,7 @@ pub(super) fn decode(bytes:&[u8],cursor:&mut usize,scheme:root_wire::Scheme) -> 
             Ok(r)=>Ok(Record::Transition(r)),Err(e)=>Err(Error::Transition(e)),
         },
         Ok(snapshot::JournalHeader::Snapshot(n))=>match snapshot::read_complete(bytes,cursor,n,scheme) {
-            Ok(v)=>Ok(Record::Snapshot(v)),Err(e)=>Err(Error::Snapshot(e)),
+            Ok(v)=>Ok(Record::Snapshot(v)),Err(e)=>{assert(snapshot_header(bytes@,n));assert(decode_failure(bytes@,*cursor,scheme,Error::Snapshot(e)));Err(Error::Snapshot(e))},
         },
         Err(e)=>Err(Error::Header(e)),
     }

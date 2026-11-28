@@ -23,7 +23,7 @@ pub(super) trait Visitor<R:FrameReader> {
             result matches Err(e) ==> final(self).refused(old(self),bytes@,e);
 }
 
-pub(super) enum Stop<F,V> { Frame(u64,FrameError<F>), Visitor(V) }
+pub(super) enum Stop<F,V> { Frame(u64,FrameError<F>), Visitor(u64,Vec<u8>,V) }
 
 pub(super) open spec fn boundary(calls:Seq<Call>,n:nat,start:u64) -> int {
     if n==0 {start as int} else {let (offset,body)=calls[n-1];offset as int+52+body.len()}
@@ -57,6 +57,49 @@ pub(super) struct Window {
     pub(super) start:u64, pub(super) end:u64, pub(super) magic:[u8;8], pub(super) version:u16, pub(super) limit:u64,
 }
 
+pub(super) open spec fn scanned<R:FrameReader,V:Visitor<R>,H:Fn([u8;8],u64,&[u8])->[u8;32]>(before:&R,reader:&R,prior:&V,visitor:&V,
+    window:Window,hash:H,out:Result<(),Stop<R::Error,V::Error>>) -> bool {
+    visitor.config()==prior.config() && reader.target()==before.target() && reader.image()==before.image() && {
+        let calls=visitor.calls().skip(prior.calls().len() as int);
+        &&& visitor.calls()==prior.calls()+calls
+        &&& match out {
+            Ok(())=>visitor.ready() && traversed(calls,window.start,window.end as int,before.image(),window.magic,window.version,window.limit,hash) && reader.position()==window.end,
+            Err(Stop::Frame(at,e))=>visitor.ready() && at<window.end && traversed(calls,window.start,at as int,before.image(),window.magic,window.version,window.limit,hash) &&
+                frame_failure(reader,at,window.end,window.magic,window.version,window.limit,hash,e),
+            Err(Stop::Visitor(at,body,e))=>at==calls.last().0 && body@==calls.last().1 && rejected::<R,V>(visitor,visitor.calls(),e) && calls.len()>0 && boundary(calls,calls.len(),window.start)<=window.end &&
+                traversed(calls,window.start,boundary(calls,calls.len(),window.start),before.image(),window.magic,window.version,window.limit,hash),
+        }
+    }
+}
+
+/// The live native root journal and its proof enter the same scan at zero.
+pub(super) fn scan_root<R:FrameReader,V:Visitor<R>,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(reader:&mut R,visitor:&mut V,
+    end:u64,limit:u64,hash:H) -> (out:Result<(),Stop<R::Error,V::Error>>)
+    requires old(visitor).ready(),end<=old(reader).image().len(),old(reader).position()==0,
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((super::arena_frame::ROOT_MAGIC,n,b)),
+    ensures scanned(old(reader),final(reader),old(visitor),final(visitor),
+        Window{start:0,end,magic:super::arena_frame::ROOT_MAGIC,version:super::arena_frame::FRAME_VERSION,limit},hash,out),
+{
+    let window=Window{start:0,end,magic:super::arena_frame::ROOT_MAGIC,version:super::arena_frame::FRAME_VERSION,limit};
+    scan(reader,visitor,window,hash)
+}
+
+proof fn authenticated_frame<R:FrameReader,H:Fn([u8;8],u64,&[u8])->[u8;32]>(before:&R,after:&R,offset:u64,end:u64,
+    magic:[u8;8],version:u16,limit:u64,hash:H,f:frame_repair::ScannedFrame)
+    requires end<=before.image().len(), frame_repair::classified(before,after,offset,end,magic,version,limit,hash,Ok(f)),
+    ensures authentic(before.image(),offset,f.body@,magic,version,limit,hash),
+{
+            let image=before.image();let at=offset as int;
+            let h=frame_repair::header_at(image,offset);
+            let n=vstd::bytes::spec_u64_from_le_bytes(h.subrange(12,20));
+            let (b,sum)=choose|b:&[u8],sum:[u8;32]| b@==f.body@ && sum@==h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum);
+            vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+            assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(n));
+            assert(h =~= super::arena_frame::header_bytes(magic,version,n,sum));
+            assert(image.subrange(at,f.end as int) =~= h+f.body@);
+            assert(authentic(image,offset,f.body@,magic,version,limit,hash));
+        }
+
 #[verifier::rlimit(25)]
 #[verifier::spinoff_prover]
 #[verifier::loop_isolation(false)]
@@ -64,17 +107,8 @@ pub(super) fn scan<R:FrameReader,V:Visitor<R>,H:Fn([u8;8],u64,&[u8])->[u8;32]+Co
     window:Window,hash:H) -> (out:Result<(),Stop<R::Error,V::Error>>)
     requires old(visitor).ready(),window.start<=window.end<=old(reader).image().len(),old(reader).position()==window.start,
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((window.magic,n,b)),
-    ensures final(visitor).config()==old(visitor).config(),final(reader).target()==old(reader).target(),final(reader).image()==old(reader).image(),{
-        let calls=final(visitor).calls().skip(old(visitor).calls().len() as int);
-        &&& final(visitor).calls()==old(visitor).calls()+calls
-        &&& match out {
-            Ok(())=>final(visitor).ready() && traversed(calls,window.start,window.end as int,old(reader).image(),window.magic,window.version,window.limit,hash) && final(reader).position()==window.end,
-            Err(Stop::Frame(at,e))=>final(visitor).ready() && at<window.end && traversed(calls,window.start,at as int,old(reader).image(),window.magic,window.version,window.limit,hash) &&
-                frame_failure(final(reader),at,window.end,window.magic,window.version,window.limit,hash,e),
-            Err(Stop::Visitor(e))=>rejected::<R,V>(final(visitor),final(visitor).calls(),e) && calls.len()>0 && boundary(calls,calls.len(),window.start)<=window.end &&
-                traversed(calls,window.start,boundary(calls,calls.len(),window.start),old(reader).image(),window.magic,window.version,window.limit,hash),
-        }
-    },
+    ensures scanned(old(reader),final(reader),old(visitor),final(visitor),window,hash,out),
+
 {
     let start=window.start;let end=window.end;let magic=window.magic;let version=window.version;let limit=window.limit;
     let mut offset=start;
@@ -93,17 +127,7 @@ pub(super) fn scan<R:FrameReader,V:Visitor<R>,H:Fn([u8;8],u64,&[u8])->[u8;32]+Co
                 return Err(Stop::Frame(offset,e))
             }
         };
-        proof {
-            let image=reader.image();let at=offset as int;
-            let h=frame_repair::header_at(image,offset);
-            let n=vstd::bytes::spec_u64_from_le_bytes(h.subrange(12,20));
-            let (b,sum)=choose|b:&[u8],sum:[u8;32]| b@==f.body@ && sum@==h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum);
-            vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
-            assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(n));
-            assert(h =~= super::arena_frame::header_bytes(magic,version,n,sum));
-            assert(image.subrange(at,f.end as int) =~= h+f.body@);
-            assert(authentic(image,offset,f.body@,magic,version,limit,hash));
-        }
+        proof {authenticated_frame(&cursor,reader,offset,end,magic,version,limit,hash,f);}
         let ghost prior=*visitor;
         let accepted=visitor.visit(reader,offset,&f.body);
         proof {
@@ -122,7 +146,7 @@ pub(super) fn scan<R:FrameReader,V:Visitor<R>,H:Fn([u8;8],u64,&[u8])->[u8;32]+Co
             assert(prior.calls() =~= visitor.calls().drop_last());
             assert(visitor.refused(&prior,visitor.calls().last().1,e));
             assert(rejected::<R,V>(visitor,visitor.calls(),e));
-            return Err(Stop::Visitor(e))
+            return Err(Stop::Visitor(offset,f.body,e))
         }
         offset=f.end;
     }

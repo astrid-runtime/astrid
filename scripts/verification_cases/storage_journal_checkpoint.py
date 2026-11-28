@@ -350,13 +350,48 @@ def consumer_defects():
         ("callback offset", walker, "visitor.visit(reader,offset,&f.body)", "visitor.visit(reader,start,&f.body)"),
         ("callback payload", walker, "visitor.visit(reader,offset,&f.body)", "visitor.visit(reader,offset,&[])"),
         ("gapless traversal", walker, "offset=f.end;", "offset=end;"),
-        ("refused visitor", walker, "return Err(Stop::Visitor(e))", "return Ok(())"),
+        ("refused visitor", walker, "return Err(Stop::Visitor(offset,f.body,e))", "return Ok(())"),
         ("root transition offset", application, "r.replay(table,scheme,at,data", "r.replay(table,scheme,0,data"),
         ("snapshot position", application, "snapshot::restore(table,at,data", "snapshot::restore(table,0,data"),
         ("returned history", visitor, "{self.table}", "{BTreeMap::new()}"),
-        ("verified root frame domain", integrated, "end,magic:ROOT_MAGIC", "end,magic:crate::arena_frame::ARENA_MAGIC"),
+        ("verified root frame domain", walker, "let window=Window{start:0,end,magic:super::arena_frame::ROOT_MAGIC", "let window=Window{start:0,end,magic:super::arena_frame::ARENA_MAGIC"),
     ]:
         yield (
             f"physical journal scan loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )
+
+    for label, source, clause, weakness in [
+        ("protected boundary", integrated, "repair(media,at,end,protected,e.damage())", "repair(media,at,end,0,e.damage())"),
+        ("actual failed cursor", integrated, "repair(media,at,end,protected,e.damage())", "repair(media,protected,end,protected,e.damage())"),
+        ("classified tail", integrated, "protected,e.damage())", "protected,crate::frame_repair::Damage::Incomplete)"),
+        ("repaired history", integrated, "Live::Repaired(at,e,table)", "Live::Repaired(at,e,BTreeMap::new())"),
+        ("refused suffix", integrated, "Ok(Outcome::Reject)=>Live::Frame(at,FrameError::Tail(e))", "Ok(Outcome::Reject)=>Live::Repaired(at,e,table)"),
+        ("container persistence", integrated, "match region.sync_container()", "match Ok::<(),V::Error>(())"),
+        ("container failure", integrated, "VolumeRecovery::Container(at,e)\n", "VolumeRecovery::Persisted(at,table,region)\n"),
+        ("returned volume history", integrated, "Ok(())=>VolumeRecovery::Persisted(at,table,region)", "Ok(())=>VolumeRecovery::Persisted(at,BTreeMap::new(),region)"),
+    ]:
+        yield (
+            f"repaired journal loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )
+
+    transition = walker.with_name("journal_transition.rs")
+    for label, source, clause, weakness, consumer in [
+        ("diagnostic position", walker, "return Err(Stop::Visitor(offset,f.body,e))",
+         "return Err(Stop::Visitor(start,f.body,e))", walker),
+        ("diagnostic bytes", walker, "return Err(Stop::Visitor(offset,f.body,e))",
+         "return Err(Stop::Visitor(offset,Vec::new(),e))", walker),
+        ("conflicting predecessor", transition, "actual==seen && actual!=expected",
+         "actual==seen && actual==expected", transition),
+        ("snapshot refusal cause", application, "Err(Error::Snapshot(e))\n",
+         "Err(Error::Snapshot(snapshot::SnapshotError::Position))\n", application),
+        ("conflict diagnostics", application, "Err(Error::Transition(r.expected,e))\n",
+         "Err(Error::Transition(None,e))\n", application),
+        ("unknown record reason", dispatch, "data.len()>=9 && first==snapshot::SENTINEL",
+         "data.len()<9 && first==snapshot::SENTINEL", dispatch),
+    ]:
+        yield (
+            f"root refusal loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
         )

@@ -161,7 +161,7 @@ fn incomplete_payload<M:crate::frame_repair::Medium>(media:&mut M,physical:u64,p
         &&& match out {
             Ok(false) => at < protected && final(media).calls() == calls && final(media).bytes() == old(media).bytes(),
             Ok(true) => at >= protected && final(media).calls() == resized.push(crate::frame_repair::Event::Flush)
-                && final(media).durable() == old(media).bytes().take(at as int) && final(media).bytes() == final(media).durable(),
+                && final(media).bytes() == old(media).bytes().take(at as int) && (old(media).syncs_file() ==> final(media).bytes() == final(media).durable()),
             Err(crate::frame_repair::Error::Resize(_)) => at >= protected && final(media).calls() == resized,
             Err(crate::frame_repair::Error::Flush(_)) => at >= protected && final(media).calls() == resized.push(crate::frame_repair::Event::Flush),
             Err(_) => false,

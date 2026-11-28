@@ -247,25 +247,15 @@ pub(super) fn scan_frames_with_bound<F: DurableIo>(
     // BufReader fill cannot sequentially read past end; live mode keeps a
     // direct BufReader so tail repair can still observe and truncate media.
     let result = match bound {
-        FrameScanBound::LiveRepair { .. } => {
-            let mut reader = std::io::BufReader::new(&mut *file);
-            let scanned = scan_frames_grammar(
-                &mut reader,
+        FrameScanBound::LiveRepair { .. } => scan_live(file, |reader| {
+            scan_frames_grammar(
+                reader,
                 |reader| reader.get_mut(),
                 policy,
                 scan_start,
                 &mut accept,
-            );
-            if scanned.is_ok() {
-                // Tail repair above is terminal: discard any read-ahead before
-                // exposing the cursor again, including when repair shortened the
-                // underlying file.
-                reader
-                    .seek(SeekFrom::End(0))
-                    .map_err(|source| io_error("seek durable file tail", source))?;
-            }
-            scanned
-        },
+            )
+        }),
         FrameScanBound::Committed(_) => {
             let limit = scan_end
                 .checked_sub(scan_start)
@@ -288,6 +278,66 @@ pub(super) fn scan_frames_with_bound<F: DurableIo>(
             .map_err(|source| io_error("restore durable committed-range cursor", source))?;
     }
     result
+}
+
+fn scan_live<F: DurableIo>(
+    file: &mut F,
+    run: impl FnOnce(&mut std::io::BufReader<&mut F>) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
+    let mut reader = std::io::BufReader::new(file);
+    run(&mut reader)?;
+    // Discard read-ahead after a repair, which can shorten the underlying file.
+    reader
+        .seek(SeekFrom::End(0))
+        .map_err(|source| io_error("seek durable file tail", source))?;
+    Ok(())
+}
+
+/// Run the verified root-history visitor directly on the live journal reader.
+pub(in crate::engine::durable) fn scan_root_file<F: DurableIo, V, E>(
+    file: &mut F,
+    limits: RecoveryLimits,
+    visitor: &mut V,
+    report: impl FnOnce(u64, &[u8], E) -> DurableError,
+) -> Result<(), DurableError>
+where
+    for<'a> V: super::super::frame_scan::Visitor<std::io::BufReader<&'a mut F>, Error = E>,
+{
+    let file_len = file
+        .durable_metadata()
+        .map_err(|source| io_error("read principal-store metadata", source))?
+        .len();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("seek durable frame", source))?;
+    let policy = FrameScanPolicy {
+        file_name: super::super::ROOT_FILE,
+        magic: super::super::ROOT_MAGIC,
+        limits,
+        protected_len: 0,
+        file_len,
+    };
+    scan_live(file, |reader| {
+        let outcome = super::super::frame_scan::scan_root(
+            reader,
+            visitor,
+            file_len,
+            limits.max_frame_bytes,
+            frame_checksum,
+        );
+        complete_scan(outcome, policy, || &mut **reader.get_mut(), report)
+    })
+}
+
+impl FrameScanPolicy {
+    fn window(self, start: u64) -> super::super::frame_scan::Window {
+        super::super::frame_scan::Window {
+            start,
+            end: self.file_len,
+            magic: self.magic,
+            version: FRAME_VERSION,
+            limit: self.limits.max_frame_bytes,
+        }
+    }
 }
 
 struct FrameCallback<T>(T);
@@ -316,65 +366,51 @@ where
     R: std::io::Read,
     GetFile: FnMut(&mut std::io::BufReader<R>) -> &mut F,
 {
-    use super::super::frame_scan::{self, Stop};
-    use frame_repair::{FrameError, TailError};
-
-    let file_name = policy.file_name;
-    let magic = policy.magic;
-    let limits = policy.limits;
-    let file_len = policy.file_len;
     let mut visitor = FrameCallback(|r: &mut std::io::BufReader<R>, at, bytes: &[u8]| {
         accept(at, bytes, get_file(r))
     });
-    let window = frame_scan::Window {
-        start: offset,
-        end: file_len,
-        magic,
-        version: FRAME_VERSION,
-        limit: limits.max_frame_bytes,
-    };
-    match frame_scan::scan(reader, &mut visitor, window, frame_checksum) {
+    let outcome =
+        super::super::frame_scan::scan(reader, &mut visitor, policy.window(offset), frame_checksum);
+    complete_scan(outcome, policy, || get_file(reader), |_, _, error| error)
+}
+
+fn complete_scan<'a, F: DurableIo + 'a, E>(
+    outcome: Result<(), super::super::frame_scan::Stop<DurableError, E>>,
+    policy: FrameScanPolicy,
+    file: impl FnOnce() -> &'a mut F,
+    report: impl FnOnce(u64, &[u8], E) -> DurableError,
+) -> Result<(), DurableError> {
+    use super::super::frame_scan::Stop;
+    use frame_repair::{FrameError, TailError};
+    let file_name = policy.file_name;
+    let limits = policy.limits;
+    match outcome {
         Ok(()) => Ok(()),
-        Err(Stop::Visitor(error) | Stop::Frame(_, FrameError::Io(error))) => Err(error),
+        Err(Stop::Visitor(at, body, error)) => Err(report(at, &body, error)),
+        Err(Stop::Frame(_, FrameError::Io(error))) => Err(error),
         Err(Stop::Frame(_, FrameError::Overflow)) => Err(DurableError::EncodingOverflow),
         Err(Stop::Frame(at, FrameError::Header(error))) => {
             Err(super::frame_header_error(file_name, at, &error))
         },
         Err(Stop::Frame(offset, FrameError::Tail(error))) => {
-            let (damage, cause) = match error {
-                TailError::HeaderShort => (
-                    Damage::Incomplete,
-                    corrupt(file_name, offset, "published frame header is truncated"),
-                ),
-                TailError::PayloadShort => (
-                    Damage::Incomplete,
-                    corrupt(file_name, offset, "published frame payload is truncated"),
-                ),
-                TailError::Magic => (
-                    Damage::Suspect {
-                        known_interior: false,
-                    },
-                    corrupt(file_name, offset, "frame magic mismatch"),
-                ),
-                TailError::Oversize { size, interior } => (
-                    Damage::Suspect {
-                        known_interior: interior,
-                    },
-                    DurableError::FrameTooLarge {
-                        file: file_name,
-                        offset,
-                        declared: size,
-                        limit: limits.max_frame_bytes,
-                    },
-                ),
-                TailError::Checksum => (
-                    Damage::Suspect {
-                        known_interior: false,
-                    },
-                    corrupt(file_name, offset, "frame checksum mismatch"),
-                ),
+            let damage = error.damage();
+            let cause = match error {
+                TailError::HeaderShort => {
+                    corrupt(file_name, offset, "published frame header is truncated")
+                },
+                TailError::PayloadShort => {
+                    corrupt(file_name, offset, "published frame payload is truncated")
+                },
+                TailError::Magic => corrupt(file_name, offset, "frame magic mismatch"),
+                TailError::Oversize { size, .. } => DurableError::FrameTooLarge {
+                    file: file_name,
+                    offset,
+                    declared: size,
+                    limit: limits.max_frame_bytes,
+                },
+                TailError::Checksum => corrupt(file_name, offset, "frame checksum mismatch"),
             };
-            repair_tail(get_file(reader), policy, offset, damage, cause)
+            repair_tail(file(), policy, offset, damage, cause)
         },
     }
 }

@@ -35,6 +35,23 @@ pub(super) open spec fn accepted<P,D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>>(rec
     }
 }
 
+pub(super) open spec fn rejected<P,D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>>(r:Record,data:Seq<u8>,at:u64,
+    scheme:root_wire::Scheme,prior:Map<P,(RootState,u64)>,decode:D,recode:C,error:Error) -> bool {
+    match (r,error) {
+        (Record::Transition(t),Error::Transition(expected,e))=>expected==t.expected &&
+            transition::replay_refused(t,data,scheme,prior,decode,recode,e),
+        (Record::Snapshot(rows),Error::Snapshot(e))=>match e {
+            snapshot::SnapshotError::Position=>at!=0 || !prior.is_empty(),
+            snapshot::SnapshotError::Noncanonical=>data!=snapshot::prefix(rows@,rows.len() as nat,scheme),
+            snapshot::SnapshotError::Codec(CodecError::Order)=>!snapshot::ordered(rows@),
+            snapshot::SnapshotError::Codec(CodecError::Principal)=>exists|i:int| 0<=i<rows.len() && #[trigger] transition::invalid_name(rows@[i].0@,decode,recode),
+            snapshot::SnapshotError::Duplicate=>exists|i:int,j:int,p:P| 0<=i<j<rows.len() &&
+                #[trigger] bound_name(rows@[i].0@,p,decode,recode) && #[trigger] bound_name(rows@[j].0@,p,decode,recode),
+        },
+        _=>false,
+    }
+}
+
 #[verifier::spinoff_prover]
 pub(super) fn apply<P:Ord,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy>(table:&mut BTreeMap<P,(RootState,u64)>,
     record:Record,data:&[u8],at:u64,scheme:root_wire::Scheme,decode:D,recode:C) -> (out:Result<(),Error>)
@@ -42,26 +59,32 @@ pub(super) fn apply<P:Ord,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy>(ta
         forall|b:&[u8]| #[trigger] decode.requires((b,)),forall|p:&P| #[trigger] recode.requires((p,)),
     ensures btree_map_inv(final(table)),out.is_err() ==> final(table)@==old(table)@,
         out.is_ok() ==> accepted(record,data@,at,scheme,old(table)@,final(table)@,decode,recode),
+        out matches Err(e) ==> rejected(record,data@,at,scheme,old(table)@,decode,recode,e),
         out matches Err(Error::Transition(_,_)) ==> record is Transition,
         out matches Err(Error::Snapshot(_)) ==> record is Snapshot,
 {
     match record {
         Record::Transition(r)=>match r.replay(table,scheme,at,data,decode,recode) {
             Ok(())=>{assert(accepted(record,data@,at,scheme,old(table)@,table@,decode,recode));Ok(())},
-            Err(e)=>Err(Error::Transition(r.expected,e)),
+            Err(e)=>{
+                Err(Error::Transition(r.expected,e))
+            },
         },
         Record::Snapshot(rows)=>{
             let encode=|rows:&Vec<(Vec<u8>,RootState)>| -> (out:Result<Vec<u8>,CodecError>)
-                ensures out matches Ok(v) ==> snapshot::ordered(rows@) && v@==snapshot::prefix(rows@,rows.len() as nat,scheme),
+                ensures out.is_err()==!snapshot::ordered(rows@),out matches Err(e) ==> e is Order,
+                    out matches Ok(v) ==> snapshot::ordered(rows@) && v@==snapshot::prefix(rows@,rows.len() as nat,scheme),
             {snapshot::encode_ordered(rows,scheme).ok_or(CodecError::Order)};
             let owner=|bytes:&Vec<u8>| -> (out:Result<P,CodecError>)
-                ensures out matches Ok(p) ==> bound_name(bytes@,p,decode,recode),
+                ensures out matches Err(e) ==> e is Principal && transition::invalid_name(bytes@,decode,recode),
+                    out matches Ok(p) ==> bound_name(bytes@,p,decode,recode),
             {
                 let b=bytes.as_slice();
                 let result=history::principal(b,decode,recode);
-                match result {
-                    Some(p)=>{assert(transition::named(b,p,decode,recode));assert(bound_name(bytes@,p,decode,recode));Ok(p)},
-                    None=>Err(CodecError::Principal),
+                if let Some(p)=result {
+                    assert(transition::named(b,p,decode,recode));assert(bound_name(bytes@,p,decode,recode));Ok(p)
+                } else {
+                    assert(transition::rejected_name(b,decode,recode));assert(transition::invalid_name(bytes@,decode,recode));Err(CodecError::Principal)
                 }
             };
             let ghost original=rows@;
@@ -77,7 +100,24 @@ pub(super) fn apply<P:Ord,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy>(ta
                     assert(accepted(record,data@,at,scheme,old(table)@,table@,decode,recode));
                     Ok(())
                 },
-                Err(e)=>Err(Error::Snapshot(e)),
+                Err(e)=>{
+                    proof {
+                        match e {
+                            snapshot::SnapshotError::Duplicate=>{
+                                let (i,j,p)=choose|i:int,j:int,p:P| 0<=i<j<original.len() &&
+                                    #[trigger] owner.ensures((&original[i].0,),Ok(p)) && #[trigger] owner.ensures((&original[j].0,),Ok(p));
+                                assert(bound_name(original[i].0@,p,decode,recode) && bound_name(original[j].0@,p,decode,recode));
+                            },
+                            snapshot::SnapshotError::Codec(CodecError::Principal)=>{
+                                let i=choose|i:int| 0<=i<original.len() && #[trigger] owner.ensures((&original[i].0,),Err(CodecError::Principal));
+                                assert(transition::invalid_name(original[i].0@,decode,recode));
+                            },
+                            _=>{},
+                        }
+                        assert(rejected(record,data@,at,scheme,old(table)@,decode,recode,Error::Snapshot(e)));
+                    }
+                    Err(Error::Snapshot(e))
+                },
             }
         },
     }
@@ -88,19 +128,19 @@ pub(super) enum VisitError { Decode(usize,super::journal_payload::Error), Apply(
 pub(super) open spec fn step<P,D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>>(data:Seq<u8>,at:u64,
     scheme:root_wire::Scheme,before:Map<P,(RootState,u64)>,after:Map<P,(RootState,u64)>,decode:D,recode:C) -> bool {
     exists|r:Record| #[trigger] accepted(r,data,at,scheme,before,after,decode,recode) && match r {
-        Record::Transition(t)=>data.len()>=8 && super::journal_payload::tag(data)==t.principal.len()<snapshot::SENTINEL,
+        Record::Transition(t)=>data.len()>=8 && super::journal_payload::tag(data)==t.principal.len() && t.principal.len()<snapshot::SENTINEL,
         Record::Snapshot(rows)=>super::journal_payload::snapshot_header(data,rows.len()),
     }
 }
 
-/// The dispatcher distinguishes malformed records from rejected decoded records.
-pub(super) open spec fn refusal(data:Seq<u8>,scheme:root_wire::Scheme,e:VisitError) -> bool {
+/// Refusals carry the decoder's wire evidence or a byte-bound decoded record
+/// and the predicate that caused its application to fail against the prior map.
+pub(super) open spec fn refusal<P,D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>>(data:Seq<u8>,at:u64,
+    scheme:root_wire::Scheme,prior:Map<P,(RootState,u64)>,decode:D,recode:C,e:VisitError) -> bool {
     match e {
-        VisitError::Decode(_,_)=>forall|expected:Option<root_wire::Root>,next:root_wire::Root|
-            data.len()>=8 && super::journal_payload::tag(data)!=snapshot::SENTINEL && super::journal_payload::tag(data)<=usize::MAX ==>
-            !(#[trigger] root_wire::tail(data,8+super::journal_payload::tag(data) as int,scheme,expected,next)),
-        VisitError::Apply(Error::Transition(_,_))=>data.len()>=8 && super::journal_payload::tag(data)!=snapshot::SENTINEL,
-        VisitError::Apply(Error::Snapshot(_))=>exists|count:usize| #[trigger] super::journal_payload::snapshot_header(data,count),
+        VisitError::Decode(cursor,reason)=>super::journal_payload::decode_failure(data,cursor,scheme,reason),
+        VisitError::Apply(reason)=>exists|r:Record| #[trigger] super::journal_payload::decoded(r,data,scheme) &&
+            rejected(r,data,at,scheme,prior,decode,recode,reason),
     }
 }
 
@@ -112,7 +152,7 @@ pub(super) fn offer<P:Ord,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy>(
         forall|b:&[u8]| #[trigger] decode.requires((b,)),forall|p:&P| #[trigger] recode.requires((p,)),
     ensures btree_map_inv(final(table)),out.is_err() ==> final(table)@==old(table)@,
         out.is_ok() ==> step(data@,at,scheme,old(table)@,final(table)@,decode,recode),
-        out matches Err(e) ==> refusal(data@,scheme,e),
+        out matches Err(e) ==> refusal(data@,at,scheme,old(table)@,decode,recode,e),
 {
     let mut cursor=0;
     let r=match super::journal_payload::decode(data,&mut cursor,scheme) {
@@ -126,6 +166,7 @@ pub(super) fn offer<P:Ord,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy>(
         },
         Err(e)=>{
             proof {
+                assert(super::journal_payload::decoded(parsed,data@,scheme));
                 if let Record::Snapshot(rows)=parsed {
                     assert(super::journal_payload::snapshot_header(data@,rows.len()));
                 }

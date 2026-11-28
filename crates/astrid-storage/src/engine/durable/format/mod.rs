@@ -63,7 +63,9 @@ use reader::SliceReader;
 #[cfg(test)]
 pub(super) use scan::scan_frames_prefix;
 use scan::{FrameScanBound, read_frame_preserving_cursor_within, scan_frames_with_bound};
-pub(super) use scan::{scan_frames, scan_frames_range, scan_frames_with_protected_prefix};
+pub(super) use scan::{
+    scan_frames, scan_frames_range, scan_frames_with_protected_prefix, scan_root_file,
+};
 
 struct CopyReader<'a, F>(&'a mut F, RecoveryLimits);
 

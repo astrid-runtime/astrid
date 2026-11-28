@@ -72,7 +72,7 @@ impl<P:Ord,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy> RootHistory<P,D,C
         ensures final(self).model().calls==old(self).model().calls.push((offset,bytes@)),final(self).model().scheme==old(self).model().scheme,
             final(self).model().decode==old(self).model().decode,final(self).model().recode==old(self).model().recode,
             out.is_ok() ==> final(self).valid() && final(self).model().states==old(self).model().states.push(final(self).model().table),
-            out matches Err(e) ==> journal_apply::refusal(bytes@,old(self).model().scheme,e),
+            out matches Err(e) ==> journal_apply::refusal(bytes@,offset,old(self).model().scheme,old(self).model().table,old(self).model().decode,old(self).model().recode,e),
             out.is_err() ==> final(self).model().table==old(self).model().table && final(self).model().states==old(self).model().states,
     {
         let result=journal_apply::offer(&mut self.table,offset,bytes,self.scheme,self.decode,self.recode);
@@ -109,7 +109,7 @@ impl<R:FrameReader,P:Ord,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy> Vis
     open spec fn config(&self) -> Self::Config {(self.model().scheme,self.model().decode,self.model().recode)}
     open spec fn refused(&self,prior:&Self,bytes:Seq<u8>,e:VisitError) -> bool {
         &&& self.model().states==prior.model().states && self.model().table==prior.model().table
-        &&& journal_apply::refusal(bytes,prior.model().scheme,e)
+        &&& journal_apply::refusal(bytes,self.model().calls.last().0,prior.model().scheme,prior.model().table,prior.model().decode,prior.model().recode,e)
     }
     fn visit(&mut self,_reader:&mut R,at:u64,bytes:&[u8]) -> Result<(),VisitError> {self.add(at,bytes)}
 }

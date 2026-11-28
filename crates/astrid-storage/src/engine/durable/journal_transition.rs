@@ -72,6 +72,34 @@ pub(super) open spec fn named<P,D:FnOnce(&[u8])->Option<P>,E:FnOnce(&P)->Vec<u8>
     decode.ensures((name,),Some(owner)) && exists|v:Vec<u8>| #[trigger] encode.ensures((&owner,),v) && v@ == name@
 }
 
+pub(super) open spec fn history_reason(seen:Option<RootState>,expected:Option<RootState>,next:RootState,error:history::Rejection) -> bool {
+    let generation=match seen {None=>0int,Some(r)=>r.generation.value() as int+1};
+    match error {
+        history::Rejection::Conflict(actual)=>actual==seen && actual!=expected,
+        history::Rejection::Overflow=>seen==expected && generation>u64::MAX,
+        history::Rejection::Generation=>seen==expected && generation<=u64::MAX && next.generation.value()!=generation,
+    }
+}
+
+pub(super) open spec fn rejected_name<P,D:FnOnce(&[u8])->Option<P>,C:FnOnce(&P)->Vec<u8>>(name:&[u8],decode:D,recode:C) -> bool {
+    decode.ensures((name,),None) || exists|p:P,v:Vec<u8>| #[trigger] decode.ensures((name,),Some(p)) && #[trigger] recode.ensures((&p,),v) && v@!=name@
+}
+
+pub(super) open spec fn invalid_name<P,D:FnOnce(&[u8])->Option<P>,C:FnOnce(&P)->Vec<u8>>(bytes:Seq<u8>,decode:D,recode:C) -> bool {
+    exists|name:&[u8]| name@==bytes && #[trigger] rejected_name(name,decode,recode)
+}
+
+pub(super) open spec fn replay_refused<P,D:FnOnce(&[u8])->Option<P>,C:FnOnce(&P)->Vec<u8>>(t:Record,data:Seq<u8>,scheme:root_wire::Scheme,
+    prior:Map<P,(RootState,u64)>,decode:D,recode:C,e:Error) -> bool {
+    match e {
+        Error::Length=>t.principal.len()>=u64::MAX,
+        Error::Noncanonical=>data!=wire(t.principal@,scheme,t.expected,t.replacement),
+        Error::Principal=>invalid_name(t.principal@,decode,recode),
+        Error::History(h)=>exists|name:&[u8],owner:P| name@==t.principal@ && #[trigger] named(name,owner,decode,recode) &&
+            history_reason(if prior.contains_key(owner) {Some(prior[owner].0)} else {None},t.expected,t.replacement,h),
+    }
+}
+
 impl Record {
     pub(super) fn replay<P:Ord,D:FnOnce(&[u8])->Option<P>,E:FnOnce(&P)->Vec<u8>>(
         &self,history:&mut BTreeMap<P,(RootState,u64)>,scheme:root_wire::Scheme,at:u64,
@@ -80,6 +108,7 @@ impl Record {
             forall|n:&[u8]| n@ == self.principal@ ==> #[trigger] decode.requires((n,)),
             forall|n:&[u8],p:P| n@ == self.principal@ && #[trigger] decode.ensures((n,),Some(p)) ==> recode.requires((&p,)),
         ensures btree_map_inv(final(history)),
+            out matches Err(e) ==> replay_refused(*self,payload@,scheme,old(history)@,decode,recode,e),
             out.is_err() ==> final(history)@ == old(history)@,
             (out matches Err(Error::Length)) == (self.principal.len() >= u64::MAX),
             (out matches Err(Error::Noncanonical)) == (self.principal.len() < u64::MAX &&
@@ -91,7 +120,9 @@ impl Record {
                 n@ == self.principal@ && #[trigger] named(n,p,decode,recode) && {
                     let actual = if old(history)@.contains_key(p) {Some(old(history)@[p].0)} else {None};
                     let next = match actual {None=>0int,Some(r)=>r.generation.value() as int + 1};
+                    &&& out matches Err(Error::History(e)) ==> history_reason(actual,self.expected,self.replacement,e)
                     &&& out.is_ok() == (actual == self.expected && self.replacement.generation.value() == next)
+                    &&& out matches Err(Error::History(e)) ==> history_reason(actual,self.expected,self.replacement,e)
                     &&& out.is_ok() ==> final(history)@ == old(history)@.insert(p,(self.replacement,at))
                 },
     {
@@ -99,10 +130,14 @@ impl Record {
         let canonical = encode(name,scheme,self.expected,self.replacement).ok_or(Error::Length)?;
         if canonical.as_slice() != payload {return Err(Error::Noncanonical);}
         assert(canonical@ =~= payload@);
-        let owner = history::principal(name,decode,recode).ok_or(Error::Principal)?;
+        let Some(owner)=history::principal(name,decode,recode) else {
+                assert(rejected_name(name,decode,recode));
+                assert(invalid_name(self.principal@,decode,recode));
+            return Err(Error::Principal);
+        };
         assert(named(name,owner,decode,recode));
         let result = history::apply(history,owner,self.expected,self.replacement,at);
-        match result { Ok(())=>Ok(()), Err(reason)=>Err(Error::History(reason)) }
+        match result { Ok(())=>Ok(()), Err(reason)=>{assert(replay_refused(*self,payload@,scheme,old(history)@,decode,recode,Error::History(reason)));Err(Error::History(reason))} }
     }
 }
 }

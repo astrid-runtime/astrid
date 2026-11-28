@@ -11,8 +11,8 @@ use super::journal_transition::{self, DecodeError};
 use super::root_wire::TailError;
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, preload_indexed_closures,
-    recovery_closure_error, scan_frames,
+    PrincipalCodec, ROOT_FILE, RecoveryLimits, corrupt, preload_indexed_closures,
+    recovery_closure_error,
 };
 
 use super::{journal_apply, journal_payload};
@@ -54,15 +54,15 @@ where
         |key: &[u8]| codec.decode(key),
         |p: &P| codec.encode(p),
     );
-    scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
-        recovered.add(offset, payload).map_err(|error| match error {
+    super::format::scan_root_file(roots, limits, &mut recovered, |offset, payload, error| {
+        match error {
             journal_apply::VisitError::Decode(cursor, error) => corrupt(
                 ROOT_FILE,
                 offset,
                 decode_error(payload, cursor, scheme, error),
             ),
             journal_apply::VisitError::Apply(error) => apply_error(offset, error),
-        })
+        }
     })?;
     Ok(recovered.finish())
 }
