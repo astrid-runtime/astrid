@@ -36,6 +36,22 @@ def consumer_defects():
         )
     reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
     for label, clause, weaker in [
+        ("initial state", "end == 0 && state == initial", "end == 0"),
+        ("whole success prefix", "dispatched(rows@,rows.len() as int,initial,s,limit,visit)", "exists|end:int| #[trigger] dispatched(rows@,end,initial,s,limit,visit)"),
+        ("span membership", "part@ == rows.subrange(lo,end) &&", "true &&"),
+        ("visitor predecessor", "dispatched(rows,lo,initial,prior,limit,visit)", "(exists|other:S| #[trigger] dispatched(rows,lo,initial,other,limit,visit))"),
+        ("failed span base", "addr == rows[lo].1.offset &&", "true &&"),
+        ("failed span size", "size as int == frame_end(rows[hi-1].1)-rows[lo].1.offset", "true"),
+        ("failed span slice", "part@ == rows.subrange(lo,hi) &&", "true &&"),
+        ("oversized first frame", "loc == rows@[lo].1 && loc.payload_len > limit", "loc == rows@[lo].1"),
+        ("overflow attribution", "lo <= i < rows.len() && #[trigger] frame_end(rows@[i].1) > u64::MAX", "i >= lo && #[trigger] frame_end(rows@[i].1) > u64::MAX"),
+    ]:
+        yield (
+            f"indexed span dispatch loses {label}", reader,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs"),
+        )
+    for label, clause, weaker in [
         ("ordered rows", "sent(rows[i],states[i],states[i+1],decode,accept)", "exists|row:Row| #[trigger] sent(row,states[i],states[i+1],decode,accept)"),
         ("decoded record", "accept.ensures((before,row.0,row.1,r,p),Ok(after))", "(exists|other:ObjectRecord| #[trigger] accept.ensures((before,row.0,row.1,other,p),Ok(after)))"),
         ("borrowed payload", "accept.ensures((before,row.0,row.1,r,p),Ok(after))", "(exists|other:&'a [u8]| #[trigger] accept.ensures((before,row.0,row.1,r,other),Ok(after)))"),

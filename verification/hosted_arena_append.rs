@@ -374,6 +374,77 @@ fn observe_span<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecor
     }
 }
 
+type IndexedRow = (crate::ObjectId,frame::ArenaLocation);
+
+proof fn dispatched_prefix<V:Fn(Vec<IndexedRow>,&[IndexedRow],u64,u64)->Result<Vec<IndexedRow>,Option<usize>>>(
+    rows:Seq<IndexedRow>,end:int,start:Vec<IndexedRow>,trace:Vec<IndexedRow>,limit:u64,visit:V)
+    requires 0 <= end <= rows.len(),crate::indexed_frame::dispatched(rows,end,start,trace,limit,visit),
+        forall|before:Vec<IndexedRow>,part:&[IndexedRow],base:u64,size:u64,after:Vec<IndexedRow>|
+            #[trigger] visit.ensures((before,part,base,size),Ok(after)) ==> after@ == before@ + part@,
+    ensures trace@ == start@ + rows.take(end),
+    decreases end,
+{
+    if end == 0 { assert(rows.take(0) =~= Seq::empty()); return; }
+    let (lo,prior,part,size) = choose|lo:int,prior:Vec<IndexedRow>,part:&[IndexedRow],size:u64|
+        crate::indexed_frame::batch(rows,lo,end,limit) && part@ == rows.subrange(lo,end) &&
+        size as int == crate::indexed_frame::frame_end(rows[end-1].1)-rows[lo].1.offset &&
+        #[trigger] visit.ensures((prior,part,rows[lo].1.offset,size),Ok(trace)) &&
+        crate::indexed_frame::dispatched(rows,lo,start,prior,limit,visit);
+    dispatched_prefix(rows,lo,start,prior,limit,visit);
+    assert(trace@ =~= start@ + rows.take(end));
+}
+
+/// Observe the production dispatcher's physical requests. The reader rejects
+/// any mismatched address or extent and may independently fail at one offset.
+fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>)
+    requires forall|i:int| 0 <= i < rows.len() ==> #[trigger] crate::indexed_frame::frame_end(rows@[i].1) <= u64::MAX,
+        forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].1.payload_len <= limit,
+{
+    use crate::indexed_frame::{dispatch,dispatched,frame_end,DispatchError};
+    let visit = |before:Vec<IndexedRow>,part:&[IndexedRow],base:u64,size:u64| -> (out:Result<Vec<IndexedRow>,Option<usize>>)
+        ensures match out {
+            Ok(after) => after@ == before@ + part@,
+            Err(Some(n)) => n == before.len() && fault == Some(base),
+            Err(None) => part.len()==0 || base != part@[0].1.offset ||
+                base as int + size != frame_end(part@[part.len()-1].1),
+        },
+    {
+        if part.is_empty() || part[0].1.offset != base ||
+            part[part.len().saturating_sub(1)].1.end() != base.checked_add(size) {return Err(None);}
+        if fault == Some(base) {return Err(Some(before.len()));}
+        let mut trace = before;
+        let mut n = 0usize;
+        while n < part.len()
+            invariant n <= part.len(), trace@ == before@ + part@.take(n as int),
+            decreases part.len()-n,
+        {
+            trace.push(part[n]);
+            assert(trace@ =~= before@ + part@.take(n as int+1));
+            n = n.saturating_add(1);
+        }
+        assert(part@.take(n as int) =~= part@);
+        Ok(trace)
+    };
+    let start = Vec::new();
+    match dispatch(rows,target,limit,start,visit) {
+        Ok(trace) => { proof {
+            dispatched_prefix(rows@,rows.len() as int,start,trace,limit,visit);
+            assert(rows@.take(rows.len() as int) =~= rows@);
+            assert(trace@ =~= rows@);
+        }},
+        Err(DispatchError::Visit(e)) => { proof {
+            let (lo,prior) = choose|lo:int,state:Vec<IndexedRow>| 0 <= lo < rows.len() &&
+                #[trigger] dispatched(rows@,lo,start,state,limit,visit) &&
+                crate::indexed_frame::visit_failed(rows@,lo,state,limit,visit,e);
+            dispatched_prefix(rows@,lo,start,prior,limit,visit);
+            assert(prior@ =~= rows@.take(lo));
+            assert(e == Some(lo as usize) && fault == Some(rows@[lo].1.offset));
+            assert(exists|i:int| 0 <= i < rows.len() && e == Some(i as usize) && fault == Some(#[trigger] rows@[i].1.offset));
+        }},
+        Err(_) => { assert(false); },
+    }
+}
+
 /// Each successful positional read can cover exactly the next range of
 /// frame indices. Induct across those ranges for any representable table.
 fn partition_reads(rows:&[(crate::ObjectId,frame::ArenaLocation)],target:u64)

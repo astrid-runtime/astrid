@@ -99,47 +99,48 @@ pub(in crate::engine::durable) fn visit_indexed_objects<
 ) -> Result<(), DurableError> {
     let mut ordered = requested.to_vec();
     ordered.sort_unstable_by_key(|(_, location)| location.offset);
-    let mut first = 0_usize;
     #[cfg(test)]
-    let mut spans = 0_usize;
-    while first < ordered.len() {
-        let first_location = ordered[first].1;
-        if first_location.payload_len > limits.max_frame_bytes {
-            return Err(DurableError::FrameTooLarge {
-                file: ARENA_FILE,
-                offset: first_location.offset,
-                declared: first_location.payload_len,
-                limit: limits.max_frame_bytes,
-            });
-        }
-        let (end, span_len) = super::indexed_frame::coalesced(&ordered, first, target_span_bytes)
-            .ok_or(DurableError::EncodingOverflow)?;
-        #[cfg(test)]
-        {
-            spans = spans.saturating_add(1);
-        }
-        let span_start = first_location.offset;
-        let span_len = usize::try_from(span_len).map_err(|_| DurableError::EncodingOverflow)?;
-        let mut span = Vec::new();
-        span.try_reserve_exact(span_len)
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        span.resize(span_len, 0);
-        read_exact_at(arena, &mut span, span_start)
-            .map_err(|source| io_error("read coalesced durable frames", source))?;
-
-        super::indexed_frame::deliver(
-            &ordered[first..end],
-            &mut accept,
-            |id, location| decode_indexed_frame(&span, span_start, id, location, identity, limits),
-            |visitor, id, location, record, payload| {
-                visitor(id, location, record, payload)?;
-                Ok(visitor)
-            },
-        )?;
-        first = end;
-    }
+    let spans = std::cell::Cell::new(0_usize);
+    super::indexed_frame::dispatch(
+        &ordered,
+        target_span_bytes,
+        limits.max_frame_bytes,
+        &mut accept,
+        |visitor, rows, span_start, span_len| {
+            #[cfg(test)]
+            spans.set(spans.get().saturating_add(1));
+            let span_len = usize::try_from(span_len).map_err(|_| DurableError::EncodingOverflow)?;
+            let mut span = Vec::new();
+            span.try_reserve_exact(span_len)
+                .map_err(|_| DurableError::EncodingOverflow)?;
+            span.resize(span_len, 0);
+            read_exact_at(arena, &mut span, span_start)
+                .map_err(|source| io_error("read coalesced durable frames", source))?;
+            super::indexed_frame::deliver(
+                rows,
+                visitor,
+                |id, location| {
+                    decode_indexed_frame(&span, span_start, id, location, identity, limits)
+                },
+                |visitor, id, location, record, payload| {
+                    visitor(id, location, record, payload)?;
+                    Ok(visitor)
+                },
+            )
+        },
+    )
+    .map_err(|error| match error {
+        super::indexed_frame::DispatchError::Limit(loc) => DurableError::FrameTooLarge {
+            file: ARENA_FILE,
+            offset: loc.offset,
+            declared: loc.payload_len,
+            limit: limits.max_frame_bytes,
+        },
+        super::indexed_frame::DispatchError::Overflow => DurableError::EncodingOverflow,
+        super::indexed_frame::DispatchError::Visit(e) => e,
+    })?;
     #[cfg(test)]
-    LAST_BATCH_SPANS.set(spans);
+    LAST_BATCH_SPANS.set(spans.get());
     Ok(())
 }
 

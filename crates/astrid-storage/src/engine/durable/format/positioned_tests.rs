@@ -369,12 +369,12 @@ fn coalesced_delivery_preserves_order_and_stops_at_the_first_failure() {
         .rev()
         .map(|(id, loc, _, _)| (*id, *loc))
         .collect();
-    let visit = |rows: &[(ObjectId, ArenaLocation)], reject_at: Option<usize>| {
+    let visit = |rows: &[(ObjectId, ArenaLocation)], reject_at: Option<usize>, target| {
         let mut seen = Vec::new();
         let outcome = visit_indexed_objects(
             &source,
             rows,
-            u64::MAX,
+            target,
             &TestIdentity,
             RecoveryLimits::process_addressable(),
             |id, loc, record, payload| {
@@ -387,15 +387,29 @@ fn coalesced_delivery_preserves_order_and_stops_at_the_first_failure() {
         );
         (outcome, seen)
     };
-    let (outcome, seen) = visit(&requests, None);
+    let (outcome, seen) = visit(&requests, None, u64::MAX);
     outcome.unwrap();
     assert_eq!(seen, frames);
-    let (outcome, seen) = visit(&requests, Some(2));
+    let (outcome, seen) = visit(&requests, Some(2), u64::MAX);
     assert!(matches!(outcome, Err(DurableError::EncodingOverflow)));
     assert_eq!(seen, frames[..2]);
+    source.reads.borrow_mut().clear();
+    let (outcome, seen) = visit(&requests, Some(2), 0);
+    assert!(matches!(outcome, Err(DurableError::EncodingOverflow)));
+    assert_eq!(seen, frames[..2]);
+    let reads: Vec<_> = frames[..2]
+        .iter()
+        .map(|(_, loc, _, payload)| {
+            (
+                loc.offset,
+                FRAME_HEADER_LEN_USIZE.saturating_add(payload.len()),
+            )
+        })
+        .collect();
+    assert_eq!(*source.reads.borrow(), reads);
     let mut wrong_identity = requests;
     wrong_identity[1].0 = frames[0].0;
-    let (outcome, seen) = visit(&wrong_identity, None);
+    let (outcome, seen) = visit(&wrong_identity, None, u64::MAX);
     assert!(outcome.is_err());
     assert_eq!(seen, frames[..1]);
 }

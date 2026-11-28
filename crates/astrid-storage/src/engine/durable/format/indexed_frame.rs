@@ -93,6 +93,76 @@ pub(super) fn coalesced(rows:&[(ObjectId,ArenaLocation)],first:usize,target:u64)
 
 type Row = (ObjectId,ArenaLocation);
 
+pub(super) enum DispatchError<E> { Limit(ArenaLocation), Overflow, Visit(E) }
+
+pub(super) open spec fn batch(rows:Seq<Row>,lo:int,hi:int,limit:u64) -> bool {
+    &&& 0 <= lo < hi <= rows.len()
+    &&& rows[lo].1.payload_len <= limit
+    &&& frame_end(rows[hi-1].1) <= u64::MAX
+    &&& forall|i:int| lo < i < hi ==> #[trigger] rows[i].1.offset == frame_end(rows[i-1].1)
+}
+
+pub(super) open spec fn dispatched<S,E,V:Fn(S,&[Row],u64,u64)->Result<S,E>>(
+    rows:Seq<Row>,end:int,initial:S,state:S,limit:u64,visit:V) -> bool
+    decreases end,
+{
+    if end <= 0 {end == 0 && state == initial} else {
+        exists|lo:int,prior:S,part:&[Row],size:u64| batch(rows,lo,end,limit) &&
+            part@ == rows.subrange(lo,end) && size as int == frame_end(rows[end-1].1)-rows[lo].1.offset &&
+            #[trigger] visit.ensures((prior,part,rows[lo].1.offset,size),Ok(state)) &&
+            dispatched(rows,lo,initial,prior,limit,visit)
+    }
+}
+
+pub(super) open spec fn visit_failed<S,E,V:Fn(S,&[Row],u64,u64)->Result<S,E>>(
+    rows:Seq<Row>,lo:int,state:S,limit:u64,visit:V,error:E) -> bool {
+    exists|hi:int,part:&[Row],addr:u64,size:u64| #[trigger] batch(rows,lo,hi,limit) && addr == rows[lo].1.offset &&
+        part@ == rows.subrange(lo,hi) && size as int == frame_end(rows[hi-1].1)-rows[lo].1.offset &&
+        #[trigger] visit.ensures((state,part,addr,size),Err(error))
+}
+
+/// Select each range before invoking the positional reader for that range.
+pub(super) fn dispatch<S,E,V:Fn(S,&[Row],u64,u64)->Result<S,E>>(rows:&[Row],target:u64,limit:u64,
+    initial:S,visit:V) -> (out:Result<S,DispatchError<E>>)
+    requires forall|s:S,p:&[Row],base:u64,n:u64| #[trigger] visit.requires((s,p,base,n)),
+    ensures match out {
+        Ok(s) => dispatched(rows@,rows.len() as int,initial,s,limit,visit),
+        Err(e) => exists|lo:int,state:S| 0 <= lo < rows.len() &&
+            #[trigger] dispatched(rows@,lo,initial,state,limit,visit) && match e {
+                DispatchError::Limit(loc) => loc == rows@[lo].1 && loc.payload_len > limit,
+                DispatchError::Overflow => exists|i:int| lo <= i < rows.len() && #[trigger] frame_end(rows@[i].1) > u64::MAX,
+                DispatchError::Visit(error) => visit_failed(rows@,lo,state,limit,visit,error),
+            },
+    },
+{
+    let mut first = 0;
+    let mut state = initial;
+    while first < rows.len()
+        invariant first <= rows.len(), dispatched(rows@,first as int,initial,state,limit,visit),
+            forall|s:S,p:&[Row],base:u64,n:u64| #[trigger] visit.requires((s,p,base,n)),
+        decreases rows.len()-first,
+    {
+        let loc = rows[first].1;
+        if loc.payload_len > limit { return Err(DispatchError::Limit(loc)); }
+        let Some((end,size)) = coalesced(rows,first,target) else {return Err(DispatchError::Overflow);};
+        let part = &rows[first..end];
+        let ghost prior = state;
+        assert(batch(rows@,first as int,end as int,limit));
+        state = match visit(state,part,loc.offset,size) {
+            Ok(next) => next,
+            Err(error) => {
+                assert(part@ == rows@.subrange(first as int,end as int));
+                assert(visit.ensures((prior,part,rows@[first as int].1.offset,size),Err(error)));
+                assert(visit_failed(rows@,first as int,prior,limit,visit,error));
+                return Err(DispatchError::Visit(error));
+            },
+        };
+        assert(dispatched(rows@,end as int,initial,state,limit,visit));
+        first = end;
+    }
+    Ok(state)
+}
+
 pub(super) open spec fn sent<'a,S,E,D:Fn(ObjectId,ArenaLocation)->Result<(ObjectRecord,&'a [u8]),E>,
     A:Fn(S,ObjectId,ArenaLocation,ObjectRecord,&'a [u8])->Result<S,E>>(
     row:Row,before:S,after:S,decode:D,accept:A) -> bool {
