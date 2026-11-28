@@ -303,18 +303,19 @@ where
                     },
                 }
             };
-            if unchanged {
-                return Err(StorageError::Serialization(
-                    "KV mutation batch contains a no-op".to_owned(),
-                ));
-            }
-            totals = super::delta_totals::update(
+            totals = super::delta_totals::admit(
                 totals,
                 key.len(),
                 previous_len,
                 replacement.as_ref().map(Vec::len),
+                unchanged,
             )
-            .map_err(|_| arithmetic_overflow())?;
+            .map_err(|error| match error {
+                super::delta_totals::ReplayError::Unchanged => {
+                    StorageError::Serialization("KV mutation batch contains a no-op".to_owned())
+                },
+                super::delta_totals::ReplayError::Accounting(_) => arithmetic_overflow(),
+            })?;
             mutations.push(current.stage(key, replacement, |data| {
                 super::delta_mutation::encode(data, |bytes, length| {
                     self.spill_value(bytes.into(), length)

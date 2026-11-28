@@ -2,6 +2,7 @@
 
 use super::checkpoint_value::ValueSlot;
 use super::delta_mutation::Mutation;
+use super::delta_totals::ApplyError;
 use super::encoding;
 use super::traversal::{Entry, Node};
 #[cfg(verus_keep_ghost)]
@@ -24,6 +25,52 @@ pub(super) fn replay(root:&mut Option<Arc<Node>>,change:super::delta_totals::Pre
 {
     *totals = change.totals;
     put(root,change.key,change.value);
+}
+
+pub(super) open spec fn sizes(v:Option<Seq<u8>>) -> Option<usize> {
+    match v {None=>None,Some(b)=>Some(b.len() as usize)}
+}
+
+pub(super) open spec fn applied<E,F:FnOnce(&Vec<u8>,&Option<ValueSlot>,bool)->Result<(Option<Vec<u8>>,Option<Vec<u8>>),E>>(
+    initial:Option<Arc<Node>>,after:Option<Arc<Node>>,row:&Mutation,old_totals:super::checkpoint_totals::NodeTotals,
+    totals:super::checkpoint_totals::NodeTotals,load:F,out:Result<(),ApplyError<E>>) -> bool {
+    let found = lookup_spec(initial,row.key@);
+    &&& ordered(after)
+    &&& match out {
+        Err(ApplyError::Load(e)) => after == initial && totals == old_totals && load.ensures((&row.key,&row.value,found.is_none()),Err(e)),
+        _ => exists|pair:(Option<Vec<u8>>,Option<Vec<u8>>)| {
+            &&& #[trigger] load.ensures((&row.key,&row.value,found.is_none()),Ok(pair))
+            &&& {
+                let prior = super::delta_totals::data_bytes(match found {Some(v)=>v,None=>pair.0});
+                let next = super::delta_totals::data_bytes(pair.1);
+                let charge = super::delta_totals::changed(old_totals,row.key.len() as nat,sizes(prior),sizes(next));
+                if prior == next {out == Err(ApplyError::Change(super::delta_totals::ReplayError::Unchanged)) && after == initial && totals == old_totals}
+                else {match charge {
+                    Err(e) => out == Err(ApplyError::Change(super::delta_totals::ReplayError::Accounting(e))) && after == initial && totals == old_totals,
+                    Ok(t) => out.is_ok() && totals == t && forall|q:Seq<u8>| #[trigger] lookup_spec(after,q) ==
+                        if q == row.key@ {Some(pair.1)} else {lookup_spec(initial,q)},
+                }}
+            }
+        },
+    }
+}
+
+pub(super) fn apply<E,F:FnOnce(&Vec<u8>,&Option<ValueSlot>,bool)->Result<(Option<Vec<u8>>,Option<Vec<u8>>),E>>(
+    root:&mut Option<Arc<Node>>,totals:&mut super::checkpoint_totals::NodeTotals,row:&Mutation,load:F,
+) -> (out:Result<(),ApplyError<E>>)
+    requires ordered(*old(root)),forall|k:&Vec<u8>,v:&Option<ValueSlot>,need:bool| #[trigger] load.requires((k,v,need)),
+    ensures applied(*old(root),*final(root),row,*old(totals),*final(totals),load,out),
+{
+    let stored = super::traversal::lookup(root.as_ref(),&row.key);
+    let pair = match load(&row.key,&row.value,stored.is_none()) {
+        Ok(pair) => pair,Err(e) => return Err(ApplyError::Load(e)),
+    };
+    let prior = stored.unwrap_or(&pair.0).as_ref().map(Vec::as_slice);
+    let prepared = match super::delta_totals::prepare(*totals,&row.key,prior,pair.1) {
+        Ok(p)=>p,Err(e)=>return Err(ApplyError::Change(e)),
+    };
+    replay(root,prepared,totals);
+    Ok(())
 }
 
 /// Stage the resolved bytes and return the corresponding durable mutation.

@@ -15,7 +15,7 @@ pub(super) open spec fn changed(old:NodeTotals,key:nat,previous:Option<usize>,re
     let entries = old.entries as int + add - remove;
     let logical = old.logical_bytes as int - a + b;
     let left = old.quota_bytes as int - a;
-    let keys = if previous.is_none() {left + key} else if replacement.is_none() {left-key} else {left};
+    let keys = if add == 1 {left + key} else if remove == 1 {left-key} else {left};
     let quota = keys + b;
     if key > u64::MAX {Err(Error::Key)}
     else if entries < 0 || entries > u64::MAX {Err(Error::Entries)}
@@ -38,13 +38,31 @@ pub(super) fn update(old:NodeTotals,key:usize,previous:Option<usize>,replacement
     }.ok_or(Error::Entries)?;
     let logical = old.logical_bytes.checked_sub(a).ok_or(Error::Logical)?.checked_add(b).ok_or(Error::Logical)?;
     let left = old.quota_bytes.checked_sub(a).ok_or(Error::Quota)?;
-    let keys = if previous.is_none() {left.checked_add(key_bytes)}
-        else if replacement.is_none() {left.checked_sub(key_bytes)} else {Some(left)};
+    let keys = match (previous,replacement) {
+        (None,Some(_)) => left.checked_add(key_bytes),
+        (Some(_),None) => left.checked_sub(key_bytes),
+        _ => Some(left),
+    };
     let quota = keys.ok_or(Error::Quota)?.checked_add(b).ok_or(Error::Quota)?;
     Ok(NodeTotals {entries,logical_bytes:logical,quota_bytes:quota})
 }
 
+pub(super) enum ApplyError<E> { Load(E), Change(ReplayError) }
+
 pub(super) enum ReplayError { Unchanged, Accounting(Error) }
+
+pub(super) fn admit(old:NodeTotals,key:usize,previous:Option<usize>,replacement:Option<usize>,unchanged:bool)
+    -> (out:Result<NodeTotals,ReplayError>)
+    ensures out == if unchanged || (previous.is_none() && replacement.is_none()) {Err(ReplayError::Unchanged)}
+        else { match changed(old,key as nat,previous,replacement) {
+            Ok(t)=>Ok(t),Err(e)=>Err(ReplayError::Accounting(e)),
+        }},
+{
+    if unchanged || (previous.is_none() && replacement.is_none()) {return Err(ReplayError::Unchanged);}
+    match update(old,key,previous,replacement) {
+        Ok(t)=>Ok(t),Err(e)=>Err(ReplayError::Accounting(e)),
+    }
+}
 
 pub(super) struct Prepared {
     pub(super) key:Vec<u8>,
@@ -84,12 +102,9 @@ pub(super) fn prepare(old:NodeTotals,key:&[u8],prior:Option<&[u8]>,value:Option<
         (None,None) => true,
         _ => false,
     };
-    if equal {return Err(ReplayError::Unchanged);}
     let before = prior.map(<[u8]>::len);
     let after = value.as_ref().map(Vec::len);
-    let totals = match update(old,key.len(),before,after) {
-        Ok(t) => t, Err(e) => return Err(ReplayError::Accounting(e)),
-    };
+    let totals = admit(old,key.len(),before,after,equal)?;
     let mut address = Vec::with_capacity(key.len());
     address.extend_from_slice(key);
     assert(address@ =~= key@);

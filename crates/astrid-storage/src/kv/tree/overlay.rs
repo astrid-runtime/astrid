@@ -26,12 +26,17 @@ impl OverlayMap {
         update::put(&mut self.root, key, value);
     }
 
-    pub(super) fn replay(
+    pub(super) fn apply<E>(
         &mut self,
-        change: delta_totals::Prepared,
         totals: &mut checkpoint_totals::NodeTotals,
-    ) {
-        update::replay(&mut self.root, change, totals);
+        row: &delta_mutation::Mutation,
+        load: impl FnOnce(
+            &Vec<u8>,
+            &Option<checkpoint_value::ValueSlot>,
+            bool,
+        ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), E>,
+    ) -> Result<(), delta_totals::ApplyError<E>> {
+        update::apply(&mut self.root, totals, row, load)
     }
 
     pub(super) fn stage<E>(

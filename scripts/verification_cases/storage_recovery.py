@@ -184,6 +184,17 @@ def consumer_defects():
             f"spill recovery loses {label}", spill,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_spill_record.rs"),
         )
+    for label, path, clause, weaker in [
+        ("writer admission", totals, "out == if unchanged ||", "true || out == if unchanged ||"),
+        ("applied totals", overlay, "out.is_ok() && totals == t &&", "out.is_ok() &&"),
+        ("overlay occupancy", overlay, "if prior == next {out == Err(ApplyError", "if found.is_some() {true} else if prior == next {out == Err(ApplyError"),
+        ("fallback error provenance", overlay, "&& load.ensures((&row.key,&row.value,found.is_none()),Err(e))", ""),
+        ("atomic error", overlay, "after == initial && totals == old_totals && load.ensures", "load.ensures"),
+    ]:
+        yield (
+            f"addressed replay loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

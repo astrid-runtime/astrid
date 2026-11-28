@@ -421,4 +421,62 @@ fn replay_delete(key:&[u8],prior:&[u8],totals:crate::checkpoint_totals::NodeTota
         }
     }
 }
+
+/// Both an observed writer row and recovery of the same key take their charge
+/// from the selected prior bytes; a shadowing overlay tombstone is authoritative.
+fn observed_replay(key:Vec<u8>,root:&mut Option<std::sync::Arc<crate::traversal::Node>>,
+    totals:&mut crate::checkpoint_totals::NodeTotals,prior:Option<Vec<u8>>,next:Vec<u8>,shadow:bool)
+    requires crate::traversal::ordered(*old(root)),
+        crate::traversal::lookup_spec(*old(root),key@) == (if shadow {Some(prior)} else {None}),
+{
+    use crate::{delta_totals as acc,kv_replacement::{PreviousValue,Replacement},overlay_update, traversal};
+    let mut copied = Vec::with_capacity(key.len());
+    copied.extend_from_slice(&key);
+    let mut data = Vec::with_capacity(next.len());
+    data.extend_from_slice(&next);
+    assert(copied@ =~= key@ && data@ =~= next@);
+    let checkpoint = prior.clone();
+    let ghost prior_view = acc::data_bytes(prior);
+    let writer = Replacement::observed(copied,prior,Some(data));
+    let (address,observation,new) = writer.into_parts();
+    let PreviousValue::Loaded {previous_len,unchanged} = observation else {unreached()};
+    let declared = acc::admit(*totals,address.len(),previous_len,new.as_ref().map(Vec::len),unchanged);
+    let row = Mutation {key,value:Some(ValueSlot::Inline(next))};
+    let read = |k:&Vec<u8>,v:&Option<ValueSlot>,need:bool| -> (out:Result<(Option<Vec<u8>>,Option<Vec<u8>>),u8>)
+        ensures if k@ == row.key@ && *v == row.value && need == !shadow {
+            out matches Ok(pair) && acc::data_bytes(pair.1) == acc::data_bytes(new) &&
+                (need ==> acc::data_bytes(pair.0) == prior_view)
+        } else {true} {
+        Ok((if need {checkpoint} else {Some(vec![0x7fu8])},new))
+    };
+    let ghost initial = *root;
+    let ghost initial_totals = *totals;
+    let result = overlay_update::apply(root,totals,&row,read);
+    proof {
+        assert(overlay_update::applied(initial,*root,&row,initial_totals,*totals,read,result));
+        assert(result.is_ok() == declared.is_ok());
+        if result.is_ok() {
+            assert(declared == Ok(*totals));
+            assert(traversal::lookup_spec(*root,row.key@) matches Some(Some(v)) && v@ == next@);
+        } else {assert(*root == initial && *totals == initial_totals);}
+    }
+}
+
+fn replay_lookup_error(root:&mut Option<std::sync::Arc<crate::traversal::Node>>,row:&Mutation,
+    totals:&mut crate::checkpoint_totals::NodeTotals)
+    requires crate::traversal::ordered(*old(root)),
+    ensures *final(root) == *old(root) && *final(totals) == *old(totals),
+{
+    let fail = |_k:&Vec<u8>,_v:&Option<ValueSlot>,_needs_base:bool| -> (out:Result<(Option<Vec<u8>>,Option<Vec<u8>>),u8>)
+        ensures out == Err(7u8) { Err(7u8) };
+    let out = crate::overlay_update::apply(root,totals,row,fail);
+    assert(out == Err(crate::delta_totals::ApplyError::Load(7u8)));
+}
+
+fn absent_delete(t:crate::checkpoint_totals::NodeTotals,key:usize) {
+    let raw = crate::delta_totals::update(t,key,None,None);
+    let write = crate::delta_totals::admit(t,key,None,None,false);
+    assert(raw == Ok(t));
+    assert(write == Err(crate::delta_totals::ReplayError::Unchanged));
+}
 }

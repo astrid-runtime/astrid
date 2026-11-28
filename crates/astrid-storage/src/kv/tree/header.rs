@@ -449,28 +449,26 @@ where
     E: KvProjectionEngine<P>,
 {
     for mutation in mutations {
-        let loaded_previous;
-        let previous = if let Some(value) = overlay.get(&mutation.key) {
-            value.as_deref()
-        } else {
-            loaded_previous = context.get(tree, &mutation.key)?;
-            loaded_previous.as_deref()
-        };
-        let replacement = mutation
-            .value
-            .as_ref()
-            .map(|value| context.value_bytes(value))
-            .transpose()?;
-        let prepared = super::delta_totals::prepare(*totals, &mutation.key, previous, replacement)
+        use super::delta_totals::ApplyError;
+        overlay
+            .apply(totals, mutation, |key, slot, needs_checkpoint| {
+                let prior = if needs_checkpoint {
+                    context.get(tree, key)?
+                } else {
+                    None
+                };
+                let replacement = slot.as_ref().map(|v| context.value_bytes(v)).transpose()?;
+                Ok((prior, replacement))
+            })
             .map_err(|error| match error {
-                super::delta_totals::ReplayError::Unchanged => {
+                ApplyError::Load(e) => e,
+                ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
                     invalid(object, "KV delta contains a no-op mutation")
                 },
-                super::delta_totals::ReplayError::Accounting(cause) => {
-                    replay_accounting_error(cause)
+                ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
+                    replay_accounting_error(e)
                 },
             })?;
-        overlay.replay(prepared, totals);
     }
     Ok(())
 }
