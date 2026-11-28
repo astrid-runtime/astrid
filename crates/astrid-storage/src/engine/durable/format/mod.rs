@@ -31,6 +31,7 @@ const _: () = assert!(arena_span::HEADER_BYTES == FRAME_HEADER_LEN_USIZE);
 
 mod framed_append;
 mod indexed;
+mod indexed_frame;
 mod location;
 mod positional_read;
 mod positioned;

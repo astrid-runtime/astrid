@@ -6,6 +6,26 @@ from .common import replace_once
 
 
 def consumer_defects():
+    reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
+    preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
+    for label, source, clause, weaker in [
+        ("physical bounds", reader, "(out matches Err(Error::Bounds)) == !fits", "(out matches Err(Error::Bounds)) ==> !fits"),
+        ("returned bytes", reader, "p@ == body && loc.payload_len", "true && loc.payload_len"),
+        ("frame kind", reader, "bytes.take(8)==magic@ &&", "true &&"),
+        ("read limit", reader, "p@ == body && loc.payload_len <= limit", "p@ == body"),
+        ("checksum inputs", reader, "hash.ensures((magic,loc.payload_len,p),loc.checksum)", "true"),
+        ("declared identity", reader, "id.digest()==body.subrange(8,40) &&", "true &&"),
+        ("record contents", reader, "record::record_at(body,40,scheme,r) &&\n                exists", "true &&\n                exists"),
+        ("computed identity", reader, "d@==id.digest() && #[trigger] identify.ensures", "true && #[trigger] identify.ensures"),
+        ("identity refusal", reader, "d@!=id.digest() &&", "true &&"),
+        ("object installation", preload, "final(loaded)@ == old(loaded)@.insert(id,record)", "true"),
+        ("next owning references", preload, "final(next)@ == old(next)@.union(children(record.contents().3).difference(old(loaded)@.dom()))", "true"),
+    ]:
+        yield (
+            f"indexed preload loses {label}", source,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs"),
+        )
     closures = Path("crates/astrid-storage/src/engine/durable/journal_closure.rs")
     for label, clause, weaker in [
         ("commit kind", "table@.contains_key(root) && table@[root].contents().0 is Commit", "table@.contains_key(root)"),

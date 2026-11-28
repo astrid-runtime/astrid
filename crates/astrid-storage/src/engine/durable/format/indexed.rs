@@ -146,11 +146,8 @@ pub(in crate::engine::durable) fn visit_indexed_objects<
             .map_err(|source| io_error("read coalesced durable frames", source))?;
 
         for (expected_id, location) in &ordered[first..end] {
-            let frame =
-                super::arena_span::frame(&span, span_start, location.offset, location.payload_len)
-                    .ok_or(DurableError::EncodingOverflow)?;
             let (record, payload) =
-                decode_indexed_frame(frame, *expected_id, *location, identity, limits)?;
+                decode_indexed_frame(&span, span_start, *expected_id, *location, identity, limits)?;
             accept(*expected_id, *location, record, payload)?;
         }
         first = end;
@@ -171,50 +168,53 @@ pub(in crate::engine::durable) fn reset_last_batch_spans() {
 }
 
 fn decode_indexed_frame<'a, I: PersistentObjectIdentity>(
-    frame: &'a [u8],
+    span: &'a [u8],
+    start: u64,
     expected_id: ObjectId,
     location: ArenaLocation,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(ObjectRecord, &'a [u8]), DurableError> {
     use super::arena_span::Error;
-    let payload = super::arena_span::payload(
-        frame,
-        ARENA_MAGIC,
-        FRAME_VERSION,
-        location.payload_len,
-        location.checksum,
-        limits.max_frame_bytes,
-        frame_checksum,
-    )
-    .map_err(|error| {
-        let detail = match error {
-            Error::Truncated => "coalesced frame is truncated",
-            Error::Magic => "frame magic mismatch",
-            Error::Version => "unsupported frame version",
-            Error::Reserved => "reserved header bytes are non-zero",
-            Error::Limit(declared) => {
-                return DurableError::FrameTooLarge {
-                    file: ARENA_FILE,
-                    offset: location.offset,
-                    declared,
-                    limit: limits.max_frame_bytes,
-                };
-            },
-            Error::Length => "indexed frame length no longer matches the arena",
-            Error::Payload => "coalesced frame payload is truncated",
-            Error::Checksum => "indexed frame checksum no longer matches the arena",
-        };
-        corrupt(ARENA_FILE, location.offset, detail)
-    })?;
-    let record = verified_payload(
-        payload,
+    use super::indexed_frame;
+    indexed_frame::read(
+        span,
+        start,
+        location,
         expected_id,
-        location.offset,
-        identity.scheme(),
-        identity,
-    )?;
-    Ok((record, payload))
+        indexed_frame::Format {
+            magic: ARENA_MAGIC,
+            version: FRAME_VERSION,
+            limit: limits.max_frame_bytes,
+            scheme: identity.scheme().into(),
+        },
+        frame_checksum,
+        |record| *identity.identify(record).as_bytes(),
+    )
+    .map_err(|error| match error {
+        indexed_frame::Error::Bounds => DurableError::EncodingOverflow,
+        indexed_frame::Error::Record(error) => record_error(location.offset, error),
+        indexed_frame::Error::Envelope(error) => {
+            let detail = match error {
+                Error::Truncated => "coalesced frame is truncated",
+                Error::Magic => "frame magic mismatch",
+                Error::Version => "unsupported frame version",
+                Error::Reserved => "reserved header bytes are non-zero",
+                Error::Limit(declared) => {
+                    return DurableError::FrameTooLarge {
+                        file: ARENA_FILE,
+                        offset: location.offset,
+                        declared,
+                        limit: limits.max_frame_bytes,
+                    };
+                },
+                Error::Length => "indexed frame length no longer matches the arena",
+                Error::Payload => "coalesced frame payload is truncated",
+                Error::Checksum => "indexed frame checksum no longer matches the arena",
+            };
+            corrupt(ARENA_FILE, location.offset, detail)
+        },
+    })
 }
 
 fn verified_payload<I: PersistentObjectIdentity>(
@@ -224,21 +224,27 @@ fn verified_payload<I: PersistentObjectIdentity>(
     scheme: super::IdentityScheme,
     identity: &I,
 ) -> Result<ObjectRecord, DurableError> {
-    use super::verified_record::{self, Error};
+    use super::verified_record;
     verified_record::confirmed(payload, scheme.into(), expected, |record| {
         *identity.identify(record).as_bytes()
     })
-    .map_err(|error| {
-        corrupt(
-            ARENA_FILE,
-            offset,
-            match error {
-                Error::Decode(e) => super::body_error_detail(e),
-                Error::Identifier => "indexed object identifier mismatch",
-                Error::Identity => "indexed object identity does not match its canonical record",
-            },
-        )
-    })
+    .map_err(|error| record_error(offset, error))
+}
+
+fn record_error(
+    offset: u64,
+    error: super::verified_record::Error<super::verified_record::BodyError>,
+) -> DurableError {
+    use super::verified_record::Error;
+    corrupt(
+        ARENA_FILE,
+        offset,
+        match error {
+            Error::Decode(e) => super::body_error_detail(e),
+            Error::Identifier => "indexed object identifier mismatch",
+            Error::Identity => "indexed object identity does not match its canonical record",
+        },
+    )
 }
 
 fn frame_len(location: ArenaLocation) -> Result<u64, DurableError> {

@@ -136,12 +136,7 @@ pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
             identity,
             limits,
             |id, _location, record, _payload| {
-                for child in record.owning_references() {
-                    if !loaded.contains_key(&child) {
-                        next.insert(child);
-                    }
-                }
-                loaded.insert(id, record);
+                super::journal_preload::accept(&mut loaded, &mut next, id, record);
                 Ok(())
             },
         )?;

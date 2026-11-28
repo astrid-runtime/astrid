@@ -283,6 +283,67 @@ fn read_leaf<H:Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]
     record::confirmed(p,scheme,id,identify).ok()
 }
 
+/// Deliver an interior indexed frame to recovery and follow only owning
+/// references of the exact record whose digest was checked against the index.
+fn indexed_preload<H:FnOnce([u8;8],u64,&[u8])->[u8;32],I:FnOnce(&crate::ObjectRecord)->[u8;32]>(
+    loaded:&mut std::collections::BTreeMap<crate::ObjectId,crate::ObjectRecord>,
+    pending:&mut std::collections::BTreeSet<crate::ObjectId>,data:&[u8],base:u64,loc:frame::ArenaLocation,
+    id:crate::ObjectId,magic:[u8;8],version:u16,limit:u64,scheme:Scheme,hash:H,identify:I)
+    requires vstd::std_specs::btree::btree_map_inv(old(loaded)),vstd::std_specs::btree::btree_set_inv(old(pending)),
+        vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|n:u64,p:&[u8]| #[trigger] hash.requires((magic,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+{
+    use crate::indexed_frame::{read,Error};
+    let ghost at = loc.offset as int - base;
+    let ghost bytes = data@.subrange(at,at+52+loc.payload_len);
+    let ghost body = bytes.skip(52);
+    let ghost earlier = loaded@;
+    let ghost queue = pending@;
+    let result = read(data,base,loc,id,crate::indexed_frame::Format {magic,version,limit,scheme},hash,identify);
+    let ghost fits = base <= loc.offset && loc.payload_len as int + 52 <= u64::MAX &&
+        at+52+loc.payload_len <= data.len();
+    assert((result matches Err(Error::Bounds)) == !fits);
+    proof {
+        if fits && loc.payload_len <= limit &&
+            bytes == frame::header_bytes(magic,version,loc.payload_len,loc.checksum) + body &&
+            record::tag(body,0,scheme) && record::leaf_body(body,40) && id.digest() == body.subrange(8,40) &&
+            (forall|p:&[u8],s:[u8;32]| p@==body && #[trigger] hash.ensures((magic,loc.payload_len,p),s) ==> s==loc.checksum) &&
+            (forall|r:&crate::ObjectRecord,d:[u8;32]| record::record_at(body,40,scheme,*r) &&
+                #[trigger] identify.ensures((r,),d) ==> d@==id.digest())
+        {
+            vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+            assert(bytes.take(8) =~= magic@);
+            assert(bytes.subrange(8,12) =~= seq![version as u8,(version >> 8) as u8,0u8,0u8]);
+            assert(bytes.subrange(8,10) =~= seq![version as u8,(version >> 8) as u8]);
+            assert(bytes.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(loc.payload_len));
+            assert(bytes.subrange(20,52) =~= loc.checksum@);
+            assert(result.is_ok());
+        }
+    }
+    match result {
+        Ok((r,p))=>{
+            assert(p@ =~= data@.subrange(at+52,at+52+loc.payload_len));
+            assert(loc.payload_len <= limit && magic@ == bytes.take(8) && bytes.subrange(20,52) == loc.checksum@);
+            assert(bytes.subrange(8,10) == seq![version as u8,(version >> 8) as u8] && bytes[10]==0 && bytes[11]==0);
+            assert(arena_span::declared(bytes) == loc.payload_len && hash.ensures((magic,loc.payload_len,p),loc.checksum));
+            assert(record::tag(body,0,scheme) && id.digest() == body.subrange(8,40));
+            crate::journal_preload::accept(loaded,pending,id,r);
+            assert(loaded@ == earlier.insert(id,r) && record::record_at(body,40,scheme,loaded@[id]));
+            assert(exists|d:[u8;32]| d@==id.digest() && #[trigger] identify.ensures((&loaded@[id],),d));
+            assert(pending@ == queue.union(crate::closure_walk::children(loaded@[id].contents().3).difference(earlier.dom())));
+        },
+        Err(Error::Record(record::Error::Identity))=>{
+            assert(exists|r:crate::ObjectRecord,d:[u8;32]| d@!=id.digest() && record::record_at(body,40,scheme,r)
+                && #[trigger] identify.ensures((&r,),d));
+        },
+        Err(Error::Record(record::Error::Identifier))=>{assert(id.digest()!=body.subrange(8,40));},
+        Err(Error::Envelope(arena_span::Error::Limit(n)))=>{assert(n==arena_span::declared(bytes) && n>limit);},
+        Err(_)=>{},
+    }
+    proof { if result.is_err() {assert(loaded@ == earlier && pending@ == queue);} }
+}
+
 /// Instantiate both ends of write/read with the same profile of hash
 /// callbacks. An earlier unrelated frame occupies a separate output chunk.
 fn prepare_pair<H:Copy+Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]>(

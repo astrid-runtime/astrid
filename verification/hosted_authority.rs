@@ -202,6 +202,8 @@ mod owner_codec;
 
 #[path = "../crates/astrid-storage/src/engine/durable/journal_history.rs"]
 mod journal_history;
+#[path = "../crates/astrid-storage/src/engine/durable/journal_preload.rs"]
+mod journal_preload;
 #[path = "../crates/astrid-storage/src/engine/durable/journal_closure.rs"]
 mod journal_closure;
 #[path = "../crates/astrid-storage/src/engine/durable/journal_transition.rs"]
@@ -242,6 +244,8 @@ use object_record::{ObjectRecord,ObjectFormatVersion};
 use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 #[path = "../crates/astrid-storage/src/engine/durable/format/arena_span.rs"]
 mod arena_span;
+#[path = "../crates/astrid-storage/src/engine/durable/format/indexed_frame.rs"]
+mod indexed_frame;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_index.rs"]
 mod arena_index;
 #[path = "../crates/astrid-storage/src/engine/durable/index/key.rs"]
