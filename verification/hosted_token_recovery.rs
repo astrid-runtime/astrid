@@ -6,7 +6,7 @@ use vstd::string::StringSliceAdditionalSpecFns;
 use vstd::{laws_eq::obeys_concrete_eq, std_specs::hash::{hash_map_inv, obeys_key_model}};
 
 #[path = "hosted_marker_append.rs"]
-mod marker_append;
+pub(crate) mod marker_append;
 
 verus! {
 
@@ -402,7 +402,7 @@ spec fn page_membership<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read
     checkpoint::image(read,has,ns+seq![0u8]+text,ns+seq![0u8],ns+seq![1u8])
 }
 
-spec fn ns_bytes(kind:Marker) -> Seq<u8> {
+pub(crate) open spec fn ns_bytes(kind:Marker) -> Seq<u8> {
     match kind {Marker::Revoked => "caps:revoked".spec_bytes(), Marker::Consumed => "caps:used".spec_bytes()}
 }
 

@@ -21,7 +21,7 @@ closed spec fn appended_marker<I:FnOnce(&crate::ObjectRecord)->crate::ObjectId>(
 
 /// Recover the stored ID, byte count and data directly from the object encoder's
 /// wire equation. References after the data may have any canonical length.
-proof fn encoded_fields(image:Seq<u8>,loc:frame::ArenaLocation,body:Seq<u8>,
+pub(crate) proof fn encoded_fields(image:Seq<u8>,loc:frame::ArenaLocation,body:Seq<u8>,
     scheme:Scheme,id:crate::ObjectId,r:crate::ObjectRecord)
     requires {
         let f=r.contents();
@@ -49,25 +49,21 @@ proof fn encoded_fields(image:Seq<u8>,loc:frame::ArenaLocation,body:Seq<u8>,
     assert(record::u64_field(body,length)==fields.2.len());
 }
 
-/// Follow a production marker record through canonical encoding and arena append.
-/// Neighbouring frames and the pre-existing file prefix have independent contents.
-#[verifier::rlimit(20)]
-fn append_token_marker<S:frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
-    I:FnOnce(&crate::ObjectRecord)->crate::ObjectId>(
-    file:&mut S,scheme:Scheme,key:Vec<u8>,previous:Option<crate::ObjectId>,
-    depth:u64,used:u64,totals:crate::checkpoint_totals::NodeTotals,
-    mut batch:Vec<Vec<u8>>,selected:usize,identify:I,hash:H,
-) -> (out:Result<(crate::ObjectId,frame::ArenaLocation),frame::BatchError<S::Error>>)
-    requires key.len()<=u32::MAX && key.len()+51<=isize::MAX && depth<u64::MAX &&
-        used+key.len()+1<=u64::MAX, old(file).image().len()<=u64::MAX, selected<batch.len(),
-        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+/// Install the selected payload in a submitted arena batch. The returned interval
+/// and file prefix refer to the actual bytes sent to the canonical file.
+pub(crate) fn append_payload<S:frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+    file:&mut S,payload:Vec<u8>,mut batch:Vec<Vec<u8>>,selected:usize,hash:H,
+) -> (out:Result<frame::ArenaLocation,frame::BatchError<S::Error>>)
+    requires old(file).image().len()<=u64::MAX,selected<batch.len(),
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((frame::ARENA_MAGIC,n,b)),
-    ensures final(file).target()==old(file).target(),
-        out matches Ok((id,loc)) ==> appended_marker(old(file).image(),final(file).image(),key@,id,loc,identify),
+    ensures final(file).target()==old(file).target(),out matches Ok(loc) ==> {
+        let at=loc.offset as int+frame::WIDTH;
+        &&& loc.offset>=old(file).image().len() && at+loc.payload_len<=final(file).image().len()
+        &&& loc.payload_len==payload.len()
+        &&& final(file).image().take(old(file).image().len() as int)==old(file).image()
+        &&& final(file).image().subrange(at,at+loc.payload_len)==payload@
+    },
 {
-    let (marker,_)=crate::hosted_delta_mutation::written_marker(key,previous,depth,used,totals);
-    let id=identify(&marker);
-    let payload=record::encode(scheme,id,&marker).unwrap();
     let ghost payload_bytes=payload@;
     batch.set(selected,payload);
     let batch=batch.as_slice();
@@ -98,14 +94,39 @@ fn append_token_marker<S:frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
             encoded.subrange(start,start+52+loc.payload_len).skip(52));
         assert(file.image().subrange(at,at+loc.payload_len) =~= encoded.subrange(start+52,start+52+loc.payload_len));
         assert(file.image().subrange(at,at+loc.payload_len)==payload_bytes);
-        encoded_fields(file.image(),loc,payload_bytes,scheme,id,marker);
+    }
+    Ok(loc)
+}
+
+/// Follow a production marker record through canonical encoding and arena append.
+/// Neighbouring frames and the pre-existing file prefix have independent contents.
+#[verifier::rlimit(20)]
+fn append_token_marker<S:frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+    I:FnOnce(&crate::ObjectRecord)->crate::ObjectId>(
+    file:&mut S,scheme:Scheme,key:Vec<u8>,previous:Option<crate::ObjectId>,
+    depth:u64,used:u64,totals:crate::checkpoint_totals::NodeTotals,
+    batch:Vec<Vec<u8>>,selected:usize,identify:I,hash:H,
+) -> (out:Result<(crate::ObjectId,frame::ArenaLocation),frame::BatchError<S::Error>>)
+    requires key.len()<=u32::MAX && key.len()+51<=isize::MAX && depth<u64::MAX &&
+        used+key.len()+1<=u64::MAX, old(file).image().len()<=u64::MAX, selected<batch.len(),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((frame::ARENA_MAGIC,n,b)),
+    ensures final(file).target()==old(file).target(),
+        out matches Ok((id,loc)) ==> appended_marker(old(file).image(),final(file).image(),key@,id,loc,identify),
+{
+    let (marker,_)=crate::hosted_delta_mutation::written_marker(key,previous,depth,used,totals);
+    let id=identify(&marker);
+    let payload=record::encode(scheme,id,&marker).unwrap();
+    let ghost prior=file.image();
+    let loc=append_payload(file,payload,batch,selected,hash)?;
+    proof {
+        encoded_fields(file.image(),loc,payload@,scheme,id,marker);
         let data=marker.contents().2;
         assert(identify.ensures((&marker,),id));
         assert(exists|r:&crate::ObjectRecord| #[trigger] identify.ensures((r,),id) &&
             r.contents().2==crate::hosted_journal_history::component_bytes(file.image(),loc));
         assert(crate::hosted_delta_mutation::marker_bytes(data,key@));
         assert(loc.offset>=prior.len());
-        assert(at+loc.payload_len<=file.image().len());
         assert(appended_marker(prior,file.image(),key@,id,loc,identify));
     }
     Ok((id,loc))

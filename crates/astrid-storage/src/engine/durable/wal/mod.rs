@@ -8,6 +8,7 @@ mod commit_wire;
 mod interior;
 mod measured_record;
 mod measurement;
+mod object_storage;
 mod overlay;
 mod physical_wire;
 mod read_buffer;

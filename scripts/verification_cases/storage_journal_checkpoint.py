@@ -72,3 +72,23 @@ def consumer_defects():
             f"appended token marker loses {label}", source,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
         )
+
+    group = Path("verification/hosted_wal_object_root.rs")
+    codec = Path("crates/astrid-storage/src/engine/durable/wal/object_storage.rs")
+    transfer = Path("verification/hosted_wal_writer_trace.rs")
+    for label, source, clause, weaker in [
+        ("scanned objects", Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
+         "ensures records@ == self.contents().objects,", "ensures true,"),
+        ("stable WAL target", transfer, "(target@)(media)==sink.wal_target(),\n{", "true,\n{"),
+        ("stored object boundary", group, "object_start:(o.next-(72+o.body.len())) as u64", "object_start:o.next as u64"),
+        ("stored root boundary", group, "root_start:(r.next-(72+r.body.len())) as u64", "root_start:r.next as u64"),
+        ("compression selection", codec, "n==compressed as int+PREFIX && n<canonical", "n==compressed as int+PREFIX"),
+        ("length prefix", codec, "ensures final(stored)@==vstd::bytes::spec_u64_to_le_bytes(length)+block@,", "ensures true,"),
+        ("compressed block", codec, "block@==body@.skip(8),", "true,"),
+        ("marker arena payload", append, "final(file).image().subrange(at,at+loc.payload_len)==payload@", "true"),
+        ("released owner", group, "parse_written(&group.root,&name,scheme,expected,replacement)", "parse_written(&group.object,&name,scheme,expected,replacement)"),
+    ]:
+        yield (
+            f"acknowledged object group loses {label}", source,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), group,
+        )

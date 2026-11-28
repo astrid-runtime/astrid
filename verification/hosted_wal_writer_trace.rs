@@ -7,6 +7,9 @@ use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},std_specs::btree::btree_m
 use crate::{owner_codec::{self,Owner},root_wire,root_transition::{self,Version,Replay}};
 use vstd::prelude::*;
 
+#[path = "hosted_wal_object_root.rs"]
+mod object_root;
+
 verus! {
 
 /// An unsealed content transaction must recheck every supplied row before the
@@ -300,6 +303,43 @@ fn ordered_roots(names:&[Vec<u8>]) -> (accepted:bool)
     true
 }
 
+/// Discharge the group's pending acknowledgement, then read the submitted extent
+/// through a positional reader on the stable image of the acknowledged target.
+fn sync_and_read<S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M>(
+    sink:S,submitted:&[u8],base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,
+    Ghost(before):Ghost<Seq<u8>>) -> (out:Option<(M,Vec<u8>)>)
+    requires before.len()==base,base as int+submitted.len()<=u64::MAX,sink.buffered_image()==before+submitted@,
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.drain_error(e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.sync_error(e),
+        forall|s:&S| #[trigger] reopen.requires((s,)),
+        forall|s:&S,m:M| #[trigger] reopen.ensures((s,),m) ==> m.image()==s.stable_image() && (target@)(m)==s.wal_target() &&
+            forall|at:u64,e:M::Error| base<=at<base as int+submitted.len() ==> !#[trigger] m.io_error(at,e),
+    ensures out matches Some((media,bytes)) && bytes@==submitted@ && media.image()==before+submitted@ &&
+        (target@)(media)==sink.wal_target(),
+{
+    let ghost original_target=sink.wal_target();
+    let sync=move || -> (out:Result<S,S::Error>)
+        requires sink.buffered_image()==before+submitted@,sink.wal_target()==original_target,
+            forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.drain_error(e),
+            forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.sync_error(e),
+        ensures out matches Ok(s) && s.stable_image()==before+submitted@ && s.wal_target()==original_target,
+    {
+        let mut buffered=sink;
+        crate::group_frontier::publish_buffer(&mut buffered)?;
+        Ok(buffered)
+    };
+    let mut pending=1u64;
+    let mut poisoned=false;
+    let (acknowledged,stable)=crate::group_frontier::sync_pending(false,&mut pending,&mut poisoned,sync).ok()?;
+    assert(acknowledged==1 && pending==0 && !poisoned);
+    let media=reopen(&stable);
+    assert((target@)(media)==original_target);
+    assert(media.image().subrange(base as int,base as int+submitted.len()) =~= submitted@);
+    let mut observed=vec![0u8;submitted.len()];
+    crate::positional_read::exact(&media,base,&mut observed).ok()?;
+    Some((media,observed))
+}
+
 /// Submit the writer's three framed records, publish the buffered WAL, and reread the
 /// submitted interval from the stable image of the same target.
 fn durable_begin_root<S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M,H,F>(
@@ -343,26 +383,8 @@ fn durable_begin_root<S:crate::group_frontier::BufferedWal,M:crate::positional_r
         sink.append_record(&submitted[first..second]).ok()?;
         sink.append_record(&submitted[second..]).ok()?;
         assert(sink.buffered_image() =~= before+submitted@);
-        let sync=move || -> (out:Result<S,S::Error>)
-            requires sink.buffered_image()==before+submitted@,sink.wal_target()==original_target,
-                forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.drain_error(e),
-                forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.sync_error(e),
-            ensures out matches Ok(s) && s.stable_image()==before+submitted@ && s.wal_target()==original_target,
-        {
-            let mut buffered=sink;
-            crate::group_frontier::publish_buffer(&mut buffered)?;
-            Ok(buffered)
-        };
-        let mut pending=1u64;
-        let mut poisoned=false;
-        let (acknowledged,stable)=crate::group_frontier::sync_pending(false,&mut pending,&mut poisoned,sync).ok()?;
-        assert(acknowledged==1 && pending==0 && !poisoned);
-        let media=reopen(&stable);
-        assert((target@)(media)==original_target);
-        assert(media.image().subrange(base as int,base as int+submitted.len()) =~= submitted@);
-        let mut observed=vec![0u8;submitted.len()];
-        crate::positional_read::exact(&media,base,&mut observed).ok()?;
-        Some(observed)
+        let (_,bytes)=sync_and_read(sink,&submitted,base,reopen,target,Ghost(before))?;
+        Some(bytes)
     };
     let (marker,body,relative)=begin_root(sequence,begin,root,chunk,hash,checksum,finish,digest,transfer)?;
     Some((marker,body,base.checked_add(relative)?))

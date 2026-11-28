@@ -110,7 +110,7 @@ where
     let mut roots = root_history.clone();
     while let Some(transaction) = next_transaction(&mut scanner)? {
         let mut object_ids = BTreeSet::new();
-        for descriptor in &transaction.objects {
+        for descriptor in transaction.objects() {
             let (id, _record, _payload) =
                 read_object_record(&mut payload_reader, *descriptor, &identity, limits)?;
             if id != descriptor.id() {

@@ -309,6 +309,8 @@ use wal_measurement as measurement;
 use wal_physical_wire as physical_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/measured_record.rs"]
 mod wal_measured_record;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/object_storage.rs"]
+mod wal_object_storage;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"]
 mod wal_physical_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/interior.rs"]

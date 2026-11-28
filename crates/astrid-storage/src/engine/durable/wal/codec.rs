@@ -20,7 +20,6 @@ const BEGIN_FIXED_LEN: usize = 8;
 const DIGEST_DOMAIN: &str = "astrid durable transaction wal v2";
 #[cfg(test)]
 pub(super) const OBJECT_FLAG_LZ4: u8 = 1;
-const COMPRESSED_OBJECT_LENGTH_LEN: usize = 8;
 
 /// Derive the physical WAL payload bound from the canonical frame bound.
 pub(super) fn wal_physical_limit(limits: WalLimits) -> WalPhysicalLimit {
@@ -374,22 +373,18 @@ pub(super) fn encode_object_storage_body(
     body: &[u8],
 ) -> Result<(ObjectEncoding, Cow<'_, [u8]>), WalError> {
     let compressed = lz4_flex::block::compress(body);
-    let stored_len = COMPRESSED_OBJECT_LENGTH_LEN
-        .checked_add(compressed.len())
-        .ok_or(WalError::Encoding("WAL compressed object length overflow"))?;
-    if stored_len >= body.len() {
+    let Some(stored_len) = super::object_storage::allocation(body.len(), compressed.len())
+        .map_err(|()| WalError::Encoding("WAL compressed object length overflow"))?
+    else {
         return Ok((ObjectEncoding::Plain, Cow::Borrowed(body)));
-    }
+    };
     let mut stored = Vec::new();
     stored
         .try_reserve_exact(stored_len)
         .map_err(|_| WalError::Encoding("WAL compressed object allocation failed"))?;
-    stored.extend_from_slice(
-        &u64::try_from(body.len())
-            .map_err(|_| WalError::Encoding("WAL object length overflow"))?
-            .to_le_bytes(),
-    );
-    stored.extend_from_slice(&compressed);
+    let length =
+        u64::try_from(body.len()).map_err(|_| WalError::Encoding("WAL object length overflow"))?;
+    super::object_storage::pack(&mut stored, length, &compressed);
     Ok((ObjectEncoding::Lz4, Cow::Owned(stored)))
 }
 
@@ -409,17 +404,11 @@ pub(super) fn decode_object_storage_body(
         validate_logical_body(body, limits, offset)?;
         return Ok((encoding, Cow::Borrowed(body)));
     }
-    if body.len() < COMPRESSED_OBJECT_LENGTH_LEN {
-        return Err(WalError::Corrupt {
-            offset,
-            detail: "WAL compressed object body is invalid",
-        });
-    }
-    let declared = WalLength::new(read_u64(
-        &body[..COMPRESSED_OBJECT_LENGTH_LEN],
+    let (length, block) = super::object_storage::split(body).ok_or(WalError::Corrupt {
         offset,
-        "WAL compressed object length is truncated",
-    )?);
+        detail: "WAL compressed object body is invalid",
+    })?;
+    let declared = WalLength::new(length);
     let limit = WalLength::new(limits.max_frame_bytes());
     if declared > limit {
         return Err(WalError::FrameTooLarge {
@@ -435,11 +424,10 @@ pub(super) fn decode_object_storage_body(
         .map_err(|_| WalError::Encoding("WAL decompression allocation failed"))?;
     decoded.resize(size, 0);
     let written =
-        lz4_flex::block::decompress_into(&body[COMPRESSED_OBJECT_LENGTH_LEN..], &mut decoded)
-            .map_err(|_| WalError::Corrupt {
-                offset,
-                detail: "WAL compressed object payload is invalid",
-            })?;
+        lz4_flex::block::decompress_into(block, &mut decoded).map_err(|_| WalError::Corrupt {
+            offset,
+            detail: "WAL compressed object payload is invalid",
+        })?;
     if written != size {
         return Err(WalError::Corrupt {
             offset,
