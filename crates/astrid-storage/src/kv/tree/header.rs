@@ -343,7 +343,7 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    use super::{delta_chain, delta_recovery::CounterError, delta_replay};
+    use super::{checkpoint_replay, delta_chain, delta_recovery::CounterError, delta_replay};
     let validated_trees = &validation_cache.trees;
     let chain = delta_chain::walk(owner, head_id, |principal, object| {
         use super::projection_record::{self, LoadError};
@@ -365,7 +365,6 @@ where
         delta_chain::Error::Source(e) => e,
     })?;
     let tree = chain.tree;
-    let checkpoint_totals = chain.totals;
     let cached = validated_trees
         .lock()
         .get(owner)
@@ -379,20 +378,20 @@ where
         let mut context = TreeContext::<P, E>::new(engine, owner);
         context.validate_tree(tree)?
     };
-    if validation.entries != checkpoint_totals.entries
-        || validation.logical_bytes != checkpoint_totals.logical_bytes
-        || validation.quota_bytes != checkpoint_totals.quota_bytes
-    {
-        return Err(invalid(head_id, "KV checkpoint accounting totals disagree"));
-    }
-    let replay = delta_replay::run(
-        (
-            TreeContext::<P, E>::new(engine, owner),
-            OverlayMap::default(),
-        ),
-        checkpoint_totals,
-        tree,
-        chain.newest_first,
+    let replay = checkpoint_replay::recover(
+        chain,
+        validation.root(),
+        NodeTotals {
+            entries: validation.entries,
+            logical_bytes: validation.logical_bytes,
+            quota_bytes: validation.quota_bytes,
+        },
+        || {
+            (
+                TreeContext::<P, E>::new(engine, owner),
+                OverlayMap::default(),
+            )
+        },
         |(mut context, mut overlay), base, object, mutations, mut totals| {
             apply_validated_mutations(
                 object,
@@ -406,17 +405,25 @@ where
         },
     )
     .map_err(|error| match error {
-        delta_replay::Error::Counter(id, CounterError::Disagree) => {
-            invalid(id, "KV delta chain counters disagree")
+        checkpoint_replay::Error::Root => {
+            invalid(head_id, "KV checkpoint validation root disagrees")
         },
-        delta_replay::Error::Counter(_, CounterError::RowOverflow) => {
-            super::delta::arithmetic_overflow()
+        checkpoint_replay::Error::Totals => {
+            invalid(head_id, "KV checkpoint accounting totals disagree")
         },
-        delta_replay::Error::Counter(id, CounterError::ChainOverflow) => {
-            invalid(id, "KV delta byte total overflow")
+        checkpoint_replay::Error::Replay(error) => match error {
+            delta_replay::Error::Counter(id, CounterError::Disagree) => {
+                invalid(id, "KV delta chain counters disagree")
+            },
+            delta_replay::Error::Counter(_, CounterError::RowOverflow) => {
+                super::delta::arithmetic_overflow()
+            },
+            delta_replay::Error::Counter(id, CounterError::ChainOverflow) => {
+                invalid(id, "KV delta byte total overflow")
+            },
+            delta_replay::Error::Apply(error) => error,
+            delta_replay::Error::Totals(id) => invalid(id, "KV delta accounting totals disagree"),
         },
-        delta_replay::Error::Apply(error) => error,
-        delta_replay::Error::Totals(id) => invalid(id, "KV delta accounting totals disagree"),
     })?;
     let (_, overlay) = replay.state;
     Ok((

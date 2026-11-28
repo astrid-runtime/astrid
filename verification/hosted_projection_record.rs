@@ -16,7 +16,7 @@ proof fn equal_totals(a:NodeTotals,b:NodeTotals)
     assert(format::checkpoint_bytes(b).subrange(9,17) =~= vstd::bytes::spec_u64_to_le_bytes(b.quota_bytes));
 }
 
-fn base(owner:u64,id:ObjectId,tree:Option<ObjectId>,totals:NodeTotals,available:bool)
+fn base(owner:u64,id:ObjectId,tree:Option<ObjectId>,totals:NodeTotals,available:bool,observed_root:Option<ObjectId>,measured:NodeTotals)
     requires obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
 {
     let version = ObjectFormatVersion::new(4).unwrap();
@@ -66,6 +66,35 @@ fn base(owner:u64,id:ObjectId,tree:Option<ObjectId>,totals:NodeTotals,available:
                 assert(chain::ids(s) =~= Seq::<ObjectId>::empty());
                 assert(!available && e == chain::Error::Source(3u8));
             },
+        }
+    }
+    if let Ok(c) = got {
+        use crate::{checkpoint_replay as checkpoint,delta_replay as replay,delta_mutation::Mutation};
+        let start = || -> (s:u64) ensures s == owner {owner};
+        let apply = |_s:u64,_tree:Option<ObjectId>,_k:ObjectId,_r:&Vec<Mutation>,_totals:NodeTotals|
+            -> (out:Result<(u64,NodeTotals),u8>) ensures out == Err(9u8) {Err(9u8)};
+        let ghost selected = c;
+        let result = checkpoint::recover(c,observed_root,measured,start,apply);
+        let ghost out = result;
+        proof {
+            assert(selected.newest_first.len() == 0);
+            match out {
+                Err(checkpoint::Error::Root) => assert(observed_root != tree),
+                Err(checkpoint::Error::Totals) => assert(tree == observed_root && measured != totals),
+                Err(checkpoint::Error::Replay(e)) => {
+                    let s = choose|s:u64| #[trigger] start.ensures((),s) &&
+                        replay::failed(s,measured,observed_root,selected.newest_first@,apply,e);
+                    assert(false);
+                },
+                Ok(end) => {
+                    let s = choose|s:u64| #[trigger] start.ensures((),s) &&
+                        replay::replayed(s,measured,observed_root,selected.newest_first@,0,apply,end);
+                    let h = choose|h:Seq<replay::Cursor<u64>>| #[trigger] replay::history(s,measured,observed_root,selected.newest_first@,0,apply,h)
+                        && h.last() == end;
+                    assert(h.len() == 1);
+                    assert(tree == observed_root && measured == totals && end.state == owner && end.totals == totals && end.depth == 0 && end.bytes == 0);
+                },
+            }
         }
     }
 }

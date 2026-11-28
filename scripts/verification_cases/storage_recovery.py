@@ -226,6 +226,17 @@ def consumer_defects():
             f"chronological replay loses {label}", fold,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_replay.rs"),
         )
+    checkpoint = Path("crates/astrid-storage/src/kv/tree/checkpoint_replay.rs")
+    for label, clause, weaker in [
+        ("root refusal", "(out is Err && out->Err_0 is Root) == (chain.tree != root)", "chain.tree != root ==> (out is Err && out->Err_0 is Root)"),
+        ("accounting refusal", "(out is Err && out->Err_0 is Totals) == (chain.tree == root && measured != chain.totals)", "chain.tree == root && measured != chain.totals ==> (out is Err && out->Err_0 is Totals)"),
+        ("initial state", "out matches Ok(c) ==> exists|s:S| #[trigger] start.ensures((),s) &&", "out matches Ok(c) ==> exists|s:S|"),
+        ("application failure history", "delta_replay::failed(s,measured,root,chain.newest_first@,apply,e)", "true"),
+    ]:
+        yield (
+            f"checkpoint replay loses {label}", checkpoint,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_projection_record.rs"),
+        )
     envelope = Path("crates/astrid-storage/src/kv/tree/projection_record.rs")
     for label, clause, weaker, target in [
         ("checkpoint physical bytes", "f.2 == checkpoint_bytes(totals) && f.4", "f.4", "hosted_projection_record"),

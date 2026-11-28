@@ -345,6 +345,8 @@ mod delta_mutation;
 mod delta_recovery;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_replay.rs"]
 mod delta_replay;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_replay.rs"]
+mod checkpoint_replay;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_totals.rs"]
 mod delta_totals;
 #[path = "../crates/astrid-storage/src/kv/tree/spill_record.rs"]
