@@ -75,7 +75,11 @@ fn snapshot<P:Copy>(principal:P,id:ObjectId,generation:u64,reader_generation:u64
         ensures result == if g != reader_generation { Ok(None) }
             else if let Some(e) = disk_error { Err(e) } else { Ok(Some(disk)) },
     {
-        if g != reader_generation {Ok(None)} else if let Some(e) = disk_error {Err(e)} else {Ok(Some(disk))}
+        let reader = read_admission::Reader {file:reader_generation,generation:reader_generation};
+        reader.read(g,key,loc,|file:&u64,requested:ObjectId,placement:crate::ArenaLocation| -> (out:Result<ObjectRecord,u8>)
+            requires *file == reader_generation && requested == id && Some(placement) == location,
+            ensures out == (if let Some(e) = disk_error {Err(e)} else {Ok(disk)}),
+            {if let Some(e) = disk_error {Err(e)} else {Ok(disk)}})
     };
     let keep = |p:&P,key:ObjectId,g:u64,r:ObjectRecord| -> (result:Result<Option<(P,ObjectId,ObjectRecord)>,u8>)
         ensures result == if g == current && membership {Ok(Some((*p,key,r)))} else {Ok(None)},
@@ -86,6 +90,35 @@ fn snapshot<P:Copy>(principal:P,id:ObjectId,generation:u64,reader_generation:u64
         Ok(read_admission::retain(p,key,g,current,r,present,insert))
     };
     read_admission::attempt(&principal,id,generation,pending,location,read,keep)
+}
+
+fn positional_reader(file:u64,observed:u64,opened:u64,id:ObjectId,at:crate::ArenaLocation,fail:bool) {
+    let r = crate::read_admission::Reader {file,generation:opened};
+    let probe = |f:&u64,k:ObjectId,l:crate::ArenaLocation| -> (out:Result<(u64,ObjectId,crate::ArenaLocation),(u64,ObjectId)>)
+        ensures out == (if fail {Err((*f,k))} else {Ok((*f,k,l))}),
+    { if fail {Err((*f,k))} else {Ok((*f,k,l))} };
+    let out = r.read(observed,id,at,probe);
+    assert(out == (if observed != opened {Ok(None)} else if fail {Err((file,id))} else {Ok(Some((file,id,at)))}));
+}
+
+/// Read both maps under the captured generation before admission.
+fn indexed_snapshot<D>(owner:u64,id:ObjectId,generation:u64,reader_generation:u64,current:u64,
+    pending:&std::collections::BTreeMap<ObjectId,crate::overlay_object::Object<Arc<ObjectRecord>,crate::ArenaLocation,D>>,
+    index:&std::collections::BTreeMap<ObjectId,crate::ArenaLocation>,disk:ObjectRecord,member:bool)
+    requires vstd::laws_cmp::obeys_cmp::<ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),
+        vstd::std_specs::btree::btree_map_inv(pending),vstd::std_specs::btree::btree_map_inv(index),
+{
+    use crate::read_admission::Attempt;
+    let s = crate::overlay_object::read_snapshot(pending,index,generation,id);
+    assert(s.location == (if index@.contains_key(id) {Some(index@[id])} else {None}));
+    let result = snapshot(owner,s.id,s.generation,reader_generation,current,s.pending,s.location,disk,None,member);
+    if pending.contains_key(&id) {
+        if generation == current && member {
+            assert(result matches Ok(Attempt::Found((p,k,r))) && p == owner && k == id && r.same_contents(&*pending@[id].record));
+        } else {assert(result == Ok(Attempt::Retry));}
+    } else if !index.contains_key(&id) {assert(result == Ok(Attempt::Missing));}
+    else if reader_generation != generation || current != generation || !member {assert(result == Ok(Attempt::Retry));}
+    else {assert(result == Ok(Attempt::Found((owner,id,disk))));}
 }
 
 /// Follow an actual confirmed frame through both warm-cache gates. A reference-free

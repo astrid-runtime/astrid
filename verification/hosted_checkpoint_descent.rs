@@ -97,7 +97,7 @@ proof fn decoded_membership<V:Fn(&[u8])->Result<(),u8>>(record:&crate::ObjectRec
         walk::slot(rows@,key,v), exists|src:walk::Loaded| #[trigger] crate::checkpoint_cache::image(src) == crate::checkpoint_cache::image(h) &&
             crate::checkpoint_record::parsed(record,src.node,validate),
     ensures exists|src:walk::Loaded| #[trigger] crate::checkpoint_record::parsed(record,src.node,validate) &&
-        src.node is Leaf && (v.is_none() ==> forall|i:int| 0 <= i < src.node->Leaf_0.entries.len() ==>
+        crate::checkpoint_cache::image(src) == crate::checkpoint_cache::image(h) && src.node is Leaf && (v.is_none() ==> forall|i:int| 0 <= i < src.node->Leaf_0.entries.len() ==>
             (#[trigger] src.node->Leaf_0.entries@[i]).key@ != key),
 {
     use crate::checkpoint_cache::{image,entry};

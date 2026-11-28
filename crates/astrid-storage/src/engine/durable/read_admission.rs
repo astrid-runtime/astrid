@@ -9,6 +9,29 @@ use vstd::{
 };
 
 verus! {
+/// The opened file and its generation are replaced together under the reader lock.
+#[derive(Debug)]
+pub(super) struct Reader<F> {
+    pub(super) file:F,
+    pub(super) generation:u64,
+}
+
+impl<F> Reader<F> {
+    pub(super) fn read<'a,R,E,D:FnOnce(&'a F,ObjectId,ArenaLocation)->Result<R,E>>(
+        &'a self,expected:u64,id:ObjectId,location:ArenaLocation,decode:D,
+    ) -> (out:Result<Option<R>,E>)
+        requires self.generation == expected ==> decode.requires((&self.file,id,location)),
+        ensures match out {
+            Ok(None) => self.generation != expected,
+            Ok(Some(r)) => self.generation == expected && decode.ensures((&self.file,id,location),Ok(r)),
+            Err(e) => self.generation == expected && decode.ensures((&self.file,id,location),Err(e)),
+        },
+    {
+        if self.generation != expected {return Ok(None);}
+        Ok(Some(decode(&self.file,id,location)?))
+    }
+}
+
 pub(super) fn retain<P,R,C,M,F>(principal:&P,id:ObjectId,observed:u64,current:u64,
     record:R,present:M,insert:F) -> (out:Option<C>)
     where M:FnOnce(ObjectId)->bool, F:FnOnce(&P,ObjectId,R)->C,

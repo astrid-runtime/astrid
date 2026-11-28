@@ -1,4 +1,5 @@
 //! Merge repeated WAL declarations without replacing an immutable record.
+use super::ObjectRecord;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use vstd::prelude::*;
@@ -52,6 +53,30 @@ impl<R,L,D> Object<R,L,D> {
         }
         Ok(())
     }
+}
+
+/// Inputs captured together under the durable engine lock.
+pub(crate) struct ReadSnapshot<K,L> {
+    pub(crate) id:K,
+    pub(crate) generation:u64,
+    pub(crate) pending:Option<ObjectRecord>,
+    pub(crate) location:Option<L>,
+}
+
+pub(crate) fn read_snapshot<K:Ord+Copy,L:Copy,D>(objects:&BTreeMap<K,Object<Arc<ObjectRecord>,L,D>>,
+    index:&BTreeMap<K,L>,generation:u64,id:K) -> (s:ReadSnapshot<K,L>)
+    requires btree_map_inv(objects),btree_map_inv(index),obeys_cmp::<K>(),obeys_cmp_concrete_eq::<K>(),
+    ensures s.id == id,s.generation == generation,
+        s.location == (if index@.contains_key(id) {Some(index@[id])} else {None}),
+        match s.pending {
+            Some(r) => objects@.contains_key(id) && r.same_contents(&*objects@[id].record),
+            None => !objects@.contains_key(id),
+        },
+{
+    let pending = objects.get(&id).map(|row:&Object<Arc<ObjectRecord>,L,D>| -> (copy:ObjectRecord)
+        ensures copy.same_contents(&*row.record), {row.record.owned_record()});
+    let location = index.get(&id).copied();
+    ReadSnapshot {id,generation,pending,location}
 }
 
 /// Install the first declaration or merge a repeated declaration for the same name.

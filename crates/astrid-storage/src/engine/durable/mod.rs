@@ -570,11 +570,7 @@ struct DurableFiles {
     arena_tail: Option<ArenaLocation>,
 }
 
-#[derive(Debug)]
-struct ArenaReader {
-    file: File,
-    generation: u64,
-}
+type ArenaReader = read_admission::Reader<File>;
 
 struct PublishedRoot {
     value: ArcSwap<RootState>,

@@ -16,6 +16,7 @@ use super::super::{ArenaLocation, DurableError, ModelError};
 
 #[path = "overlay_object.rs"]
 mod overlay_object;
+pub(in crate::engine::durable) use overlay_object::read_snapshot;
 
 /// One immutable object retained by the pending WAL overlay.
 ///

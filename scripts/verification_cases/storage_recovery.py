@@ -225,6 +225,29 @@ def consumer_defects():
             f"staged record source loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_record_source.rs"),
         )
+    reader = Path("crates/astrid-storage/src/engine/durable/read_admission.rs")
+    for label, clause, weaker in [
+        ("stale retry", "Ok(None) => self.generation != expected,", "Ok(None) => true,"),
+        ("matching generation", "Ok(Some(r)) => self.generation == expected && decode.", "Ok(Some(r)) => decode."),
+        ("indexed read", "decode.ensures((&self.file,id,location),Ok(r))", "true"),
+        ("indexed error", "decode.ensures((&self.file,id,location),Err(e))", "true"),
+    ]:
+        yield (
+            f"generation-bound reader loses {label}", reader,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_batch_slots.rs"),
+        )
+    source = Path("crates/astrid-storage/src/engine/durable/wal/overlay_object.rs")
+    for label, clause, weaker in [
+        ("address", "ensures s.id == id,s.generation == generation,", "ensures s.generation == generation,"),
+        ("generation", "ensures s.id == id,s.generation == generation,", "ensures s.id == id,"),
+        ("arena placement", "s.location == (if index@.contains_key(id) {Some(index@[id])} else {None}),", "s.location.is_some() == index@.contains_key(id),"),
+        ("WAL contents", " && r.same_contents(&*objects@[id].record)", ""),
+        ("WAL presence", "None => !objects@.contains_key(id),", "None => true,"),
+    ]:
+        yield (
+            f"locked object snapshot loses {label}", source,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_batch_slots.rs"),
+        )
     cache = Path("crates/astrid-storage/src/kv/tree/checkpoint_cache.rs")
     for label, clause, weaker in [
         ("hit contents", "image(final(self).contents()[id]) == image(h)", "true"),

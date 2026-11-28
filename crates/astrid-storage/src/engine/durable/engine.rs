@@ -97,32 +97,27 @@ where
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
-            let (pending, location, generation) = {
+            let snapshot = {
                 let inner = self.lock_usable_with(&mut recovery)?;
-                let pending = inner
-                    .pending_wal
-                    .get_object(&id)
-                    .map(|object| object.record().clone());
-                (
-                    pending,
-                    inner.index.get(&id).copied(),
+                super::wal::read_snapshot(
+                    inner.pending_wal.object_index(),
+                    &inner.index,
                     inner.arena_generation,
+                    id,
                 )
             };
             match read_admission::attempt(
                 principal,
-                id,
-                generation,
-                pending,
-                location,
+                snapshot.id,
+                snapshot.generation,
+                snapshot.pending,
+                snapshot.location,
                 |generation, object, location| {
                     let reader_guard = self.arena_reader.read();
                     let reader = reader_guard.as_ref().ok_or(DurableError::Closed)?;
-                    if reader.generation != generation {
-                        return Ok(None);
-                    }
-                    read_indexed_object(&reader.file, object, location, &self.identity, self.limits)
-                        .map(Some)
+                    reader.read(generation, object, location, |file, id, at| {
+                        read_indexed_object(file, id, at, &self.identity, self.limits)
+                    })
                 },
                 |owner, object, generation, record| {
                     self.retain_loaded_object_if_current_with(
