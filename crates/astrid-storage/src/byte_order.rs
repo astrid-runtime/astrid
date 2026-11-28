@@ -12,6 +12,36 @@ pub(crate) open spec fn below(a: Seq<u8>, b: Seq<u8>) -> bool
     else { a[0] < b[0] || (a[0] == b[0] && below(a.skip(1), b.skip(1))) }
 }
 
+pub(crate) proof fn strict_order(a: Seq<u8>, b: Seq<u8>)
+    ensures below(a, b) ==> !below(b, a) && a != b,
+            !below(a,b) && a != b ==> below(b,a),
+    decreases a.len(),
+{
+    reveal_with_fuel(below, 2);
+    if a.len() == 0 && b.len() == 0 { assert(a =~= b); }
+    if a.len() > 0 && b.len() > 0 && a[0] == b[0] {
+        strict_order(a.skip(1), b.skip(1));
+        if a.skip(1) == b.skip(1) {
+            assert(a =~= b) by {
+                assert forall|i: int| 0 <= i < a.len() implies a[i] == b[i] by {
+                    if i > 0 { assert(a.skip(1)[i-1] == b.skip(1)[i-1]); }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) proof fn transitive(a: Seq<u8>, b: Seq<u8>, c: Seq<u8>)
+    requires below(a, b), below(b, c),
+    ensures below(a, c),
+    decreases c.len(),
+{
+    reveal_with_fuel(below, 2);
+    if a.len() > 0 && b.len() > 0 && c.len() > 0 && a[0] == b[0] && b[0] == c[0] {
+        transitive(a.skip(1), b.skip(1), c.skip(1));
+    }
+}
+
 /// Compare persisted byte keys in unsigned lexicographic order.
 #[inline]
 pub(crate) fn bytewise_cmp(left: &[u8], right: &[u8]) -> (order: Ordering)

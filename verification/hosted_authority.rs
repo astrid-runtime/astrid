@@ -321,6 +321,8 @@ mod hosted_checkpoint_range;
 mod checkpoint_leaf;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_page.rs"]
 mod checkpoint_page;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_point.rs"]
+mod checkpoint_point;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_record.rs"]
 mod checkpoint_record;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_reference.rs"]
@@ -356,6 +358,7 @@ mod projection_record;
 #[path = "../crates/astrid-storage/src/kv/tree/replay_values.rs"]
 mod replay_values;
 mod hosted_projection_record;
+mod hosted_checkpoint_point;
 mod hosted_spill_record;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_batch.rs"]
 mod delta_batch;

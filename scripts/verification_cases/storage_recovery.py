@@ -209,6 +209,19 @@ def consumer_defects():
             f"delta chain loses {label}", chain,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_chain.rs"),
         )
+    point = Path("crates/astrid-storage/src/kv/tree/checkpoint_point.rs")
+    for label, clause, weaker in [
+        ("hit key", "(#[trigger] input@[i]).key@ == key@ && input@[i].value == v", "(#[trigger] input@[i]).value == v"),
+        ("hit slot", "(#[trigger] input@[i]).key@ == key@ && input@[i].value == v", "(#[trigger] input@[i]).key@ == key@"),
+        ("canonical membership", "(#[trigger] input@[i]).key@ == key@ ==> out == Some(input@[i].value)", "(#[trigger] input@[i]).key@ == key@ ==> true"),
+        ("lower fence", "index > 0 ==>\n                !encoding::below(key@,(#[trigger] children@[i]).lower_bound@)", "index > 0 ==> children@[i].level == (#[trigger] children@[i]).level"),
+        ("upper fence", "encoding::below(key@,(#[trigger] children@[i]).lower_bound@)\n        },", "(#[trigger] children@[i]).level == children@[i].level\n        },"),
+    ]:
+        yield (
+            f"checkpoint point lookup loses {label}", point,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_checkpoint_point.rs"),
+        )
     values = Path("crates/astrid-storage/src/kv/tree/replay_values.rs")
     for label, clause, weaker in [
         ("prior bytes", "pair.0 == prior && replacement", "replacement"),

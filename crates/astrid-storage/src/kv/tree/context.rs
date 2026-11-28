@@ -81,12 +81,8 @@ where
         while let Some(object) = root {
             let handle = self.node(object)?;
             match handle.node {
-                Node::Leaf(mut leaf) => {
-                    return Ok(leaf
-                        .entries
-                        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
-                        .ok()
-                        .map(|index| leaf.entries.swap_remove(index).value));
+                Node::Leaf(leaf) => {
+                    return Ok(super::checkpoint_point::leaf(leaf.entries, key));
                 },
                 Node::Branch(branch) => {
                     let index = child_index(&branch.children, key);
@@ -581,9 +577,7 @@ where
 }
 
 pub(super) fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {
-    children
-        .partition_point(|child| child.lower_bound.as_slice() <= key)
-        .saturating_sub(1)
+    super::checkpoint_point::child(children, key)
 }
 
 fn page_retained(record: &ObjectRecord) -> StorageResult<u64> {

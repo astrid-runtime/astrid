@@ -43,6 +43,7 @@ mod checkpoint_leaf;
 mod checkpoint_leaf_record;
 mod checkpoint_leaf_summary;
 mod checkpoint_page;
+mod checkpoint_point;
 mod checkpoint_progress;
 mod checkpoint_range;
 mod checkpoint_record;
