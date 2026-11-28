@@ -368,7 +368,86 @@ fn complete_group<B,D,T,E,P,F>(batch: B, persist: P, advance: F)
                 #[trigger] persist.ensures((&batch,), Ok(d)) && advance.ensures((d,), Err(error))),
 {
     let staged = crate::group_frontier::PersistedGroup::persist(batch, persist)?;
-    staged.publish(advance)
+    let (published,receipt)=staged.publish(advance)?;
+    Ok((published.into_batch(),receipt))
+}
+
+type WriterRoots=BTreeMap<u64,crate::RootState>;
+type AcceptedRoot=crate::group_receipt::Accepted<PreparedRoot<u64,crate::RootState>,u64,()>;
+type RootReplies=Vec<(u64,Result<crate::RootState,u64>)>;
+
+/// Publish each accepted root into one owner map and correlate its result with the original receipt.
+/// A persistence or frontier refusal returns every receipt with an error before publishing roots.
+fn group_root_receipts<D,P,F>(batch:Vec<AcceptedRoot>,writer:WriterRoots,persist:P,advance:F,unavailable:u64)
+    -> (out:(WriterRoots,RootReplies))
+    where P:FnOnce(&Vec<AcceptedRoot>)->Result<D,u64>,F:FnOnce(D)->Result<(),u64>,
+    requires btree_map_inv(&writer),obeys_cmp::<u64>(),obeys_cmp_concrete_eq::<u64>(),obeys_clone_eq::<u64>(),
+        persist.requires((&batch,)),forall|d:D| #[trigger] persist.ensures((&batch,),Ok(d)) ==> advance.requires((d,)),
+    ensures out.1.len()==batch.len(),btree_map_inv(&out.0),
+        forall|i:int| 0<=i<batch.len() ==> (#[trigger] out.1@[i]).0==batch@[i].receipt,
+        ({
+            let rows=out.1@;
+            ||| (exists|d:D| #[trigger] persist.ensures((&batch,),Ok(d)) && advance.ensures((d,),Ok(()))) &&
+                (exists|history:Seq<WriterRoots>| history.len()==batch.len()+1 && history[0]==writer && history.last()==out.0 &&
+                    forall|i:int| 0<=i<batch.len() ==> {
+                        let root=batch@[i].prepared.binding();
+                        &&& #[trigger] history[i+1]@==history[i]@.insert(root.0,root.2)
+                        &&& rows[i].1==Ok(root.2)
+                    })
+            ||| out.0==writer && exists|error:u64| (persist.ensures((&batch,),Err(error)) ||
+                exists|d:D| #[trigger] persist.ensures((&batch,),Ok(d)) && advance.ensures((d,),Err(error))) &&
+                forall|i:int| 0<=i<batch.len() ==> #[trigger] rows[i].1==Err(if i==0 {error} else {unavailable})
+        }),
+{
+    use crate::{group_frontier::PersistedGroup,group_receipt};
+    let mut done=RootReplies::new();
+    let published=match PersistedGroup::persist(batch,persist) {
+        Ok(group)=>group.publish(advance),Err(failure)=>Err(failure),
+    };
+    let group=match published {
+        Ok((token,()))=>token,
+        Err((failed,error))=>{
+            let ghost start=done.len() as int;
+            assert(start==0 && failed==batch);
+            group_receipt::reject(failed,&mut done,error,|| -> (e:u64) ensures e==unavailable {unavailable});
+            assert forall|i:int| 0<=i<batch.len() implies (#[trigger] done@[i]).0==batch@[i].receipt &&
+                done@[i].1==Err(if i==0 {error} else {unavailable}) by {
+                assert(done@[start+i].0==failed@[i].receipt);
+            }
+            return (writer,done);
+        },
+    };
+    let publish=|mut roots:WriterRoots,root:PreparedRoot<u64,crate::RootState>| -> (v:(WriterRoots,crate::RootState))
+        requires btree_map_inv(&roots),
+        ensures btree_map_inv(&v.0),v.0@==roots@.insert(root.binding().0,root.binding().2),v.1==root.binding().2,
+    {
+        let (replacement,())=root.publish(&mut roots,|_,_,_| (),|_,_,_| ());
+        (roots,replacement)
+    };
+    let ghost valid=|roots:WriterRoots| btree_map_inv(&roots);
+    assert(group_receipt::preserves(valid,publish));
+    let final_roots=group_receipt::release(group,&mut done,writer,publish);
+    proof {
+        assert(done@.skip(0) =~= done@);
+        let history=choose|h:Seq<WriterRoots>| #[trigger] group_receipt::completed(batch@,writer,h,done@,publish) && h.last()==final_roots;
+        assert forall|i:int| 0<=i<batch.len() implies {
+            let root=batch@[i].prepared.binding();
+            &&& #[trigger] history[i+1]@==history[i]@.insert(root.0,root.2)
+            &&& done@[i].1==Ok(root.2)
+        } by {
+            let row=done@[i];
+            assert(row.1 is Ok);
+            let value=choose|v:crate::RootState| row.1==Ok(v);
+            assert(publish.ensures((history[i],batch@[i].prepared),(history[i+1],value)));
+        }
+        if batch.len()>0 {
+            let i=batch.len() as int-1;
+            assert(history[i+1]==history.last());
+            assert(done@[i].1==Ok(batch@[i].prepared.binding().2));
+            assert(publish.ensures((history[i],batch@[i].prepared),(history[i+1],batch@[i].prepared.binding().2)));
+        } else {assert(final_roots==writer);}
+    };
+    (final_roots,done)
 }
 
 struct ReceiptTrace {sent:Ghost<Seq<(u64,Result<u64,u64>)>>}
@@ -399,7 +478,7 @@ fn mixed_receipts(prior:u64,submitted:u64,peer:u64,root:u64,error:u64) {
     use crate::group_receipt::Accepted;
     let mut done = vec![(prior,Err(error))];
     let first = Accepted {prepared:root,receipt:submitted,observer:()};
-    first.published(&mut done,|r:u64| -> (o:u64) ensures o == r, {r});
+    first.published(&mut done,|r:u64| -> (o:((),u64)) ensures o == ((),r), {((),r)});
     let second = Accepted {prepared:(),receipt:peer,observer:()};
     second.failed(&mut done,error);
     let mut trace = ReceiptTrace {sent:Ghost(Seq::empty())};
@@ -459,7 +538,7 @@ fn queued_callers(a:u64,b:u64,tx:u64,other:u64,observer:u64,peer_observer:u64,er
     assert(accepted.receipt == first && accepted.observer == observer && accepted.prepared == (tx,observer));
     assert(failed == Err((second,(other,peer_observer,error))));
     let mut done = Vec::<(Arc<u64>,Result<u64,u64>)>::new();
-    accepted.published(&mut done,|p:(u64,u64)| -> (root:u64) ensures root == p.0,{p.0});
+    accepted.published(&mut done,|p:(u64,u64)| -> (root:((),u64)) ensures root == ((),p.0),{((),p.0)});
     assert(done@ == seq![(first,Ok(tx))]);
 }
 

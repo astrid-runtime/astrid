@@ -917,7 +917,7 @@ def consumer_defects():
     for name, clause in [
         ("staged group loses the ordered batch", "group.binding().0 == batch"),
         ("failed persistence loses the original group", "submitted == batch"),
-        ("published receipts lose the persisted group", "batch == self.binding().0"),
+        ("published receipts lose the persisted group", "published.batch() == self.binding().0"),
         ("failed frontier loses the submitted group", "submitted == self.binding().0"),
         ("failed persistence loses the original error", "persist.ensures((&batch,), Err(error))"),
         ("failed frontier loses the original error", "advance.ensures((self.binding().1,), Err(error))"),

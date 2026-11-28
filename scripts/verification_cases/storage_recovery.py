@@ -499,7 +499,7 @@ def consumer_defects():
         ("prepared transaction", "prepare.ensures((self.transaction,&self.observer),Ok(a.prepared))", "true"),
         ("rejected receipt", "receipt == self.receipt && prepare.ensures", "prepare.ensures"),
         ("rejected transaction", "receipt == self.receipt && prepare.ensures((self.transaction,&self.observer),Err(e))", "receipt == self.receipt"),
-        ("published outcome", "#[trigger] publish.ensures((self.prepared,),out) &&", "true &&"),
+        ("published outcome", "#[trigger] publish.ensures((self.prepared,),(next,out)) &&", "true &&"),
         ("published receipt", "final(done)@ == old(done)@.push((self.receipt,Ok(out)))", "final(done)@.len() == old(done)@.len()+1"),
         ("failed receipt", "final(done)@ == old(done)@.push((self.receipt,Err(error)))", "final(done)@.len() == old(done)@.len()+1"),
         ("first completion", "*final(self) == if notify {Self::Ready(result)} else {*old(self)}", "true"),
@@ -512,6 +512,17 @@ def consumer_defects():
     ]:
         yield (
             f"group receipt loses {label}", receipt,
+            lambda s, a=original, b=weaker: replace_once(s, a, b), Path("verification/hosted_kv_model.rs"),
+        )
+    for label, original, weaker in [
+        ("submitter", "r.0==entries[i].receipt", "true"),
+        ("state transition", "publish.ensures((states[i],entries[i].prepared),(states[i+1],value))", "true"),
+        ("final writer", "states.last()==last,", "true,"),
+        ("first error", "e==error} else {unavailable.ensures((),e)})\n        },\n{", "true} else {unavailable.ensures((),e)})\n        },\n{"),
+        ("peer error", "e==error} else {unavailable.ensures((),e)})\n        },\n{", "e==error} else {true})\n        },\n{"),
+    ]:
+        yield (
+            f"published group loses {label}", receipt,
             lambda s, a=original, b=weaker: replace_once(s, a, b), Path("verification/hosted_kv_model.rs"),
         )
     transition = Path("crates/astrid-storage/src/engine/durable/root_transition.rs")

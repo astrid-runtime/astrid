@@ -341,6 +341,16 @@ pub(super) struct PersistedGroup<B, D> {
     durable: D,
 }
 
+/// The persisted batch whose publication frontier has advanced successfully.
+pub(super) struct Published<B>(B);
+
+impl<B> Published<B> {
+    pub(super) closed spec fn batch(&self) -> B { self.0 }
+    pub(super) fn into_batch(self) -> (batch:B)
+        ensures batch==self.batch(),
+    { self.0 }
+}
+
 impl<B, D> PersistedGroup<B, D> {
     pub(super) closed spec fn binding(&self) -> (B, D) {
         (self.batch, self.durable)
@@ -361,17 +371,17 @@ impl<B, D> PersistedGroup<B, D> {
         }
     }
 
-    pub(super) fn publish<T, E, F>(self, advance: F) -> (result: Result<(B, T), (B, E)>)
+    pub(super) fn publish<T, E, F>(self, advance: F) -> (result: Result<(Published<B>, T), (B, E)>)
         where F: FnOnce(D) -> Result<T, E>,
         requires advance.requires((self.binding().1,)),
         ensures
-            result matches Ok((batch, frontier)) ==> batch == self.binding().0
+            result matches Ok((published, frontier)) ==> published.batch() == self.binding().0
                 && advance.ensures((self.binding().1,), Ok(frontier)),
             result matches Err((submitted, error)) ==> submitted == self.binding().0
                 && advance.ensures((self.binding().1,), Err(error)),
     {
         match advance(self.durable) {
-            Ok(frontier) => Ok((self.batch, frontier)),
+            Ok(frontier) => Ok((Published(self.batch), frontier)),
             Err(error) => Err((self.batch, error)),
         }
     }

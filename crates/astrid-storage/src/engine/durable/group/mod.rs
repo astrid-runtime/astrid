@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::storage_model::{ModelError, ObjectId};
 use parking_lot::{Condvar, Mutex};
 
+use super::frontier::Published;
 use super::representations::{PendingRepresentationUpdate, RepresentationStore};
 
 use super::{
@@ -530,10 +531,13 @@ where
             }),
         };
         match published {
-            Ok((accepted, ())) => {
+            Ok((published_group, ())) => {
                 publication_poison.disarm();
-                for entry in accepted {
-                    entry.published(completions, |mut prepared| {
+                receipt::release(
+                    published_group,
+                    completions,
+                    (inner, retired_projections, published_commits),
+                    |(inner, retired_projections, published_commits), mut prepared| {
                         let (published, retired) = self.publish_durable_root(inner, &mut prepared);
                         retired_projections.extend(retired);
                         if let Some((id, payload)) = prepared.commit.take()
@@ -550,12 +554,13 @@ where
                                 },
                             );
                         }
-                        CommitOutcome {
+                        let outcome = CommitOutcome {
                             root: published,
                             objects_inserted: prepared.objects_inserted,
-                        }
-                    });
-                }
+                        };
+                        ((inner, retired_projections, published_commits), outcome)
+                    },
+                );
             },
             Err((accepted, error)) => {
                 self.mark_requires_recovery(inner);
@@ -904,13 +909,9 @@ fn complete_failed_group<P: Ord>(
     accepted: Vec<AcceptedCommit<P>>,
     error: DurableError,
 ) {
-    let mut first = Some(error);
-    for accepted in accepted {
-        accepted.failed(
-            completions,
-            first.take().unwrap_or(DurableError::RequiresRecovery),
-        );
-    }
+    receipt::reject(accepted, completions, error, || {
+        DurableError::RequiresRecovery
+    });
 }
 
 #[cfg(test)]
