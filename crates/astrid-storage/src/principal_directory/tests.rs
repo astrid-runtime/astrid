@@ -178,3 +178,46 @@ fn batch_membership_yields_to_pending_writers_before_completing() {
     writer.join().unwrap();
     progressed.expect("a pending writer must progress before the batch finishes");
 }
+
+#[tokio::test]
+async fn recovery_holds_one_directory_read_across_every_callback() {
+    use std::sync::Arc;
+
+    use crate::{MemoryKvStore, OwnershipStore};
+
+    let directory = PrincipalDirectory::default();
+    let first = alias("first");
+    let second = alias("second");
+    let first_uid = uid(1);
+    let second_uid = uid(2);
+    directory.register(first.clone(), first_uid).unwrap();
+    directory.register(second.clone(), second_uid).unwrap();
+    let ownership = OwnershipStore::new(Arc::new(MemoryKvStore::new()), directory.clone()).unwrap();
+    drop(
+        ownership
+            .guard_principal_deletion_for_alias(first_uid, first.clone())
+            .await
+            .unwrap(),
+    );
+    drop(
+        ownership
+            .guard_principal_deletion(second_uid)
+            .await
+            .unwrap(),
+    );
+    let snapshot = ownership.load().await.unwrap();
+
+    let mut seen = Vec::new();
+    directory
+        .replay_retirements(&snapshot, |alias| {
+            assert!(
+                directory.inner.try_write().is_none(),
+                "directory writers must wait until every retirement callback finishes"
+            );
+            seen.push(alias);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+    assert_eq!(seen, vec![first, second]);
+    assert!(directory.inner.try_write().is_some());
+}

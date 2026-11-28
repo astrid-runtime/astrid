@@ -162,6 +162,38 @@ impl PrincipalDirectory {
             })
     }
 
+    /// Replay durable retirement while one directory read guard stays held.
+    ///
+    /// The callback runs synchronously and must not re-enter this directory.
+    /// For each deletion, it receives the retained alias and the distinct live
+    /// alias. Equal names are delivered once. An empty retained alias yields
+    /// only the live alias, and a deletion with neither name yields nothing.
+    /// Collecting the names and then dropping the guard would let a rename
+    /// land between observation and the store updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first callback error and does not visit later aliases.
+    pub fn replay_retirements<E, F>(
+        &self,
+        ownership: &crate::OwnershipSnapshot,
+        mut restore: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(PrincipalId) -> Result<(), E>,
+    {
+        let state = self.inner.read();
+        for (uid, retained) in ownership.pending_retirement_targets() {
+            for alias in recovery_aliases(&state.principals, &uid, retained.cloned())
+                .into_iter()
+                .flatten()
+            {
+                restore(alias)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a durable UID currently names an admitted live principal.
     #[must_use]
     pub fn contains_uid(&self, uid: PrincipalUid) -> bool {
@@ -237,6 +269,21 @@ impl PrincipalDirectory {
         state.principals.insert(uid, new_alias);
         Ok(())
     }
+}
+
+/// Retained name, then a distinct live name. Matching names are returned once.
+fn recovery_aliases(
+    directory: &HashMap<PrincipalUid, PrincipalId>,
+    uid: &PrincipalUid,
+    retained: Option<PrincipalId>,
+) -> [Option<PrincipalId>; 2] {
+    let Some(current) = directory.get(uid) else {
+        return [retained, None];
+    };
+    if retained.as_ref().is_some_and(|prior| prior == current) {
+        return [retained, None];
+    }
+    [retained, Some(current.clone())]
 }
 
 #[cfg(test)]
