@@ -59,10 +59,32 @@ impl WalSink for super::super::File {
     }
 }
 
+impl<S: WalSink> super::super::frontier::WalOutput for S {
+    type Error = io::Error;
+
+    fn append_record(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes)
+    }
+}
+
+impl super::super::frontier::BufferedWal for BufWriter<super::super::File> {
+    fn drain(&mut self) -> io::Result<super::super::frontier::WalDrain> {
+        use super::super::frontier::WalDrain;
+        self.flush()?;
+        Ok(match self.get_ref() {
+            super::super::File::Native(_) => WalDrain::File,
+            super::super::File::Volume(_) => WalDrain::Container,
+        })
+    }
+
+    fn sync_file(&mut self) -> io::Result<()> {
+        self.get_ref().sync_data()
+    }
+}
+
 impl WalSink for BufWriter<super::super::File> {
     fn sync_data(&mut self) -> io::Result<()> {
-        self.flush()?;
-        self.get_ref().sync_data()
+        super::super::frontier::publish_buffer(self)
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
@@ -415,6 +437,7 @@ where
             &mut self.poisoned,
             || self.sink.sync_data(),
         )
+        .map(|(count, ())| count)
         .map_err(|error| match error {
             PublicationError::Active => {
                 WalError::InvalidTransaction("cannot publish an active transaction")
@@ -484,7 +507,9 @@ where
             .ok_or(WalError::CountOverflow {
                 field: "WAL append offset",
             })?;
-        if let Err(source) = self.sink.write_all(encoded) {
+        if let Err(source) =
+            super::super::frontier::WalOutput::append_record(&mut self.sink, encoded)
+        {
             self.poisoned = true;
             return Err(WalError::Io {
                 operation: "append ASTWAL2 record",

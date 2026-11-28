@@ -336,7 +336,7 @@ fn publish_completed_batch(count: u64, success: bool, current: u64, observed: u6
         if success { Ok(()) } else { Err(()) }
     };
     match crate::group_frontier::sync_pending(false,&mut pending,&mut poisoned,sync) {
-        Ok(reported) => {
+        Ok((reported, ())) => {
             assert(success && reported == count && pending == 0 && !poisoned);
             let position = crate::group_frontier::wal_position(current,tail,observed,pending_tail);
             assert(position.is_some() == (current <= observed));

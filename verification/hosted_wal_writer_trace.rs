@@ -187,8 +187,8 @@ fn write_data<H>(record:Measured,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]
 /// provide a concrete writer-produced layout. Require success in the reader
 /// and recover the exact stored Root bytes in its released batch.
 #[verifier::rlimit(25)]
-fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usize,hash:H,
-    checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>)
+fn begin_root<H,F,T:FnOnce(Vec<u8>,usize,usize)->Option<Vec<u8>>>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usize,hash:H,
+    checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,transfer:T)
     -> (out:Option<(CheckedMarker,Vec<u8>,u64)>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
     requires sequence != 0, begin_body.len() as int + root_body.len() + 288 <= usize::MAX,
@@ -196,7 +196,11 @@ fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usiz
         forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
         forall|p:&[u8]| #[trigger] finish.requires((p,)),
         forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v == (digest@)(p@),
-    ensures out matches Some((checked,recovered,start)) && {
+        forall|v:Vec<u8>,i:usize,j:usize| i<=j<=v.len() && v.len()==begin_body.len()+root_body.len()+288 ==> #[trigger] transfer.requires((v,i,j)),
+        forall|v:Vec<u8>,i:usize,j:usize,r:Vec<u8>| #[trigger] transfer.ensures((v,i,j),Some(r)) ==> r@==v@,
+    ensures out.is_none() ==> exists|v:Vec<u8>,i:usize,j:usize| i<=j<=v.len() && v.len()==begin_body.len()+root_body.len()+288 &&
+            #[trigger] transfer.ensures((v,i,j),None),
+        out matches Some((checked,recovered,start)) ==> {
         let m = checked.marker();
         &&& recovered@ == root_body@
         &&& start as int == 72 + begin_body.len()
@@ -246,6 +250,7 @@ fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usiz
         reveal(complete);
         assert(complete(w,stream@,0,u64::MAX,checksum@,digest@));
     }
+    let stream = transfer(stream,begin.next,root.next)?;
     let scan = scan_transaction(&stream,0,u64::MAX,chunk_size,hash,checksum,finish,digest,Ghost(Some(w)))?;
     proof {
         reveal_with_fuel(selected,3);
@@ -264,6 +269,74 @@ fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usiz
     let released = scan.batch.roots()[0];
     let start = released.next - (72 + released.body.len());
     Some((scan.marker,recovered,start as u64))
+}
+
+/// Submit the writer's three framed records, publish the buffered WAL, and reread the
+/// submitted interval from the stable image of the same target.
+fn durable_begin_root<S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M,H,F>(
+    sequence:u64,begin:&[u8],root:&[u8],chunk:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
+    finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,sink:S,base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>)
+    -> (out:Option<(CheckedMarker,Vec<u8>,u64)>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
+    requires sequence!=0,begin.len() as int+root.len()+288<=usize::MAX,
+        sink.at_end(),sink.buffered_image().len()==base,base as int+begin.len()+root.len()+288<=u64::MAX,
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v==(checksum@)(p@),
+        forall|p:&[u8]| #[trigger] finish.requires((p,)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v==(digest@)(p@),
+        forall|s:&S| #[trigger] reopen.requires((s,)),
+        forall|s:&S,m:M| #[trigger] reopen.ensures((s,),m) ==> m.image()==s.stable_image() && (target@)(m)==s.wal_target() &&
+            forall|at:u64,e:M::Error| base<=at<base as int+begin.len()+root.len()+288 ==> !#[trigger] m.io_error(at,e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.append_error(e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.drain_error(e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.sync_error(e),
+    ensures out matches Some((marker,body,start)) && body@==root@ && start as int==base as int+72+begin.len() &&
+        marker.marker().counts.sequence==sequence && marker.marker().counts.logical==2 && marker.marker().counts.roots==1 &&
+        marker.marker().digest==(digest@)(wal_measurement::digest_header(WalRecordKind::Begin,0,sequence,0,begin.len() as u64)+begin@+
+            wal_measurement::digest_header(WalRecordKind::Root,0,sequence,1,root.len() as u64)+root@),
+{
+    let ghost before=sink.buffered_image();
+    let ghost original_target=sink.wal_target();
+    let transfer=move |submitted:Vec<u8>,first:usize,second:usize| -> (out:Option<Vec<u8>>)
+        requires first<=second<=submitted.len(),submitted.len()==begin.len()+root.len()+288,
+            sink.at_end(),sink.buffered_image()==before,before.len()==base,sink.wal_target()==original_target,
+            base as int+submitted.len()<=u64::MAX,
+            forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.append_error(e),
+            forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.drain_error(e),
+            forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.sync_error(e),
+            forall|s:&S| #[trigger] reopen.requires((s,)),
+            forall|s:&S,m:M| #[trigger] reopen.ensures((s,),m) ==> m.image()==s.stable_image() && (target@)(m)==s.wal_target() &&
+                forall|at:u64,e:M::Error| base<=at<base as int+submitted.len() ==> !#[trigger] m.io_error(at,e),
+        ensures out matches Some(read) && read@==submitted@,
+    {
+        let mut sink=sink;
+        sink.append_record(&submitted[..first]).ok()?;
+        sink.append_record(&submitted[first..second]).ok()?;
+        sink.append_record(&submitted[second..]).ok()?;
+        assert(sink.buffered_image() =~= before+submitted@);
+        let sync=move || -> (out:Result<S,S::Error>)
+            requires sink.buffered_image()==before+submitted@,sink.wal_target()==original_target,
+                forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.drain_error(e),
+                forall|s:S,e:S::Error| s.wal_target()==original_target ==> !#[trigger] s.sync_error(e),
+            ensures out matches Ok(s) && s.stable_image()==before+submitted@ && s.wal_target()==original_target,
+        {
+            let mut buffered=sink;
+            crate::group_frontier::publish_buffer(&mut buffered)?;
+            Ok(buffered)
+        };
+        let mut pending=1u64;
+        let mut poisoned=false;
+        let (acknowledged,stable)=crate::group_frontier::sync_pending(false,&mut pending,&mut poisoned,sync).ok()?;
+        assert(acknowledged==1 && pending==0 && !poisoned);
+        let media=reopen(&stable);
+        assert((target@)(media)==original_target);
+        assert(media.image().subrange(base as int,base as int+submitted.len()) =~= submitted@);
+        let mut observed=vec![0u8;submitted.len()];
+        crate::positional_read::exact(&media,base,&mut observed).ok()?;
+        Some(observed)
+    };
+    let (marker,body,relative)=begin_root(sequence,begin,root,chunk,hash,checksum,finish,digest,transfer)?;
+    Some((marker,body,base.checked_add(relative)?))
 }
 
 spec fn version(r:root_wire::Root) -> Version {
@@ -335,7 +408,8 @@ fn recover_root<H,F,K:Ord+Copy,L>(sequence:u64,begin:&[u8],owner:Owner,scheme:ro
             vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         }
     }
-    let (_,body,offset) = begin_root(sequence,begin,&wire,chunk,hash,checksum,finish,digest)?;
+    let (_,body,offset) = begin_root(sequence,begin,&wire,chunk,hash,checksum,finish,digest,
+        |v:Vec<u8>,_:usize,_:usize| -> (out:Option<Vec<u8>>) ensures out==Some(v), {Some(v)})?;
     proof { vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes(); }
     assert(body@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(key.len() as u64));
     let (saved,mut cursor) = root_wire::read_owner(&body).ok()?;

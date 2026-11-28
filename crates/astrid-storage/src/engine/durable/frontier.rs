@@ -121,18 +121,64 @@ pub(super) fn finish_journal<C:JournalContainer,F:FnOnce()->Result<(),C::Error>>
     }
 }
 
+/// `BufWriter::flush` writes pending bytes and flushes the underlying handle.
+pub(super) enum WalDrain { File, Container }
+
+pub(super) trait WalOutput {
+    type Error;
+    /// Logical WAL contents after writing the tail still held by the buffer.
+    spec fn buffered_image(&self) -> Seq<u8>;
+    spec fn wal_target(&self) -> (int,Seq<u8>);
+    spec fn at_end(&self) -> bool;
+    spec fn append_error(&self,e:Self::Error) -> bool;
+    fn append_record(&mut self,bytes:&[u8]) -> (out:Result<(),Self::Error>)
+        ensures final(self).wal_target()==old(self).wal_target(),
+            out matches Err(e) ==> old(self).append_error(e),
+            out.is_ok() && old(self).at_end() ==> final(self).at_end() &&
+                final(self).buffered_image()==old(self).buffered_image()+bytes@;
+}
+
+pub(super) trait BufferedWal:WalOutput {
+    spec fn file_image(&self) -> Seq<u8>;
+    spec fn stable_image(&self) -> Seq<u8>;
+    spec fn drain_error(&self,e:Self::Error) -> bool;
+    spec fn sync_error(&self,e:Self::Error) -> bool;
+    fn drain(&mut self) -> (out:Result<WalDrain,Self::Error>)
+        ensures final(self).wal_target()==old(self).wal_target(),
+            out matches Ok(WalDrain::File) ==> final(self).file_image()==old(self).buffered_image(),
+            out matches Ok(WalDrain::Container) ==> final(self).stable_image()==old(self).buffered_image(),
+            out matches Err(e) ==> old(self).drain_error(e);
+    fn sync_file(&mut self) -> (out:Result<(),Self::Error>)
+        ensures final(self).wal_target()==old(self).wal_target(),
+            out.is_ok() ==> final(self).stable_image()==old(self).file_image(),
+            out matches Err(e) ==> old(self).sync_error(e);
+}
+
+pub(super) fn publish_buffer<S:BufferedWal>(sink:&mut S) -> (out:Result<(),S::Error>)
+    ensures final(sink).wal_target()==old(sink).wal_target(),
+        out.is_ok() ==> final(sink).stable_image()==old(sink).buffered_image(),
+        out matches Err(e) ==> old(sink).drain_error(e) ||
+            exists|drained:S| drained.wal_target()==old(sink).wal_target() &&
+                drained.file_image()==old(sink).buffered_image() && #[trigger] drained.sync_error(e),
+{
+    match sink.drain()? {
+        WalDrain::File=>sink.sync_file(),
+        WalDrain::Container=>Ok(()),
+    }
+}
+
 pub(super) enum PublicationError<E> { Active, Empty, Sync(E) }
 
 /// Consume the pending count only after the actual writer sync succeeds.
-pub(super) fn sync_pending<E,F>(active: bool, pending: &mut u64, poisoned: &mut bool, sync: F)
-    -> (outcome: Result<u64, PublicationError<E>>)
-    where F: FnOnce() -> Result<(), E>,
+pub(super) fn sync_pending<T,E,F>(active: bool, pending: &mut u64, poisoned: &mut bool, sync: F)
+    -> (outcome: Result<(u64,T), PublicationError<E>>)
+    where F: FnOnce() -> Result<T, E>,
     requires sync.requires(()),
     ensures
         (outcome matches Err(PublicationError::Active)) == active,
         (outcome matches Err(PublicationError::Empty)) == (!active && *old(pending) == 0),
-        outcome matches Ok(n) ==> n == *old(pending) && n > 0 && !active
-            && exists|w: Result<(),E>| w.is_ok() && #[trigger] sync.ensures((),w),
+        outcome matches Ok((n,receipt)) ==> n == *old(pending) && n > 0 && !active
+            && sync.ensures((),Ok(receipt)),
         outcome matches Err(PublicationError::Sync(error)) ==> !active && *old(pending) > 0
             && sync.ensures((), Err(error)),
         *final(pending) == if outcome.is_ok() { 0 } else { *old(pending) },
@@ -140,14 +186,16 @@ pub(super) fn sync_pending<E,F>(active: bool, pending: &mut u64, poisoned: &mut 
 {
     if active { return Err(PublicationError::Active); }
     if *pending == 0 { return Err(PublicationError::Empty); }
-    let synced = sync();
-    if let Err(error) = synced {
-        *poisoned = true;
-        return Err(PublicationError::Sync(error));
-    }
+    let receipt = match sync() {
+        Ok(value) => value,
+        Err(error) => {
+            *poisoned = true;
+            return Err(PublicationError::Sync(error));
+        }
+    };
     let count = *pending;
     *pending = 0;
-    Ok(count)
+    Ok((count,receipt))
 }
 
 pub(super) struct PersistedGroup<B, D> {

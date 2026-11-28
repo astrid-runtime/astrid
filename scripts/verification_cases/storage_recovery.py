@@ -22,6 +22,18 @@ def consumer_defects():
             Path("verification/hosted_acknowledged_root.rs"),
         )
 
+    for label, clause, weaker in [
+        ("buffered append bytes", "final(self).buffered_image()==old(self).buffered_image()+bytes@", "true"),
+        ("stable WAL image", "out.is_ok() ==> final(sink).stable_image()==old(sink).buffered_image(),", "out.is_ok() ==> true,"),
+        ("stable WAL target", "ensures final(sink).wal_target()==old(sink).wal_target(),", "ensures true,"),
+        ("append error origin", "out matches Err(e) ==> old(self).append_error(e),", "out matches Err(e) ==> true,"),
+    ]:
+        yield (
+            f"buffered WAL readback loses {label}", frontier,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_wal_writer_trace.rs"),
+        )
+
     arena = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     for label, clause, weaker in [
         ("complete row count", "r.len()==input.len() && packed(input", "r.len()<=input.len() && packed(input"),

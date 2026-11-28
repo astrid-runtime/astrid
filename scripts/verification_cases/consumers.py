@@ -929,7 +929,7 @@ def consumer_defects():
     for name, clause in [
         ("sync failure loses the unacknowledged batch count", "*final(pending) == if outcome.is_ok() { 0 } else { *old(pending) },"),
         ("sync failure loses writer poisoning", "*final(poisoned) == (*old(poisoned) || outcome matches Err(PublicationError::Sync(_))),"),
-        ("sync success loses its connection to the physical sink", "&& exists|w: Result<(),E>| w.is_ok() && #[trigger] sync.ensures((),w)"),
+        ("sync success loses its connection to the physical sink", "&& sync.ensures((),Ok(receipt))"),
         ("unchanged WAL arena loses its published tail contract", "else if observed == current { Some((current, tail)) }"),
     ]:
         yield (

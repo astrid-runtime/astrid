@@ -286,7 +286,7 @@ def defects():
         (
             "successful WAL sync acknowledges an empty group",
             Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
-            lambda source: replace_once(source, "Ok(count)", "Ok(0)"),
+            lambda source: replace_once(source, "Ok((count,receipt))", "Ok((0,receipt))"),
         ),
         (
             "WAL frontier rewinds to a shorter arena",
