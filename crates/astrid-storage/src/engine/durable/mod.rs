@@ -809,6 +809,7 @@ mod batch_slots;
 #[path = "index/admission.rs"]
 mod checkpoint_admission;
 mod direct_placement;
+mod read_admission;
 mod staging;
 
 use crate::engine::durable_cache as cache;

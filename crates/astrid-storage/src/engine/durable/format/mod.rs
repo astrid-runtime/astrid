@@ -38,6 +38,7 @@ mod positioned;
 mod positioned_tests;
 mod prepared;
 mod reader;
+mod recovered_record;
 mod scan;
 #[cfg(test)]
 mod scan_tests;
@@ -298,37 +299,32 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
         limits,
         protected_len,
         |offset, payload, _source| {
-            let (id, record) = decode_object_frame(payload, scheme)
-                .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
-            let computed = identity.identify(&record);
-            if computed != id {
-                return Err(corrupt(ARENA_FILE, offset, "object identity mismatch"));
-            }
-            if encode_object_frame(scheme, id, &record)? != payload {
-                return Err(corrupt(ARENA_FILE, offset, "object frame is not canonical"));
-            }
-            let payload_len =
-                u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-            let checksum = frame_checksum(ARENA_MAGIC, payload_len, payload);
-            let location = ArenaLocation {
+            use recovered_record::{Error, IndexError};
+            let location = recovered_record::index(
+                &mut index,
                 offset,
-                payload_len,
-                checksum,
-            };
-            match index.get(&id) {
-                Some(existing)
-                    if existing.payload_len == payload_len && existing.checksum == checksum => {},
-                Some(_) => {
-                    return Err(DurableError::RecoveryModel {
-                        file: ARENA_FILE,
-                        offset,
-                        source: ModelError::ObjectCollision(id),
-                    });
+                payload,
+                scheme.into(),
+                |r| identity.identify(r),
+                |length, bytes| frame_checksum(ARENA_MAGIC, length, bytes),
+            )
+            .map_err(|error| match error {
+                IndexError::Record(Error::Decode(e)) => {
+                    corrupt(ARENA_FILE, offset, body_error_detail(e))
                 },
-                None => {
-                    index.insert(id, location);
+                IndexError::Record(Error::Identity) => {
+                    corrupt(ARENA_FILE, offset, "object identity mismatch")
                 },
-            }
+                IndexError::Record(Error::Overflow) => DurableError::EncodingOverflow,
+                IndexError::Record(Error::Canonical) => {
+                    corrupt(ARENA_FILE, offset, "object frame is not canonical")
+                },
+                IndexError::Collision(id) => DurableError::RecoveryModel {
+                    file: ARENA_FILE,
+                    offset,
+                    source: ModelError::ObjectCollision(id),
+                },
+            })?;
             tail = Some(location);
             Ok(())
         },
@@ -542,11 +538,7 @@ pub(super) fn decode_object_frame(
     bytes: &[u8],
     scheme: IdentityScheme,
 ) -> Result<(ObjectId, ObjectRecord), &'static str> {
-    verified_record::decode(bytes, scheme.into(), |input, start| {
-        decode_record_body(input, start, scheme)
-    })
-    .map(|(id, record)| (ObjectId::new(id), record))
-    .map_err(decode_error_detail)
+    recovered_record::unpack(bytes, scheme.into()).map_err(body_error_detail)
 }
 
 /// Confirm a prepared WAL frame before retaining its immutable payload and record.
@@ -580,21 +572,6 @@ fn body_error_detail(
         verified_record::DecodeError::Tag(e) => e.detail(),
         verified_record::DecodeError::Record(e) => e.detail(),
     }
-}
-
-fn decode_error_detail(error: verified_record::DecodeError<&'static str>) -> &'static str {
-    match error {
-        verified_record::DecodeError::Tag(e) => e.detail(),
-        verified_record::DecodeError::Record(detail) => detail,
-    }
-}
-
-fn decode_record_body(
-    bytes: &[u8],
-    start: usize,
-    scheme: IdentityScheme,
-) -> Result<ObjectRecord, &'static str> {
-    verified_record::body(bytes, start, scheme.into()).map_err(verified_record::BodyError::detail)
 }
 
 #[cfg(test)]

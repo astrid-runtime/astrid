@@ -40,7 +40,7 @@ proof fn reference_rows(bytes:Seq<u8>,start:int,rows:Seq<ObjectReference>,n:nat,
     }
 }
 
-spec fn same_fields(a:ObjectRecord,b:ObjectRecord) -> bool {
+pub(super) open spec fn same_fields(a:ObjectRecord,b:ObjectRecord) -> bool {
     let x = a.contents();
     let y = b.contents();
     &&& x.0 == y.0 && x.1 == y.1 && x.2 == y.2 && x.4 == y.4 && x.5 == y.5
@@ -48,7 +48,7 @@ spec fn same_fields(a:ObjectRecord,b:ObjectRecord) -> bool {
     &&& forall|i:int| 0 <= i < x.3.len() ==> #[trigger] x.3[i].fields() == y.3[i].fields()
 }
 
-proof fn unique_record(bytes:Seq<u8>,scheme:Scheme,a:ObjectRecord,b:ObjectRecord)
+pub(super) proof fn unique_record(bytes:Seq<u8>,scheme:Scheme,a:ObjectRecord,b:ObjectRecord)
     requires wire::record_at(bytes,40,scheme,a),wire::record_at(bytes,40,scheme,b),
     ensures same_fields(a,b),
 {
@@ -64,10 +64,110 @@ proof fn unique_record(bytes:Seq<u8>,scheme:Scheme,a:ObjectRecord,b:ObjectRecord
     }
 }
 
+proof fn equal_reference_encoding(a:Seq<ObjectReference>,b:Seq<ObjectReference>,n:nat,scheme:Scheme)
+    requires n <= a.len(),n <= b.len(),
+        forall|i:int| 0 <= i < n ==> #[trigger] a[i].fields() == b[i].fields(),
+    ensures wire::reference_prefix(a,n,scheme) == wire::reference_prefix(b,n,scheme),
+    decreases n,
+{
+    if n > 0 {
+        equal_reference_encoding(a,b,(n-1) as nat,scheme);
+        assert(a[n-1].fields() == b[n-1].fields());
+    }
+}
+
+/// Replay a complete reference-free record against an arbitrary prior index.
+fn replay_placement(map:&mut std::collections::BTreeMap<ObjectId,crate::ArenaLocation>,offset:u64,
+    frame:&[u8],source:&ObjectRecord,scheme:Scheme,id:ObjectId,sum:[u8;32])
+    -> (out:Result<crate::ArenaLocation,crate::recovered_record::IndexError>)
+    requires vstd::std_specs::btree::btree_map_inv(old(map)),vstd::laws_cmp::obeys_cmp::<ObjectId>(),
+        vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),source.contents().3.len() == 0,
+        frame@ == crate::recovered_record::encoding(scheme,id,*source),wire::tag(frame@,0,scheme),
+        id.digest() == frame@.subrange(8,40),wire::leaf_body(frame@,40),wire::record_at(frame@,40,scheme,*source),
+    ensures ({
+        let loc = crate::ArenaLocation {offset,payload_len:frame.len() as u64,checksum:sum};
+        if old(map)@.contains_key(id) {
+            &&& final(map)@ == old(map)@
+            &&& if old(map)@[id].payload_len == frame.len() && old(map)@[id].checksum == sum {out == Ok(loc)}
+                else {out == Err(crate::recovered_record::IndexError::Collision(id))}
+        } else {out == Ok(loc) && final(map)@ == old(map)@.insert(id,loc)}
+    }),
+{
+    use crate::recovered_record::{self as scan,IndexError,Error};
+    let identify = |_:&ObjectRecord| -> (r:ObjectId) ensures r == id { id };
+    let checksum = |_:u64,_:&[u8]| -> (s:[u8;32]) ensures s == sum { sum };
+    let out = scan::index(map,offset,frame,scheme,identify,checksum);
+    proof {
+        match &out {
+            Ok(loc) => {
+                let key = choose|key:ObjectId| #[trigger] scan::authenticated(frame@,scheme,key,identify) &&
+                    if old(map)@.contains_key(key) {scan::agrees(old(map)@[key],*loc) && map@ == old(map)@}
+                    else {map@ == old(map)@.insert(key,*loc)};
+                ObjectId::same_digest(key,id);
+            },
+            Err(IndexError::Collision(key)) => {ObjectId::same_digest(*key,id);},
+            Err(IndexError::Record(Error::Canonical)) => {
+                let (r,key) = choose|r:ObjectRecord,key:ObjectId| wire::record_at(frame@,40,scheme,r) &&
+                    key.digest() == frame@.subrange(8,40) && #[trigger] identify.ensures((&r,),key) &&
+                    frame@ != scan::encoding(scheme,key,r);
+                unique_record(frame@,scheme,r,*source);
+                assert(false);
+            },
+            _ => {},
+        }
+    }
+    out
+}
+
+fn scan_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&ObjectRecord,scheme:Scheme,id:ObjectId,hash:H)
+    -> (out:Result<ObjectRecord,wire::Error<wire::BodyError>>)
+    requires frame@ == crate::recovered_record::encoding(scheme,id,*source),wire::tag(frame@,0,scheme),
+        id.digest() == frame@.subrange(8,40),wire::complete_body(frame@,40,scheme),
+        source.contents().3.len() == 0 ==> wire::leaf_body(frame@,40),
+        wire::record_at(frame@,40,scheme,*source),
+        forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
+        forall|r:&ObjectRecord,d:[u8;32]| same_fields(*r,*source) && #[trigger] hash.ensures((r,),d) ==> d@ == id.digest(),
+    ensures match out {
+        Ok(decoded) => same_fields(decoded,*source),
+        Err(e) => source.contents().3.len() > 0 && e matches wire::Error::Decode(wire::DecodeError::Record(wire::BodyError::Allocation)),
+    },
+{
+    use crate::recovered_record::{self as scan,Error};
+    let identify = |r:&ObjectRecord| -> (actual:ObjectId)
+        ensures exists|d:[u8;32]| #[trigger] hash.ensures((r,),d) && actual.digest() == d@,
+    { ObjectId::new(hash(r)) };
+    match scan::recover(frame,scheme,identify) {
+        Ok((name,r)) => {
+            proof { ObjectId::same_digest(name,id); unique_record(frame@,scheme,r,*source); }
+            Ok(r)
+        },
+        Err(Error::Decode(e)) => Err(wire::Error::Decode(e)),
+        Err(Error::Identity) => {
+            proof {
+                let (r,actual) = choose|r:ObjectRecord,actual:ObjectId| wire::record_at(frame@,40,scheme,r) &&
+                    #[trigger] identify.ensures((&r,),actual) && actual.digest() != frame@.subrange(8,40);
+                unique_record(frame@,scheme,r,*source);
+            }
+            assert(false); unreachable!()
+        },
+        Err(Error::Canonical) => {
+            proof {
+                let (r,name) = choose|r:ObjectRecord,name:ObjectId| wire::record_at(frame@,40,scheme,r) &&
+                    name.digest() == frame@.subrange(8,40) && #[trigger] identify.ensures((&r,),name) &&
+                    frame@ != scan::encoding(scheme,name,r);
+                ObjectId::same_digest(name,id);
+                unique_record(frame@,scheme,r,*source);
+                equal_reference_encoding(r.contents().3,source.contents().3,r.contents().3.len(),scheme);
+            }
+            assert(false); unreachable!()
+        },
+        Err(Error::Overflow) => { assert(false); unreachable!() },
+    }
+}
 /// An arbitrary canonical production record, including every labelled edge,
 /// recovers its original meaning from the complete encoder output.
 #[verifier::rlimit(45)]
-fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,id:ObjectId,hash:H)
+fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,id:ObjectId,hash:H,scan:bool)
     -> (out:Result<ObjectRecord,wire::Error<wire::BodyError>>)
     requires scheme.algorithm@ != seq![0u8,0u8],scheme.construction@ != seq![0u8,0u8],
         ObjectRecord::labels_ordered(source.contents().3),
@@ -122,6 +222,7 @@ fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,i
         assert(wire::complete_body(bytes,40,scheme));
         if n == 0 {assert(wire::leaf_body(bytes,40));}
     }
+    if scan {return scan_written(&frame,source,scheme,id,hash);}
     let result = wire::confirmed(&frame,scheme,id,hash);
     proof {
         if let Err(wire::Error::Identity) = result {
@@ -138,7 +239,7 @@ fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,i
 /// Instantiate the conditional identity theorem with an executable name that
 /// depends on the actual decoded record. This witnesses satisfiability, while
 /// the production digest still needs its own refinement.
-fn logical_size_witness(source:&ObjectRecord, scheme:Scheme, empty:[u8;32], nonempty:[u8;32])
+fn logical_size_witness(source:&ObjectRecord, scheme:Scheme, empty:[u8;32], nonempty:[u8;32],scan:bool)
     -> (out:Result<ObjectRecord,wire::Error<wire::BodyError>>)
     requires scheme.algorithm@ != seq![0u8,0u8], scheme.construction@ != seq![0u8,0u8],
         ObjectRecord::labels_ordered(source.contents().3),
@@ -151,7 +252,7 @@ fn logical_size_witness(source:&ObjectRecord, scheme:Scheme, empty:[u8;32], none
         ensures digest == (if r.contents().4 == 0 {empty} else {nonempty}),
     { if r.logical_bytes() == 0 {empty} else {nonempty} };
     let id = ObjectId::new(identify(source));
-    round_trip(source,scheme,id,identify)
+    round_trip(source,scheme,id,identify,scan)
 }
 
 }

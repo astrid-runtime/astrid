@@ -772,6 +772,36 @@ def checkpoint_record_consumers():
         )
 
 
+def durable_read_consumers():
+    recovered = Path("crates/astrid-storage/src/engine/durable/format/recovered_record.rs")
+    admission = Path("crates/astrid-storage/src/engine/durable/read_admission.rs")
+    for label, path, clause, weaker, consumer in [
+        ("generation", admission, "Some(kept) => observed == current &&", "Some(kept) =>", "batch_slots"),
+        ("membership", admission, "&& present.ensures((id,),true) &&", "&&", "batch_slots"),
+        ("cache result", admission, "insert.ensures((principal,id,record),kept)", "true", "batch_slots"),
+        ("refusal", admission, "None => observed != current || present.ensures((id,),false)", "None => true", "batch_slots"),
+        ("pending record choice", admission, "Some(p) => r == p", "Some(p) => true", "batch_slots"),
+        ("indexed source", admission, "read.ensures((generation,id,loc),Ok(Some(r)))", "true", "batch_slots"),
+        ("absent source", admission, "Ok(Attempt::Missing) => pending.is_none() && location.is_none()", "Ok(Attempt::Missing) => true", "batch_slots"),
+        ("retry after lost reader", admission, "read.ensures((generation,id,loc),Ok(None))", "true", "batch_slots"),
+        ("disk refusal", admission, "read.ensures((generation,id,loc),Err(e))", "true", "batch_slots"),
+        ("recovered canonical bytes", recovered, "identify.ensures((&r,),id) && payload == encoding(scheme,id,r)", "identify.ensures((&r,),id)", "record_model"),
+        ("recovered identity", recovered, "identify.ensures((&r,),id) && payload == encoding(scheme,id,r)", "payload == encoding(scheme,id,r)", "record_model"),
+        ("placement offset", recovered, "Ok(loc) => loc.offset == offset &&", "Ok(loc) =>", "record_roundtrip"),
+        ("placement size", recovered, "loc.payload_len == payload.len() &&", "true &&", "record_roundtrip"),
+        ("placement checksum", recovered, "checksum.ensures((loc.payload_len,payload),loc.checksum)", "true", "record_roundtrip"),
+        ("first placement", recovered, "agrees(old(map)@[id],loc) && final(map)@ == old(map)@", "agrees(old(map)@[id],loc)", "record_roundtrip"),
+        ("new placement", recovered, "final(map)@ == old(map)@.insert(id,loc)", "true", "record_roundtrip"),
+        ("collision mismatch", recovered, "(old(map)@[id].payload_len != payload.len() || old(map)@[id].checksum != sum)", "true", "record_roundtrip"),
+        ("scan refusal", recovered, "&& refused(payload@,scheme,identify,e)", "", "record_roundtrip"),
+    ]:
+        yield (
+            f"durable read loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path(f"verification/hosted_{consumer}.rs"),
+        )
+
+
 def checkpoint_decode_consumers():
     yield from checkpoint_page_consumers()
     yield from checkpoint_reference_consumers()
@@ -784,3 +814,4 @@ def checkpoint_decode_consumers():
     yield from checkpoint_value_consumers()
     yield from checkpoint_entries_consumers()
     yield from checkpoint_record_consumers()
+    yield from durable_read_consumers()

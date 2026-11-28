@@ -9,6 +9,8 @@ mod chunk_range;
 mod child_range;
 #[path = "../crates/astrid-storage/src/engine/durable/batch_slots.rs"]
 mod batch_slots;
+#[path = "../crates/astrid-storage/src/engine/durable/read_admission.rs"]
+mod read_admission;
 #[path = "../crates/astrid-storage/src/kv/tree/memo_admission.rs"]
 mod memo_admission;
 #[path = "../crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs"]
@@ -242,6 +244,8 @@ mod direct_placement;
 mod positional_read;
 #[path = "../crates/astrid-storage/src/engine/durable/format/verified_record.rs"]
 mod verified_record;
+#[path = "../crates/astrid-storage/src/engine/durable/format/recovered_record.rs"]
+mod recovered_record;
 mod hosted_record_model;
 mod hosted_arena_placement;
 mod hosted_arena_append;

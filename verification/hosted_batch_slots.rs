@@ -35,6 +35,59 @@ fn publish_one<P,F,I>(owner:&P,ids:&[ObjectId],id:ObjectId,loaded:ObjectRecord,p
     batch.records
 }
 
+/// A competing generation or a missing object cannot publish a stale load.
+fn readmission<P:Copy>(owner:P,key:ObjectId,observed:u64,current:u64,indexed:Option<ObjectId>,
+    pending:Option<ObjectId>,loaded:ObjectRecord) -> (out:Option<(P,ObjectId,ObjectRecord)>)
+    ensures out == if observed == current && (indexed == Some(key) || pending == Some(key)) {
+        Some((owner,key,loaded))
+    } else { None },
+{
+    let present = |id:ObjectId| -> (found:bool) ensures found == (indexed == Some(id) || pending == Some(id)) {
+        (match indexed {Some(k) => k.same(&id),None => false}) ||
+        (match pending {Some(k) => k.same(&id),None => false})
+    };
+    let publish = |p:&P,id:ObjectId,r:ObjectRecord| -> (row:(P,ObjectId,ObjectRecord)) ensures row == (*p,id,r) { (*p,id,r) };
+    crate::read_admission::retain(&owner,key,observed,current,loaded,present,publish)
+}
+
+/// A snapshot with both sources offers the WAL body even if the arena reader
+/// changed generation or would fail. A stale publication of either body retries.
+fn snapshot<P:Copy>(principal:P,id:ObjectId,generation:u64,reader_generation:u64,current:u64,
+    pending:Option<ObjectRecord>,location:Option<crate::ArenaLocation>,disk:ObjectRecord,
+    disk_error:Option<u8>,membership:bool)
+    -> (out:Result<crate::read_admission::Attempt<(P,ObjectId,ObjectRecord)>,u8>)
+    ensures ({
+        let retained = |r:ObjectRecord| if generation == current && membership {
+            Ok(crate::read_admission::Attempt::Found((principal,id,r)))
+        } else { Ok(crate::read_admission::Attempt::Retry) };
+        out == match pending {
+            Some(r) => retained(r),
+            None => if location.is_none() {Ok(crate::read_admission::Attempt::Missing)}
+                else if generation != reader_generation {Ok(crate::read_admission::Attempt::Retry)}
+                else if let Some(e) = disk_error {Err(e)}
+                else {retained(disk)},
+        }
+    }),
+{
+    use crate::read_admission;
+    let read = |g:u64,key:ObjectId,loc:crate::ArenaLocation| -> (result:Result<Option<ObjectRecord>,u8>)
+        requires g == generation && key == id && Some(loc) == location,
+        ensures result == if g != reader_generation { Ok(None) }
+            else if let Some(e) = disk_error { Err(e) } else { Ok(Some(disk)) },
+    {
+        if g != reader_generation {Ok(None)} else if let Some(e) = disk_error {Err(e)} else {Ok(Some(disk))}
+    };
+    let keep = |p:&P,key:ObjectId,g:u64,r:ObjectRecord| -> (result:Result<Option<(P,ObjectId,ObjectRecord)>,u8>)
+        ensures result == if g == current && membership {Ok(Some((*p,key,r)))} else {Ok(None)},
+    {
+        let present = |_:ObjectId| -> (yes:bool) ensures yes == membership {membership};
+        let insert = |q:&P,k:ObjectId,loaded:ObjectRecord| -> (row:(P,ObjectId,ObjectRecord))
+            ensures row == (*q,k,loaded) {(*q,k,loaded)};
+        Ok(read_admission::retain(p,key,g,current,r,present,insert))
+    };
+    read_admission::attempt(&principal,id,generation,pending,location,read,keep)
+}
+
 fn load_visits<R,E,F>(plan:&[child_range::Visit],read:F, table:Ghost<spec_fn(ObjectId)->Option<R>>,
     error:Ghost<E>) -> (out:Result<Vec<(child_range::Visit,R)>,child_range::LoadError<E>>)
     where F:FnOnce(Vec<ObjectId>)->Result<Vec<Option<R>>,E>,

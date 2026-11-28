@@ -406,6 +406,88 @@ fn indexed_region<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32
     Some(r)
 }
 
+/// A KV page decoded from this indexed media region inherits both its wire ID and
+/// its independently derived record digest. Cache hits and pending WAL reads use other paths.
+fn indexed_page<M,H,I,K,E>(media:&M,span:&mut [u8],start:u64,offset:u64,size:u64,
+    magic:[u8;8],version:u16,checksum:[u8;32],limit:u64,id:crate::ObjectId,scheme:Scheme,
+    hash:H,identify:I,page_version:crate::ObjectFormatVersion,validate:K,
+    Ghost(identity):Ghost<spec_fn(crate::ObjectRecord)->[u8;32]>)
+    -> (out:Option<crate::checkpoint_page::Handle<crate::ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>>)
+    where M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32],
+        I:Fn(&crate::ObjectRecord)->[u8;32], K:Fn(&[u8])->Result<(),E>+Copy,
+    requires forall|n:u64,p:&[u8]| #[trigger] hash.requires((magic,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|r:&crate::ObjectRecord,d:[u8;32]| #[trigger] identify.ensures((r,),d) ==> d == identity(*r),
+        forall|k:&[u8]| #[trigger] validate.requires((k,)),
+    ensures out matches Some(h) ==> ({
+        let bytes = media.image().subrange(offset as int+52,offset as int+52+size);
+        &&& start <= offset && offset as int-start+52+size <= old(span).len() && size <= limit
+        &&& offset as int+52+size <= media.image().len()
+        &&& h.object == id && id.digest() == bytes.subrange(8,40)
+        &&& exists|p:&[u8]| p@ == bytes && #[trigger] hash.ensures((magic,size,p),checksum)
+        &&& exists|r:crate::ObjectRecord| #[trigger] record::record_at(bytes,40,scheme,r) &&
+            identity(r)@ == id.digest() && r.contents().1 == page_version.number() &&
+            r.contents().4 == 0 && r.contents().5 == crate::ObjectClass::Metadata &&
+            crate::checkpoint_record::parsed(&r,h.node,validate)
+    }),
+{
+    let r = indexed_region(media,span,start,offset,size,magic,version,checksum,limit,id,scheme,hash,identify,Ghost(identity))?;
+    let h = crate::checkpoint_record::read(id,&r,page_version,validate).ok()?;
+    assert(record::record_at(media.image().subrange(offset as int+52,offset as int+52+size),40,scheme,r));
+    Some(h)
+}
+/// Recover a fresh name, look up its placement and follow that placement back
+/// to the KV page on the same media image. The scan and reread may use different
+/// record allocations. Only the media image is shared between the two reads.
+fn replay_indexed_page<M,H,I,K,E>(media:&M,span:&mut [u8],start:u64,offset:u64,scanned:&[u8],
+    magic:[u8;8],version:u16,limit:u64,requested:crate::ObjectId,scheme:Scheme,hash:H,identify:I,
+    page_version:crate::ObjectFormatVersion,validate:K,Ghost(identity):Ghost<spec_fn(crate::ObjectRecord)->[u8;32]>)
+    -> (out:Option<crate::checkpoint_page::Handle<crate::ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>>)
+    where M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+        I:Fn(&crate::ObjectRecord)->[u8;32]+Copy,K:Fn(&[u8])->Result<(),E>+Copy,
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        scanned@ == media.image().subrange(offset as int+52,offset as int+52+scanned.len()),
+        forall|n:u64,p:&[u8]| #[trigger] hash.requires((magic,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|r:&crate::ObjectRecord,d:[u8;32]| #[trigger] identify.ensures((r,),d) ==> d == identity(*r),
+        forall|k:&[u8]| #[trigger] validate.requires((k,)),
+    ensures out matches Some(h) ==> ({
+        &&& start <= offset && offset as int+52+scanned.len() <= media.image().len() && scanned.len() <= limit
+        &&& h.object == requested && h.object.digest() == scanned@.subrange(8,40)
+        &&& exists|sum:[u8;32],p:&[u8]| #[trigger] hash.ensures((magic,scanned.len() as u64,scanned),sum) &&
+            p@ == scanned@ && #[trigger] hash.ensures((magic,scanned.len() as u64,p),sum)
+        &&& exists|a:crate::ObjectRecord,r:crate::ObjectRecord| #[trigger] record::record_at(scanned@,40,scheme,a) &&
+            #[trigger] crate::checkpoint_record::parsed(&r,h.node,validate) && record::record_at(scanned@,40,scheme,r) &&
+            crate::hosted_record_roundtrip::same_fields(a,r) && identity(a)@ == requested.digest() && identity(r)@ == requested.digest() &&
+            crate::recovered_record::encoding(scheme,requested,a) == scanned@ && r.contents().1 == page_version.number()
+    }),
+{
+    let mut map = std::collections::BTreeMap::new();
+    let name = |r:&crate::ObjectRecord| -> (id:crate::ObjectId)
+        ensures id.digest() == identity(*r)@, { crate::ObjectId::new(identify(r)) };
+    let sum = |len:u64,bytes:&[u8]| -> (out:[u8;32])
+        ensures hash.ensures((magic,len,bytes),out), { hash(magic,len,bytes) };
+    let tail = crate::recovered_record::index(&mut map,offset,scanned,scheme,name,sum).ok()?;
+    let ghost key = choose|key:crate::ObjectId| #[trigger] crate::recovered_record::authenticated(scanned@,scheme,key,name) &&
+        map@ == Map::empty().insert(key,tail);
+    let loc = map.get(&requested)?;
+    assert(requested == key && *loc == tail);
+    let h = indexed_page(media,span,start,loc.offset,loc.payload_len,magic,version,loc.checksum,limit,
+        requested,scheme,hash,identify,page_version,validate,Ghost(identity))?;
+    proof {
+        let a = choose|a:crate::ObjectRecord| #[trigger] record::record_at(scanned@,40,scheme,a) &&
+            name.ensures((&a,),key) && scanned@ == crate::recovered_record::encoding(scheme,key,a);
+        let r = choose|r:crate::ObjectRecord| #[trigger] record::record_at(scanned@,40,scheme,r) &&
+            identity(r)@ == requested.digest() && r.contents().1 == page_version.number() &&
+            r.contents().4 == 0 && r.contents().5 == crate::ObjectClass::Metadata &&
+            crate::checkpoint_record::parsed(&r,h.node,validate);
+        crate::hosted_record_roundtrip::unique_record(scanned@,scheme,a,r);
+        assert(identity(a)@ == requested.digest());
+        assert(crate::checkpoint_record::parsed(&r,h.node,validate));
+    }
+    Some(h)
+}
+
 /// A one-frame media source distinguishes this physical placement from every
 /// other address. A mismatched index, size, or checksum cannot return a record.
 /// A correctly placed valid leaf must return its actual data.

@@ -19,6 +19,14 @@ impl ObjectId {
     pub(crate) proof fn same_digest(a:Self,b:Self)
         requires a.digest() == b.digest(), ensures a == b,
     {assert(a.0 =~= b.0);}
+    pub(crate) fn same(&self, other:&Self) -> (equal:bool)
+        ensures equal == (*self == *other),
+    {
+        let equal = self.0.as_slice() == other.0.as_slice();
+        if equal { assert(self.0 =~= other.0); }
+        equal
+    }
+
     /// Construct an object identifier from its digest bytes.
     #[must_use]
     pub const fn new(bytes: [u8; 32]) -> (out:Self) ensures out.digest() == bytes@ {

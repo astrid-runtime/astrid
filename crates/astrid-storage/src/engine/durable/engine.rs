@@ -1,3 +1,4 @@
+use super::read_admission::{self, Attempt};
 use super::{
     ARENA_FILE, ARENA_MAGIC, Arc, BTreeMap, BTreeSet, ClosureObjects, DurableEngine, DurableError,
     DurableInner, FaultPoint, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
@@ -108,39 +109,34 @@ where
                     inner.arena_generation,
                 )
             };
-            if let Some(record) = pending {
-                if let Some(record) = self.retain_loaded_object_if_current_with(
-                    principal,
-                    id,
-                    generation,
-                    record,
-                    &mut recovery,
-                )? {
-                    return Ok(Some(record));
-                }
-                continue;
-            }
-            let Some(location) = location else {
-                return Ok(None);
-            };
-            let reader_guard = self.arena_reader.read();
-            let Some(reader) = reader_guard.as_ref() else {
-                return Err(DurableError::Closed);
-            };
-            if reader.generation != generation {
-                continue;
-            }
-            let record =
-                read_indexed_object(&reader.file, id, location, &self.identity, self.limits)?;
-            drop(reader_guard);
-            if let Some(record) = self.retain_loaded_object_if_current_with(
+            match read_admission::attempt(
                 principal,
                 id,
                 generation,
-                record,
-                &mut recovery,
+                pending,
+                location,
+                |generation, object, location| {
+                    let reader_guard = self.arena_reader.read();
+                    let reader = reader_guard.as_ref().ok_or(DurableError::Closed)?;
+                    if reader.generation != generation {
+                        return Ok(None);
+                    }
+                    read_indexed_object(&reader.file, object, location, &self.identity, self.limits)
+                        .map(Some)
+                },
+                |owner, object, generation, record| {
+                    self.retain_loaded_object_if_current_with(
+                        owner,
+                        object,
+                        generation,
+                        record,
+                        &mut recovery,
+                    )
+                },
             )? {
-                return Ok(Some(record));
+                Attempt::Found(record) => return Ok(Some(record)),
+                Attempt::Missing => return Ok(None),
+                Attempt::Retry => {},
             }
         }
     }
@@ -266,12 +262,15 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation
-            || (!inner.index.contains_key(&id) && inner.pending_wal.get_object(&id).is_none())
-        {
-            return Ok(None);
-        }
-        Ok(Some(self.object_cache.insert(principal, id, record)))
+        Ok(super::read_admission::retain(
+            principal,
+            id,
+            generation,
+            inner.arena_generation,
+            record,
+            |key| inner.index.contains_key(&key) || inner.pending_wal.get_object(&key).is_some(),
+            |owner, key, loaded| self.object_cache.insert(owner, key, loaded),
+        ))
     }
 
     fn ensure_cached_read_usable(&self) -> Result<(), DurableError> {
