@@ -6,40 +6,8 @@ use std::sync::{Arc, Mutex};
 use super as native_logs;
 use super::super::today_date_string;
 
-/// Open (creating the log dir if needed) the daily-rotated log file for
-/// `capsule_name` under an admitted principal's immutable UID. Logs are an
-/// operational native projection at `log/principals/<uid>/<capsule>/`; they
-/// are not part of the durable `home://` VFS and never use `PrincipalHome`.
-/// Returns `None` if the Astrid log root cannot be resolved, the principal is
-/// not admitted in `directory`, or the file cannot be opened safely.
-///
-/// When `prune` is true, deletes rotated logs older than 7 days before
-/// opening. Pruning is an O(N) directory scan and must only be requested on
-/// the load-time path — never from [`super::super::WasmEngine::invoke_interceptor`], which
-/// runs on the async hot path.
-///
-/// Mirrors the registration gate from [`super::super::build_principal_vfs_bundle`]: an
-/// invocation for an unregistered principal yields `None` instead of
-/// creating any native principal state.
-pub(crate) fn open_capsule_log(
-    directory: &astrid_storage::PrincipalDirectory,
-    principal: &astrid_core::PrincipalId,
-    capsule_name: &str,
-    prune: bool,
-) -> Option<Arc<Mutex<std::fs::File>>> {
-    let astrid_home = astrid_core::dirs::AstridHome::resolve().ok()?;
-    open_capsule_log_at(
-        &astrid_home.log_dir(),
-        directory,
-        principal,
-        capsule_name,
-        prune,
-    )
-}
-
-/// Test-friendly core of [`open_capsule_log`]: open a log file under a
-/// supplied top-level log root after resolving the principal's immutable UID.
-/// No alias is ever used as a physical path component.
+/// Test fixture for opening the daily log of a registered principal.
+#[cfg(test)]
 pub(in crate::engine::wasm) fn open_capsule_log_at(
     log_root: &Path,
     directory: &astrid_storage::PrincipalDirectory,
@@ -51,6 +19,9 @@ pub(in crate::engine::wasm) fn open_capsule_log_at(
     open_capsule_log_at_uid(log_root, uid, capsule_name, prune)
 }
 
+/// Open an operational log under `log/principals/<uid>/<capsule>/`, outside
+/// the durable home VFS. Only load-time callers request pruning, which scans
+/// existing rotated files in this directory.
 pub(super) fn open_capsule_log_at_uid(
     log_root: &Path,
     uid: astrid_core::PrincipalUid,
