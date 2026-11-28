@@ -55,7 +55,7 @@ pub(crate) fn recover<R:FrameReader,M:Medium,I,C,H>(reader:&mut R,media:&mut M,e
     limit:u64,scheme:Scheme,identify:I,checksum:C,hash:H) -> (out:Recovery<R::Error,M::Error>)
     where I:Fn(&ObjectRecord)->ObjectId+Copy,C:Fn(u64,&[u8])->[u8;32]+Copy,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
     requires old(reader).target()==old(media).target(),old(reader).image()==old(media).bytes(),old(reader).position()==0,
-        old(media).syncs_file(),old(media).durable()==old(media).bytes(),protected<=end==old(reader).image().len(),
+        old(media).durable()==old(media).bytes(),protected<=end==old(reader).image().len(),
         obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
         forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
         forall|n:u64,b:&[u8]| #[trigger] checksum.requires((n,b)),
@@ -63,7 +63,8 @@ pub(crate) fn recover<R:FrameReader,M:Medium,I,C,H>(reader:&mut R,media:&mut M,e
     ensures final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),final(media).target()==old(media).target(),
         match out {
             Recovery::Loaded(at,(map,tail))=>btree_map_inv(&map) && protected<=at<=end &&
-                final(media).durable()==old(reader).image().take(at as int) &&
+                final(media).bytes()==old(reader).image().take(at as int) && (at==end ==> *final(media)==*old(media)) &&
+                ((at==end || old(media).syncs_file()) ==> final(media).durable()==final(media).bytes()) &&
                 indexed(map@,tail,old(reader).image(),at,limit,scheme,identify,checksum,hash) &&
                 (at<end ==> !frame_repair::has_later::<M>(old(reader).image(),at,end,ARENA_MAGIC,limit)),
             Recovery::Record(at,b,e)=>*final(media)==*old(media) && frame_scan::authentic(old(reader).image(),at,b@,ARENA_MAGIC,FRAME_VERSION,limit,hash) &&
@@ -126,6 +127,46 @@ pub(crate) fn recover<R:FrameReader,M:Medium,I,C,H>(reader:&mut R,media:&mut M,e
     }
     Recovery::Loaded(at,(map,tail))
 }
+enum VolumeIndex<E,F,V:crate::frontier::JournalContainer> {
+    Clean(Index),Persisted(u64,Index,V),Frame(u64,FrameError<E>),Record(u64,Vec<u8>,IndexError),
+    Media(u64,frame_repair::TailError,frame_repair::Error<F>),Container(u64,V::Error),
+}
+
+/// The volume fence follows a real resize and precedes release of the index.
+fn recover_volume<R:FrameReader,M:Medium,I,C,H,V:crate::frontier::JournalContainer,F:FnOnce(&M)->V>(
+    reader:&mut R,media:&mut M,end:u64,protected:u64,limit:u64,scheme:Scheme,identify:I,checksum:C,hash:H,capture:F)
+    -> (out:VolumeIndex<R::Error,M::Error,V>)
+    where I:Fn(&ObjectRecord)->ObjectId+Copy,C:Fn(u64,&[u8])->[u8;32]+Copy,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+    requires !old(media).syncs_file(),old(reader).target()==old(media).target(),old(reader).image()==old(media).bytes(),old(reader).position()==0,
+        old(media).durable()==old(media).bytes(),protected<=end==old(reader).image().len(),
+        obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),forall|n:u64,b:&[u8]| #[trigger] checksum.requires((n,b)),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((ARENA_MAGIC,n,b)),
+        forall|m:&M| m.target()==old(media).target() ==> #[trigger] capture.requires((m,)),
+        forall|m:&M,v:V| #[trigger] capture.ensures((m,),v) ==> (v.container_id(),v.region_id())==m.target() && v.journal_image()==m.bytes(),
+    ensures final(media).target()==old(media).target(),
+        out matches VolumeIndex::Clean((map,tail)) ==> *final(media)==*old(media) && btree_map_inv(&map) &&
+            indexed(map@,tail,old(reader).image(),end,limit,scheme,identify,checksum,hash),
+        out matches VolumeIndex::Persisted(at,(map,tail),v) ==> protected<=at<end && btree_map_inv(&map) && final(media).bytes()==v.durable_image() &&
+            (v.container_id(),v.region_id())==old(reader).target() && v.durable_image()==old(reader).image().take(at as int) &&
+            indexed(map@,tail,old(reader).image(),at,limit,scheme,identify,checksum,hash),
+        out matches VolumeIndex::Container(at,e) ==> protected<=at<end &&
+            crate::hosted_journal_scan::container_failure::<V>(old(media).target(),old(reader).image().take(at as int),e),
+{
+    match recover(reader,media,end,protected,limit,scheme,identify,checksum,hash) {
+        Recovery::Loaded(at,index)=>{
+            if at==end {return VolumeIndex::Clean(index);}
+            match crate::hosted_journal_scan::persist_staged(media,capture) {
+                Ok(region)=>VolumeIndex::Persisted(at,index,region),
+                Err(e)=>VolumeIndex::Container(at,e),
+            }
+        }
+        Recovery::Frame(at,e)=>VolumeIndex::Frame(at,e),
+        Recovery::Record(at,b,e)=>VolumeIndex::Record(at,b,e),
+        Recovery::Media(at,e,f)=>VolumeIndex::Media(at,e,f),
+    }
+}
+
 /// Reopen the positional handle after possible truncation and use the index
 /// produced by scanning this very arena to restore the root journal.
 struct Reopened<P> {
@@ -176,6 +217,80 @@ fn reopen<S:FrameReader,T:Medium,A:crate::positional_read::Media,R:FrameReader,M
     let loaded=crate::hosted_recovered_roots::recover_indexed(reader,journal,&arena,&index,end,protected,batch,limit,
         scheme,decode,recode,hash,digest,project)?;
     Some(Reopened{loaded,arena_end:at,index:Ghost(index@),tail:Ghost(tail)})
+}
+
+struct VolumeRoots<P,V,J> {
+    state:Reopened<P>,
+    arena_fence:Option<V>,
+    root_fence:Option<J>,
+}
+
+spec fn stable_region<V:crate::frontier::JournalContainer>(fence:Option<V>,target:(int,Seq<u8>),image:Seq<u8>,end:u64) -> bool {
+    match fence {
+        None=>end==image.len(),
+        Some(v)=>end<image.len() && (v.container_id(),v.region_id())==target && v.durable_image()==image.take(end as int),
+    }
+}
+
+/// The two named regions share a volume. Keep both successful repair receipts
+/// and read the selected objects through a positional handle after journal repair.
+#[verifier::spinoff_prover]
+fn reopen_volume<S:FrameReader,T:Medium,A:crate::positional_read::Media,R:FrameReader,M:Medium,P:Ord,I,C,H,D,E,F,O,
+    V:crate::frontier::JournalContainer,J:crate::frontier::JournalContainer,AV:FnOnce(&T)->V,JV:FnOnce(&M)->J>(
+    scan:&mut S,backing:&mut T,open:O,arena_region:AV,reader:&mut R,journal:&mut M,root_region:JV,arena_end:u64,arena_protected:u64,
+    end:u64,protected:u64,batch:u64,limit:u64,scheme:Scheme,identify:I,checksum:C,hash:H,decode:D,recode:E,project:F)
+    -> (out:Option<VolumeRoots<P,V,J>>)
+    where I:Fn(&ObjectRecord)->ObjectId+Copy,C:Fn(u64,&[u8])->[u8;32]+Copy,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+        D:Fn(&[u8])->Option<P>+Copy,E:Fn(&P)->Vec<u8>+Copy,O:FnOnce(&T)->Option<A>,
+        F:FnOnce(&BTreeMap<P,(crate::RootState,u64)>)->BTreeMap<P,crate::RootState>,
+    requires old(scan).target()==old(backing).target(),old(scan).image()==old(backing).bytes(),old(scan).position()==0,
+        !old(backing).syncs_file(),old(backing).bytes()==old(backing).durable(),arena_protected<=arena_end==old(scan).image().len(),
+        old(reader).target()==old(journal).target(),old(reader).image()==old(journal).bytes(),old(reader).position()==0,
+        !old(journal).syncs_file(),old(journal).bytes()==old(journal).durable(),protected<=end==old(reader).image().len(),
+        old(scan).target().0==old(reader).target().0,old(scan).target().1!=old(reader).target().1,
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|m:&T| m.target()==old(backing).target() ==> #[trigger] arena_region.requires((m,)),
+        forall|m:&T,v:V| #[trigger] arena_region.ensures((m,),v) ==> (v.container_id(),v.region_id())==m.target() && v.journal_image()==m.bytes(),
+        forall|m:&M| m.target()==old(journal).target() ==> #[trigger] root_region.requires((m,)),
+        forall|m:&M,v:J| #[trigger] root_region.ensures((m,),v) ==> (v.container_id(),v.region_id())==m.target() && v.journal_image()==m.bytes(),
+        forall|m:&T| #[trigger] open.requires((m,)),
+        forall|m:&T,a:A| #[trigger] open.ensures((m,),Some(a)) ==> a.target()==m.target() && a.image()==m.bytes(),
+        forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),forall|n:u64,b:&[u8]| #[trigger] checksum.requires((n,b)),
+        forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),
+        forall|n:u64,b:&[u8],s:[u8;32]| #[trigger] checksum.ensures((n,b),s) ==> hash.ensures((ARENA_MAGIC,n,b),s),
+        forall|b:&[u8]| #[trigger] decode.requires((b,)),forall|p:&P| #[trigger] recode.requires((p,)),
+        forall|h:&BTreeMap<P,(crate::RootState,u64)>| #[trigger] project.requires((h,)),
+        forall|h:&BTreeMap<P,(crate::RootState,u64)>,t:BTreeMap<P,crate::RootState>| #[trigger] project.ensures((h,),t) ==> btree_map_inv(&t),
+    ensures out matches Some(v) ==> {
+        let r=v.state;
+        &&& final(backing).target()==old(scan).target() && final(journal).target()==old(reader).target()
+        &&& final(backing).target().0==final(journal).target().0 && final(backing).target().1!=final(journal).target().1
+        &&& arena_protected<=r.arena_end<=arena_end && protected<=r.loaded.end<=end
+        &&& stable_region(v.arena_fence,final(backing).target(),old(scan).image(),r.arena_end)
+        &&& stable_region(v.root_fence,final(journal).target(),old(reader).image(),r.loaded.end)
+        &&& final(backing).bytes()==old(scan).image().take(r.arena_end as int) && final(journal).bytes()==old(reader).image().take(r.loaded.end as int)
+        &&& indexed(r.index@,r.tail@,old(scan).image(),r.arena_end,limit,scheme,identify,checksum,hash)
+        &&& crate::hosted_journal_scan::recovered(r.loaded.history@,final(journal).bytes(),r.loaded.end,limit,scheme,decode,recode,hash)
+        &&& crate::hosted_recovered_roots::retained(&r.loaded,final(backing).bytes(),r.index@,scheme)
+    },
+{
+    use crate::hosted_journal_scan::{self as roots,VolumeRecovery};
+    let (ae,(index,tail),af)=match recover_volume(scan,backing,arena_end,arena_protected,limit,scheme,identify,checksum,hash,arena_region) {
+        VolumeIndex::Clean(t)=>{assert(backing.bytes().take(arena_end as int) =~= backing.bytes());(arena_end,t,None)},
+        VolumeIndex::Persisted(at,t,v)=>(at,t,Some(v)),
+        _=>return None,
+    };
+    let (re,history,rf)=match roots::recover_volume(reader,journal,end,protected,limit,scheme,decode,recode,hash,root_region) {
+        VolumeRecovery::Unmodified(t)=>{assert(journal.bytes().take(end as int) =~= journal.bytes());(end,t,None)},
+        VolumeRecovery::Persisted(at,t,v)=>(at,t,Some(v)),
+        _=>return None,
+    };
+    let arena=open(backing)?;
+    let digest=|r:&ObjectRecord| -> (s:[u8;32]) ensures exists|id:ObjectId| #[trigger] identify.ensures((r,),id) && s@==id.digest(),
+        {let id=identify(r);*id.as_bytes()};
+    let loaded=crate::hosted_recovered_roots::load_history(history,re,&arena,&index,batch,limit,scheme,hash,digest,project)?;
+    let state=Reopened{loaded,arena_end:ae,index:Ghost(index@),tail:Ghost(tail)};
+    Some(VolumeRoots{state,arena_fence:af,root_fence:rf})
 }
 
 }

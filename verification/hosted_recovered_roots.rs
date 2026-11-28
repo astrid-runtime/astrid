@@ -51,6 +51,20 @@ pub(crate) fn recover_indexed<R:frame_repair::FrameReader,M:frame_repair::Medium
         journal::Live::Repaired(at,_,t)=>(at,t),
         _=>return None,
     };
+    load_history(history,at,arena,index,batch,limit,scheme,hash,identify,project)
+}
+
+/// Both file and volume recovery validate the same projection and physical records.
+pub(crate) fn load_history<A:positional_read::Media,P:Ord,H,I,F>(history:BTreeMap<P,(RootState,u64)>,at:u64,arena:&A,
+    index:&BTreeMap<ObjectId,ArenaLocation>,batch:u64,limit:u64,scheme:root_wire::Scheme,hash:H,identify:I,project:F)
+    -> (out:Option<Loaded<P>>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&ObjectRecord)->[u8;32]+Copy,F:FnOnce(&BTreeMap<P,(RootState,u64)>)->BTreeMap<P,RootState>,
+    requires btree_map_inv(&history),btree_map_inv(index),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|h:&BTreeMap<P,(RootState,u64)>| #[trigger] project.requires((h,)),
+        forall|h:&BTreeMap<P,(RootState,u64)>,t:BTreeMap<P,RootState>| #[trigger] project.ensures((h,),t) ==> btree_map_inv(&t),
+    ensures out matches Some(v) ==> v.end==at && v.history@==history@ && retained(&v,arena.image(),index@,scheme),
+{
     let candidate=project(&history);
     let format=Format{magic:arena_frame::ARENA_MAGIC,version:arena_frame::FRAME_VERSION,scheme,limit};
     let (roots,(records,known))=preload::preload_closure(index,&history,arena,batch,format,hash,identify,candidate)?;

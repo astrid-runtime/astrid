@@ -220,6 +220,31 @@ pub(crate) closed spec fn container_failure<V:crate::frontier::JournalContainer>
     exists|v:V| (v.container_id(),v.region_id())==target && v.journal_image()==bytes && #[trigger] v.sync_failed(error)
 }
 
+pub(crate) fn persist_staged<M:crate::frame_repair::Medium,V:crate::frontier::JournalContainer,F:FnOnce(&M)->V>(
+    media:&M,capture:F) -> (out:Result<V,V::Error>)
+    requires capture.requires((media,)),
+        forall|v:V| #[trigger] capture.ensures((media,),v) ==> (v.container_id(),v.region_id())==media.target() && v.journal_image()==media.bytes(),
+    ensures out matches Ok(v) ==> (v.container_id(),v.region_id())==media.target() && v.durable_image()==media.bytes() &&
+        exists|before:V| #[trigger] capture.ensures((media,),before) && v.sync_attempts()==before.sync_attempts().push(Ok(())),
+        out matches Err(e) ==> container_failure::<V>(media.target(),media.bytes(),e),
+{
+    let backing=crate::frontier::Backing::<(),&M>::Volume(media);
+    let take=|m:&&M| -> (v:V)
+        requires *m==media,
+        ensures capture.ensures((*m,),v),
+        {capture(*m)};
+    match backing.persist_repair(|_:&()| Ok(()),take) {
+        Ok(Some(region))=>Ok(region),
+        Ok(None)=>{assert(false);unreachable!()},
+        Err(e)=>{
+            let ghost before=choose|v:V| #[trigger] take.ensures((&media,),v) && v.sync_failed(e);
+            assert(before.sync_failed(e));
+            assert(container_failure::<V>(media.target(),media.bytes(),e));
+            Err(e)
+        },
+    }
+}
+
 pub(crate) fn recover_volume<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D,C,H,V:crate::frontier::JournalContainer,F:FnOnce(&M)->V>(
     reader:&mut R,media:&mut M,end:u64,protected:u64,limit:u64,scheme:root_wire::Scheme,decode:D,recode:C,hash:H,capture:F)
     -> (out:VolumeRecovery<P,R::Error,crate::frame_repair::Error<M::Error>,V>)
@@ -230,24 +255,18 @@ pub(crate) fn recover_volume<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((ROOT_MAGIC,n,b)),
         forall|m:&M| m.target()==old(media).target() && !m.syncs_file() ==> #[trigger] capture.requires((m,)),
         forall|m:&M,v:V| #[trigger] capture.ensures((m,),v) ==> (v.container_id(),v.region_id())==m.target() && v.journal_image()==m.bytes(),
-    ensures out matches VolumeRecovery::Persisted(at,t,v) ==> protected<=at<end && (v.container_id(),v.region_id())==old(reader).target() &&
+    ensures out matches VolumeRecovery::Persisted(at,t,v) ==> btree_map_inv(&t) && final(media).target()==old(media).target() && final(media).bytes()==v.durable_image() && protected<=at<end && (v.container_id(),v.region_id())==old(reader).target() &&
             v.durable_image()==old(reader).image().take(at as int) && recovered(t@,v.durable_image(),at,limit,scheme,decode,recode,hash),
-        out matches VolumeRecovery::Unmodified(t) ==> *final(media)==*old(media) && recovered(t@,final(media).bytes(),end,limit,scheme,decode,recode,hash),
+        out matches VolumeRecovery::Unmodified(t) ==> btree_map_inv(&t) && *final(media)==*old(media) && recovered(t@,final(media).bytes(),end,limit,scheme,decode,recode,hash),
         out matches VolumeRecovery::Container(at,e) ==> protected<=at<end && final(media).bytes()==old(reader).image().take(at as int) &&
             container_failure::<V>(old(reader).target(),final(media).bytes(),e),
 {
     match recover_live(reader,media,end,protected,limit,scheme,decode,recode,hash) {
         Live::Complete(t)=>VolumeRecovery::Unmodified(t),
         Live::Repaired(at,_,table)=>{
-            let mut region=capture(media);
-            let ghost before=region;
-            match region.sync_container() {
-                Ok(())=>VolumeRecovery::Persisted(at,table,region),
-                Err(e)=>{
-                    assert(before.sync_failed(e));
-                    assert(container_failure::<V>(old(reader).target(),media.bytes(),e));
-                    VolumeRecovery::Container(at,e)
-                },
+            match persist_staged(media,capture) {
+                Ok(region)=>VolumeRecovery::Persisted(at,table,region),
+                Err(e)=>VolumeRecovery::Container(at,e),
             }
         },
         Live::Frame(at,e)=>VolumeRecovery::Frame(at,e),

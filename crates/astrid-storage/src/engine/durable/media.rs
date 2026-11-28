@@ -219,10 +219,8 @@ impl DurableIo for File {
     }
 
     fn durable_sync_repaired_tail(&self) -> io::Result<()> {
-        match self {
-            Self::Native(file) => file.sync_data(),
-            Self::Volume(file) => file.sync_data(),
-        }
+        self.persist_repair(NativeFile::sync_data, |region| region)
+            .map(drop)
     }
 
     fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -280,6 +278,15 @@ impl StoreMetadata {
             Self::Native(metadata) => metadata.len(),
             Self::Volume(metadata) => metadata.len(),
         }
+    }
+}
+
+// Tail repair borrows the selected region and propagates the original I/O error.
+impl super::frontier::JournalContainer for &VolumeFile {
+    type Error = io::Error;
+
+    fn sync_container(&mut self) -> io::Result<()> {
+        self.sync_data()
     }
 }
 

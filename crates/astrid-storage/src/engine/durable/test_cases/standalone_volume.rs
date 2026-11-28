@@ -286,3 +286,41 @@ fn reopen_after_failed_tail_sync_requires_a_successful_volume_fence() {
     );
     drop(engine);
 }
+
+#[test]
+fn cold_volume_open_persists_both_repaired_regions_and_restores_the_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, volume, engine) = open_recording_engine(&directory);
+    let (commit, tx) = transaction("alice", None, b"retained");
+    let root = engine.commit(tx).unwrap().root();
+    engine.close().unwrap();
+    drop(engine);
+    let regions = [
+        VolumeRegion::new(ARENA_FILE).unwrap(),
+        VolumeRegion::new(ROOT_FILE).unwrap(),
+    ];
+    let lengths = regions.each_ref().map(|r| volume.region_len(r).unwrap());
+    for (region, len) in regions.iter().zip(lengths) {
+        volume
+            .write_region_from(region, len, 5, &mut &[0; 5][..])
+            .unwrap();
+    }
+    volume.sync().unwrap();
+    let recovered = TestEngine::open_volume(
+        volume.clone(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    // Inspect a second container before another engine has a chance to repair it.
+    let copy = directory.path().join("both-repaired.volume");
+    std::fs::copy(path, &copy).unwrap();
+    let stable = HostedFileVolume::open(copy).unwrap();
+    for (region, len) in regions.iter().zip(lengths) {
+        assert_eq!(stable.region_len(region).unwrap(), len);
+    }
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert!(recovered.object(commit).unwrap().is_some());
+}

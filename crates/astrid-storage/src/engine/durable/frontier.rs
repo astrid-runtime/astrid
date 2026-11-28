@@ -42,6 +42,7 @@ pub(super) fn wal_position<L: Copy>(current: u64, tail: Option<L>, observed: u64
 
 pub(super) trait JournalContainer {
     type Error;
+    spec fn sync_attempts(&self) -> Seq<Result<(),Self::Error>>;
     spec fn journal_image(&self) -> Seq<u8>;
     spec fn durable_image(&self) -> Seq<u8>;
     spec fn container_id(&self) -> int;
@@ -49,6 +50,7 @@ pub(super) trait JournalContainer {
     spec fn sync_failed(&self,error:Self::Error) -> bool;
     fn sync_container(&mut self) -> (out:Result<(),Self::Error>)
         ensures final(self).container_id()==old(self).container_id(), final(self).region_id()==old(self).region_id(),
+            final(self).sync_attempts()==old(self).sync_attempts().push(out),
             out.is_ok() ==> final(self).durable_image()==old(self).journal_image(),
             out matches Err(e) ==> old(self).sync_failed(e);
 }
@@ -60,6 +62,38 @@ pub(super) enum JournalFlush<C> { StableFile, AwaitingContainer(C) }
 pub(super) enum Backing<N,V> { Native(N), Volume(V) }
 
 impl<N,V> Backing<N,V> {
+    /// Finalize a repaired length on the owning backing before returning.
+    /// Group commit can defer a container fence; repair has no later writer.
+    pub(super) fn persist_repair<'a,C:JournalContainer<Error=E>,E,F:FnOnce(&N)->Result<(),E>,G:FnOnce(&'a V)->C>(
+        &'a self,fsync:F,capture:G) -> (out:Result<Option<C>,E>)
+        requires self matches Self::Native(n) ==> fsync.requires((n,)),
+            self matches Self::Volume(v) ==> capture.requires((v,)),
+        ensures match self {
+            Self::Native(n)=>match out {
+                Ok(None)=>fsync.ensures((n,),Ok(())),Err(e)=>fsync.ensures((n,),Err(e)),_=>false,
+            },
+            Self::Volume(v)=>exists|before:C| #[trigger] capture.ensures((v,),before) &&
+                match out {
+                    Err(e)=>before.sync_failed(e),
+                    Ok(Some(after))=>after.durable_image()==before.journal_image() &&
+                        after.container_id()==before.container_id() && after.region_id()==before.region_id() &&
+                        after.sync_attempts()==before.sync_attempts().push(Ok(())),
+                    Ok(None)=>false,
+                },
+        },
+    {
+        match self {
+            Self::Native(n)=>{fsync(n)?;Ok(None)}
+            Self::Volume(v)=>{
+                let mut handle=capture(v);
+                let ghost before=handle;
+                handle.sync_container()?;
+                assert(handle.sync_attempts()==before.sync_attempts().push(Ok(())));
+                Ok(Some(handle))
+            }
+        }
+    }
+
     pub(super) fn flush_with<C,E,F:FnOnce(&N)->Result<(),E>,G:FnOnce(&V)->C>(
         &self,fsync:F,capture:G) -> (out:Result<JournalFlush<C>,E>)
         requires self matches Self::Native(n) ==> fsync.requires((n,)),

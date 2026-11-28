@@ -367,12 +367,31 @@ def consumer_defects():
         ("classified tail", integrated, "protected,e.damage(),ROOT_MAGIC,limit)", "protected,crate::frame_repair::Damage::Incomplete,ROOT_MAGIC,limit)"),
         ("repaired history", integrated, "Live::Repaired(at,e,table)", "Live::Repaired(at,e,BTreeMap::new())"),
         ("refused suffix", integrated, "Ok(Outcome::Reject)=>Live::Frame(at,FrameError::Tail(e))", "Ok(Outcome::Reject)=>Live::Repaired(at,e,table)"),
-        ("container persistence", integrated, "match region.sync_container()", "match Ok::<(),V::Error>(())"),
-        ("container failure", integrated, "VolumeRecovery::Container(at,e)\n", "VolumeRecovery::Persisted(at,table,region)\n"),
-        ("returned volume history", integrated, "Ok(())=>VolumeRecovery::Persisted(at,table,region)", "Ok(())=>VolumeRecovery::Persisted(at,BTreeMap::new(),region)"),
+        ("container persistence", walker.with_name("frontier.rs"), "handle.sync_container()?;", "/* skip container sync */"),
+        ("container failure", integrated, "Err(e)=>VolumeRecovery::Container(at,e)", "Err(_)=>VolumeRecovery::Unmodified(table)"),
+        ("returned volume history", integrated, "Ok(region)=>VolumeRecovery::Persisted(at,table,region)", "Ok(region)=>VolumeRecovery::Persisted(at,BTreeMap::new(),region)"),
     ]:
         yield (
             f"repaired journal loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )
+
+    backing = walker.with_name("frontier.rs")
+    volume = Path("verification/hosted_arena_scan.rs")
+    for label, source, clause, weakness in [
+        ("native sync", backing, "Self::Native(n)=>{fsync(n)?;Ok(None)}", "Self::Native(_)=>{Ok(None)}"),
+        ("returned container", backing, "Ok(Some(handle))", "Ok(None)"),
+        ("container failure", backing, "handle.sync_container()?;", "let _=handle.sync_container();"),
+        ("arena fence", volume, "Ok(region)=>VolumeIndex::Persisted(at,index,region)", "Ok(_)=>VolumeIndex::Clean(index)"),
+        ("arena fence error", volume, "Err(e)=>VolumeIndex::Container(at,e)", "Err(_)=>VolumeIndex::Clean(index)"),
+        ("empty arena fence", volume, "if at==end {return VolumeIndex::Clean(index);}", "if at<=end {return VolumeIndex::Clean(index);}"),
+        ("returned arena receipt", volume, "state,arena_fence:af,root_fence:rf", "state,arena_fence:None,root_fence:rf"),
+        ("returned journal receipt", volume, "state,arena_fence:af,root_fence:rf", "state,arena_fence:af,root_fence:None"),
+        ("journal end", volume, "load_history(history,re,&arena,", "load_history(history,end,&arena,"),
+        ("physical region separation", volume, "old(scan).target().1!=old(reader).target().1,", "true,"),
+    ]:
+        yield (
+            f"volume repair loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )
 
@@ -390,7 +409,7 @@ def consumer_defects():
         ("positional identity", arena_scan, "a.target()==m.target() && a.image()==m.durable()", "a.image()==m.durable()"),
         ("positional image", arena_scan, "a.target()==m.target() && a.image()==m.durable()", "a.target()==m.target()"),
         ("refusal cause", arena_scan, "return Recovery::Record(at,b,e);", "return Recovery::Record(at,b,IndexError::Collision(ObjectId::new([0;32])));"),
-        ("restored index", arena_scan, "index:Ghost(index@),tail:Ghost(tail)", "index:Ghost(Map::empty()),tail:Ghost(tail)"),
+        ("restored index", arena_scan, "Some(Reopened{loaded,arena_end:at,index:Ghost(index@)", "Some(Reopened{loaded,arena_end:at,index:Ghost(Map::empty())"),
     ]:
         yield (
             f"arbitrary arena recovery loses {label}", source,
@@ -410,7 +429,7 @@ def consumer_defects():
 
     loaded = Path("verification/hosted_recovered_roots.rs")
     for label, source, clause, weakness in [
-        ("persisted end", loaded, "history:Ghost(history@),end:at", "history:Ghost(history@),end"),
+        ("persisted end", loaded, "history:Ghost(history@),end:at", "history:Ghost(history@),end:0"),
         ("root projection", loaded, "let v=Loaded{roots,records", "let v=Loaded{roots:BTreeMap::new(),records"),
         ("restored object domain", loaded, "roots,records,known,history:Ghost", "roots,records,known:BTreeSet::new(),history:Ghost"),
         ("separate physical targets", loaded, "arena.target()!=old(reader).target(),", "true,"),
