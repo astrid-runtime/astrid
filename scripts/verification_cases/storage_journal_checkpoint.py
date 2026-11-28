@@ -199,6 +199,17 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), publication,
         )
 
+    merge_rows = Path("crates/astrid-storage/src/engine/durable/wal/merge_rows.rs")
+    for label, before, after in [
+        ("lower prepared identity", "Ordering::Greater=>Row::Prepared(*j,frame)", "Ordering::Greater=>Row::Prepared(*i,frame)"),
+        ("overlapping record", "Ordering::Equal=>Row::Both(*i,record,frame)", "Ordering::Equal=>Row::Prepared(*j,frame)"),
+        ("decoded payload", "if &decoded==record", "if &decoded!=record"),
+    ]:
+        yield (
+            f"WAL input merge loses {label}", merge_rows,
+            lambda s, a=before, b=after: replace_once(s, a, b), merge_rows,
+        )
+
     batch_writer = Path("verification/hosted_wal_batch_writer.rs")
     for label, clause, weakness in [
         ("object ordinal", "o.encoding.flag(),sequence,count as u64,o.body.len()", "o.encoding.flag(),sequence,0,o.body.len()"),

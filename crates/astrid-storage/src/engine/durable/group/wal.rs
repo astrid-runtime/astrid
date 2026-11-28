@@ -168,66 +168,34 @@ where
         for (position, accepted) in accepted.iter().enumerate() {
             let sequence = writer.next_sequence().map_err(wal_durable_error)?;
             writer.begin(sequence, None).map_err(wal_durable_error)?;
-            if position == 0 {
-                let mut staged = staged.iter().peekable();
-                let mut prepared = prepared[position].iter().peekable();
-                loop {
-                    match (staged.peek(), prepared.peek()) {
-                        (Some((staged_id, staged_record)), Some((prepared_id, frame))) => {
-                            match staged_id.cmp(prepared_id) {
-                                std::cmp::Ordering::Less => {
-                                    writer
-                                        .append_object(**staged_id, staged_record)
-                                        .map_err(wal_durable_error)?;
-                                    staged.next();
-                                },
-                                std::cmp::Ordering::Greater => {
-                                    writer
-                                        .append_prepared_object(**prepared_id, frame)
-                                        .map_err(wal_durable_error)?;
-                                    prepared.next();
-                                },
-                                std::cmp::Ordering::Equal => {
-                                    let (_, decoded) =
-                                        decode_object_frame(frame, self.identity.scheme())
-                                            .map_err(|detail| DurableError::Corrupt {
-                                                file: ARENA_FILE,
-                                                offset: 0,
-                                                detail,
-                                            })?;
-                                    if decoded != **staged_record {
-                                        return Err(ModelError::ObjectCollision(**staged_id).into());
-                                    }
-                                    writer
-                                        .append_prepared_object(**prepared_id, frame)
-                                        .map_err(wal_durable_error)?;
-                                    staged.next();
-                                    prepared.next();
-                                },
-                            }
+            let empty = BTreeMap::new();
+            let staged_rows = if position == 0 { staged } else { &empty };
+            super::super::merge_rows::merge(
+                staged_rows,
+                &prepared[position],
+                &mut *writer,
+                |writer, row| -> Result<_, DurableError> {
+                    use super::super::merge_rows::Input;
+                    let input = row.resolve(
+                        |frame| {
+                            decode_object_frame(frame, self.identity.scheme())
+                                .map(|(_, record)| record)
+                                .map_err(|detail| DurableError::Corrupt {
+                                    file: ARENA_FILE,
+                                    offset: 0,
+                                    detail,
+                                })
                         },
-                        (Some((id, record)), None) => {
-                            writer
-                                .append_object(**id, record)
-                                .map_err(wal_durable_error)?;
-                            staged.next();
-                        },
-                        (None, Some((id, frame))) => {
-                            writer
-                                .append_prepared_object(**id, frame)
-                                .map_err(wal_durable_error)?;
-                            prepared.next();
-                        },
-                        (None, None) => break,
+                        |id| DurableError::from(ModelError::ObjectCollision(id)),
+                    )?;
+                    match input {
+                        Input::Staged(id, record) => writer.append_object(id, record),
+                        Input::Prepared(id, frame) => writer.append_prepared_object(id, frame),
                     }
-                }
-            } else {
-                for (id, frame) in &prepared[position] {
-                    writer
-                        .append_prepared_object(*id, frame)
-                        .map_err(wal_durable_error)?;
-                }
-            }
+                    .map_err(wal_durable_error)?;
+                    Ok(writer)
+                },
+            )?;
             accepted
                 .prepared
                 .root

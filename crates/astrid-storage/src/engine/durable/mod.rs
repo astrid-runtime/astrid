@@ -869,6 +869,8 @@ mod journal_snapshot;
 mod journal_transition;
 mod journal_visitor;
 mod lifecycle;
+#[path = "wal/merge_rows.rs"]
+mod merge_rows;
 mod native_io;
 mod recovery;
 mod representation_engine;

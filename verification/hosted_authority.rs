@@ -237,6 +237,8 @@ mod root_transition;
 mod wal_root_history;
 #[path = "../crates/astrid-storage/src/engine/durable/closure_load.rs"]
 mod closure_load;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/merge_rows.rs"]
+mod merge_rows;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/overlay_object.rs"]
 mod overlay_object;
 #[path = "../crates/astrid-storage/src/engine/transaction_records.rs"]
