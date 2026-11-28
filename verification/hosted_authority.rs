@@ -227,6 +227,8 @@ mod reference_kind;
 use reference_kind::ReferenceKind;
 #[path = "../crates/astrid-storage/src/storage_model/object_reference.rs"]
 mod object_reference;
+#[path = "../crates/astrid-storage/src/storage_model/reference_lookup.rs"]
+mod reference_lookup;
 #[path = "../crates/astrid-storage/src/storage_model/root_state.rs"]
 mod root_state;
 use root_state::{RootGeneration, RootState};
@@ -339,6 +341,7 @@ mod checkpoint_header;
 mod checkpoint_value;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_mutation.rs"]
 mod delta_mutation;
+mod hosted_delta_mutation;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_entries.rs"]
 mod checkpoint_entries;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_leaf_summary.rs"]

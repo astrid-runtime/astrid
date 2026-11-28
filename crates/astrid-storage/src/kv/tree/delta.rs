@@ -4,7 +4,7 @@ use crate::storage_model::{
     ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel,
 };
 
-use super::node::{INLINE_VALUE_MAX, NodeTotals, ValueSlot};
+use super::node::{NodeTotals, ValueSlot};
 use super::overlay::OverlayMap;
 use super::validation::validate_composite_key;
 use super::{FORMAT_VERSION, ROOT_LABEL};
@@ -13,11 +13,10 @@ use crate::kv::tree_error::invalid;
 
 const CHECKPOINT: u8 = 0;
 const DELTA: u8 = 1;
-const DELETE: u8 = 0;
-const INLINE: u8 = 1;
-const SPILLED: u8 = 2;
+#[cfg(test)]
+use super::delta_mutation::{DELETE, INLINE, SPILLED};
+use super::delta_mutation::{Operation, ReadError, WriteError};
 const PREVIOUS_LABEL: &[u8] = b"previous";
-const VALUE_LABEL_PREFIX: &[u8] = b"value/";
 
 pub(super) use super::delta_mutation::Mutation;
 
@@ -116,32 +115,13 @@ pub(super) fn delta_record(
         ));
     }
     for (index, mutation) in mutations.iter().enumerate() {
-        let key_length = u32::try_from(mutation.key.len()).map_err(|_| arithmetic_overflow())?;
-        canonical.extend_from_slice(&key_length.to_le_bytes());
-        canonical.extend_from_slice(&mutation.key);
-        match &mutation.value {
-            None => canonical.push(DELETE),
-            Some(ValueSlot::Inline(value)) => {
-                if value.len() > INLINE_VALUE_MAX {
-                    return Err(serialization("oversized inline KV delta value"));
-                }
-                canonical.push(INLINE);
-                canonical.extend_from_slice(
-                    &u64::try_from(value.len())
-                        .map_err(|_| arithmetic_overflow())?
-                        .to_le_bytes(),
-                );
-                canonical.extend_from_slice(value);
-            },
-            Some(ValueSlot::Spilled { object, length }) => {
-                if *length <= INLINE_VALUE_MAX as u64 {
-                    return Err(serialization("small KV delta value was not inlined"));
-                }
-                canonical.push(SPILLED);
-                canonical.extend_from_slice(&length.to_le_bytes());
-                references.push(ObjectReference::owns(value_label(index)?, *object));
-            },
-        }
+        mutation
+            .append(index, &mut canonical, &mut references)
+            .map_err(|error| match error {
+                WriteError::Overflow => arithmetic_overflow(),
+                WriteError::Oversized => serialization("oversized inline KV delta value"),
+                WriteError::SmallSpill => serialization("small KV delta value was not inlined"),
+            })?;
     }
     references.sort();
     ObjectRecord::new(
@@ -220,35 +200,41 @@ fn decode_delta(
         .transpose()?;
     let mut mutations = Vec::with_capacity(count);
     for index in 0..count {
-        let key_length = cursor.u32_usize()?;
-        let key = cursor.take(key_length)?.to_vec();
+        let key = super::checkpoint_key_field::read(cursor.bytes, &mut cursor.offset)
+            .map_err(|error| match error {
+                super::checkpoint_key_field::KeyError::Field(error) => field_error(id, error),
+                super::checkpoint_key_field::KeyError::Length => {
+                    invalid(id, "KV projection count is too large")
+                },
+            })?
+            .to_vec();
         validate_composite_key(id, &key)?;
-        let value = match cursor.u8()? {
-            DELETE => None,
-            INLINE => {
-                let length = cursor.u64_usize()?;
-                if length > INLINE_VALUE_MAX {
-                    return Err(invalid(id, "oversized inline KV delta value"));
+        let operation =
+            super::delta_mutation::read(cursor.bytes, &mut cursor.offset).map_err(|error| {
+                match error {
+                    ReadError::Field(error) => field_error(id, error),
+                    ReadError::Length => invalid(id, "KV projection length is too large"),
+                    ReadError::Oversized => invalid(id, "oversized inline KV delta value"),
+                    ReadError::SmallSpill => invalid(id, "small KV delta value was not inlined"),
+                    ReadError::Tag => invalid(id, "invalid KV delta operation tag"),
                 }
-                Some(ValueSlot::Inline(cursor.take(length)?.to_vec()))
+            })?;
+        let value = match operation {
+            Operation::Delete => None,
+            Operation::Inline(data) => Some(ValueSlot::Inline(data.to_vec())),
+            Operation::Spill(length) => {
+                let object = super::delta_mutation::spill_object(record.references(), index)
+                    .map_err(|error| match error {
+                        super::delta_mutation::EdgeError::Index => arithmetic_overflow(),
+                        super::delta_mutation::EdgeError::Missing => {
+                            invalid(id, "spilled KV delta value is missing")
+                        },
+                        super::delta_mutation::EdgeError::NonOwning => {
+                            invalid(id, "spilled KV delta value is not owning")
+                        },
+                    })?;
+                Some(ValueSlot::Spilled { object, length })
             },
-            SPILLED => {
-                let length = cursor.u64()?;
-                if length <= INLINE_VALUE_MAX as u64 {
-                    return Err(invalid(id, "small KV delta value was not inlined"));
-                }
-                let reference = record
-                    .reference(&value_label(index)?)
-                    .ok_or_else(|| invalid(id, "spilled KV delta value is missing"))?;
-                if reference.kind() != ReferenceKind::Owns {
-                    return Err(invalid(id, "spilled KV delta value is not owning"));
-                }
-                Some(ValueSlot::Spilled {
-                    object: reference.target(),
-                    length,
-                })
-            },
-            _ => return Err(invalid(id, "invalid KV delta operation tag")),
         };
         mutations.push(Mutation { key, value });
     }
@@ -294,12 +280,11 @@ pub(super) fn mutation_payload_bytes(mutations: &[Mutation]) -> StorageResult<u6
     })
 }
 
-fn value_label(index: usize) -> StorageResult<ReferenceLabel> {
-    let index = u32::try_from(index).map_err(|_| arithmetic_overflow())?;
-    let mut label = Vec::with_capacity(VALUE_LABEL_PREFIX.len().saturating_add(4));
-    label.extend_from_slice(VALUE_LABEL_PREFIX);
-    label.extend_from_slice(&index.to_be_bytes());
-    Ok(ReferenceLabel::new(label))
+fn field_error(id: ObjectId, error: crate::storage_fields::ReadError) -> StorageError {
+    match error {
+        crate::storage_fields::ReadError::Overflow(_) => arithmetic_overflow(),
+        crate::storage_fields::ReadError::Truncated => invalid(id, "truncated KV projection head"),
+    }
 }
 
 fn arithmetic_overflow() -> StorageError {
@@ -359,11 +344,6 @@ impl<'a> Cursor<'a> {
 
     fn u64(&mut self) -> StorageResult<u64> {
         Ok(u64::from_le_bytes(self.array()?))
-    }
-
-    fn u64_usize(&mut self) -> StorageResult<usize> {
-        usize::try_from(self.u64()?)
-            .map_err(|_| invalid(self.id, "KV projection length is too large"))
     }
 
     fn done(self) -> StorageResult<()> {

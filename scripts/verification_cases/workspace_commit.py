@@ -102,13 +102,17 @@ def defects():
         ("failure can substitute a different matching edge", "&& state_edge(*c) == Some(edge)", "&& true"),
         ("state edge can point elsewhere", "r.fields() == (super::commit_candidate::STATE@,g.state_id,super::ReferenceKind::Owns)", "r.fields().0 == super::commit_candidate::STATE@"),
         ("state can carry a different shape", "&&& structural(*g.state,ObjectKind::PrincipalState,v)", "&&& true"),
-        ("canonical state edge can be missed", "forall|i:int| #[trigger] positioned(refs@,label@,i) ==> (out matches Some(r) && *r == refs@[i]),", "true,"),
         ("read error may come from another object", "out matches Err(Error::Read(error)) ==> load.ensures((owner,root.commit),Err(error))", "out matches Err(Error::Read(error)) ==> true"),
     ]:
         yield (
             f"content graph {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    yield (
+        "content graph canonical state edge can be missed", Path("crates/astrid-storage/src/storage_model/reference_lookup.rs"),
+        lambda s: replace_once(s, "forall|i:int| #[trigger] positioned(refs@,label@,i) ==> (out matches Some(r) && *r == refs@[i]),", "true,"), trace,
+    )
 
     component_source = Path("crates/astrid-storage/src/content/store/components.rs")
     component_trace = Path("verification/hosted_header_components.rs")

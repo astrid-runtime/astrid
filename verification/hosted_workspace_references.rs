@@ -41,8 +41,8 @@ fn find_canonical_state(refs:&[ObjectReference],i:Ghost<int>) -> (out:Option<&Ob
             crate::ObjectRecord::ordered_pair(refs@,i@,j);
         }
     }
-    assert(crate::header_graph::positioned(refs@,b"state"@,i@));
-    crate::header_graph::find(refs,b"state")
+    assert(crate::reference_lookup::positioned(refs@,b"state"@,i@));
+    crate::reference_lookup::find(refs,b"state")
 }
 
 /// Starting at the writer's published root map, distinguish an exact cache

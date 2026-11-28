@@ -80,6 +80,21 @@ def consumer_defects():
             f"retirement storage loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), consumer,
         )
+    for label, clause, weaker in [
+        ("row encoding", "out.is_ok() ==> final(bytes)@ == old(bytes)@ + self.payload()", "true"),
+        ("edge target", "final(refs)@.last().fields() == (label_bytes(index as u32),object,super::ReferenceKind::Owns)", "true"),
+        ("edge prefix", "final(refs)@.drop_last() == old(refs)@ &&", "true &&"),
+        ("parse eligibility", "out.is_ok() == valid(bytes@,*old(cursor) as int)", "true"),
+        ("delete extent", "*final(cursor) as int == start+1,", "true,"),
+        ("inline content", "data@ == bytes@.subrange(start+9,*final(cursor) as int)", "true"),
+        ("spill length", "&& length == n,", ","),
+        ("spill lookup", "==> out == Ok(refs@[i].fields().1)", "==> true"),
+        ("index label", "label.value()@ == label_bytes(index as u32)", "true"),
+    ]:
+        yield (
+            f"delta wire loses {label}", delta,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

@@ -29,6 +29,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::num::NonZeroU32;
 mod object_reference;
+pub(crate) mod reference_lookup;
 mod root_state;
 pub use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 pub use root_state::{RootGeneration, RootState};
