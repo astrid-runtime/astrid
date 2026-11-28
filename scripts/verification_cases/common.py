@@ -123,6 +123,7 @@ INPUTS = [
     Path("verification/hosted_wal_writer_trace.rs"),
     Path("verification/hosted_closure_model.rs"),
     Path("verification/hosted_record_model.rs"),
+    Path("crates/astrid-storage/src/engine/durable_cache/resident.rs"),
     Path("crates/astrid-storage/src/engine/durable/format/recovered_record.rs"),
     Path("crates/astrid-storage/src/engine/durable/read_admission.rs"),
     Path("verification/hosted_arena_placement.rs"),

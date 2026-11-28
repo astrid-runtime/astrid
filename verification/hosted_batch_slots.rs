@@ -123,6 +123,39 @@ fn published<P:Ord+Copy>(owner:P,commit:&crate::read_admission::PublishedCommitP
     candidate.warm(&owner,current,roots,index,offer)
 }
 
+/// Read the newly installed physical record through a real principal partition.
+fn resident_lookup(owner:u64,requester:u64,stored:ObjectId,request:ObjectId,record:Arc<ObjectRecord>,
+    tick:u64,projection:u64) -> (out:Option<Arc<ObjectRecord>>)
+    requires vstd::laws_cmp::obeys_cmp::<Arc<u64>>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<Arc<u64>>(),
+        vstd::laws_cmp::obeys_cmp::<ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),
+        vstd::laws_cmp::obeys_cmp::<(u64,ObjectId)>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<(u64,ObjectId)>(),
+        vstd::std_specs::cmp::borrowed_key_ordering_matches::<Arc<u64>,u64>(),
+    ensures out == if requester == owner && request == stored {Some(record)} else {None},
+{
+    use std::collections::{BTreeMap,BTreeSet};
+    use crate::resident::{self,Partition,PrincipalEntry};
+    let mut objects = BTreeMap::new();
+    let mut partitions = BTreeMap::new();
+    let mut entries = BTreeMap::new();
+    let mut global = BTreeSet::new();
+    let mut local = BTreeSet::new();
+    let mut clock = tick;
+    resident::install(&mut objects,stored,record,17,tick,owner);
+    entries.insert(stored,PrincipalEntry {last_access:tick,projections:projection});
+    global.insert((tick,stored)); local.insert((tick,stored));
+    let key = Arc::new(owner);
+    partitions.insert(Arc::clone(&key),Partition {entries,lru:local,charged_bytes:17});
+    let check = |p:&u64| requires *p == requester, { };
+    assert(partitions@.contains_key(key) && *key == owner && partitions@[key].entries@.contains_key(stored));
+    if requester == owner && stored.same(&request) {assert(resident::member(partitions@,requester,request));}
+    let out = resident::visit(&requester,request,&mut partitions,&mut objects,&mut clock,&mut global,check);
+    assert(objects@[stored].record == record);
+    let partition = partitions.get(&key).unwrap();
+    assert(partition.charged_bytes == 17 && partition.entries@[stored].projections == projection);
+    assert(clock == if requester == owner && request == stored {resident::next(tick)} else {tick});
+    out
+}
+
 fn load_visits<R,E,F>(plan:&[child_range::Visit],read:F, table:Ghost<spec_fn(ObjectId)->Option<R>>,
     error:Ghost<E>) -> (out:Result<Vec<(child_range::Visit,R)>,child_range::LoadError<E>>)
     where F:FnOnce(Vec<ObjectId>)->Result<Vec<Option<R>>,E>,

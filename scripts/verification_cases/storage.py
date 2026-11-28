@@ -822,6 +822,25 @@ def publication_cache_consumers():
         )
 
 
+def resident_cache_consumers():
+    path = Path("crates/astrid-storage/src/engine/durable_cache/resident.rs")
+    for label, clause, weaker in [
+        ("installed record", "final(objects)@ == old(objects)@.insert(id,\n        CachedObject {record,weight,last_access:tick,principals:members})", "final(objects)@.contains_key(id)"),
+        ("hit completeness", "out == if old(objects)@.contains_key(id)", "out.is_some() ==> out == if old(objects)@.contains_key(id)"),
+        ("hit record", "Some(old(objects)@[id].record)\n        } else", "out\n        } else"),
+        ("physical preservation", "==> final(objects)@[k].record == old(objects)@[k].record", "==> true"),
+        ("access clock", "out.is_some() ==> *final(clock) == next(*old(clock))", "true"),
+        ("principal charge", "&&& after.charged_bytes == before.charged_bytes", "&&& true"),
+        ("projection custody", "&&& after.entries@ == before.entries@.insert(id,PrincipalEntry {last_access:t,..old})", "&&& true"),
+        ("unrelated partitions", "if *peer != *owner { final(partitions)@[peer] == old(partitions)@[peer] }", "if *peer != *owner { true }"),
+    ]:
+        yield (
+            f"resident cache loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_batch_slots.rs"),
+        )
+
+
 def checkpoint_decode_consumers():
     yield from checkpoint_page_consumers()
     yield from checkpoint_reference_consumers()
@@ -836,3 +855,4 @@ def checkpoint_decode_consumers():
     yield from checkpoint_record_consumers()
     yield from durable_read_consumers()
     yield from publication_cache_consumers()
+    yield from resident_cache_consumers()

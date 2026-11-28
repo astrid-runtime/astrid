@@ -19,6 +19,7 @@ mod access;
 mod clear;
 mod policy;
 mod principals;
+mod resident;
 
 use principals::CachedPrincipals;
 
@@ -27,12 +28,7 @@ pub use policy::{
     ObjectCacheStats, PrincipalObjectCacheBudget,
 };
 
-struct CachedObject<P: Ord> {
-    record: Arc<ObjectRecord>,
-    weight: u64,
-    last_access: u64,
-    principals: CachedPrincipals<P>,
-}
+type CachedObject<P> = resident::CachedObject<CachedPrincipals<P>>;
 
 struct CachedProjection {
     value: Arc<dyn Any + Send + Sync>,
@@ -45,17 +41,9 @@ struct CacheAdmission {
     principal: ObjectCacheCapacity,
 }
 
-struct PrincipalEntry {
-    last_access: u64,
-    projections: BTreeMap<ProjectionCacheKey, CachedProjection>,
-}
+type PrincipalEntry = resident::PrincipalEntry<BTreeMap<ProjectionCacheKey, CachedProjection>>;
 
-#[derive(Default)]
-struct PrincipalPartition {
-    entries: BTreeMap<ObjectId, PrincipalEntry>,
-    lru: BTreeSet<(u64, ObjectId)>,
-    charged_bytes: u64,
-}
+type PrincipalPartition = resident::Partition<BTreeMap<ProjectionCacheKey, CachedProjection>>;
 
 struct CacheState<P: Ord> {
     entries: BTreeMap<ObjectId, CachedObject<P>>,
