@@ -88,6 +88,30 @@ pub(crate) fn recovered_header<P:Ord+Copy,M:crate::positional_read::Media,H:Fn([
         graph.from_arena(media.image(),index@,format.scheme,v),
 {
     let (roots,(table,_known))=preload_closure(index,history,media,target,format,hash,identify,candidate)?;
+    header_from_table(roots,table,owner,v,Ghost(media.image()),Ghost(index@),format.scheme)
+}
+
+/// Resolve the requesting owner directly from the table retained by cold restart.
+pub(crate) fn loaded_header<P:Ord+Copy>(loaded:crate::hosted_recovered_roots::Loaded<P>,owner:&P,
+    v:crate::ObjectFormatVersion,image:Ghost<Seq<u8>>,index:Ghost<Map<crate::ObjectId,crate::ArenaLocation>>,
+    scheme:crate::root_wire::Scheme) -> (out:Option<RecoveredGraph<P>>)
+    requires crate::hosted_recovered_roots::retained(&loaded,image@,index@,scheme),
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
+    ensures out matches Some(g) ==> g.owner==*owner && loaded.history@.contains_key(*owner) &&
+        g.root==loaded.history@[*owner].0 && g.records@==loaded.records@ && g.from_arena(image@,index@,scheme,v),
+{
+    header_from_table(loaded.roots,loaded.records,owner,v,image,index,scheme)
+}
+
+fn header_from_table<P:Ord+Copy>(roots:BTreeMap<P,RootState>,table:BTreeMap<crate::ObjectId,crate::ObjectRecord>,
+    owner:&P,v:crate::ObjectFormatVersion,image:Ghost<Seq<u8>>,index:Ghost<Map<crate::ObjectId,crate::ArenaLocation>>,
+    scheme:crate::root_wire::Scheme) -> (out:Option<RecoveredGraph<P>>)
+    requires btree_map_inv(&roots),btree_map_inv(&table),table@.dom().subset_of(index@.dom()),
+        crate::journal_preload::closed_on(table@,table@.dom()),crate::hosted_journal_history::backed_by_arena(image@,index@,scheme,table@),
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
+    ensures out matches Some(g) ==> g.owner==*owner && roots@.contains_key(*owner) && g.root==roots@[*owner] &&
+        g.records@==table@ && g.from_arena(image@,index@,scheme,v),
+{
     let root=crate::root_transition::published(&roots,owner)?;
     let records=&table;
     let load=|_:&P,id:crate::ObjectId| -> (r:Result<std::sync::Arc<crate::ObjectRecord>,()>)
@@ -96,8 +120,8 @@ pub(crate) fn recovered_header<P:Ord+Copy,M:crate::positional_read::Media,H:Fn([
         match records.get(&id) {Some(r)=>Ok(std::sync::Arc::new(r.owned_record())),None=>Err(())}
     };
     let (g,head)=match crate::header_graph::read_kv(owner,root,v,load) {Ok(pair)=>pair,Err(_)=>return None};
-    assert(media_record(media.image(),(root.commit,index@[root.commit]),format.scheme,table@[root.commit]));
-    assert(media_record(media.image(),(g.state_id,index@[g.state_id]),format.scheme,table@[g.state_id]));
+    assert(media_record(image@,(root.commit,index@[root.commit]),scheme,table@[root.commit]));
+    assert(media_record(image@,(g.state_id,index@[g.state_id]),scheme,table@[g.state_id]));
     proof {
         if let Some(id)=head {
             let refs=g.state.contents().3;
@@ -107,7 +131,7 @@ pub(crate) fn recovered_header<P:Ord+Copy,M:crate::positional_read::Media,H:Fn([
             assert(actual[i].fields()==edge.fields());
             owning_row(actual,i,id);
             assert(crate::journal_preload::outgoing(table@,g.state_id).subset_of(table@.dom()));
-            assert(media_record(media.image(),(id,index@[id]),format.scheme,table@[id]));
+            assert(media_record(image@,(id,index@[id]),scheme,table@[id]));
         }
     }
     Some(RecoveredGraph{owner:*owner,root,graph:g,component:head,records:table})

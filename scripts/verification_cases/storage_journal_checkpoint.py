@@ -41,6 +41,15 @@ def consumer_defects():
     journal = Path("verification/hosted_journal_history.rs")
     marker = Path("verification/hosted_delta_mutation.rs")
     admission = Path("verification/hosted_token_recovery.rs")
+    for label, source, before, after in [
+        ("owner", graph, "g.owner==*owner && loaded.history@", "loaded.history@"),
+        ("component", admission, "if !component.same(&marker) {return None;}", ""),
+        ("decision", admission, "Some((graph.root,result))", "Some((graph.root,Ok(Admission::Allowed)))"),
+    ]:
+        yield (
+            f"retained owner marker loses {label}", source,
+            lambda s, a=before, b=after: replace_once(s, a, b), admission,
+        )
     for label, source, clause, weaker, target in [
         ("arena target", checkpoint, "&&& s.arena_target()==old(files).arena_target()", "&&& true", consumer),
         ("stable arena bytes", checkpoint, "&&& stable.get(Target::Arena)==pending.get(Target::Arena)", "&&& true", consumer),

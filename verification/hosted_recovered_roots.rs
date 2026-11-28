@@ -15,6 +15,7 @@ pub(crate) struct Loaded<P> {
 
 pub(crate) open spec fn retained<P:Ord>(v:&Loaded<P>,image:Seq<u8>,index:Map<ObjectId,ArenaLocation>,scheme:root_wire::Scheme) -> bool {
     let h=v.history@;
+    &&& btree_map_inv(&v.roots) && btree_map_inv(&v.records)
     &&& v.roots@.dom()==h.dom()
     &&& forall|p:P| #[trigger] h.contains_key(p) ==> v.roots@[p]==h[p].0
     &&& v.known@==v.records@.dom() && v.known@.subset_of(index.dom())

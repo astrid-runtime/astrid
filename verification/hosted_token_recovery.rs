@@ -761,6 +761,48 @@ fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
         rev_read,used_read,legacy,Ghost(text@),Ghost(path))
 }
 
+/// Follow the owner in a physically retained restart table to its marker and run admission.
+/// A missing owner, unreadable header or different component yields no decision.
+fn decide_recovered_marker<P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A,R,C,F>(
+    loaded:crate::hosted_recovered_roots::Loaded<P>,owner:P,marker:crate::ObjectId,version:crate::ObjectFormatVersion,
+    image:Ghost<Seq<u8>>,index:Ghost<Map<crate::ObjectId,crate::ArenaLocation>>,scheme:crate::root_wire::Scheme,
+    kind:Marker,target:Id,single_use:bool,other:&(crate::memo_projection::Projection<B>,V),
+    select:Select,fail:Fail,measure:M,start:I,values:(K,D),translate:A,rev_read:R,used_read:C,legacy:F)
+    -> (out:Option<(crate::RootState,Result<Admission,ReopenError<E>>)>)
+    where Check:Fn(&[u8])->Option<KE>+Copy,Select:Fn(crate::ObjectId)->Check,Fail:Fn(crate::ObjectId)->E,
+        M:FnOnce(&P,Option<crate::ObjectId>)->Result<crate::projection_recovery::Measured<B,V>,E>,I:FnOnce(&P)->S,
+        K:Fn(S,Option<crate::ObjectId>,&Vec<u8>)->Result<(S,Option<Vec<u8>>),E>+Copy,
+        D:Fn(S,&crate::checkpoint_value::ValueSlot)->Result<(S,Vec<u8>),E>+Copy,A:Fn(crate::ObjectId,crate::delta_totals::ApplyError<E>)->E,
+        R:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,
+        C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
+    requires vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
+        crate::hosted_recovered_roots::retained(&loaded,image@,index@,scheme),index@.contains_key(marker),
+        forall|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) ==> crate::hosted_delta_mutation::marker_bytes(
+            crate::hosted_journal_history::component_bytes(image@,index@[marker]),ns_bytes(kind)+seq![0u8]+text),
+        forall|id:crate::ObjectId| #[trigger] select.requires((id,)),
+        forall|id:crate::ObjectId| #[trigger] fail.requires((id,)),
+        forall|id:crate::ObjectId,check:Check,b:&[u8]| #[trigger] select.ensures((id,),check) ==> #[trigger] check.requires((b,)),
+        vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|p:&P,tree:Option<crate::ObjectId>| *p==owner ==> #[trigger] measure.requires((p,tree)),
+        forall|p:&P| *p==owner ==> #[trigger] start.requires((p,)),
+        forall|s:S,t:Option<crate::ObjectId>,key:&Vec<u8>| #[trigger] values.0.requires((s,t,key)),
+        forall|s:S,v:&crate::checkpoint_value::ValueSlot| #[trigger] values.1.requires((s,v)),
+        forall|id:crate::ObjectId,e:crate::delta_totals::ApplyError<E>| #[trigger] translate.requires((id,e)),
+        checkpoint::readable(rev_read),checkpoint::readable(used_read),other.0.overlay.ordered_snapshot(),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+    ensures out matches Some((root,result)) ==> loaded.history@.contains_key(owner) && root==loaded.history@[owner].0 &&
+        loaded.records@.contains_key(marker) && (result matches Ok(decision) ==>
+            (kind is Revoked ==> decision is Revoked) && (single_use ==> !(decision is Allowed))),
+{
+    let graph=crate::hosted_recovered_header::loaded_header(loaded,&owner,version,image,index,scheme)?;
+    let component=graph.component?;
+    if !component.same(&marker) {return None;}
+    let result=reopen_loaded_marker(&graph,version,image,index,scheme,kind,target,single_use,other,
+        select,fail,measure,start,values,translate,rev_read,used_read,legacy);
+    Some((graph.root,result))
+}
+
 // A canonical marker delta followed by a physical delta for an unrelated key.
 fn two_written_components(owner:u64,newest:crate::ObjectId,writer:crate::ObjectId,target:Id,kind:Marker)
     -> (out:Result<Admission,ReopenError<()>>)
