@@ -85,7 +85,8 @@ proof fn permutation_members<T>(before:Seq<T>,after:Seq<T>)
     before.to_set_ensures(); after.to_set_ensures();
     assert(before.to_set() =~= after.to_set()) by {
         assert forall|r:T| before.to_set().contains(r) <==> #[trigger] after.to_set().contains(r) by {
-            assert(before.to_multiset().count(r)==after.to_multiset().count(r));
+            vstd::seq_lib::to_multiset_contains(before,r);
+            vstd::seq_lib::to_multiset_contains(after,r);
         }
     }
 }
