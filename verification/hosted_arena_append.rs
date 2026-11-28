@@ -5,6 +5,53 @@ use vstd::prelude::*;
 
 verus! {
 
+/// Check the physical frame domain, format, declared length and digest before replaying its payload.
+fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52],magic:[u8;8],version:u16,
+    body:&[u8],hash:H,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>) -> (accepted:bool)
+    requires forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),
+        forall|m:[u8;8],n:u64,b:&[u8],sum:[u8;32]| #[trigger] hash.ensures((m,n,b),sum) ==> sum == (digest@)(m,n,b@),
+    ensures accepted == (header@ == frame::header_bytes(magic,version,body.len() as u64,
+        (digest@)(magic,body.len() as u64,body@))),
+{
+    let ghost size = body.len() as u64;
+    let ghost sum = (digest@)(magic,size,body@);
+    let ghost canonical = frame::header_bytes(magic,version,size,sum);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(canonical.take(8) =~= magic@);
+        assert(canonical.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(size));
+        assert(canonical.subrange(20,52) =~= sum@);
+    }
+    if !frame::magic_matches(header,magic) {return false;}
+    let selected = match frame::decode_header(header,version) {Ok(v)=>v,Err(_)=>return false};
+    match frame::check_payload(selected,magic,body,hash) {
+        Ok(actual) => {
+            assert(selected.payload_len == size);
+            assert(header@.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(size));
+            assert(header@ =~= canonical) by {
+                assert forall|i:int| 0 <= i < 52 implies header@[i] == #[trigger] canonical[i] by {
+                    if i < 8 {assert(header@.take(8)[i] == header@[i]);}
+                    else if i >= 20 {assert(header@.subrange(20,52)[i-20] == header@[i]);}
+                    else if i >= 12 {assert(header@.subrange(12,20)[i-12] == header@[i]);}
+                }
+            }
+            true
+        },
+        Err(frame::PayloadError::Length) => {assert(header@ != canonical);false},
+        Err(frame::PayloadError::Checksum) => {
+            proof {if header@ == canonical {
+                assert(selected.payload_len == size);
+                assert(selected.checksum@ =~= sum@);
+                assert(selected.checksum =~= sum);
+                let ghost different = choose|v:[u8;32]| v != selected.checksum &&
+                    #[trigger] hash.ensures((magic,selected.payload_len,body),v);
+                assert(different == sum);
+            }}
+            false
+        },
+    }
+}
+
 struct Buffer(Vec<u8>);
 
 impl frame::Sink for Buffer {

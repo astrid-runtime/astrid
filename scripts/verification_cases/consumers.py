@@ -399,6 +399,22 @@ def consumer_defects():
     append = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     vectors = Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs")
     readback = Path("verification/hosted_arena_append.rs")
+    for label, clause, weaker in [
+        ("frame domain", "ok == (bytes@.take(8) == magic@)", "true"),
+        ("version refusal", "(out matches Err(HeaderError::Version)) == !current", "(out matches Err(HeaderError::Version)) ==> !current"),
+        ("reserved bits", "(out matches Err(HeaderError::Reserved)) == (current && !clear)", "(out matches Err(HeaderError::Reserved)) ==> (current && !clear)"),
+        ("declared length", "h.payload_len == vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(12,20))", "true"),
+        ("saved checksum", "h.checksum@ == bytes@.subrange(20,52)", "true"),
+        ("payload length", "(out matches Err(PayloadError::Length)) == (payload.len() != header.payload_len)", "(out matches Err(PayloadError::Length)) ==> (payload.len() != header.payload_len)"),
+        ("accepted digest", "sum == header.checksum && hash.ensures", "hash.ensures"),
+        ("hash arguments", "sum == header.checksum && hash.ensures((magic,header.payload_len,payload),sum)", "sum == header.checksum"),
+        ("checksum refusal", "sum != header.checksum &&", "true &&"),
+    ]:
+        yield (
+            f"physical frame loses {label}", append,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), readback,
+        )
+
     for name, source, original, changed, target in [
         ("omits the frame header width", append, "offset.checked_add(WIDTH as u64)?.checked_add(size)?", "offset.checked_add(size)?", append),
         ("reverses a vector pair", vectors, "parts.push(P::borrow(header));\n        parts.push(P::borrow(payload));", "parts.push(P::borrow(payload));\n        parts.push(P::borrow(header));", vectors),

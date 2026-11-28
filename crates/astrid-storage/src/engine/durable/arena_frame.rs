@@ -5,6 +5,7 @@ use vstd::prelude::*;
 verus! {
 
 pub(super) const WIDTH: usize = 52;
+pub(super) const CHECKSUM_START:usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ArenaLocation {
@@ -74,6 +75,66 @@ pub(super) fn header(magic:[u8;8],version:u16,size:u64,sum:[u8;32]) -> (out:[u8;
     out[20..].copy_from_slice(&sum);
     assert(out@ =~= header_bytes(magic,version,size,sum));
     out
+}
+
+#[derive(Clone,Copy)]
+pub(super) struct DecodedFrameHeader {
+    pub(super) payload_len:u64,
+    pub(super) checksum:[u8;32],
+}
+
+pub(super) enum HeaderError { Version, Reserved }
+
+pub(super) fn magic_matches(bytes:&[u8;52],magic:[u8;8]) -> (ok:bool)
+    ensures ok == (bytes@.take(8) == magic@),
+{
+    let mut i = 0usize;
+    while i < 8
+        invariant i <= 8, forall|j:int| 0 <= j < i ==> #[trigger] bytes@[j] == magic@[j],
+        decreases 8 - i,
+    {
+        if bytes[i] != magic[i] {assert(bytes@.take(8)[i as int] == bytes@[i as int]);return false;}
+        i = i.saturating_add(1);
+    }
+    assert(bytes@.take(8) =~= magic@);
+    true
+}
+
+pub(super) fn decode_header(bytes:&[u8;52],version:u16) -> (out:Result<DecodedFrameHeader,HeaderError>)
+    ensures ({
+        let current = bytes@[8] == version as u8 && bytes@[9] == (version >> 8) as u8;
+        let clear = bytes@[10] == 0 && bytes@[11] == 0;
+        &&& (out matches Err(HeaderError::Version)) == !current
+        &&& (out matches Err(HeaderError::Reserved)) == (current && !clear)
+        &&& out matches Ok(h) ==> h.payload_len == vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(12,20))
+            && h.checksum@ == bytes@.subrange(20,52)
+    }),
+{
+    assert(((version & 255) as u8) == version as u8 && (version & 255) <= 255) by(bit_vector);
+    if bytes[8] != (version & 255) as u8 || bytes[9] != (version >> 8) as u8 {return Err(HeaderError::Version);}
+    if bytes[10] != 0 || bytes[11] != 0 {return Err(HeaderError::Reserved);}
+    let mut length = [0u8;8];
+    length.copy_from_slice(&bytes[12..20]);
+    let mut checksum = [0u8;32];
+    checksum.copy_from_slice(&bytes[CHECKSUM_START..]);
+    Ok(DecodedFrameHeader {payload_len:u64::from_le_bytes(length),checksum})
+}
+
+pub(super) enum PayloadError { Length, Checksum }
+
+pub(super) fn check_payload<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:DecodedFrameHeader,magic:[u8;8],
+    payload:&[u8],hash:H) -> (out:Result<[u8;32],PayloadError>)
+    requires hash.requires((magic,header.payload_len,payload)),
+    ensures (out matches Err(PayloadError::Length)) == (payload.len() != header.payload_len),
+        out matches Ok(sum) ==> sum == header.checksum && hash.ensures((magic,header.payload_len,payload),sum),
+        out matches Err(PayloadError::Checksum) ==> (exists|sum:[u8;32]| sum != header.checksum &&
+            #[trigger] hash.ensures((magic,header.payload_len,payload),sum)),
+{
+    if payload.len() as u64 != header.payload_len {return Err(PayloadError::Length);}
+    let actual = hash(magic,header.payload_len,payload);
+    if actual.as_slice() != header.checksum.as_slice() {return Err(PayloadError::Checksum);}
+    assert(actual =~= header.checksum);
+    Ok(actual)
 }
 
 pub(super) struct PreparedFrame {

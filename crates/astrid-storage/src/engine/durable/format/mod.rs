@@ -1,14 +1,14 @@
 //! Native arena and root-journal framing, parsing, and recovery.
 
-#[cfg(test)]
-use super::File;
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, CHECKSUM_START, DurableError, DurableIo,
-    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, IdentityScheme, ModelError,
-    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, DurableError, DurableIo, FRAME_HEADER_LEN,
+    FRAME_HEADER_LEN_USIZE, FRAME_VERSION, IdentityScheme, ModelError, ObjectClass,
+    ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
     PersistentObjectIdentity, RecoveryLimits, ReferenceKind, ReferenceLabel, SeekFrom, io,
     root_wire,
 };
+#[cfg(test)]
+use super::{CHECKSUM_START, File};
 #[cfg(test)]
 use std::fs::OpenOptions;
 #[cfg(test)]
@@ -198,7 +198,7 @@ fn validate_positioned_header(
     header: &[u8; FRAME_HEADER_LEN_USIZE],
     limits: RecoveryLimits,
 ) -> Result<DecodedFrameHeader, DurableError> {
-    if header[..8] != magic {
+    if !arena_frame::magic_matches(header, magic) {
         return Err(corrupt(file_name, offset, "frame magic mismatch"));
     }
     let decoded = decode_frame_header(file_name, offset, header)?;
@@ -230,16 +230,15 @@ fn validate_positioned_payload(
     decoded: DecodedFrameHeader,
     payload: &[u8],
 ) -> Result<[u8; 32], DurableError> {
-    if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?
-        != decoded.payload_len
+    arena_frame::check_payload(decoded, magic, payload, frame_checksum).map_err(|error| match error
     {
-        return Err(corrupt(file_name, offset, "frame payload length mismatch"));
-    }
-    let actual = frame_checksum(magic, decoded.payload_len, payload);
-    if actual != decoded.checksum {
-        return Err(corrupt(file_name, offset, "frame checksum mismatch"));
-    }
-    Ok(actual)
+        arena_frame::PayloadError::Length => {
+            corrupt(file_name, offset, "frame payload length mismatch")
+        },
+        arena_frame::PayloadError::Checksum => {
+            corrupt(file_name, offset, "frame checksum mismatch")
+        },
+    })
 }
 
 impl<F: DurableIo> positional_read::Media for F {
@@ -342,37 +341,20 @@ pub(in crate::engine::durable) fn recovery_arena_scans() -> usize {
     RECOVERY_ARENA_SCANS.with(std::cell::Cell::get)
 }
 
-#[derive(Clone, Copy)]
-struct DecodedFrameHeader {
-    payload_len: u64,
-    checksum: [u8; 32],
-}
+use super::arena_frame::{self, DecodedFrameHeader};
 
 fn decode_frame_header(
     file_name: &'static str,
     offset: u64,
     header: &[u8; FRAME_HEADER_LEN_USIZE],
 ) -> Result<DecodedFrameHeader, DurableError> {
-    let version = u16::from_le_bytes([header[8], header[9]]);
-    if version != FRAME_VERSION {
-        return Err(corrupt(file_name, offset, "unsupported frame version"));
-    }
-    if header[10..12] != [0, 0] {
-        return Err(corrupt(
-            file_name,
-            offset,
-            "reserved header bytes are non-zero",
-        ));
-    }
-    Ok(DecodedFrameHeader {
-        payload_len: u64::from_le_bytes(
-            header[12..20]
-                .try_into()
-                .map_err(|_| DurableError::EncodingOverflow)?,
-        ),
-        checksum: header[CHECKSUM_START..]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
+    arena_frame::decode_header(header, FRAME_VERSION).map_err(|error| match error {
+        arena_frame::HeaderError::Version => {
+            corrupt(file_name, offset, "unsupported frame version")
+        },
+        arena_frame::HeaderError::Reserved => {
+            corrupt(file_name, offset, "reserved header bytes are non-zero")
+        },
     })
 }
 

@@ -44,7 +44,8 @@ const INDEX_MAGIC: [u8; 8] = *b"ASTIDX1\0";
 const FRAME_VERSION: u16 = 1;
 const FRAME_HEADER_LEN: u64 = arena_frame::WIDTH as u64;
 const FRAME_HEADER_LEN_USIZE: usize = arena_frame::WIDTH;
-const CHECKSUM_START: usize = 20;
+#[cfg(test)]
+use arena_frame::CHECKSUM_START;
 const LIFECYCLE_USABLE: u8 = 0;
 const LIFECYCLE_REQUIRES_RECOVERY: u8 = 1;
 const LIFECYCLE_CLOSED: u8 = 2;

@@ -3,8 +3,8 @@
 use std::io::{Read as _, Seek as _};
 
 use super::{
-    CHECKSUM_START, DurableError, DurableFrameRange, DurableIo, FRAME_HEADER_LEN,
-    FRAME_HEADER_LEN_USIZE, FRAME_VERSION, RecoveryLimits, SeekFrom, corrupt, decode_frame_header,
+    DurableError, DurableFrameRange, DurableIo, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE,
+    FRAME_VERSION, RecoveryLimits, SeekFrom, arena_frame, corrupt, decode_frame_header,
     frame_checksum, frame_checksum_hasher, io_error, read_exact_at, scan_frames_with_source,
     validate_positioned_header, validate_positioned_payload,
 };
@@ -331,7 +331,7 @@ where
         reader
             .read_exact(&mut header)
             .map_err(|source| io_error("read durable frame header", source))?;
-        if header[..8] != magic {
+        if !arena_frame::magic_matches(&header, magic) {
             truncate_unpublished_tail_or_fail(
                 get_file(reader),
                 policy,
@@ -383,7 +383,7 @@ where
             break;
         }
         let payload = read_frame_payload(reader, payload_len)?;
-        if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
+        if arena_frame::check_payload(decoded, magic, &payload, frame_checksum).is_err() {
             truncate_unpublished_tail_or_fail(
                 get_file(reader),
                 policy,
@@ -505,17 +505,13 @@ fn physical_frame_is_valid<F: DurableIo>(
     let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
     file.read_exact(&mut header)
         .map_err(|source| io_error("read durable recovery candidate", source))?;
-    if header[..8] != magic
-        || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
-        || header[10..12] != [0, 0]
-    {
+    if !arena_frame::magic_matches(&header, magic) {
         return Ok(false);
     }
-    let payload_len = u64::from_le_bytes(
-        header[12..20]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
-    );
+    let Ok(decoded) = arena_frame::decode_header(&header, FRAME_VERSION) else {
+        return Ok(false);
+    };
+    let payload_len = decoded.payload_len;
     let frame_len = FRAME_HEADER_LEN
         .checked_add(payload_len)
         .ok_or(DurableError::EncodingOverflow)?;
@@ -525,9 +521,7 @@ fn physical_frame_is_valid<F: DurableIo>(
     if payload_len > limits.max_frame_bytes {
         return Ok(true);
     }
-    let expected: [u8; 32] = header[CHECKSUM_START..]
-        .try_into()
-        .map_err(|_| DurableError::EncodingOverflow)?;
+    let expected = decoded.checksum;
     // Reuse the process-wide LazyLock initial domain state from frame_checksum_hasher.
     let mut hasher = frame_checksum_hasher(magic, payload_len);
     let mut unread = payload_len;
