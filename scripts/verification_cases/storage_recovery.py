@@ -8,6 +8,18 @@ from .common import replace_once
 def consumer_defects():
     receipt = Path("crates/astrid-storage/src/engine/durable/group/receipt.rs")
     for label, original, weaker in [
+        ("submitter binding", "final(queue)@ == old(queue)@.push(Self {transaction,receipt:*receipt,observer})", "final(queue).len() == old(queue).len()+1"),
+        ("leader election", "lead == !*old(active)", "true"),
+        ("leader ownership", "*final(active), lead ==", "true, lead =="),
+        ("FIFO drain", "batch@ == old(queue)@", "batch.len() == old(queue).len()"),
+        ("drained queue", "final(queue)@ == Seq::<Self>::empty()", "true"),
+        ("successor receipt", "out == if queue.len() == 0 {None} else {Some(queue@[0].receipt)}", "out.is_some() == (queue.len() > 0)"),
+        ("successor election", "*final(active) == (queue.len() > 0 && *old(active))", "true"),
+        ("prepared receipt", "a.receipt == self.receipt && a.observer == self.observer &&", "a.observer == self.observer &&"),
+        ("prepared observer", "a.receipt == self.receipt && a.observer == self.observer &&", "a.receipt == self.receipt &&"),
+        ("prepared transaction", "prepare.ensures((self.transaction,&self.observer),Ok(a.prepared))", "true"),
+        ("rejected receipt", "receipt == self.receipt && prepare.ensures", "prepare.ensures"),
+        ("rejected transaction", "receipt == self.receipt && prepare.ensures((self.transaction,&self.observer),Err(e))", "receipt == self.receipt"),
         ("published outcome", "#[trigger] publish.ensures((self.prepared,),out) &&", "true &&"),
         ("published receipt", "final(done)@ == old(done)@.push((self.receipt,Ok(out)))", "final(done)@.len() == old(done)@.len()+1"),
         ("failed receipt", "final(done)@ == old(done)@.push((self.receipt,Err(error)))", "final(done)@.len() == old(done)@.len()+1"),

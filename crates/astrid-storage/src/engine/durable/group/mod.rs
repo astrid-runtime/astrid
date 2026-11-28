@@ -1,6 +1,6 @@
 //! Caller-coordinated durability batching for principal-root commits.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -95,7 +95,7 @@ impl Default for GroupCommitPolicy {
 
 pub(super) struct CommitGroup<P> {
     leader_active: bool,
-    queue: VecDeque<QueuedCommit<P>>,
+    queue: Vec<QueuedCommit<P>>,
     #[cfg(test)]
     drain_gate: Option<DrainGate>,
 }
@@ -117,7 +117,7 @@ impl<P> Default for CommitGroup<P> {
     fn default() -> Self {
         Self {
             leader_active: false,
-            queue: VecDeque::new(),
+            queue: Vec::new(),
             #[cfg(test)]
             drain_gate: None,
         }
@@ -153,15 +153,9 @@ impl<'a, P> LeaderLease<'a, P> {
             return None;
         }
         self.active = false;
-        let mut group = self.group.lock();
-        group
-            .queue
-            .front()
-            .map(|next| Arc::clone(&next.receipt))
-            .or_else(|| {
-                group.leader_active = false;
-                None
-            })
+        let mut guard = self.group.lock();
+        let group = &mut *guard;
+        QueuedCommit::successor(&group.queue, &mut group.leader_active)
     }
 }
 
@@ -173,11 +167,8 @@ impl<P> Drop for LeaderLease<'_, P> {
     }
 }
 
-struct QueuedCommit<P> {
-    transaction: RootTransaction<P>,
-    receipt: Arc<CommitReceipt>,
-    observer: Option<Arc<dyn ProjectionObserver>>,
-}
+type QueuedCommit<P> =
+    receipt::Submission<RootTransaction<P>, CommitReceipt, Option<Arc<dyn ProjectionObserver>>>;
 
 type AcceptedCommit<P> =
     receipt::Accepted<Prepared<P>, Arc<CommitReceipt>, Option<Arc<dyn ProjectionObserver>>>;
@@ -291,18 +282,15 @@ where
     ) -> Result<CommitOutcome, DurableError> {
         let receipt = Arc::new(CommitReceipt::default());
         let mut lead = {
-            let mut group = self.commit_group.lock();
-            group.queue.push_back(QueuedCommit {
+            let mut guard = self.commit_group.lock();
+            let group = &mut *guard;
+            QueuedCommit::enqueue(
+                &mut group.queue,
+                &mut group.leader_active,
                 transaction,
-                receipt: Arc::clone(&receipt),
+                &receipt,
                 observer,
-            });
-            if group.leader_active {
-                false
-            } else {
-                group.leader_active = true;
-                true
-            }
+            )
         };
         loop {
             if lead {
@@ -380,7 +368,7 @@ where
 
         let batch: Vec<_> = {
             let mut group = self.commit_group.lock();
-            group.queue.drain(..).collect()
+            QueuedCommit::drain(&mut group.queue)
         };
         self.process_commit_group(batch);
 
@@ -429,25 +417,15 @@ where
             &mut pending_frames,
         );
         for request in batch {
-            match self.prepare(
-                &mut inner,
-                request.transaction,
-                &pending_roots,
-                request.observer.as_deref(),
-            ) {
-                Ok(mut prepared) => {
-                    if let Err(error) = reserve_group_frames(&mut prepared, &mut pending_frames) {
-                        completions.push((request.receipt, Err(error)));
-                        continue;
-                    }
-                    prepared.root.stage(&mut pending_roots);
-                    accepted.push(AcceptedCommit {
-                        prepared,
-                        receipt: request.receipt,
-                        observer: request.observer,
-                    });
-                },
-                Err(error) => completions.push((request.receipt, Err(error))),
+            match request.prepare(|transaction, observer| {
+                let mut prepared =
+                    self.prepare(&mut inner, transaction, &pending_roots, observer.as_deref())?;
+                reserve_group_frames(&mut prepared, &mut pending_frames)?;
+                prepared.root.stage(&mut pending_roots);
+                Ok(prepared)
+            }) {
+                Ok(entry) => accepted.push(entry),
+                Err((receipt, error)) => completions.push((receipt, Err(error))),
             }
         }
 

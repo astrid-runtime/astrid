@@ -371,6 +371,40 @@ fn mixed_receipts(prior:u64,submitted:u64,peer:u64,root:u64,error:u64) {
     assert(trace.sent@ =~= seq![(prior,Err(error)),(submitted,Ok(root)),(peer,Err(error))]);
 }
 
+// Submit two independent callers, hand off leadership without dequeuing,
+// drain their FIFO and prepare their transactions under the original observers.
+fn queued_callers(a:u64,b:u64,tx:u64,other:u64,observer:u64,peer_observer:u64,error:u64) {
+    use crate::group_receipt::Submission;
+    use std::sync::Arc;
+    let first = Arc::new(a);
+    let second = Arc::new(b);
+    let mut queue = Vec::new();
+    let mut leader = false;
+    let elected = Submission::enqueue(&mut queue,&mut leader,tx,&first,observer);
+    assert(elected && leader);
+    let competing = Submission::enqueue(&mut queue,&mut leader,other,&second,peer_observer);
+    assert(!competing && leader);
+    let next = Submission::successor(&queue,&mut leader);
+    assert(next == Some(first) && leader);
+    let batch = Submission::drain(&mut queue);
+    assert(batch.len() == 2 && queue.len() == 0);
+    let no_next = Submission::successor(&queue,&mut leader);
+    assert(no_next.is_none() && !leader);
+    let mut it = batch.into_iter();
+    let Some(request) = it.next() else {assert(false);return;};
+    let Some(peer) = it.next() else {assert(false);return;};
+    let accepted = request.prepare(|v:u64,o:&u64| -> (r:Result<(u64,u64),u64>)
+        ensures r == Ok((v,*o)), {Ok((v,*o))});
+    let failed = peer.prepare(|v:u64,o:&u64| -> (r:Result<(),(u64,u64,u64)>)
+        ensures r == Err((v,*o,error)), {Err((v,*o,error))});
+    let Ok(accepted) = accepted else {assert(false);return;};
+    assert(accepted.receipt == first && accepted.observer == observer && accepted.prepared == (tx,observer));
+    assert(failed == Err((second,(other,peer_observer,error))));
+    let mut done = Vec::<(Arc<u64>,Result<u64,u64>)>::new();
+    accepted.published(&mut done,|p:(u64,u64)| -> (root:u64) ensures root == p.0,{p.0});
+    assert(done@ == seq![(first,Ok(tx))]);
+}
+
 // A completion replaces a pending leadership signal. Neither a second
 // completion nor a late promotion can replace the result before polling.
 fn receive_result<T>(first:T,late:T,after:T) {

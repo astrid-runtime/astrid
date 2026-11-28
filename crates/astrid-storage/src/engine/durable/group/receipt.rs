@@ -1,4 +1,5 @@
 //! Commit receipt transitions under the receipt mutex and ordered batch delivery.
+use std::sync::Arc;
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::std_specs::iter::IteratorSpec;
@@ -41,6 +42,59 @@ impl<T> Slot<T> {
             Self::Promoted => Some(Action::Lead),
             Self::Ready(t) => {*self = Self::Consumed; Some(Action::Complete(t))},
             Self::Consumed => {*self = Self::Consumed; None},
+        }
+    }
+}
+
+pub(super) struct Submission<T,R,B> {
+    pub(super) transaction:T,
+    pub(super) receipt:Arc<R>,
+    pub(super) observer:B,
+}
+
+type Preparation<P,R,B,E> = Result<Accepted<P,Arc<R>,B>,(Arc<R>,E)>;
+
+impl<T,R,B> Submission<T,R,B> {
+    pub(super) fn enqueue(queue:&mut Vec<Self>,active:&mut bool,transaction:T,receipt:&Arc<R>,observer:B)
+        -> (lead:bool)
+        ensures final(queue)@ == old(queue)@.push(Self {transaction,receipt:*receipt,observer}),
+            *final(active), lead == !*old(active),
+    {
+        queue.push(Self {transaction,receipt:Arc::clone(receipt),observer});
+        let lead = !*active;
+        *active = true;
+        lead
+    }
+
+    /// Move the entire FIFO allocation to its leader under the queue mutex.
+    pub(super) fn drain(queue:&mut Vec<Self>) -> (batch:Vec<Self>)
+        ensures final(queue)@ == Seq::<Self>::empty(), batch@ == old(queue)@,
+    {
+        let mut batch = Vec::new();
+        std::mem::swap(queue,&mut batch);
+        batch
+    }
+
+    pub(super) fn successor(queue:&[Self],active:&mut bool) -> (out:Option<Arc<R>>)
+        ensures out == if queue.len() == 0 {None} else {Some(queue@[0].receipt)},
+            *final(active) == (queue.len() > 0 && *old(active)),
+    {
+        if let Some(next) = queue.first() {Some(Arc::clone(&next.receipt))}
+        else {*active = false; None}
+    }
+
+    pub(super) fn prepare<P,E,F:FnOnce(T,&B)->Result<P,E>>(self,prepare:F)
+        -> (out:Preparation<P,R,B,E>)
+        requires prepare.requires((self.transaction,&self.observer)),
+        ensures match out {
+            Ok(a) => a.receipt == self.receipt && a.observer == self.observer &&
+                prepare.ensures((self.transaction,&self.observer),Ok(a.prepared)),
+            Err((receipt,e)) => receipt == self.receipt && prepare.ensures((self.transaction,&self.observer),Err(e)),
+        },
+    {
+        match prepare(self.transaction,&self.observer) {
+            Ok(prepared) => Ok(Accepted {prepared,receipt:self.receipt,observer:self.observer}),
+            Err(error) => Err((self.receipt,error)),
         }
     }
 }
