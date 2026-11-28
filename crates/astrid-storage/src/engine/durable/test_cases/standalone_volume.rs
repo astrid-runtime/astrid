@@ -199,3 +199,90 @@ fn hosted_standalone_sync_failure_is_not_an_ack() {
     let copied = copy_volume_while_live(&path, &directory);
     assert_eq!(copied.object(id).unwrap(), None);
 }
+
+#[test]
+fn volume_tail_repair_flushes_the_container_and_propagates_failure() {
+    for fail_sync in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let volume = RecordingVolume::wrap(
+            HostedFileVolume::open(directory.path().join("repair.volume")).unwrap(),
+        );
+        let mut arena = super::File::volume(volume.clone(), ARENA_FILE, true).unwrap();
+        arena.write_all(&[0; 5]).unwrap();
+        volume.sync().unwrap();
+        let before = volume.sync_count();
+        if fail_sync {
+            volume.fail_next_syncs(1);
+        }
+        let recovered = super::format::recover_arena(&mut arena, &TestIdentity, limits(), 0);
+        if fail_sync {
+            assert!(matches!(
+                recovered,
+                Err(DurableError::Io {
+                    operation: "flush durable tail truncation",
+                    ..
+                })
+            ));
+        } else {
+            let (index, tail) = recovered.unwrap();
+            assert!(index.is_empty() && tail.is_none());
+        }
+        assert_eq!(volume.sync_count(), before + 1);
+        if !fail_sync {
+            super::format::recover_arena(&mut arena, &TestIdentity, limits(), 0).unwrap();
+            assert_eq!(volume.sync_count(), before + 1);
+        }
+    }
+}
+
+#[test]
+fn reopen_after_failed_tail_sync_requires_a_successful_volume_fence() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retry.volume");
+    let volume = RecordingVolume::wrap(HostedFileVolume::open(&path).unwrap());
+    let mut arena = super::File::volume(volume.clone(), ARENA_FILE, true).unwrap();
+    arena.write_all(&[0; 5]).unwrap();
+    volume.sync().unwrap();
+    volume.fail_next_syncs(1);
+    let failed = super::format::recover_arena(&mut arena, &TestIdentity, limits(), 0);
+    assert!(matches!(
+        failed,
+        Err(DurableError::Io {
+            operation: "flush durable tail truncation",
+            ..
+        })
+    ));
+    assert_eq!(arena.metadata().unwrap().len(), 0);
+    drop(arena);
+
+    // The shortened region is visible in memory. Startup must still fence
+    // preceding mutations even when its subsequent arena scan will be clean.
+    let reopen = || {
+        TestEngine::open_volume(
+            volume.clone(),
+            TestIdentity,
+            Utf8Codec,
+            limits(),
+            DurableEnginePolicy::default(),
+        )
+    };
+    volume.fail_next_syncs(1);
+    assert!(matches!(
+        reopen(),
+        Err(DurableError::Io {
+            operation: "flush Astrid volume namespace",
+            ..
+        })
+    ));
+    let engine = reopen().unwrap();
+    let copy = directory.path().join("stable.volume");
+    std::fs::copy(&path, &copy).unwrap();
+    let stable = HostedFileVolume::open(copy).unwrap();
+    assert_eq!(
+        stable
+            .region_len(&VolumeRegion::new(ARENA_FILE).unwrap())
+            .unwrap(),
+        0
+    );
+    drop(engine);
+}

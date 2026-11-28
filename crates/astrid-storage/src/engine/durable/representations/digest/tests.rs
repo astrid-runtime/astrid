@@ -104,6 +104,10 @@ impl DurableIo for ProbeJournal {
         Ok(())
     }
 
+    fn durable_sync_repaired_tail(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
         let start = usize::try_from(offset).unwrap();
         if start >= self.bytes.len() {

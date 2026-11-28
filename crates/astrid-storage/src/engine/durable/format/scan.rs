@@ -11,7 +11,9 @@ use super::{
 
 /// Successful scans leave the cursor at the current append boundary. After
 /// an error the cursor is unspecified: callers must abandon or reposition the
-/// handle before reuse. A rejected callback is never treated as tail damage.
+/// handle before reuse. A failed repair flush can leave a shortened, volatile
+/// tail. Repositioning resets the cursor only. Volume startup fences prior
+/// mutations before scanning. A rejected callback is never treated as tail damage.
 pub(in crate::engine::durable) fn scan_frames<F: DurableIo>(
     file: &mut F,
     file_name: &'static str,
@@ -548,6 +550,6 @@ fn physical_frame_is_valid<F: DurableIo>(
 fn truncate_tail<F: DurableIo>(file: &mut F, valid_len: u64) -> Result<(), DurableError> {
     file.durable_set_len(valid_len)
         .map_err(|source| io_error("truncate incomplete durable tail", source))?;
-    file.durable_sync_data()
+    file.durable_sync_repaired_tail()
         .map_err(|source| io_error("flush durable tail truncation", source))
 }
