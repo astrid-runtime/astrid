@@ -414,6 +414,7 @@ mod checkpoint_progress;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_walk.rs"]
 mod checkpoint_walk;
 mod hosted_checkpoint_walk;
+mod hosted_checkpoint_membership;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/traversal.rs"]
 mod traversal;

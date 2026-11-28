@@ -477,6 +477,37 @@ fn restore_namespace<I,T,V,E,R,F>(groups:&mut HashMap<Id,Vec<Marker>>,kind:Marke
     Ok(())
 }
 
+// Membership follows a finite chain of scheduled children to the actual marker
+// row. A deletion in the captured overlay still takes precedence.
+spec fn reachable_marker<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(kind:Marker,target:Id,
+    root:Option<I>,read:R,overlay:Option<std::sync::Arc<crate::traversal::Node>>) -> bool {
+    let ns = ns_bytes(kind);
+    &&& crate::hosted_checkpoint_membership::stable(read)
+    &&& exists|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) && ({
+        let address = ns+seq![0u8]+text;
+        let has = |p:Page<I,T>| crate::hosted_checkpoint_membership::reachable(read,p,address,ns+seq![0u8],ns+seq![1u8]);
+        marker_visible(root,has,overlay,address)
+    })
+}
+
+proof fn reachable_marker_in_snapshot<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(kind:Marker,target:Id,
+    root:Option<I>,read:R,overlay:Option<std::sync::Arc<crate::traversal::Node>>)
+    requires reachable_marker(kind,target,root,read,overlay),
+    ensures marker_in_snapshot(kind,target,root,read,overlay),
+{
+    let ns = ns_bytes(kind);
+    let text = choose|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) && ({
+        let address = ns+seq![0u8]+text;
+        let has = |p:Page<I,T>| crate::hosted_checkpoint_membership::reachable(read,p,address,ns+seq![0u8],ns+seq![1u8]);
+        marker_visible(root,has,overlay,address)
+    });
+    let address = ns+seq![0u8]+text;
+    let has = |p:Page<I,T>| crate::hosted_checkpoint_membership::reachable(read,p,address,ns+seq![0u8],ns+seq![1u8]);
+    crate::hosted_checkpoint_membership::derive(read,address,ns+seq![0u8],ns+seq![1u8]);
+    assert(page_membership(read,has,ns,text));
+    assert(exists|h:spec_fn(Page<I,T>)->bool| #[trigger] page_membership(read,h,ns,text) && marker_visible(root,h,overlay,address));
+}
+
 /// Run both namespace scans from their captured checkpoint root IDs. For each
 /// target, the page model relates membership to the actual decoded leaves and
 /// selected child pages. The captured overlays can mask either checkpoint.
@@ -491,6 +522,8 @@ fn reopen_from_pages<I,T,V,E,R,C,F>(rev_id:Option<I>,used_id:Option<I>,rev_read:
         obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
     ensures match out {
         Ok(decision) => {
+            &&& reachable_marker(Marker::Revoked,target,rev_id,rev_read,crate::traversal::deref_option(rev_overlay)) ==> decision is Revoked
+            &&& single_use && reachable_marker(Marker::Consumed,target,used_id,used_read,crate::traversal::deref_option(used_overlay)) ==> !(decision is Allowed)
             &&& marker_in_snapshot(Marker::Revoked,target,rev_id,rev_read,crate::traversal::deref_option(rev_overlay)) ==> decision is Revoked
             &&& single_use && marker_in_snapshot(Marker::Consumed,target,used_id,used_read,crate::traversal::deref_option(used_overlay)) ==> !(decision is Allowed)
         },
@@ -502,6 +535,16 @@ fn reopen_from_pages<I,T,V,E,R,C,F>(rev_id:Option<I>,used_id:Option<I>,rev_read:
     let kinds = Marker::recovery_order();
     let mut groups = HashMap::new();
     restore_namespace(&mut groups,kinds[0],target,rev_id,rev_read,rev_overlay,legacy)?;
+    proof {
+        let ro = crate::traversal::deref_option(rev_overlay);
+        let uo = crate::traversal::deref_option(used_overlay);
+        if reachable_marker(Marker::Revoked,target,rev_id,rev_read,ro) {
+            reachable_marker_in_snapshot(Marker::Revoked,target,rev_id,rev_read,ro);
+        }
+        if reachable_marker(Marker::Consumed,target,used_id,used_read,uo) {
+            reachable_marker_in_snapshot(Marker::Consumed,target,used_id,used_read,uo);
+        }
+    }
     let ghost revoked = marker_batch::has(groups@,target,Marker::Revoked);
     restore_namespace(&mut groups,kinds[1],target,used_id,used_read,used_overlay,legacy)?;
     assert(revoked ==> marker_batch::has(groups@,target,Marker::Revoked));

@@ -306,6 +306,17 @@ def live_token_consumers():
 
 
 def marker_batch_consumers():
+    membership = Path("verification/hosted_checkpoint_membership.rs")
+    for label, clause, weaker in [
+        ("leaf row", "contains(rows@,rows@.len(),key,start,end)\n    } else", "true\n    } else"),
+        ("selected child", "scheduled(c@,0,start,end).contains(pages.drop_last().last())", "true"),
+        ("complete path", "&&& path(read,pages.drop_last(),key,start,end)",
+         "&&& (pages.len() == 2 || path(read,pages.drop_last(),key,start,end))"),
+    ]:
+        yield (
+            f"checkpoint membership loses {label}", membership,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), membership,
+        )
     record = Path("crates/astrid-storage/src/kv/tree/checkpoint_record.rs")
     record_reader = Path("verification/hosted_checkpoint_record.rs")
     for label, clause, weaker in [
