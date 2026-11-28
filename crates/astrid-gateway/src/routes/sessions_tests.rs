@@ -1,4 +1,16 @@
 use super::*;
+use astrid_events::ipc::MessageOrigin;
+
+fn session_caller(principal: &PrincipalId) -> crate::auth::CallerContext {
+    crate::auth::CallerContext {
+        principal: principal.clone(),
+        device_key_id: Some("0123456789abcdef".to_owned()),
+        request_owner: astrid_events::ipc::RequestOwnerId::generate(),
+        issued_at_epoch: 1,
+        expires_at_epoch: 60,
+    }
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::state::SigningMaterial;
@@ -234,6 +246,8 @@ async fn request_capsule_round_trips_scoped_reply() {
     let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
     let bus_capsule = Arc::clone(&bus);
     let resp_topic = response_topic.clone();
+    let caller = session_caller(&principal);
+    let owner = caller.request_owner;
     let cid = correlation_id.to_string();
     let capsule = tokio::spawn(async move {
         let event = req_rx.recv().await.expect("request arrives");
@@ -242,6 +256,8 @@ async fn request_capsule_round_trips_scoped_reply() {
             assert_eq!(message.principal.as_deref(), Some("alice"));
             assert_ne!(message.source_id, Uuid::nil());
             assert_eq!(message.origin, MessageOrigin::RemoteGateway);
+            assert_eq!(message.device_key_id.as_deref(), Some("0123456789abcdef"));
+            assert_eq!(message.request_owner, Some(owner));
         } else {
             panic!("expected an IPC request event");
         }
@@ -273,8 +289,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         &response_topic,
         payload,
         correlation_id,
-        &principal,
-        None,
+        &caller,
         &[test_provider_source_id()],
         CAPSULE_TIMEOUT,
     )
@@ -372,8 +387,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         &response_topic,
         payload,
         correlation_id,
-        &principal,
-        None,
+        &session_caller(&principal),
         &[test_provider_source_id()],
         CAPSULE_TIMEOUT,
     )
@@ -429,8 +443,7 @@ async fn request_capsule_accepts_live_registry_source_id() {
         &response_topic,
         payload,
         correlation_id,
-        &principal,
-        None,
+        &session_caller(&principal),
         &[live_source],
         CAPSULE_TIMEOUT,
     )
@@ -771,8 +784,7 @@ async fn request_capsule_round_trips_update_reply() {
         &response_topic,
         payload,
         correlation_id,
-        &principal,
-        None,
+        &session_caller(&principal),
         &[test_provider_source_id()],
         CAPSULE_TIMEOUT,
     )
@@ -824,8 +836,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         &response_topic,
         payload,
         correlation_id,
-        &principal,
-        None,
+        &session_caller(&principal),
         &[test_provider_source_id()],
         Duration::from_millis(150),
     )
@@ -876,8 +887,7 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
         &response_topic,
         payload,
         correlation_id,
-        &principal,
-        None,
+        &session_caller(&principal),
         &[test_provider_source_id()],
         Duration::from_millis(150),
     )
@@ -927,8 +937,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         &response_topic,
         payload,
         correlation_id,
-        &principal,
-        None,
+        &session_caller(&principal),
         &[test_provider_source_id()],
         // Short timeout — we expect the mismatched reply to be skipped
         // and the call to time out rather than return a foreign body.

@@ -1,6 +1,6 @@
 use super::{
     AstridEvent, Duration, EventBus, EventMetadata, GatewayError, GatewayResult, IpcMessage,
-    IpcPayload, MessageOrigin, PrincipalId, Topic, Uuid, Value,
+    IpcPayload, PrincipalId, Topic, Uuid, Value,
 };
 use crate::state::GatewayState;
 
@@ -45,9 +45,7 @@ pub(super) fn scoped_topic_probe_key(principal: &PrincipalId, topic: &str) -> St
 /// awaits exactly one reply from the session capsule. It defensively verifies
 /// the kernel-stamped `source_id` and body `correlation_id` before returning.
 ///
-/// `device_key_id` is stamped when present, exactly as `bus_admin.rs`
-/// does, so a device-scoped bearer carries its attenuation floor to the
-/// kernel cap-gate on the way to the capsule.
+/// The caller stamps its bearer owner, device scope and transport origin on the request.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn request_capsule(
     bus: &EventBus,
@@ -55,13 +53,12 @@ pub(super) async fn request_capsule(
     response_topic: &str,
     payload: Value,
     correlation_id: &str,
-    principal: &PrincipalId,
-    device_key_id: Option<&str>,
+    caller: &crate::auth::CallerContext,
     expected_source_ids: &[Uuid],
     timeout: Duration,
 ) -> GatewayResult<Value> {
     // Subscribe before publish so a fast capsule cannot race the waiter.
-    let principal = principal.to_string();
+    let principal = caller.principal.to_string();
     let mut receiver = bus.subscribe_topic_routed_scoped(
         Uuid::new_v4(),
         response_topic,
@@ -70,16 +67,11 @@ pub(super) async fn request_capsule(
         Some(Some(principal.clone())),
     );
 
-    let mut msg = IpcMessage::new(
+    let msg = caller.stamp_ipc(IpcMessage::new(
         Topic::from_raw(request_topic),
         IpcPayload::RawJson(payload),
         Uuid::new_v4(),
-    )
-    .with_principal(principal.clone())
-    .with_origin(MessageOrigin::RemoteGateway);
-    if let Some(key_id) = device_key_id {
-        msg = msg.with_device_key_id(key_id.to_string());
-    }
+    ));
     bus.publish(AstridEvent::Ipc {
         metadata: EventMetadata::new("astrid-gateway::sessions"),
         message: msg,

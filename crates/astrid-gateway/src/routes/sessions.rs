@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::PrincipalId;
-use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -343,8 +343,7 @@ pub(super) async fn list_sessions_inner(
         &response_topic,
         payload,
         &correlation_id,
-        &caller.principal,
-        caller.device_key_id.as_deref(),
+        caller,
         &expected_sources,
         CAPSULE_TIMEOUT,
     )
@@ -409,8 +408,7 @@ pub(super) async fn get_session_messages_inner(
         &response_topic,
         payload,
         &correlation_id,
-        &caller.principal,
-        caller.device_key_id.as_deref(),
+        caller,
         &expected_sources,
         CAPSULE_TIMEOUT,
     )
@@ -486,8 +484,7 @@ pub(super) async fn get_session_inner(
         &response_topic,
         payload,
         &correlation_id,
-        &caller.principal,
-        caller.device_key_id.as_deref(),
+        caller,
         &expected_sources,
         CAPSULE_TIMEOUT,
     )
@@ -537,11 +534,7 @@ pub(super) async fn update_session_inner(
     id: String,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SessionSummary>> {
-    // Clone the principal/device floor before `read_json_body` consumes
-    // `req` (which `caller_from` borrows), exactly as `models.rs` does.
-    let caller = caller_from(&req)?;
-    let principal = caller.principal.clone();
-    let device_key_id = caller.device_key_id.clone();
+    let caller = caller_from(&req)?.clone();
     metrics::counter!("astrid_gateway_agent_sessions_update_total").increment(1);
 
     validate_session_id(&id)?;
@@ -555,7 +548,8 @@ pub(super) async fn update_session_inner(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_update_payload(&correlation_id, &id, &body)?;
     let response_topic = format!("{TOPIC_UPDATE_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = provider_source_ids(&state, &principal, TOPIC_UPDATE_REQUEST).await?;
+    let expected_sources =
+        provider_source_ids(&state, &caller.principal, TOPIC_UPDATE_REQUEST).await?;
 
     let value = request_capsule(
         &bus,
@@ -563,8 +557,7 @@ pub(super) async fn update_session_inner(
         &response_topic,
         payload,
         &correlation_id,
-        &principal,
-        device_key_id.as_deref(),
+        &caller,
         &expected_sources,
         CAPSULE_TIMEOUT,
     )
@@ -631,8 +624,7 @@ pub(super) async fn delete_session_inner(
         &response_topic,
         payload,
         &correlation_id,
-        &caller.principal,
-        caller.device_key_id.as_deref(),
+        caller,
         &expected_sources,
         CAPSULE_TIMEOUT,
     )
@@ -704,8 +696,7 @@ pub(super) async fn search_sessions_inner(
         &response_topic,
         payload,
         &correlation_id,
-        &caller.principal,
-        caller.device_key_id.as_deref(),
+        caller,
         &expected_sources,
         CAPSULE_TIMEOUT,
     )

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::PrincipalId;
-use astrid_events::ipc::RequestOwnerId;
+use astrid_events::ipc::{IpcMessage, MessageOrigin, RequestOwnerId};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -83,6 +83,19 @@ pub struct CallerContext {
     /// observe or answer each other's approval prompts. Reusing the same bearer
     /// intentionally means reusing the same authenticated session.
     pub request_owner: RequestOwnerId,
+}
+
+impl CallerContext {
+    /// Bind a gateway-originated publication to this authenticated bearer.
+    /// Downstream capability checks use the device and transport origin, and
+    /// interactive replies use the request owner to reach the issuing client.
+    pub(crate) fn stamp_ipc(&self, mut message: IpcMessage) -> IpcMessage {
+        message.device_key_id.clone_from(&self.device_key_id);
+        message
+            .with_principal(self.principal.to_string())
+            .with_request_owner(self.request_owner)
+            .with_origin(MessageOrigin::RemoteGateway)
+    }
 }
 
 /// Stable, non-secret comparison handle for one authenticated bearer.
