@@ -891,6 +891,10 @@ def hot_snapshot_consumers():
 def journal_snapshot_consumers():
     path = Path("crates/astrid-storage/src/engine/durable/journal_snapshot.rs")
     for label, clause, weaker in [
+        ("row acceptance", "(out matches Ok(r) && r.0@ == name && journal_history::represents(w,r.1))", "(out matches Ok(r) ==> r.0@ == name && journal_history::represents(w,r.1))"),
+        ("parsed owner", "Ok(r) && r.0@ == name &&", "Ok(r) &&"),
+        ("parsed root", "r.0@ == name && journal_history::represents(w,r.1)", "r.0@ == name"),
+        ("next cursor", "+ row_bytes(row,scheme).len(),", "+ (*final(cursor) as int - *old(cursor) as int),"),
         ("serializer image", "bytes@ == prefix(rows@,rows.len() as nat,scheme)", "true"),
         ("serialized header", "to_le_bytes(SENTINEL) + seq![RECORD]", "to_le_bytes(SENTINEL) + seq![0u8]"),
         ("serialized length", "spec_u64_to_le_bytes(row.0.len() as u64)", "spec_u64_to_le_bytes(0)"),

@@ -8,6 +8,8 @@ use vstd::{
     std_specs::{btree::btree_map_inv, iter::IteratorSpec},
 };
 
+const _: () = assert!(usize::BITS <= u64::BITS);
+
 verus! {
 type Row = (Vec<u8>,RootState);
 pub(super) const SENTINEL:u64 = u64::MAX;
@@ -31,10 +33,10 @@ pub(super) open spec fn prefix(rows:Seq<Row>,n:nat,scheme:root_wire::Scheme) -> 
 }
 
 /// The caller checks strict owner ordering before serializing.
-pub(super) fn serialize(rows:&[Row],scheme:root_wire::Scheme) -> (out:Option<Vec<u8>>)
-    ensures out.is_some(), out matches Some(bytes) ==> bytes@ == prefix(rows@,rows.len() as nat,scheme),
+pub(super) fn serialize(rows:&[Row],scheme:root_wire::Scheme) -> (bytes:Vec<u8>)
+    ensures bytes@ == prefix(rows@,rows.len() as nat,scheme),
 {
-    let count = u64::try_from(rows.len()).ok()?;
+    let count = rows.len() as u64;
     let mut bytes = vstd::bytes::u64_to_le_bytes(SENTINEL);
     bytes.push(RECORD);
     bytes.extend_from_slice(&root_wire::little_endian(count));
@@ -45,7 +47,7 @@ pub(super) fn serialize(rows:&[Row],scheme:root_wire::Scheme) -> (out:Option<Vec
         decreases rows.len() - i,
     {
         let (principal,root) = &rows[i];
-        let length = u64::try_from(principal.len()).ok()?;
+        let length = principal.len() as u64;
         let ghost before = bytes@;
         bytes.extend_from_slice(&root_wire::little_endian(length));
         bytes.extend_from_slice(principal);
@@ -54,7 +56,68 @@ pub(super) fn serialize(rows:&[Row],scheme:root_wire::Scheme) -> (out:Option<Vec
         assert(bytes@ =~= before + row_bytes(rows@[i as int],scheme));
         i = i.saturating_add(1);
     }
-    Some(bytes)
+    bytes
+}
+
+pub(super) enum RowError { Read(root_wire::ReadError), Length, Root(root_wire::RootError) }
+
+pub(super) open spec fn framed(name:Seq<u8>, w:root_wire::Root, scheme:root_wire::Scheme) -> Seq<u8> {
+    vstd::bytes::spec_u64_to_le_bytes(name.len() as u64) + name + w.wire(scheme)
+}
+
+/// Read one length-prefixed owner and its fixed-width root from the snapshot cursor.
+pub(super) fn read_row(bytes:&[u8], cursor:&mut usize, scheme:root_wire::Scheme) -> (out:Result<Row,RowError>)
+    ensures out matches Ok(row) ==> root_wire::at(bytes@,*old(cursor) as int,row_bytes(row,scheme))
+        && *final(cursor) as int == *old(cursor) as int + row_bytes(row,scheme).len(),
+        forall|name:Seq<u8>,w:root_wire::Root| name.len() <= u64::MAX &&
+            #[trigger] root_wire::at(bytes@,*old(cursor) as int,framed(name,w,scheme)) ==>
+            (out matches Ok(r) && r.0@ == name && journal_history::represents(w,r.1)),
+{
+    let ghost start = *cursor as int;
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert forall|name:Seq<u8>,w:root_wire::Root| name.len() <= u64::MAX && #[trigger] root_wire::at(bytes@,start,framed(name,w,scheme)) implies
+            bytes@.subrange(start,start+8) == vstd::bytes::spec_u64_to_le_bytes(name.len() as u64)
+            && bytes@.subrange(start+8,start+8+name.len() as int) == name
+            && root_wire::at(bytes@,start+8+name.len() as int,w.wire(scheme)) by {
+            let frame = framed(name,w,scheme);
+            root_wire::subfield(bytes@,start,frame,0,8);
+            root_wire::subfield(bytes@,start,frame,8,name.len() as int);
+            root_wire::subfield(bytes@,start,frame,8+name.len() as int,48);
+            assert(frame.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(name.len() as u64));
+            assert(frame.subrange(8,8+name.len() as int) =~= name);
+            assert(frame.subrange(8+name.len() as int,8+name.len() as int+48) =~= w.wire(scheme));
+        }
+    }
+    let field = match root_wire::fixed::<8>(bytes,cursor) {Ok(v) => v, Err(e) => return Err(RowError::Read(e))};
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    let Ok(len) = usize::try_from(u64::from_le_bytes(field)) else {return Err(RowError::Length);};
+    let name = match root_wire::take(bytes,cursor,len) {Ok(v) => {let mut name = Vec::with_capacity(len); name.extend_from_slice(v); name},Err(e) => return Err(RowError::Read(e))};
+    let ghost pos = *cursor as int;
+    let wire = match root_wire::read_root(bytes,cursor,scheme) {Ok(r) => r,Err(e) => return Err(RowError::Root(e))};
+    let root = journal_history::from_wire(wire);
+    let row = (name,root);
+    assert(row_bytes(row,scheme) =~= field@ + row.0@ + wire.wire(scheme));
+    assert(bytes@.subrange(start,*cursor as int) =~= row_bytes(row,scheme)) by {
+        assert forall|i:int| 0 <= i < *cursor as int - start implies
+            bytes@[start+i] == #[trigger] row_bytes(row,scheme)[i] by {
+            if i < 8 {assert(field@[i] == bytes@[start+i]);}
+            else if start+i < pos {assert(row.0@[i-8] == bytes@[start+i]);}
+            else {assert(wire.wire(scheme)[start+i-pos] == bytes@[start+i]);}
+        }
+    }
+    assert forall|n:Seq<u8>,w:root_wire::Root| n.len() <= u64::MAX && #[trigger] root_wire::at(bytes@,start,framed(n,w,scheme)) implies
+        row.0@ == n && journal_history::represents(w,row.1) by {
+        assert(n.len() == len);
+        assert(w.wire(scheme) == wire.wire(scheme));
+        assert(w.wire(scheme).take(8) =~= w.generation@);
+        assert(wire.wire(scheme).take(8) =~= wire.generation@);
+        assert(w.wire(scheme).skip(16) =~= w.commit@);
+        assert(wire.wire(scheme).skip(16) =~= wire.commit@);
+        assert(w.generation@ =~= wire.generation@);
+        assert(w.commit@ =~= wire.commit@);
+    }
+    Ok(row)
 }
 
 pub(super) enum SnapshotError<E> { Position, Noncanonical, Duplicate, Codec(E) }

@@ -76,6 +76,23 @@ fn journal_transition<K:Ord+Copy,F>(history:&mut BTreeMap<K,(RootState,u64)>,own
 }
 
 
+/// Decode one row emitted by the snapshot serializer at the running cursor.
+fn consume_snapshot_row(payload:&[u8],cursor:&mut usize,expected:&(Vec<u8>,RootState),scheme:root_wire::Scheme)
+    -> (row:(Vec<u8>,RootState))
+    requires root_wire::at(payload@,*old(cursor) as int,crate::journal_snapshot::row_bytes(*expected,scheme)),
+    ensures row.0@ == expected.0@, row.1 == expected.1,
+        *final(cursor) as int == *old(cursor) as int + crate::journal_snapshot::row_bytes(*expected,scheme).len(),
+{
+    use crate::journal_snapshot as snapshot;
+    let wire = crate::journal_history::to_wire(expected.1);
+    assert(snapshot::row_bytes(*expected,scheme) =~= snapshot::framed(expected.0@,wire,scheme));
+    let restored = match snapshot::read_row(payload,cursor,scheme) {
+        Ok(r) => r, Err(_) => {assert(false);return (Vec::new(),expected.1);},
+    };
+    proof {crate::journal_history::unique(wire,restored.1,expected.1);}
+    restored
+}
+
 /// Restore two distinct principals from a compacted journal, then advance just the fleet root.
 /// Use the production snapshot serializer for both the durable payload and the canonical check.
 fn compacted_transition(system:RootState, fleet:RootState, replacement:RootState, id:[u8;32],
@@ -106,7 +123,7 @@ fn compacted_transition(system:RootState, fleet:RootState, replacement:RootState
     };
     assert(rows@[0].0@ == seq![0u8]);
     assert(rows@[1].0.len() == 33 && rows@[1].0[0] == 2);
-    let payload = snapshot::serialize(&rows,scheme).unwrap();
+    let payload = snapshot::serialize(&rows,scheme);
     assert(payload@ == snapshot::header(2) + snapshot::row_bytes(rows@[0],scheme) +
         snapshot::row_bytes(rows@[1],scheme)) by {
         reveal_with_fuel(snapshot::prefix,3);
@@ -119,9 +136,22 @@ fn compacted_transition(system:RootState, fleet:RootState, replacement:RootState
         vstd::bytes::spec_u64_to_le_bytes(system.generation.value()) + scheme.algorithm@ +
         scheme.construction@ + seq![32u8,0,0,0] + system.commit.digest();
     assert(snapshot::row_bytes(rows@[0],scheme) =~= first);
+    let mut cursor = 17usize;
+    let ghost one = snapshot::row_bytes(rows@[0],scheme);
+    let ghost two = snapshot::row_bytes(rows@[1],scheme);
+    assert(payload@.subrange(17,17int+one.len()) =~= one);
+    let parsed_system = consume_snapshot_row(&payload,&mut cursor,&rows[0],scheme);
+    assert(payload@.subrange(cursor as int,cursor as int+two.len()) =~= two);
+    let parsed_fleet = consume_snapshot_row(&payload,&mut cursor,&rows[1],scheme);
+    assert(cursor == payload.len());
+    let parsed = vec![parsed_system,parsed_fleet];
+    assert(snapshot::row_bytes(parsed@[0],scheme) =~= one);
+    assert(snapshot::row_bytes(parsed@[1],scheme) =~= two);
+    assert(snapshot::prefix(parsed@,2,scheme) == payload@) by {reveal_with_fuel(snapshot::prefix,3);}
+    let rows = parsed;
     let encode = |input:&Vec<(Vec<u8>,RootState)>| -> (r:Result<Vec<u8>,()>)
         ensures r matches Ok(w) && w@ == snapshot::prefix(input@,input.len() as nat,scheme),
-    { Ok(snapshot::serialize(input,scheme).unwrap()) };
+    { Ok(snapshot::serialize(input,scheme)) };
     match snapshot::restore(&mut history,0,&payload,rows,encode,decode) {
         Ok(()) => {
             let ghost ids = choose|ids:Seq<u8>| ids.len() == rows.len() &&

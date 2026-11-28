@@ -261,7 +261,7 @@ pub(super) fn encode_root_snapshot(
             "root snapshot principals are not strictly ordered",
         ));
     }
-    journal_snapshot::serialize(roots, scheme.into()).ok_or(DurableError::EncodingOverflow)
+    Ok(journal_snapshot::serialize(roots, scheme.into()))
 }
 
 enum DecodedRootJournalRecord {
@@ -291,10 +291,13 @@ fn decode_root_journal_record(
             .try_reserve_exact(count)
             .map_err(|_| "root snapshot allocation failed")?;
         for _ in 0..count {
-            let principal_len = reader.usize_len()?;
-            let principal = reader.take(principal_len)?.to_vec();
-            let root = reader.root_state(scheme)?;
-            entries.push((principal, root));
+            let row = journal_snapshot::read_row(bytes, &mut reader.offset, scheme.into())
+                .map_err(|error| match error {
+                    journal_snapshot::RowError::Read(e) => read_error(e),
+                    journal_snapshot::RowError::Length => "length is not process-addressable",
+                    journal_snapshot::RowError::Root(e) => reader.root_error(e, scheme),
+                })?;
+            entries.push(row);
         }
         if entries
             .windows(2)
@@ -364,12 +367,6 @@ impl<'a> RootReader<'a> {
 
     fn usize_len(&mut self) -> Result<usize, &'static str> {
         usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
-    }
-
-    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, &'static str> {
-        super::root_wire::read_root(self.bytes, &mut self.offset, scheme.into())
-            .map(Into::into)
-            .map_err(|error| self.root_error(error, scheme))
     }
 
     fn root_error(
