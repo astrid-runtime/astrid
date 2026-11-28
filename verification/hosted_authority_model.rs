@@ -464,14 +464,19 @@ fn marker_round_trip<K: Eq + std::hash::Hash + Clone, F: Fn(&K) -> [u8; 16]>(
         vstd::std_specs::hash::obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
         vstd::pervasive::obeys_clone_eq::<K>(), bytes.requires((id,)),
 {
-    let (namespace, target) = crate::token_authority::fence_revocation(authority, id);
-    let original = bytes(target);
-    let key = crate::marker_key::encode(&original);
-    let recovered = crate::marker_key::decode(&key);
-    assert(namespace@ == "caps:revoked"@ && recovered == Some(original));
-    assert(bytes.ensures((id,), original));
-    let fenced = crate::token_authority::status(authority, id);
-    assert(fenced.revoked());
+    let write=|ns:&'static str,key:[u8;36],value:[u8;1]| -> (out:(&'static str,[u8;36],[u8;1]))
+        ensures out==(ns,key,value), {(ns,key,value)};
+    let request=crate::token_authority::submit_revocation(authority,id,bytes,write);
+    let ghost (uuid,ns,key,value)=choose|uuid:[u8;16],ns:&'static str,key:[u8;36],value:[u8;1]|
+        #[trigger] bytes.ensures((id,),uuid) && ns@=="caps:revoked"@ && crate::marker_key::spells(uuid@,key@) &&
+        value@==seq![1u8] && #[trigger] write.ensures((ns,key,value),request);
+    let recovered=crate::marker_key::decode(&request.1);
+    assert(request.0@=="caps:revoked"@ && request.2@==seq![1u8]);
+    assert(recovered==Some(uuid) && bytes.ensures((id,),uuid));
+    let fenced=crate::token_authority::status(authority,id);
+    let reusable=fenced.admit(false);
+    let single=fenced.admit(true);
+    assert(reusable is Revoked && single is Revoked);
 }
 
 /// The store's single-use consumption is the model's consume transition, and

@@ -281,6 +281,15 @@ def defects():
 
 
 def live_token_consumers():
+    for label, argument in [
+        ("namespace", '"caps:used",key,value'),
+        ("token", "namespace,[0u8;36],value"),
+        ("presence", "namespace,key,[0u8]"),
+    ]:
+        yield (
+            f"revocation submission changes {label}", AUTHORITY,
+            lambda s, arg=argument: replace_once(s, "let result=write(namespace,key,value);", f"let result=write({arg});"), AUTHORITY,
+        )
     for label, clause in [
         ("marker namespace", 'address.0@ == "caps:revoked"@'),
         ("marker identity", "*address.1 == *id"),

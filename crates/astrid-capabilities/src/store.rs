@@ -525,14 +525,21 @@ impl CapabilityStore {
         // Only a successful durable write provides the restart guarantee.
         {
             let mut authority = self.authority.write().await;
-            let (namespace, fenced_id) = authority::fence_revocation(&mut authority, token_id);
             if let Some(store) = &self.persistent_store {
-                let encoded = marker_key::encode(fenced_id.0.as_bytes());
-                let key = marker_text(&encoded)?;
-                store
-                    .set(namespace, key, PRESENCE_MARKER.to_vec())
-                    .await
-                    .map_err(|error| CapabilityError::StorageError(error.to_string()))?;
+                authority::submit_revocation(
+                    &mut authority,
+                    token_id,
+                    |id| *id.0.as_bytes(),
+                    |namespace, encoded, value| async move {
+                        store
+                            .set(namespace, marker_text(&encoded)?, value.to_vec())
+                            .await
+                            .map_err(|error| CapabilityError::StorageError(error.to_string()))
+                    },
+                )
+                .await?;
+            } else {
+                authority::fence_revocation(&mut authority, token_id);
             }
         }
         if let Some(store) = &self.persistent_store {

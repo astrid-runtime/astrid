@@ -44,6 +44,36 @@ pub(super) fn fence_revocation<'a, K: Eq + Hash + Clone>(
     Marker::Revoked.address(id)
 }
 
+/// Install the live fence, then hand the exact marker write to the backend.
+pub(super) fn submit_revocation<K: Eq + Hash + Clone, R, B, W>(
+    authority: &mut HashMap<K, TokenStatus>, id: &K, bytes: B, write: W,
+) -> (out: R)
+    where B: FnOnce(&K) -> [u8;16], W: FnOnce(&'static str,[u8;36],[u8;1]) -> R,
+    requires hash_map_inv(old(authority)), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+        vstd::pervasive::obeys_clone_eq::<K>(), bytes.requires((id,)),
+        forall|ns:&'static str,key:[u8;36],value:[u8;1]| ns@=="caps:revoked"@ && value@==seq![1u8] ==>
+            #[trigger] write.requires((ns,key,value)),
+    ensures hash_map_inv(final(authority)), ({
+        let fenced=final(authority)@[*id];
+        &&& final(authority)@.contains_key(*id) && fenced.revoked()
+        &&& fenced.used()==(old(authority)@.contains_key(*id) && old(authority)@[*id].used())
+        &&& final(authority)@==old(authority)@.insert(*id,fenced)
+    }),
+        exists|uuid:[u8;16],ns:&'static str,key:[u8;36],value:[u8;1]| #[trigger] bytes.ensures((id,),uuid) &&
+            ns@=="caps:revoked"@ && super::marker_key::spells(uuid@,key@) && value@==seq![1u8] &&
+            #[trigger] write.ensures((ns,key,value),out),
+{
+    let (namespace,target)=fence_revocation(authority,id);
+    let uuid=bytes(target);
+    let key=super::marker_key::encode(&uuid);
+    let value=PRESENCE_MARKER;
+    assert(value@ =~= seq![1u8]);
+    assert(write.requires((namespace,key,value)));
+    let result=write(namespace,key,value);
+    assert(write.ensures((namespace,key,value),result));
+    result
+}
+
 /// Bind a single-use marker address to the live entry updated after the CAS.
 pub(super) struct Consumption<'a,K> {
     id: &'a K,
