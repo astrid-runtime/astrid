@@ -19,7 +19,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", 
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = "0.18.0"
+fuser = "0.19.0"
 nix = { workspace = true }
 
 [dev-dependencies]
