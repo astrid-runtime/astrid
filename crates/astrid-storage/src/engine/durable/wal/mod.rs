@@ -34,7 +34,12 @@ pub(super) use types::{
 #[allow(unused_imports)]
 pub(super) use writer::{WalSink, WalWriter};
 
-use super::{DurableError, WAL_FILE, io_error, root_transition, root_wire};
+#[cfg(verus_keep_ghost)]
+use super::ObjectId;
+use super::{
+    DurableError, RootState, WAL_FILE, io_error, journal_history, journal_transition,
+    root_transition, root_wire,
+};
 
 /// Convert the private WAL grammar error into the durable engine's stable
 /// public error surface without discarding underlying I/O failures.

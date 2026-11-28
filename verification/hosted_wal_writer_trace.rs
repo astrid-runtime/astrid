@@ -339,6 +339,69 @@ fn durable_begin_root<S:crate::group_frontier::BufferedWal,M:crate::positional_r
     Some((marker,body,base.checked_add(relative)?))
 }
 
+/// Recover the same owner and roots from a published WAL and fold the validated
+/// descriptor into canonical journal bytes. The two files use independent offsets.
+fn durable_journal_fold<S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M,H,F,
+    P:Ord+Copy,K:FnOnce(Owner)->P,N:FnOnce(&P)->Owner>(sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,
+    expected:Option<RootState>,replacement:RootState,chunk:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
+    finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,sink:S,base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,
+    key_of:K,name_of:N,key:P,history:&mut BTreeMap<P,(RootState,u64)>)
+    -> (out:Option<Decision<RootState,Vec<u8>>>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
+    requires sequence!=0,begin.len() as int+138+288<=usize::MAX,
+        sink.at_end(),sink.buffered_image().len()==base,base as int+begin.len()+138+288<=u64::MAX,
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v==(checksum@)(p@),
+        forall|p:&[u8]| #[trigger] finish.requires((p,)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v==(digest@)(p@),
+        forall|s:&S| #[trigger] reopen.requires((s,)),
+        forall|s:&S,m:M| #[trigger] reopen.ensures((s,),m) ==> m.image()==s.stable_image() && (target@)(m)==s.wal_target() &&
+            forall|at:u64,e:M::Error| base<=at<base as int+begin.len()+138+288 ==> !#[trigger] m.io_error(at,e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.append_error(e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.drain_error(e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.sync_error(e),
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),btree_map_inv(old(history)),
+        name_of.requires((&key,)),forall|o:Owner| #[trigger] name_of.ensures((&key,),o) ==> o.bytes()==owner.bytes(),
+        forall|o:Owner| o.bytes()==owner.bytes() ==> #[trigger] key_of.requires((o,)),
+        forall|o:Owner,p:P| o.bytes()==owner.bytes() && #[trigger] key_of.ensures((o,),p) ==> p==key,
+    ensures btree_map_inv(final(history)), ({
+        let original=old(history)@;
+        let actual=if original.contains_key(key) {Some(original[key].0)} else {None};
+        let generation=match expected {None=>0int,Some(r)=>r.generation.value() as int+1};
+        let already=actual==Some(replacement);
+        &&& out.is_some()==(replacement.generation.value()==generation)
+        &&& final(history)@==if out matches Some(Decision::Applied(_)) {
+            original.insert(key,(replacement,(base as int+72+begin.len()) as u64))
+        } else {original}
+        &&& match out {
+            Some(Decision::AlreadyPublished)=>already,
+            Some(Decision::Conflict(r))=>!already && actual!=expected && r==actual,
+            Some(Decision::Applied(bytes))=>!already && actual==expected &&
+                bytes@==crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement),
+            None=>true,
+        }
+    }),
+{
+    let name=owner.encode();
+    let encoded=crate::journal_transition::encode(&name,scheme,expected,replacement)?;
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        if let Some(r)=expected {assert(crate::journal_transition::root(r,scheme).len()==48);}
+        assert(crate::journal_transition::root(replacement,scheme).len()==48);
+        assert(encoded.len()<=138);
+    }
+    let (_,body,offset)=durable_begin_root(sequence,begin,&encoded,chunk,hash,checksum,finish,digest,sink,base,reopen,target)?;
+    let record=crate::hosted_acknowledged_root::parse_written(&body,&name,scheme,expected,replacement);
+
+    let prior=record.expected.map(|r:RootState| -> (v:Version) ensures root_transition::represents(v,r), {root_transition::version(r)});
+    if !root_transition::valid_generation(prior,record.replacement.generation.get()) {return None;}
+    let decode=|bytes:&[u8]| -> (out:Option<P>) requires bytes@==name@, ensures out==Some(key),
+    {Some(key_of(owner_codec::decode(bytes)?))};
+    let recode=|p:&P| -> (out:Vec<u8>) requires *p==key, ensures out@==name@, {name_of(p).encode()};
+    let bound=table::BoundJournal::bind(&record.principal,record.expected,record.replacement,offset,decode,recode)?;
+    bound.fold(history,scheme)
+}
+
 spec fn version(r:root_wire::Root) -> Version {
     Version {generation:vstd::bytes::spec_u64_from_le_bytes(r.generation@),commit:r.commit}
 }

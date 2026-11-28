@@ -6,7 +6,7 @@ use vstd::{prelude::*,laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},pervasive::obe
 
 verus! {
 /// Parse the production journal header and transition body from the bytes emitted by preparation.
-fn parse_written(body:&[u8],name:&[u8],scheme:root_wire::Scheme,expected:Option<RootState>,next:RootState)
+pub(super) fn parse_written(body:&[u8],name:&[u8],scheme:root_wire::Scheme,expected:Option<RootState>,next:RootState)
     -> (out:journal::Record)
     requires name.len()<u64::MAX,body@==journal::wire(name@,scheme,expected,next),
     ensures out.principal@==name@ && out.expected==expected && out.replacement==next,

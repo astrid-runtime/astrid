@@ -34,6 +34,20 @@ def consumer_defects():
             Path("verification/hosted_wal_writer_trace.rs"),
         )
 
+    wal_history = Path("crates/astrid-storage/src/engine/durable/wal/root_history.rs")
+    for label, clause, weaker in [
+        ("descriptor offset", "(n,e,r,at)==(name@,expected,replacement,offset)", "(n,e,r)==(name@,expected,replacement)"),
+        ("decoded owner", "&&& decode.ensures((name,),Some(p))", "&&& true"),
+        ("applied history", "{prior.insert(key,(replacement,offset))} else {prior}", "{final(history)@} else {prior}"),
+        ("journal bytes", "applicable && bytes@==journal_transition::wire(name,scheme,expected,replacement)", "applicable"),
+        ("conflicting root", "!already && !applicable && r==actual", "!already && !applicable"),
+    ]:
+        yield (
+            f"published WAL fold loses {label}", wal_history,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_wal_writer_trace.rs"),
+        )
+
     arena = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     for label, clause, weaker in [
         ("complete row count", "r.len()==input.len() && packed(input", "r.len()<=input.len() && packed(input"),

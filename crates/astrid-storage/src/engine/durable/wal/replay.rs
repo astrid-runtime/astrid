@@ -25,7 +25,6 @@ use super::{WalLimits, durable_error};
 use crate::engine::durable::format::{append_frames, canonical_record_bytes, encode_object_frame};
 use crate::engine::durable::representations::RepresentationStore;
 use crate::engine::durable::root_transition::{self, Replay};
-use crate::engine::durable::roots::encode_root_record;
 use crate::engine::durable::validation::{ClosureObjects, validate_incremental_closure};
 use crate::engine::durable::{
     ARENA_MAGIC, ArenaLocation, DurableError, PersistentObjectIdentity, PrincipalCodec, ROOT_MAGIC,
@@ -294,20 +293,20 @@ where
 
     let mut roots_to_publish = Vec::new();
     let mut known = validated.clone();
-    for descriptor in transaction.roots {
+    for descriptor in &transaction.roots {
         let transition = descriptor.transition();
-        let principal =
-            codec
-                .decode(transition.principal())
-                .ok_or(DurableError::InvalidPrincipal {
-                    offset: descriptor.offset().get(),
-                })?;
-        if codec.encode(&principal) != transition.principal() {
-            return Err(DurableError::InvalidPrincipal {
-                offset: descriptor.offset().get(),
-            });
-        }
-        let actual = root_history::lookup(root_history, &principal);
+        let bound = root_history::BoundJournal::bind(
+            transition.principal(),
+            transition.expected(),
+            transition.replacement(),
+            descriptor.offset().get(),
+            |bytes| codec.decode(bytes),
+            |principal| codec.encode(principal),
+        )
+        .ok_or(DurableError::InvalidPrincipal {
+            offset: descriptor.offset().get(),
+        })?;
+        let actual = root_history::lookup(root_history, bound.owner());
         let replacement = transition.replacement();
         if matches!(
             root_transition::replay(
@@ -340,7 +339,7 @@ where
             replacement.commit,
         )?;
         known.extend(reachable);
-        roots_to_publish.push((principal, transition.clone(), descriptor.offset().get()));
+        roots_to_publish.push(bound);
     }
 
     let mut direct = Vec::new();
@@ -371,30 +370,15 @@ where
     }
 
     let mut journals = Vec::new();
-    for (principal, transition, offset) in roots_to_publish {
-        match root_history::fold(
-            root_history,
-            principal,
-            transition.expected(),
-            transition.replacement(),
-            offset,
-            Into::into,
-            |_, expected, replacement| {
-                encode_root_record(
-                    identity.scheme(),
-                    transition.principal(),
-                    expected,
-                    replacement,
-                )
-            },
-        )? {
+    for bound in roots_to_publish {
+        let expected = bound.expected();
+        match bound
+            .fold(root_history, identity.scheme().into())
+            .ok_or(DurableError::EncodingOverflow)?
+        {
             Decision::AlreadyPublished => {},
             Decision::Conflict(actual) => {
-                return Err(ModelError::RootConflict {
-                    expected: transition.expected(),
-                    actual,
-                }
-                .into());
+                return Err(ModelError::RootConflict { expected, actual }.into());
             },
             Decision::Applied(journal) => journals.push(journal),
         }
