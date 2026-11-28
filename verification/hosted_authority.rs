@@ -271,6 +271,8 @@ mod checkpoint_key;
 use checkpoint_admission::IndexState;
 #[path = "../crates/astrid-storage/src/engine/durable/index/wire.rs"]
 mod checkpoint_wire;
+#[path = "../crates/astrid-storage/src/engine/durable/index/history.rs"]
+mod checkpoint_history;
 #[path = "../crates/astrid-storage/src/engine/durable/format/checkpoint_reader.rs"]
 mod checkpoint_reader;
 #[path = "../crates/astrid-storage/src/engine/durable/format/duplicates.rs"]
@@ -310,6 +312,7 @@ mod hosted_arena_append;
 mod hosted_recovery_barrier;
 mod hosted_checkpoint_recovery;
 mod hosted_duplicate_recovery;
+mod hosted_checkpoint_scan;
 mod hosted_record_roundtrip;
 mod hosted_closure_model;
 

@@ -38,7 +38,7 @@ const INDEX_FILE: &str = "objects.index";
 const LOCK_FILE: &str = "store.lock";
 const WAL_FILE: &str = "transactions.wal";
 const WAL_WRITE_BUFFER_BYTES: usize = 64 * 1024;
-const INDEX_MAGIC: [u8; 8] = *b"ASTIDX1\0";
+use arena_frame::INDEX_MAGIC;
 const FRAME_HEADER_LEN: u64 = arena_frame::WIDTH as u64;
 const FRAME_HEADER_LEN_USIZE: usize = arena_frame::WIDTH;
 #[cfg(test)]

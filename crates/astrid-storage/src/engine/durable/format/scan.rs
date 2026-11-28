@@ -265,6 +265,7 @@ fn scan_live<F: DurableIo>(
 #[derive(Clone, Copy)]
 pub(in crate::engine::durable) enum RecoveryFile {
     Roots,
+    Index,
     Arena { protected_len: u64 },
 }
 /// Scan the live file using its verified history visitor.
@@ -283,6 +284,7 @@ where
         .map_err(|source| io_error("read principal-store metadata", source))?
         .len();
     let (file_name, magic, protected_len) = match kind {
+        RecoveryFile::Index => (super::super::INDEX_FILE, super::super::INDEX_MAGIC, 0),
         RecoveryFile::Roots => (super::super::ROOT_FILE, super::super::ROOT_MAGIC, 0),
         RecoveryFile::Arena { protected_len } => {
             (super::ARENA_FILE, super::ARENA_MAGIC, protected_len)
@@ -306,6 +308,13 @@ where
     };
     scan_live(file, |reader| {
         let outcome = match kind {
+            RecoveryFile::Index => super::super::frame_scan::scan_index(
+                reader,
+                visitor,
+                file_len,
+                limits.max_frame_bytes,
+                frame_checksum,
+            ),
             RecoveryFile::Roots => super::super::frame_scan::scan_root(
                 reader,
                 visitor,

@@ -147,6 +147,21 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), observer,
         )
     media = Path("crates/astrid-storage/src/engine/durable/format/positional_read.rs")
+    history = Path("crates/astrid-storage/src/engine/durable/index/history.rs")
+    raw_cache = Path("verification/hosted_checkpoint_scan.rs")
+    for label, source, before, after in [
+        ("offset", history, "validate(s,at)", "validate(s,0)"),
+        ("predecessor", history, "wire::record(bytes,prior,self.scheme,check)", "wire::record(bytes,None,self.scheme,check)"),
+        ("file magic", raw_cache, "frame_scan::scan_index(reader,&mut history,end,limit,hash)", "frame_scan::scan_root(reader,&mut history,end,limit,hash)"),
+        ("repair refusal", raw_cache, "Ok(Outcome::Repaired)=>{},", "Ok(_)=>{},"),
+        ("repair receipt", raw_cache, "(at,Some(f))", "(at,None)"),
+        ("measured end", raw_cache, "Some(CacheImage{state,end:at,fence})", "Some(CacheImage{state,end,fence})"),
+        ("checkpoint receipt at reopen", Path("verification/hosted_duplicate_recovery.rs"), "end:candidate.end,fence:candidate.fence", "end:candidate.end,fence:None"),
+    ]:
+        yield (
+            f"raw checkpoint recovery loses {label}", source,
+            lambda s, a=before, b=after: replace_once(s, a, b), source,
+        )
     wire = Path("crates/astrid-storage/src/engine/durable/index/wire.rs")
     for label, before, after in [
         ("declared length", "let state=IndexState{arena_len,arena_tail,objects};", "let state=IndexState{arena_len:0,arena_tail,objects};"),

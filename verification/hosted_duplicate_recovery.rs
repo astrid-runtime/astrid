@@ -1,5 +1,6 @@
 //! Recover from checksum-validated physical frames, including redundant copies.
 use crate::{ArenaLocation,ObjectId,checkpoint_admission as admission,duplicates::{self,Media},root_wire::Scheme,verified_record};
+use crate::hosted_checkpoint_scan::{CacheImage,decoded_cache,persisted,recover_cache};
 use std::collections::BTreeMap;
 use vstd::{prelude::*,laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},std_specs::btree::btree_map_inv};
 
@@ -430,103 +431,26 @@ fn admit_cached<M:crate::positional_read::Media,H:FrameDigest,R:crate::checkpoin
     admission::IndexState::validated(candidate,complete,measured,arena)
 }
 
-/// Starting at an empty cache, the first complete payload must be a snapshot.
-/// Every following payload must extend the immediately preceding index.
-spec fn decoded_step<V:Fn(&admission::IndexState)->Result<(),()>>(bytes:Seq<u8>,prior:Option<admission::IndexState>,
-    next:admission::IndexState,scheme:Scheme,check:V) -> bool {
-    &&& bytes.len()>0
-    &&& match prior {
-        None=>bytes[0]==crate::checkpoint_wire::SNAPSHOT_RECORD && check.ensures((&next,),Ok(())) &&
-            crate::checkpoint_wire::snapshot_at(bytes,1,bytes.len() as int,scheme,next),
-        Some(old)=>bytes[0]==crate::checkpoint_wire::DELTA_RECORD &&
-            exists|add:admission::IndexState| #[trigger] check.ensures((&add,),Ok(())) &&
-                crate::checkpoint_wire::delta_at(bytes,1,bytes.len() as int,scheme,old,add,next),
-    }
-}
-
-spec fn cache_chain<V:Fn(&admission::IndexState)->Result<(),()>>(rows:Seq<Vec<u8>>,states:Seq<admission::IndexState>,scheme:Scheme,check:V) -> bool {
-    &&& rows.len()==states.len()
-    &&& forall|i:int| 0<=i<rows.len() ==> decoded_step((#[trigger] rows[i])@,
-        if i==0 {None} else {Some(states[i-1])},states[i],scheme,check)
-}
-
-enum CacheInput<'a,V> { Candidate(Option<admission::IndexState>), Records(&'a [Vec<u8>],V) }
-
-impl<V:Fn(&admission::IndexState)->Result<(),()>+Copy> CacheInput<'_,V> {
-    spec fn ready(&self) -> bool {
-        match self {
-            Self::Candidate(v)=>v matches Some(s) ==> btree_map_inv(&s.objects),
-            Self::Records(_,check)=>forall|s:&admission::IndexState| #[trigger] check.requires((s,)),
-        }
-    }
-
-    spec fn admits(&self,scheme:Scheme,state:admission::IndexState) -> bool {
-        match self {
-            Self::Candidate(v)=>*v==Some(state),
-            Self::Records(rows,check)=>rows.len()>0 && exists|states:Seq<admission::IndexState>| #[trigger] cache_chain(rows@,states,scheme,*check) && states.last()==state,
-        }
-    }
-
-    fn decode(self,scheme:Scheme) -> (out:Option<admission::IndexState>)
-        requires self.ready(),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
-        ensures out matches Some(s) ==> btree_map_inv(&s.objects) && self.admits(scheme,s),
-    {
-        let Self::Records(rows,check)=self else {
-            return match self {Self::Candidate(v)=>v,_=>unreachable!()};
-        };
-        let mut state:Option<admission::IndexState>=None;
-        let mut i=0usize;
-        let ghost mut states=Seq::<admission::IndexState>::empty();
-        while i<rows.len()
-            invariant i<=rows.len(),state.is_some()==(i>0),cache_chain(rows@.take(i as int),states,scheme,check),
-                state matches Some(s) ==> s==states.last(),
-                state matches Some(s) ==> btree_map_inv(&s.objects),
-                forall|s:&admission::IndexState| #[trigger] check.requires((s,)),
-                obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
-            decreases rows.len()-i,
-        {
-            let bytes=rows[i].as_slice();
-            let ghost prior=state;
-            let next=crate::checkpoint_wire::record(bytes,state,scheme,check).ok()?;
-            proof {
-                assert(decoded_step(bytes@,prior,next,scheme,check));
-                let prefix=rows@.take(i as int+1);
-                let extended=states.push(next);
-                assert forall|j:int| 0<=j<prefix.len() implies decoded_step((#[trigger] prefix[j])@,
-                    if j==0 {None} else {Some(extended[j-1])},extended[j],scheme,check) by {
-                    if j<i {
-                        assert(rows@.take(i as int)[j]==prefix[j]);
-                        assert(decoded_step(rows@.take(i as int)[j]@,if j==0 {None} else {Some(states[j-1])},states[j],scheme,check));
-                    } else {
-                        assert(j==i && prefix[j]@==bytes@);
-                        if i>0 {assert(prior==Some(states[i as int-1]));}
-                    }
-                }
-                assert(cache_chain(prefix,extended,scheme,check));
-                states=extended;
-            }
-            state=Some(next);
-            i+=1;
-        }
-        assert(rows@.take(i as int) =~= rows@);
-        assert(cache_chain(rows@,states,scheme,check));
-        state
-    }
-}
-
 /// Cache-hit recovery retains the index actually admitted by the production
 /// validator and the journal fence, then rereads every reachable object.
 #[verifier::spinoff_prover]
 fn reopen_cached<A:crate::positional_read::Media,H:FrameDigest,T:crate::checkpoint_reader::Input,
     R:crate::frame_repair::FrameReader,M:crate::frame_repair::Medium,V:crate::frontier::JournalContainer,
-    P:Ord,D,C,G,I,F,O,B:Fn(&admission::IndexState)->Result<(),()>+Copy>(cache_input:CacheInput<B>,complete:bool,measured:u64,arena:&A,entries:T,hash:&H,
+    P:Ord,D,C,G,I,F,O,E,B:Fn(&admission::IndexState,u64)->Result<(),E>+Copy,
+    S:crate::frame_repair::FrameReader,N:crate::frame_repair::Medium,W:crate::frontier::JournalContainer,Z:FnOnce(&N)->W>(
+    checkpoint:&mut S,cache_file:&mut N,cache_end:u64,cache_limit:u64,validate:B,cache_capture:Z,measured:u64,arena:&A,entries:T,hash:&H,
     reader:&mut R,journal:&mut M,capture:O,end:u64,protected:u64,batch:u64,limit:u64,scheme:Scheme,
     decode:D,recode:C,hash_frame:G,identify:I,project:F)
-    -> (out:Option<(crate::hosted_recovered_roots::Loaded<P>,admission::IndexState,Option<V>)>)
+    -> (out:Option<(crate::hosted_recovered_roots::Loaded<P>,CacheImage<W>,Option<V>)>)
     where D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy,G:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
         I:Fn(&crate::ObjectRecord)->[u8;32]+Copy,F:FnOnce(&BTreeMap<P,(crate::RootState,u64)>)->BTreeMap<P,crate::RootState>,
         O:FnOnce(&M)->V,
-    requires cache_input.ready(),
+    requires old(checkpoint).target()==old(cache_file).target(),old(checkpoint).image()==old(cache_file).bytes(),old(checkpoint).position()==0,
+        !old(cache_file).syncs_file(),old(cache_file).bytes()==old(cache_file).durable(),cache_end==old(checkpoint).image().len(),
+        old(checkpoint).target().0==arena.target().0,old(checkpoint).target().1!=arena.target().1,old(checkpoint).target().1!=old(reader).target().1,
+        forall|s:&admission::IndexState,at:u64| #[trigger] validate.requires((s,at)),
+        forall|m:&N| m.target()==old(cache_file).target() ==> #[trigger] cache_capture.requires((m,)),
+        forall|m:&N,w:W| #[trigger] cache_capture.ensures((m,),w) ==> (w.container_id(),w.region_id())==m.target() && w.journal_image()==m.bytes(),
         entries.image()==arena.image(),measured==arena.image().len(),
         old(reader).target()==old(journal).target(),arena.target().0==old(reader).target().0,arena.target().1!=old(reader).target().1,
         !old(journal).syncs_file(),old(reader).image()==old(journal).durable(),old(journal).durable()==old(journal).bytes(),
@@ -540,9 +464,16 @@ fn reopen_cached<A:crate::positional_read::Media,H:FrameDigest,T:crate::checkpoi
         forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
         forall|h:&BTreeMap<P,(crate::RootState,u64)>| #[trigger] project.requires((h,)),
         forall|h:&BTreeMap<P,(crate::RootState,u64)>,t:BTreeMap<P,crate::RootState>| #[trigger] project.ensures((h,),t) ==> btree_map_inv(&t),
-    ensures out matches Some((v,s,fence)) ==> {
+    ensures out matches Some((v,c,fence)) ==> {
+        let s=c.state;
         let physical=Physical{media:arena,hash,magic:crate::arena_frame::ARENA_MAGIC,version:crate::arena_frame::FRAME_VERSION,limit};
-        &&& complete && cache_input.admits(scheme,s) && admitted_state(s,physical,scheme,measured)
+        &&& decoded_cache(old(checkpoint).image(),c.end,cache_limit,scheme,validate,hash_frame,s)
+        &&& 0<c.end<=cache_end
+        &&& (c.end<cache_end ==> !crate::frame_repair::has_later::<N>(old(checkpoint).image(),c.end,cache_end,crate::arena_frame::INDEX_MAGIC,cache_limit))
+        &&& final(cache_file).target()==old(checkpoint).target() && final(cache_file).bytes()==old(checkpoint).image().take(c.end as int)
+        &&& persisted(c.fence,final(cache_file).target(),final(cache_file).bytes(),c.end,cache_end)
+        &&& (c.fence.is_none() ==> final(cache_file).durable()==final(cache_file).bytes())
+        &&& admitted_state(s,physical,scheme,measured)
         &&& final(journal).target()==old(reader).target() && protected<=v.end<=end
         &&& final(journal).bytes()==old(reader).image().take(v.end as int)
         &&& match fence {
@@ -556,15 +487,15 @@ fn reopen_cached<A:crate::positional_read::Media,H:FrameDigest,T:crate::checkpoi
     use crate::hosted_journal_scan::{recover_volume,VolumeRecovery};
     let source=Physical{media:arena,hash,magic:crate::arena_frame::ARENA_MAGIC,version:crate::arena_frame::FRAME_VERSION,limit};
     let mut cache=CachedArena{source,entries,scheme};
-    let candidate=cache_input.decode(scheme);
-    let state=admit_cached(candidate,complete,measured,&mut cache)?;
+    let candidate=recover_cache(checkpoint,cache_file,cache_end,cache_limit,scheme,validate,hash_frame,cache_capture)?;
+    let state=admit_cached(Some(candidate.state),true,measured,&mut cache)?;
     let (at,history,fence)=match recover_volume(reader,journal,end,protected,limit,scheme,decode,recode,hash_frame,capture) {
         VolumeRecovery::Unmodified(h)=>{assert(journal.bytes().take(end as int) =~= journal.bytes());(end,h,None)},
         VolumeRecovery::Persisted(at,h,v)=>(at,h,Some(v)),
         _=>return None,
     };
     let loaded=crate::hosted_recovered_roots::load_history(history,at,arena,&state.objects,batch,limit,scheme,hash_frame,identify,project)?;
-    Some((loaded,state,fence))
+    Some((loaded,CacheImage{state,end:candidate.end,fence:candidate.fence},fence))
 }
 
 }

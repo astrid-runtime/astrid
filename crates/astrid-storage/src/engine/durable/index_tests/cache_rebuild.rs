@@ -372,3 +372,51 @@ fn rebuilt_checkpoint_reuses_identical_arena_copies_on_restart() {
         }
     }
 }
+
+#[test]
+fn checkpoint_repair_reuses_torn_prefix_and_rebuilds_after_decoding_refusal() {
+    use super::super::format::{recovery_arena_scans, reset_recovery_arena_scans};
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    for hosted in [false, true] {
+        for bad_record in [false, true] {
+            let fixture = Fixture::new(hosted);
+            let faults = Arc::new(TripPublication::default());
+            let engine = fixture.open(Arc::clone(&faults));
+            let (commit, tx) = transaction("alice", None, b"checkpoint");
+            let root = engine.commit(tx).unwrap().root();
+            engine.flush().unwrap();
+            drop(engine);
+
+            let mut index = match &fixture.volume {
+                Some(volume) => File::volume(volume.clone(), INDEX_FILE, false).unwrap(),
+                None => File::native(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(fixture.directory.path().join(INDEX_FILE))
+                        .unwrap(),
+                ),
+            };
+            if bad_record {
+                // Valid physical frame with an unknown record kind after the snapshot.
+                append_frame(&mut index, INDEX_MAGIC, &[0xff]).unwrap();
+            } else {
+                index.seek(SeekFrom::End(0)).unwrap();
+                index.write_all(&INDEX_MAGIC[..5]).unwrap();
+            }
+            if let Some(volume) = &fixture.volume {
+                volume.sync().unwrap();
+            } else {
+                index.sync_data().unwrap();
+            }
+            drop(index);
+
+            reset_recovery_arena_scans();
+            let recovered = fixture.open(faults);
+            assert_eq!(recovery_arena_scans(), usize::from(bad_record));
+            assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(root));
+            assert!(recovered.object(commit).unwrap().is_some());
+        }
+    }
+}

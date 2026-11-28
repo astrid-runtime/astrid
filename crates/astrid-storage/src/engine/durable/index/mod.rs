@@ -20,7 +20,7 @@ use super::{
     ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
     FRAME_HEADER_LEN_USIZE, FaultInjector, File, INDEX_FILE, INDEX_MAGIC, IdentityScheme,
     PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, append_frame,
-    create_private_file_capability, live_files_mut, open_rw_capability, scan_frames,
+    create_private_file_capability, live_files_mut, open_rw_capability,
     sync_store_directory_capability, verify_indexed_location, verify_indexed_tail,
 };
 use crate::volume::AstridVolume;
@@ -29,6 +29,7 @@ use std::sync::Arc;
 use super::{format::encode_identity, root_wire};
 
 use super::{IndexState, checkpoint_admission as admission};
+mod history;
 mod key;
 use super::arena_index;
 use key as checkpoint_key;
@@ -37,6 +38,8 @@ mod snapshot;
 mod tests;
 mod validation;
 mod wire;
+use super::{frame_repair, frame_scan};
+use wire as checkpoint_wire;
 
 use snapshot::Snapshot;
 
@@ -230,28 +233,24 @@ pub(super) fn recover_index(
     limits: RecoveryLimits,
     authoritative_arena_len: u64,
 ) -> Option<IndexState> {
-    let mut state = None;
-    let recovered = scan_frames(
+    let mut history = history::History::new(scheme.into(), validate_state);
+    let recovered = super::format::scan_recovery_file(
         file,
-        INDEX_FILE,
-        INDEX_MAGIC,
         RecoveryLimits::process_addressable(),
-        |offset, payload| {
-            state = Some(decode_record(state.take(), payload, scheme, offset)?);
-            Ok(())
-        },
+        super::format::RecoveryFile::Index,
+        &mut history,
+        |offset, _, error| record_error(offset, error),
     );
+    if recovered.is_err() {
+        return None;
+    }
+    let state = history.finish();
     let mut reader = CandidateArena {
         arena,
         scheme,
         limits,
     };
-    IndexState::validated(
-        state,
-        recovered.is_ok(),
-        authoritative_arena_len,
-        &mut reader,
-    )
+    IndexState::validated(state, true, authoritative_arena_len, &mut reader)
 }
 
 struct CandidateArena<'a> {
@@ -274,6 +273,7 @@ impl admission::Arena for CandidateArena<'_> {
     }
 }
 
+#[cfg(test)]
 fn decode_record(
     state: Option<IndexState>,
     payload: &[u8],
@@ -283,7 +283,11 @@ fn decode_record(
     wire::record(payload, state, scheme.into(), |state| {
         validate_state(state, offset)
     })
-    .map_err(|error| match error {
+    .map_err(|error| record_error(offset, error))
+}
+
+fn record_error(offset: u64, error: wire::RecordError<DurableError>) -> DurableError {
+    match error {
         wire::RecordError::Invalid(error) => error,
         wire::RecordError::Discontinuous => corrupt(
             offset,
@@ -304,7 +308,7 @@ fn decode_record(
         },
         wire::RecordError::Unknown => corrupt(offset, "unknown index record kind"),
         wire::RecordError::Trailing => corrupt(offset, "trailing index-record bytes"),
-    })
+    }
 }
 
 /// Replace the disposable index with one complete, flushed checkpoint.
