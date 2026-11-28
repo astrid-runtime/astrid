@@ -39,6 +39,11 @@ def consumer_defects():
     yield from mcp.defects()
     native_address = Path("crates/astrid-vfs/src/host_address.rs")
     for label, before, after in [
+        ("pending open handle", "entry.binding().0==handle && open.ensures", "open.ensures"),
+        ("physical root result", "open.ensures((path,),Ok(entry.binding().1))", "true"),
+        ("physical root refusal", "Err(e)=>open.ensures((path,),Err(e))", "Err(_)=>true"),
+        ("published root identity", "*final(table)@[self.binding().0]==self.binding().1", "true"),
+        ("other roots during registration", "final(table)@==old(table)@.insert(self.binding().0,final(table)@[self.binding().0])", "true"),
         ("registered handle", "out.is_some() == table@.contains_key(*handle)", "out.is_some() ==> table@.contains_key(*handle)"),
         ("registration update", "final(table)@ == old(table)@.insert(handle,entry)", "final(table)@.contains_key(handle)"),
         ("close isolation", "final(table)@ == old(table)@.remove(*handle)", "!final(table)@.contains_key(*handle)"),

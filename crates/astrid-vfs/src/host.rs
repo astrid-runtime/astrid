@@ -69,14 +69,22 @@ impl HostVfs {
     ///
     /// Returns a typed VFS error when the directory cannot be opened.
     pub fn with_registered_dir(handle: DirHandle, physical_path: &Path) -> VfsResult<Self> {
-        let dir = Dir::open_ambient_dir(physical_path, cap_std::ambient_authority())
-            .map_err(classify_io_error)?;
+        let opened = Self::open_root(handle, physical_path).map_err(classify_io_error)?;
         let mut open_dirs = HashMap::new();
-        host_address::install(&mut open_dirs, handle, Arc::new(dir));
+        opened.publish(&mut open_dirs);
         Ok(Self {
             open_dirs: RwLock::new(open_dirs),
             open_files: RwLock::new(HashMap::new()),
             fd_semaphore: Arc::new(Semaphore::new(64)),
+        })
+    }
+
+    fn open_root(
+        handle: DirHandle,
+        path: &Path,
+    ) -> std::io::Result<host_address::OpenedDirectory<DirHandle, Dir>> {
+        host_address::OpenedDirectory::open(handle, path, |selected| {
+            Dir::open_ambient_dir(selected, cap_std::ambient_authority())
         })
     }
 
@@ -88,17 +96,15 @@ impl HostVfs {
     ///
     /// Returns a typed VFS error if the directory cannot be opened.
     pub async fn register_dir(&self, handle: DirHandle, physical_path: PathBuf) -> VfsResult<()> {
-        let dir_res = tokio::task::spawn_blocking(move || {
-            Dir::open_ambient_dir(&physical_path, cap_std::ambient_authority())
-        })
-        .await
-        .expect("spawn_blocking panicked");
+        let dir_res = tokio::task::spawn_blocking(move || Self::open_root(handle, &physical_path))
+            .await
+            .expect("spawn_blocking panicked");
 
         match dir_res {
-            Ok(dir) => {
+            Ok(opened) => {
                 let mut dirs: tokio::sync::RwLockWriteGuard<'_, HashMap<DirHandle, Arc<Dir>>> =
                     self.open_dirs.write().await;
-                host_address::install(&mut dirs, handle, Arc::new(dir));
+                opened.publish(&mut dirs);
                 Ok(())
             },
             Err(e) => {

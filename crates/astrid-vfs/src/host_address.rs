@@ -23,6 +23,35 @@ pub(super) fn install<K:Eq+Hash,T>(table:&mut HashMap<K,Arc<T>>, handle:K, entry
     ensures vstd::std_specs::hash::hash_map_inv(final(table)), final(table)@ == old(table)@.insert(handle,entry),
 { table.insert(handle,entry); }
 
+/// A successful physical open and the table handle for which it was issued.
+/// The blocking worker can return this value before the table lock is acquired.
+pub(super) struct OpenedDirectory<K,D> {handle:K,directory:D}
+
+impl<K:Eq+Hash,D> OpenedDirectory<K,D> {
+    pub(super) closed spec fn binding(&self) -> (K,D) {(self.handle,self.directory)}
+
+    pub(super) fn open<P,E,F:FnOnce(P)->Result<D,E>>(handle:K,path:P,open:F) -> (out:Result<Self,E>)
+        requires open.requires((path,)),
+        ensures match out {
+            Ok(entry)=>entry.binding().0==handle && open.ensures((path,),Ok(entry.binding().1)),
+            Err(e)=>open.ensures((path,),Err(e)),
+        },
+    {
+        let directory=open(path)?;
+        Ok(Self{handle,directory})
+    }
+
+    pub(super) fn publish(self,table:&mut HashMap<K,Arc<D>>)
+        requires vstd::std_specs::hash::hash_map_inv(old(table)),vstd::std_specs::hash::obeys_key_model::<K>(),
+            vstd::laws_eq::obeys_concrete_eq::<K>(),
+        ensures vstd::std_specs::hash::hash_map_inv(final(table)),
+            final(table)@.contains_key(self.binding().0) && *final(table)@[self.binding().0]==self.binding().1,
+            final(table)@==old(table)@.insert(self.binding().0,final(table)@[self.binding().0]),
+    {
+        install(table,self.handle,Arc::new(self.directory));
+    }
+}
+
 pub(super) fn close<K:Eq+Hash,T>(table:&mut HashMap<K,Arc<T>>, handle:&K) -> (removed:bool)
     requires vstd::std_specs::hash::hash_map_inv(old(table)), vstd::std_specs::hash::obeys_key_model::<K>(),
         vstd::laws_eq::obeys_concrete_eq::<K>(),

@@ -29,6 +29,26 @@ fn after_rebind<'a>(table:&mut HashMap<u64,Arc<u64>>, key:u64, replacement:Arc<u
     Some((result,*current))
 }
 
+/// Two opens can finish before either worker publishes. Discarding one
+/// result leaves the other registration intact, even for equal handles.
+fn register_workers(table:&mut HashMap<u64,Arc<u64>>,first:u64,next:u64,path:u64,other:u64,
+    deny:bool,cancel:bool) -> (out:Result<(),u64>)
+    requires vstd::std_specs::hash::hash_map_inv(old(table)),
+    ensures out==if deny {Err(path)} else {Ok(())},
+        final(table)@.contains_key(next) && *final(table)@[next]==if first==next && !deny && !cancel {path} else {other},
+        !deny && !cancel ==> final(table)@.contains_key(first) && *final(table)@[first]==path,
+        forall|k:u64| k!=next && (k!=first || deny || cancel) ==> #[trigger] final(table)@.get(k)==old(table)@.get(k),
+{
+    use crate::host_address::OpenedDirectory;
+    let pending=OpenedDirectory::open(first,path,|p:u64| -> (r:Result<u64,u64>) ensures r==if deny {Err(p)} else {Ok(p)},
+        {if deny {Err(p)} else {Ok(p)}});
+    let later=OpenedDirectory::open(next,other,|p:u64| -> (r:Result<u64,u64>) ensures r==Ok(p), {Ok(p)});
+    later.unwrap().publish(table);
+    let opened=pending?;
+    if !cancel {opened.publish(table);}
+    Ok(())
+}
+
 /// Carry the guard, handle and relative operand through mount choice, directory
 /// lookup and worker dispatch; another mount can contain the very same handle.
 fn admitted_worker<'a>(tables:[&HashMap<u64,Arc<u64>>;3], handles:[u64;3],
