@@ -143,6 +143,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/engine/durable/arena_frame.rs"),
     Path("crates/astrid-storage/src/engine/durable/frame_repair.rs"),
     Path("crates/astrid-storage/src/engine/durable/recovery_barrier.rs"),
+    Path("crates/astrid-storage/src/engine/durable/recovered_closure.rs"),
     Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs"),
     Path("crates/astrid-storage/src/engine/durable/direct_placement.rs"),
     Path("crates/astrid-storage/src/engine/durable/format/arena_span.rs"),

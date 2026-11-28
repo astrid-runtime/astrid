@@ -254,6 +254,8 @@ mod arena_frame;
 mod frame_repair;
 #[path = "../crates/astrid-storage/src/engine/durable/recovery_barrier.rs"]
 mod recovery_barrier;
+#[path = "../crates/astrid-storage/src/engine/durable/recovered_closure.rs"]
+mod recovered_closure;
 use arena_frame::ArenaLocation;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_vectors.rs"]
 mod arena_vectors;

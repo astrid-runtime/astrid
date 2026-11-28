@@ -9,8 +9,8 @@ use super::journal_snapshot::{self, SnapshotError};
 use super::root_wire::{self, TailError};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
-    preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
+    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, preload_indexed_closures,
+    recovery_closure_error, scan_frames, validate_commit_closure,
 };
 
 use journal_snapshot::{HeaderError, JournalHeader};
@@ -84,7 +84,6 @@ where
     P: Ord,
     I: PersistentObjectIdentity,
 {
-    let mut validated = BTreeSet::new();
     let preload = preload_indexed_closures(
         arena,
         index,
@@ -96,29 +95,25 @@ where
         let root_offset = recovered.values().next().map_or(0, |(_, offset)| *offset);
         recovery_closure_error(error, root_offset)
     })?;
-    let empty_index = BTreeMap::new();
-    for (root, offset) in recovered.values().copied() {
-        let records = materialize_closure(
-            &mut super::ClosureObjects::<_, P> {
-                arena,
-                index: &empty_index,
-                incoming: &preload,
-                pending: None,
-                identity,
-                limits,
-            },
-            root.commit,
-        )
-        .map_err(|error| recovery_closure_error(error, offset))?;
-        validate_commit_closure(&records, root.commit).map_err(|source| {
-            DurableError::RecoveryModel {
+    let validated = super::recovered_closure::check_all(
+        &recovered,
+        |commit, at| {
+            super::validation::materialize_with(commit, |id| {
+                preload
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| DurableError::from(ModelError::MissingObject(id)))
+            })
+            .map_err(|error| recovery_closure_error(error, at))
+        },
+        |records, commit, at| {
+            validate_commit_closure(records, commit).map_err(|source| DurableError::RecoveryModel {
                 file: ROOT_FILE,
-                offset,
+                offset: at,
                 source,
-            }
-        })?;
-        validated.extend(records.into_iter().map(|(id, _)| id));
-    }
+            })
+        },
+    )?;
     Ok((
         recovered
             .into_iter()

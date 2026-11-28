@@ -812,6 +812,7 @@ mod checkpoint_admission;
 mod direct_placement;
 mod frame_repair;
 mod read_admission;
+mod recovered_closure;
 mod recovery_barrier;
 mod staging;
 

@@ -8,6 +8,30 @@ from .common import replace_once
 def consumer_defects():
     append = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     readback = Path("verification/hosted_arena_append.rs")
+    closure = Path("crates/astrid-storage/src/engine/durable/recovered_closure.rs")
+    for label, clause, weaker in [
+        ("load binding", "Ok(()) => exists|rows:Vec<(K,R)>| #[trigger] load.ensures((commit,offset),Ok(rows)) &&", "Ok(()) => exists|rows:Vec<(K,R)>|"),
+        ("validation binding", "validate.ensures((&rows,commit,offset),Ok(())) &&", "true &&"),
+        ("accepted IDs", "final(known)@ == old(known)@.union(ids(rows@))", "true"),
+        ("failed collection", "Err(e) => final(known)@ == old(known)@ &&", "Err(e) =>"),
+        ("load error", "load.ensures((commit,offset),Err(e)) ||", "true ||"),
+        ("validation error", "&& validate.ensures((&rows,commit,offset),Err(e))", "&& true"),
+    ]:
+        yield (
+            f"recovered closure loses {label}", closure,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_recovery_barrier.rs"),
+        )
+    for label, clause, weaker in [
+        ("owner coverage", "entries.to_set() == history@.kv_pairs() && entries.len() == history.len() &&", "entries.len() == history.len() &&"),
+        ("owner validation", "forall|i:int| 0 <= i < entries.len() ==> #[trigger] accepted(entries[i].1,sets[i],load,validate)", "true"),
+        ("object coverage", "known.contains(k) == #[trigger] recorded(sets,k)", "known.contains(k) ==> #[trigger] recorded(sets,k)"),
+        ("object origin", "known.contains(k) == #[trigger] recorded(sets,k)", "known.contains(k) <== #[trigger] recorded(sets,k)"),
+        ("error origin", "Err(e) => exists|p:P| #[trigger] history@.contains_key(p)", "Err(e) => true || exists|p:P| #[trigger] history@.contains_key(p)"),
+    ]:
+        yield (
+            f"recovered closure loses {label}", closure,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_recovery_barrier.rs"),
+        )
     barrier = Path("crates/astrid-storage/src/engine/durable/recovery_barrier.rs")
     for label, clause, weaker in [
         ("WAL identity", "stable.wal() == wal", "true"),

@@ -72,6 +72,13 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
     source: &mut ClosureObjects<'_, I, P>,
     root: ObjectId,
 ) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
+    materialize_with(root, |id| source.load(id))
+}
+
+pub(super) fn materialize_with(
+    root: ObjectId,
+    mut load: impl FnMut(ObjectId) -> Result<ObjectRecord, DurableError>,
+) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
     let mut records = BTreeMap::new();
     let mut marks = BTreeMap::<ObjectId, u8>::new();
     let mut stack = vec![(root, false)];
@@ -86,7 +93,7 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
             Some(1) => return Err(ModelError::ObjectCycle(id).into()),
             Some(_) | None => {},
         }
-        let record = source.load(id)?;
+        let record = load(id)?;
         marks.insert(id, 1);
         stack.push((id, true));
         for child in record.owning_references().rev() {
