@@ -398,6 +398,8 @@ def consumer_defects():
 
     probe = walker.with_name("frame_probe.rs")
     for label, source, clause, weakness in [
+        ("incomplete-payload barrier", repair, "ensures result==self.classification(),\n    {\n        match self {\n            Self::HeaderShort =>",
+         "ensures result==self.classification(),\n    {\n        match self {\n            Self::HeaderShort | Self::PayloadShort =>"),
         ("search start", repair, "let start=offset.saturating_add(1);", "let start=offset.saturating_add(2);"),
         ("candidate address", probe, "candidate(media,at,end,magic,limit)?", "candidate(media,offset,end,magic,limit)?"),
         ("window overlap", probe, "offset=offset.saturating_add(i as u64);", "offset=offset.saturating_add(count as u64);"),

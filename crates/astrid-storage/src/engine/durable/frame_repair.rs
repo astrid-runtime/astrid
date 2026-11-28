@@ -189,18 +189,18 @@ pub(super) enum Damage { Incomplete, Suspect { known_interior:bool } }
 impl TailError {
     pub(super) open spec fn classification(self) -> Damage {
         match self {
-            Self::HeaderShort | Self::PayloadShort => Damage::Incomplete,
+            Self::HeaderShort => Damage::Incomplete,
             Self::Oversize {interior,..} => Damage::Suspect {known_interior:interior},
-            Self::Checksum | Self::Magic => Damage::Suspect {known_interior:false},
+            Self::PayloadShort | Self::Checksum | Self::Magic => Damage::Suspect {known_interior:false},
         }
     }
     pub(super) fn damage(self) -> (result:Damage)
         ensures result==self.classification(),
     {
         match self {
-            Self::HeaderShort | Self::PayloadShort => Damage::Incomplete,
+            Self::HeaderShort => Damage::Incomplete,
             Self::Oversize {interior,..} => Damage::Suspect {known_interior:interior},
-            Self::Checksum | Self::Magic => Damage::Suspect {known_interior:false},
+            Self::PayloadShort | Self::Checksum | Self::Magic => Damage::Suspect {known_interior:false},
         }
     }
 }

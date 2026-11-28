@@ -159,7 +159,7 @@ pub(crate) fn recover_live<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D,C
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((ROOT_MAGIC,n,b)),
     ensures final(media).syncs_file()==old(media).syncs_file(),final(media).target()==old(reader).target(),
         out matches Live::Complete(t) ==> *final(media)==*old(media) && recovered(t@,final(media).bytes(),end,limit,scheme,decode,recode,hash),
-        out matches Live::Repaired(at,e,t) ==> protected<=at<end &&
+        out matches Live::Repaired(at,e,t) ==> protected<=at<end && !crate::frame_repair::has_later::<M>(old(media).bytes(),at,end,ROOT_MAGIC,limit) &&
             stopped(final(reader),at,end,crate::frame_repair::FrameError::Tail(e),limit,scheme,decode,recode,hash) &&
             (match e.classification() {
                 crate::frame_repair::Damage::Incomplete=>final(media).calls()==old(media).calls().push(crate::frame_repair::Event::Resize(at)).push(crate::frame_repair::Event::Flush),
@@ -182,7 +182,15 @@ pub(crate) fn recover_live<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D,C
         Err(ScanError::Frame(at,FrameError::Tail(e),table))=>{
             match crate::frame_repair::repair(media,at,end,protected,e.damage(),ROOT_MAGIC,limit) {
                 Ok(Outcome::Repaired)=>{
-                    proof {retain_prefix(table@,reader.image(),at,limit,scheme,decode,recode,hash);}
+                    proof {
+                        if e is HeaderShort {
+                            let r=choose|r:R| r.target()==reader.target() && r.image()==reader.image() && r.position()==at &&
+                                #[trigger] crate::frame_repair::classified(&r,reader,at,end,ROOT_MAGIC,FRAME_VERSION,limit,hash,Err(FrameError::Tail(e)));
+                            assert(end<at as int+52);
+                            assert forall|next:u64| at<next implies !(#[trigger] crate::frame_probe::protects::<M>(r.image(),ROOT_MAGIC,end,limit,next)) by {};
+                        }
+                        retain_prefix(table@,reader.image(),at,limit,scheme,decode,recode,hash);
+                    }
                     Live::Repaired(at,e,table)
                 },
                 Ok(Outcome::Reject)=>Live::Frame(at,FrameError::Tail(e)),

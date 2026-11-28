@@ -157,14 +157,18 @@ fn incomplete_payload<M:crate::frame_repair::Medium>(media:&mut M,physical:u64,p
         physical <= old(media).bytes().len(),
     ensures ({
         let calls = old(media).calls();
-        let resized = calls.push(crate::frame_repair::Event::Resize(at));
+        let searched = calls.push(crate::frame_repair::Event::Probe(at));
+        let resized = searched.push(crate::frame_repair::Event::Resize(at));
+        let later=crate::frame_repair::has_later::<M>(old(media).bytes(),at,physical,frame::ARENA_MAGIC,limit);
         &&& match out {
-            Ok(false) => at < protected && final(media).calls() == calls && final(media).bytes() == old(media).bytes(),
-            Ok(true) => at >= protected && final(media).calls() == resized.push(crate::frame_repair::Event::Flush)
-                && final(media).bytes() == old(media).bytes().take(at as int) && (old(media).syncs_file() ==> final(media).bytes() == final(media).durable()),
-            Err(crate::frame_repair::Error::Resize(_)) => at >= protected && final(media).calls() == resized,
-            Err(crate::frame_repair::Error::Flush(_)) => at >= protected && final(media).calls() == resized.push(crate::frame_repair::Event::Flush),
-            Err(_) => false,
+            Ok(false) => (at<protected || later) && final(media).calls()==(if at<protected {calls} else {searched}) &&
+                final(media).bytes()==old(media).bytes() && final(media).durable()==old(media).durable(),
+            Ok(true) => at>=protected && !later && final(media).calls()==resized.push(crate::frame_repair::Event::Flush) &&
+                final(media).bytes()==old(media).bytes().take(at as int) && (old(media).syncs_file() ==> final(media).bytes()==final(media).durable()),
+            Err(crate::frame_repair::Error::Probe(_))=>at>=protected && final(media).calls()==searched &&
+                final(media).bytes()==old(media).bytes() && final(media).durable()==old(media).durable(),
+            Err(crate::frame_repair::Error::Resize(_))=>at>=protected && !later && final(media).calls()==resized,
+            Err(crate::frame_repair::Error::Flush(_))=>at>=protected && !later && final(media).calls()==resized.push(crate::frame_repair::Event::Flush),
         }
     }),
 {
@@ -174,7 +178,7 @@ fn incomplete_payload<M:crate::frame_repair::Medium>(media:&mut M,physical:u64,p
         r::Extent::Incomplete => {},
         _ => {assert(false);return Ok(false);},
     }
-    match r::repair(media,at,w.end,w.protected,r::Damage::Incomplete,frame::ARENA_MAGIC,limit) {
+    match r::repair(media,at,w.end,w.protected,r::TailError::PayloadShort.damage(),frame::ARENA_MAGIC,limit) {
         Ok(r::Outcome::Reject) => Ok(false),Ok(r::Outcome::Repaired) => Ok(true),Err(e) => Err(e),
     }
 }
