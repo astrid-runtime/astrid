@@ -213,6 +213,10 @@ mod journal_preload;
 mod journal_closure;
 #[path = "../crates/astrid-storage/src/engine/durable/journal_transition.rs"]
 mod journal_transition;
+#[path = "../crates/astrid-storage/src/engine/durable/journal_visitor.rs"]
+mod journal_visitor;
+#[path = "../crates/astrid-storage/src/engine/durable/journal_apply.rs"]
+mod journal_apply;
 #[path = "../crates/astrid-storage/src/engine/durable/journal_payload.rs"]
 mod journal_payload;
 #[path = "../crates/astrid-storage/src/engine/durable/journal_snapshot.rs"]
@@ -222,6 +226,7 @@ mod hosted_recovered_header;
 mod hosted_acknowledged_root;
 mod hosted_cold_journal;
 mod hosted_cold_snapshot;
+mod hosted_journal_scan;
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/root_history.rs"]
@@ -273,6 +278,8 @@ mod checkpoint_admission;
 mod arena_frame;
 #[path = "../crates/astrid-storage/src/engine/durable/frame_repair.rs"]
 mod frame_repair;
+#[path = "../crates/astrid-storage/src/engine/durable/frame_scan.rs"]
+mod frame_scan;
 #[path = "../crates/astrid-storage/src/engine/durable/recovery_barrier.rs"]
 mod recovery_barrier;
 #[path = "../crates/astrid-storage/src/engine/durable/recovered_closure.rs"]

@@ -103,20 +103,14 @@ pub(super) open spec fn header_at(image:Seq<u8>,offset:u64) -> Seq<u8> {
     image.subrange(offset as int,offset as int+52)
 }
 
-/// Read one frame at the logical cursor. Tail repair and callback errors are
-/// handled by the caller; only an authenticated complete frame can be emitted.
-#[verifier::spinoff_prover]
-pub(super) fn next_frame<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
-    reader:&mut R,offset:u64,end:u64,magic:[u8;8],version:u16,limit:u64,hash:H)
-    -> (out:Result<ScannedFrame,FrameError<R::Error>>)
-    requires old(reader).position()==offset,offset<end<=old(reader).image().len(),
-        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
-    ensures final(reader).target()==old(reader).target(),final(reader).image()==old(reader).image(),{
+pub(super) open spec fn classified<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
+    before:&R,after:&R,offset:u64,end:u64,magic:[u8;8],version:u16,limit:u64,hash:H,
+    out:Result<ScannedFrame,FrameError<R::Error>>) -> bool {
         let at=offset as int;
         if end<at+52 {
             out matches Err(FrameError::Tail(TailError::HeaderShort))
         } else {
-            let image=old(reader).image();let h=header_at(image,offset);
+            let image=before.image();let h=header_at(image,offset);
             let n=vstd::bytes::spec_u64_from_le_bytes(h.subrange(12,20));
             let next=at+52+n;
             let matches=h.take(8)==magic@;
@@ -125,7 +119,7 @@ pub(super) fn next_frame<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
             let valid=matches && current && clear;
             match out {
                 Ok(f)=>valid && n<=limit && at<f.end==next<=end &&
-                    super::arena_frame::WIDTH==52 && final(reader).position()==f.end &&
+                    super::arena_frame::WIDTH==52 && after.position()==f.end &&
                     f.body.len()==n && f.body@==image.subrange(at+52,next) &&
                     exists|b:&[u8],sum:[u8;32]| b@==f.body@ && sum@==h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
                 Err(FrameError::Tail(TailError::HeaderShort))=>false,
@@ -138,11 +132,22 @@ pub(super) fn next_frame<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
                 Err(FrameError::Tail(TailError::Checksum))=>valid && n<=limit && next<=end &&
                     exists|b:&[u8],sum:[u8;32]| b@==image.subrange(at+52,next) &&
                         sum@!=h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
-                Err(FrameError::Io(e))=>old(reader).failed(at,52,e) || valid && n<=limit && next<=end &&
-                    exists|r:R| r.image()==image && r.target()==old(reader).target() && r.position()==at+52 && #[trigger] r.failed(at+52,n,e),
+                Err(FrameError::Io(e))=>before.failed(at,52,e) || valid && n<=limit && next<=end &&
+                    exists|r:R| r.image()==image && r.target()==before.target() && r.position()==at+52 && #[trigger] r.failed(at+52,n,e),
             }
         }
-    },
+}
+
+/// Read one frame at the logical cursor. Tail repair and callback errors are
+/// handled by the caller; only an authenticated complete frame can be emitted.
+#[verifier::spinoff_prover]
+pub(super) fn next_frame<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
+    reader:&mut R,offset:u64,end:u64,magic:[u8;8],version:u16,limit:u64,hash:H)
+    -> (out:Result<ScannedFrame,FrameError<R::Error>>)
+    requires old(reader).position()==offset,offset<end<=old(reader).image().len(),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+    ensures final(reader).target()==old(reader).target(),final(reader).image()==old(reader).image(),
+        classified(old(reader),final(reader),offset,end,magic,version,limit,hash,out),
 {
     use super::arena_frame as frame;
     if end.saturating_sub(offset)<super::arena_frame::WIDTH as u64 {return Err(FrameError::Tail(TailError::HeaderShort));}

@@ -290,11 +290,25 @@ pub(super) fn scan_frames_with_bound<F: DurableIo>(
     result
 }
 
+struct FrameCallback<T>(T);
+
+impl<R, T, E> super::super::frame_scan::Visitor<R> for FrameCallback<T>
+where
+    R: FrameReader,
+    T: FnMut(&mut R, u64, &[u8]) -> Result<(), E>,
+{
+    type Error = E;
+
+    fn visit(&mut self, reader: &mut R, offset: u64, bytes: &[u8]) -> Result<(), E> {
+        (self.0)(reader, offset, bytes)
+    }
+}
+
 fn scan_frames_grammar<F, R, GetFile>(
     reader: &mut std::io::BufReader<R>,
     mut get_file: GetFile,
     policy: FrameScanPolicy,
-    mut offset: u64,
+    offset: u64,
     accept: &mut impl FnMut(u64, &[u8], &mut F) -> Result<(), DurableError>,
 ) -> Result<(), DurableError>
 where
@@ -302,69 +316,67 @@ where
     R: std::io::Read,
     GetFile: FnMut(&mut std::io::BufReader<R>) -> &mut F,
 {
+    use super::super::frame_scan::{self, Stop};
+    use frame_repair::{FrameError, TailError};
+
     let file_name = policy.file_name;
     let magic = policy.magic;
     let limits = policy.limits;
     let file_len = policy.file_len;
-    while offset < file_len {
-        use frame_repair::{FrameError, TailError};
-        let frame = match frame_repair::next_frame(
-            reader,
-            offset,
-            file_len,
-            magic,
-            FRAME_VERSION,
-            limits.max_frame_bytes,
-            frame_checksum,
-        ) {
-            Ok(frame) => frame,
-            Err(FrameError::Io(error)) => return Err(error),
-            Err(FrameError::Overflow) => return Err(DurableError::EncodingOverflow),
-            Err(FrameError::Header(error)) => {
-                return Err(super::frame_header_error(file_name, offset, &error));
-            },
-            Err(FrameError::Tail(error)) => {
-                let (damage, cause) = match error {
-                    TailError::HeaderShort => (
-                        Damage::Incomplete,
-                        corrupt(file_name, offset, "published frame header is truncated"),
-                    ),
-                    TailError::PayloadShort => (
-                        Damage::Incomplete,
-                        corrupt(file_name, offset, "published frame payload is truncated"),
-                    ),
-                    TailError::Magic => (
-                        Damage::Suspect {
-                            known_interior: false,
-                        },
-                        corrupt(file_name, offset, "frame magic mismatch"),
-                    ),
-                    TailError::Oversize { size, interior } => (
-                        Damage::Suspect {
-                            known_interior: interior,
-                        },
-                        DurableError::FrameTooLarge {
-                            file: file_name,
-                            offset,
-                            declared: size,
-                            limit: limits.max_frame_bytes,
-                        },
-                    ),
-                    TailError::Checksum => (
-                        Damage::Suspect {
-                            known_interior: false,
-                        },
-                        corrupt(file_name, offset, "frame checksum mismatch"),
-                    ),
-                };
-                repair_tail(get_file(reader), policy, offset, damage, cause)?;
-                break;
-            },
-        };
-        accept(offset, &frame.body, get_file(reader))?;
-        offset = frame.end;
+    let mut visitor = FrameCallback(|r: &mut std::io::BufReader<R>, at, bytes: &[u8]| {
+        accept(at, bytes, get_file(r))
+    });
+    let window = frame_scan::Window {
+        start: offset,
+        end: file_len,
+        magic,
+        version: FRAME_VERSION,
+        limit: limits.max_frame_bytes,
+    };
+    match frame_scan::scan(reader, &mut visitor, window, frame_checksum) {
+        Ok(()) => Ok(()),
+        Err(Stop::Visitor(error) | Stop::Frame(_, FrameError::Io(error))) => Err(error),
+        Err(Stop::Frame(_, FrameError::Overflow)) => Err(DurableError::EncodingOverflow),
+        Err(Stop::Frame(at, FrameError::Header(error))) => {
+            Err(super::frame_header_error(file_name, at, &error))
+        },
+        Err(Stop::Frame(offset, FrameError::Tail(error))) => {
+            let (damage, cause) = match error {
+                TailError::HeaderShort => (
+                    Damage::Incomplete,
+                    corrupt(file_name, offset, "published frame header is truncated"),
+                ),
+                TailError::PayloadShort => (
+                    Damage::Incomplete,
+                    corrupt(file_name, offset, "published frame payload is truncated"),
+                ),
+                TailError::Magic => (
+                    Damage::Suspect {
+                        known_interior: false,
+                    },
+                    corrupt(file_name, offset, "frame magic mismatch"),
+                ),
+                TailError::Oversize { size, interior } => (
+                    Damage::Suspect {
+                        known_interior: interior,
+                    },
+                    DurableError::FrameTooLarge {
+                        file: file_name,
+                        offset,
+                        declared: size,
+                        limit: limits.max_frame_bytes,
+                    },
+                ),
+                TailError::Checksum => (
+                    Damage::Suspect {
+                        known_interior: false,
+                    },
+                    corrupt(file_name, offset, "frame checksum mismatch"),
+                ),
+            };
+            repair_tail(get_file(reader), policy, offset, damage, cause)
+        },
     }
-    Ok(())
 }
 
 impl<R: std::io::Read> FrameReader for std::io::BufReader<R> {
