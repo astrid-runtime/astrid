@@ -11,6 +11,9 @@ verus! {
 
 broadcast use vstd::std_specs::hash::group_hash_axioms;
 
+/// Value written for a durable revocation or single-use marker.
+pub(super) const PRESENCE_MARKER: [u8;1] = [1];
+
 /// Read the live authority for the requested token, including never-marked tokens.
 pub(super) fn status<K: Eq + Hash>(authority: &HashMap<K, TokenStatus>, id: &K) -> (out: TokenStatus)
     requires hash_map_inv(authority), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),

@@ -756,6 +756,24 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), replay,
         )
 
+    writer = Path("crates/astrid-storage/src/kv/tree/delta_writer.rs")
+    typed = Path("verification/hosted_delta_mutation.rs")
+    for label, path, clause, weaker, consumer in [
+        ("row bytes", writer, "f.2==seq![DELTA]+header.wire()+body_prefix(rows@,rows.len() as nat)",
+         "f.2.len()==37+body_prefix(rows@,rows.len() as nat).len()", typed),
+        ("owning reference targets", writer, "f.3.map_values(ref_fields())==edge_prefix(previous,rows@,rows.len() as nat)",
+         "f.3.len()==edge_prefix(previous,rows@,rows.len() as nat).len()", typed),
+        ("logical bytes", writer, "f.4==totals.logical_bytes &&", "true &&", typed),
+        ("canonical metadata class", writer, "f.5==ObjectClass::Metadata", "true", typed),
+        ("predecessor of emitted marker", typed, "&& p==previous && depth==prior_depth+1", "&& depth==prior_depth+1", replay),
+        ("physical presence byte", Path("crates/astrid-capabilities/src/store/authority.rs"),
+         "const PRESENCE_MARKER: [u8;1] = [1]", "const PRESENCE_MARKER: [u8;1] = [0]", typed),
+    ]:
+        yield (
+            f"cold delta writer loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), consumer,
+        )
+
     checkpoint = Path("crates/astrid-storage/src/kv/tree/checkpoint_replay.rs")
     for label, clause, weaker in [
         ("root refusal", "(out is Err && out->Err_0 is Root) == (chain.tree != root)", "chain.tree != root ==> (out is Err && out->Err_0 is Root)"),

@@ -371,6 +371,8 @@ mod delta_totals;
 mod spill_record;
 #[path = "../crates/astrid-storage/src/kv/tree/projection_record.rs"]
 mod projection_record;
+#[path = "../crates/astrid-storage/src/kv/tree/delta_writer.rs"]
+mod delta_writer;
 #[path = "../crates/astrid-storage/src/kv/tree/mutation_replay.rs"]
 mod mutation_replay;
 #[path = "../crates/astrid-storage/src/kv/tree/replay_values.rs"]

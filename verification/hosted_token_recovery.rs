@@ -694,6 +694,68 @@ fn reopen_captured_root<'a,P,S,B,V,T,W,E,L,M,I,K,D,A,R,C,F,G>(owner:&'a P,head:c
     }
 }
 
+// A canonical marker delta followed by a physical delta for an unrelated key.
+fn two_written_components(owner:u64,newest:crate::ObjectId,writer:crate::ObjectId,target:Id,kind:Marker)
+    -> (out:Result<Admission,ReopenError<()>>)
+    requires newest!=writer,vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),
+    ensures out matches Ok(a) ==> !(a is Allowed) && (kind is Revoked ==> a is Revoked),
+{
+    use crate::{delta_chain::Head,checkpoint_totals::NodeTotals,projection_recovery::Measured};
+    let ns=kind.namespace().as_bytes();
+    let text=marker_key::encode(&target);
+    let address=crate::encoding::composite(ns,&text);
+    proof {
+        reveal_strlit("caps:used");reveal_strlit("caps:revoked");
+        vstd::string::is_ascii_spec_bytes("caps:used");vstd::string::is_ascii_spec_bytes("caps:revoked");
+        assert(ns@==ns_bytes(kind));
+    }
+    assert(36<=address.len()<=64 && ns.len()<=16);
+    let n=(address.len() as u64).saturating_add(1);
+    let m=n.saturating_add(4);
+    let first=NodeTotals{entries:1,logical_bytes:1,quota_bytes:n};
+    let last=NodeTotals{entries:2,logical_bytes:2,quota_bytes:m};
+    let load=|p:&u64,id:crate::ObjectId| -> (out:Result<Head,()>)
+        requires newest!=writer && ns.len()<=16 && n<=65 && address@==ns@+seq![0u8]+text@,
+        ensures if *p==owner && (id==writer || id==newest) {
+            out matches Ok(Head::Delta{previous,mutations,..}) && mutations.len()==1 &&
+                (if id==writer {previous.is_none() && mutations@[0].key@==address@} else {
+                    previous==Some(writer) && mutations@[0].key@==seq![120u8,0u8,121u8]}) && mutations@[0].value.is_some()
+        } else {out.is_err()},
+    {
+        if *p!=owner {return Err(());}
+        if id.same(&writer) {
+            Ok(crate::hosted_delta_mutation::written_marker(crate::encoding::composite(ns,&text),None,0,0,first))
+        } else if id.same(&newest) {
+            Ok(crate::hosted_delta_mutation::written_marker(vec![120u8,0,121],Some(writer),1,n,last))
+        } else {Err(())}
+    };
+    let zero=NodeTotals{entries:0,logical_bytes:0,quota_bytes:0};
+    let measure=|_:&u64,tree:Option<crate::ObjectId>| -> (r:Result<Measured<(),()>,()>)
+    {Ok(Measured{root:tree,totals:zero,boundary:(),validation:()})};
+    let lookup=|_:(),_:Option<crate::ObjectId>,_:&Vec<u8>| -> (r:Result<((),Option<Vec<u8>>),()>) {Ok(((),None))};
+    let value=|_:(),_:&crate::checkpoint_value::ValueSlot| -> (r:Result<((),Vec<u8>),()>) {Ok(((),vec![1u8]))};
+    let page=|_:Page<crate::ObjectId,()>| -> (r:Result<Contents<crate::ObjectId,(),()>,()>) ensures r.is_err(), {Err(())};
+    let legacy=|_:&[u8]| -> (r:Result<Id,()>) {Err(())};
+    let other=(crate::memo_projection::Projection{head:None,tree:None,overlay:crate::overlay::OverlayMap::empty(),
+        depth:0,delta_bytes:0,totals:zero,boundary:Some(())},());
+    let ghost path=seq![newest,writer];
+    proof {
+        assert(ns@==ns_bytes(kind));
+        assert(path.last()==writer);
+        assert(crate::projection_recovery::head_writes(&owner,writer,load,address@,true));
+        assert forall|i:int,h:Head| 0<=i<path.len()-1 && #[trigger] load.ensures((&owner,path[i]),Ok(h)) implies
+            (h matches Head::Delta{previous,mutations,..} && previous==Some(path[i+1]) &&
+                crate::overlay_batch::after_rows(mutations@,mutations.len() as nat,address@,None).is_none()) by {
+            assert(i==0 && path[i]==newest && path[i+1]==writer);
+            assert(address@!=seq![120u8,0u8,121u8]);
+            reveal_with_fuel(crate::overlay_batch::after_rows,2);
+        }
+    }
+    decode_then_reopen(&owner,newest,kind,target,true,&other,load,measure,|_:&u64|(),(lookup,value),|_,_|(),
+        page,page,legacy,Ghost(text@),Ghost(path))
+}
+
 /// Instantiate the page evidence for an actual decoded leaf and recover its
 /// marker with the full walker, merger and store replay.
 fn checkpoint_marker_decision(target:Id,kind:Marker) -> (out:Result<Admission,RecoveryError<()>>)

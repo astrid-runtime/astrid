@@ -65,6 +65,7 @@ mod delta_mutation;
 mod delta_recovery;
 mod delta_replay;
 mod delta_totals;
+mod delta_writer;
 mod handoff;
 mod header;
 mod hot_cache;

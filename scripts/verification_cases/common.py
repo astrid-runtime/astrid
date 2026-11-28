@@ -338,6 +338,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/kv/tree/delta_totals.rs"),
     Path("crates/astrid-storage/src/kv/tree/spill_record.rs"),
     Path("crates/astrid-storage/src/kv/tree/projection_record.rs"),
+    Path("crates/astrid-storage/src/kv/tree/delta_writer.rs"),
     Path("crates/astrid-storage/src/kv/tree/mutation_replay.rs"),
     Path("crates/astrid-storage/src/kv/tree/replay_values.rs"),
     Path("crates/astrid-storage/src/kv/tree/record_source.rs"),

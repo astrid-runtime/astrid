@@ -385,6 +385,7 @@ pub(super) fn observe_span<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::
 
 type IndexedRow = (crate::ObjectId,frame::ArenaLocation);
 
+#[verifier::rlimit(20)]
 proof fn dispatched_prefix<V:Fn(Vec<IndexedRow>,&[IndexedRow],u64,u64)->Result<Vec<IndexedRow>,Option<Vec<IndexedRow>>>>(
     rows:Seq<IndexedRow>,end:int,start:Vec<IndexedRow>,trace:Vec<IndexedRow>,limit:u64,visit:V)
     requires 0 <= end <= rows.len(),crate::indexed_frame::dispatched(rows,end,start,trace,limit,visit),

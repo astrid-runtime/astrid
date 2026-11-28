@@ -136,19 +136,36 @@ fn mixed_batch(object:ObjectId,trailing:bool,deny_second:bool) -> (out:Result<Ve
     let first = Mutation {key:vec![110u8,0,97],value:Some(ValueSlot::Inline(vec![42u8]))};
     let second = Mutation {key:vec![110u8,0,98],value:Some(ValueSlot::Spilled {object,length:2048})};
     let b = [110u8,0,98];
-    let mut bytes = vec![1u8];
     let header = crate::delta_header::Header {depth:1,delta_bytes:2055,entries:2,quota_bytes:2055,count:2};
-    header.append(&mut bytes);
-    let mut refs = Vec::new();
-    let one = first.append(0,&mut bytes,&mut refs);
-    let two = second.append(1,&mut bytes,&mut refs);
-    assert(one.is_ok() && two.is_ok());
+    let rows=vec![first,second];
+    let totals=crate::checkpoint_totals::NodeTotals{entries:2,logical_bytes:2049,quota_bytes:2055};
+    let version=crate::ObjectFormatVersion::new(4).unwrap();
+    proof {
+        reveal_with_fuel(batch::usage,3);
+        reveal_with_fuel(crate::encoding::below,5);
+        assert(batch::ordered(rows@));
+        assert(batch::usage(rows@,2)==(2055nat,1nat));
+        assert forall|i:int| 0<=i<rows.len() implies !crate::delta_writer::invalid_row(rows@[i],delta::WriteError::Overflow) &&
+            !crate::delta_writer::invalid_row(rows@[i],delta::WriteError::Oversized) &&
+            !crate::delta_writer::invalid_row(rows@[i],delta::WriteError::SmallSpill) by {if i!=0 {assert(i==1);}}
+    }
+    let record=match crate::delta_writer::record(version,None,0,0,&rows,totals) {Ok(r)=>r,Err(_)=>{assert(false);unreached()}};
+    let mut bytes=Vec::new();
+    bytes.extend_from_slice(record.canonical_bytes());
+    let refs=record.references();
+    proof {
+        reveal_with_fuel(crate::delta_writer::body_prefix,3);
+        reveal_with_fuel(crate::delta_writer::edge_prefix,3);
+        assert(bytes@ == seq![1u8]+header.wire()+crate::delta_writer::body_prefix(rows@,2));
+        assert(refs@.map_values(crate::delta_writer::ref_fields()).len()==refs.len());
+        assert(refs@.map_values(crate::delta_writer::ref_fields())[0]==refs@[0].fields());
+    }
     if trailing { bytes.push(0xff); }
     let check = |k:&[u8]| -> (err:Option<u8>) ensures err == if deny_second && k@ == b@ {Some(7u8)} else {None} {
         if deny_second && matches!(crate::encoding::bytewise_cmp(k,&b),std::cmp::Ordering::Equal) {Some(7u8)} else {None}
     };
     let raw = bytes.as_slice();
-    let edges = refs.as_slice();
+    let edges = refs;
     let got = crate::delta_header::Header::read(raw);
     assert(got.is_ok()) by {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
     let Ok((decoded,start)) = got else {unreached() };
@@ -165,7 +182,7 @@ fn mixed_batch(object:ObjectId,trailing:bool,deny_second:bool) -> (out:Result<Ve
         assert(bytes@.subrange(37,41) =~= storage_words::word32(3));
         assert(bytes@.subrange(54,58) =~= storage_words::word32(3));
         key::encoded_length(bytes@,37,3); key::encoded_length(bytes@,54,3);
-        assert(bytes@.subrange(41,44) =~= first.key@);
+        assert(bytes@.subrange(41,44) =~= rows@[0].key@);
         assert(bytes@.subrange(58,61) =~= b@);
         assert(bytes@[44] == 1 && bytes@[61] == 2);
         assert(bytes@.subrange(45,53) =~= vstd::bytes::spec_u64_to_le_bytes(1));
@@ -246,6 +263,79 @@ proof fn header_equal(h:crate::delta_header::Header,read:crate::delta_header::He
     assert(read.wire().subrange(32,36) =~= storage_words::word32(read.count));
     assert(h.wire().subrange(32,36) =~= storage_words::word32(h.count));
     storage_words::unique_word32(h.count,read.count);
+}
+
+// Reopen the physical record produced for a single presence marker, including
+// the prior component edge. Its address and one-byte value survive the round trip.
+pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u64,prior_bytes:u64,totals:crate::checkpoint_totals::NodeTotals) -> (out:crate::delta_chain::Head)
+    requires key.len()<=u32::MAX && key.len()+51<=isize::MAX && prior_depth<u64::MAX && prior_bytes+key.len()+1<=u64::MAX,
+    ensures out matches crate::delta_chain::Head::Delta{previous:p,depth,delta_bytes,mutations,totals:t} && p==previous && depth==prior_depth+1 && delta_bytes==prior_bytes+key.len()+1 && t==totals && mutations.len()==1 &&
+        mutations@[0].key@==key@ && (mutations@[0].value matches Some(ValueSlot::Inline(v)) && v@==seq![1u8]),
+{
+    use crate::{delta_recovery as recovery,delta_batch as batch,projection_record as format,delta_chain::Head,delta_header::Header};
+    let ghost address=key@;
+    let width=key.len();
+    let charge=(width as u64).saturating_add(1);
+
+    let rows=vec![Mutation{key,value:Some(ValueSlot::Inline(vec![crate::token_authority::PRESENCE_MARKER[0]]))}];
+    let version=crate::ObjectFormatVersion::new(4).unwrap();
+    proof {
+        reveal_with_fuel(batch::usage,2);
+        assert(batch::usage(rows@,1)==(charge as nat,0nat));
+        assert(batch::ordered(rows@));
+    }
+    let record=match crate::delta_writer::record(version,previous,prior_depth,prior_bytes,&rows,totals) {Ok(r)=>r,Err(_)=>{assert(false);unreached()}};
+    let header=Header{depth:prior_depth.saturating_add(1),delta_bytes:prior_bytes.saturating_add(charge),entries:totals.entries,quota_bytes:totals.quota_bytes,count:1};
+    let bytes=record.canonical_bytes();let refs=record.references();
+    let check=|_:&[u8]| -> (r:Option<u8>) ensures r.is_none(), {None};
+    let decoded=format::decode(&record,version,b"root",check);
+    let ghost result=decoded;
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        reveal_with_fuel(crate::delta_writer::body_prefix,2);
+        reveal_with_fuel(crate::delta_writer::edge_prefix,2);
+        assert(bytes@.subrange(1,37) =~= header.wire());
+        assert(bytes@.subrange(37,41) =~= storage_words::word32(width as u32));
+        key::encoded_length(bytes@,37,width as u32);
+        let tag=41+width;
+        assert(bytes@.subrange(41,tag) =~= address);
+        assert(bytes@[tag]==delta::INLINE && bytes@.subrange(tag+1,tag+9) =~= vstd::bytes::spec_u64_to_le_bytes(1));
+        assert(bytes@.subrange(tag+9,bytes.len() as int) =~= seq![1u8]);
+        assert(refs@.map_values(crate::delta_writer::ref_fields()).len()==refs.len());
+        if previous.is_some() {
+            assert(refs@.map_values(crate::delta_writer::ref_fields())[0]==refs@[0].fields());
+            assert(reference_lookup::selected(refs@,crate::delta_header::PREVIOUS@,0,1)==Some(refs@[0]));
+        }
+        assert forall|bs:&[u8],rs:&[ObjectReference],end:usize,out:Result<Mutation,delta::DecodeError<u8>>|
+            bs@==bytes@ && rs@==refs@ && #[trigger] delta::decoded(bs,37,end,rs,0,check,out)
+            implies out matches Ok(m) && m.key@==address && (m.value matches Some(ValueSlot::Inline(v)) && v@==seq![1u8]) && end==bytes.len() by {};
+        if let Ok(Head::Delta{previous:p,depth,delta_bytes,mutations,totals:n})=result {
+            let h=Header{depth,delta_bytes,entries:n.entries,quota_bytes:n.quota_bytes,count:mutations.len() as u32};
+            let recovered=recovery::Recovered{previous:p,depth,delta_bytes,rows:mutations,totals:n};
+            let (bs,rs,path)=choose|bs:&[u8],rs:&[ObjectReference],path:Seq<usize>| #[trigger] recovery::admitted(&record,check,recovered,bs,rs,path);
+            header_equal(header,h);
+            assert(delta::decoded(bs,37,path[1],rs,0,check,Ok(mutations@[0])));
+        } else if let Err(format::Error::Delta(e))=result {
+            let (h,bs,rs)=choose|h:Header,bs:&[u8],rs:&[ObjectReference]| bs@==bytes@ && rs@==refs@ && #[trigger] recovery::refused(bs,rs,check,h,e);
+            header_equal(header,h);
+            match e {
+                recovery::Error::Batch(err)=>{
+                    let (done,path,end)=choose|done:Seq<Mutation>,path:Seq<usize>,end:usize| #[trigger] batch::stopped(bs,rs,37,1,check,done,path,end,err);
+                    if done.len()>0 {assert(delta::decoded(bs,37,path[1],rs,0,check,Ok(done[0])));}
+                },
+                recovery::Error::Audit(err)=>{
+                    let (done,path)=choose|done:Seq<Mutation>,path:Seq<usize>| done.len()==1 && #[trigger] batch::layout(bs,rs,37,bs.len(),done,path,check) &&
+                        recovery::audit_refusal(done,h.delta_bytes,previous.is_some(),rs.len() as nat,err);
+                    assert(delta::decoded(bs,37,path[1],rs,0,check,Ok(done[0])));
+                    reveal_with_fuel(batch::usage,2);
+                    assert(batch::usage(done,1)==(charge as nat,0nat) && batch::ordered(done));
+                },
+                _=>{},
+            }
+            assert(false);
+        }
+    }
+    match decoded {Ok(h)=>h,Err(_)=>{assert(false);unreached()}}
 }
 
 /// The same fixed header is used by the KV delta record writer and the replay reader.

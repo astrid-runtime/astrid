@@ -1,6 +1,6 @@
 //! Canonical write-ahead projection records over immutable KV checkpoints.
 
-use crate::storage_model::{ObjectClass, ObjectId, ObjectKind, ObjectRecord};
+use crate::storage_model::{ObjectId, ObjectRecord};
 
 use super::node::NodeTotals;
 #[cfg(test)]
@@ -16,6 +16,7 @@ use super::delta_mutation::{DELETE, INLINE, SPILLED};
 use super::delta_mutation::{DecodeError, EdgeError, ReadError, WriteError};
 #[cfg(test)]
 use super::projection_record::CHECKPOINT;
+#[cfg(test)]
 use super::projection_record::DELTA;
 
 pub(super) use super::delta_mutation::Mutation;
@@ -50,47 +51,26 @@ pub(super) fn delta_record(
     mutations: &[Mutation],
     totals: NodeTotals,
 ) -> StorageResult<ObjectRecord> {
-    if mutations.is_empty() || !super::delta_batch::keys_ordered(mutations) {
-        return Err(serialization("KV delta keys are not strictly ordered"));
-    }
-    let depth = previous_depth
-        .checked_add(1)
-        .ok_or_else(arithmetic_overflow)?;
-    let mutation_bytes = mutation_payload_bytes(mutations)?;
-    let delta_bytes = previous_delta_bytes
-        .checked_add(mutation_bytes)
-        .ok_or_else(arithmetic_overflow)?;
-    let count = u32::try_from(mutations.len()).map_err(|_| arithmetic_overflow())?;
-    let mut canonical = Vec::new();
-    canonical.push(DELTA);
-    super::delta_header::Header {
-        depth,
-        delta_bytes,
-        entries: totals.entries,
-        quota_bytes: totals.quota_bytes,
-        count,
-    }
-    .append(&mut canonical);
-    let mut references = super::delta_header::predecessor_edges(previous);
-    for (index, mutation) in mutations.iter().enumerate() {
-        mutation
-            .append(index, &mut canonical, &mut references)
-            .map_err(|error| match error {
-                WriteError::Overflow => arithmetic_overflow(),
-                WriteError::Oversized => serialization("oversized inline KV delta value"),
-                WriteError::SmallSpill => serialization("small KV delta value was not inlined"),
-            })?;
-    }
-    references.sort();
-    ObjectRecord::new(
-        ObjectKind::NamespaceMap,
+    use super::delta_writer::EncodeError;
+    super::delta_writer::record(
         FORMAT_VERSION,
-        canonical,
-        references,
-        totals.logical_bytes,
-        ObjectClass::Metadata,
+        previous,
+        previous_depth,
+        previous_delta_bytes,
+        mutations,
+        totals,
     )
-    .map_err(|error| model_error(&error))
+    .map_err(|error| match error {
+        EncodeError::Keys => serialization("KV delta keys are not strictly ordered"),
+        EncodeError::Overflow | EncodeError::Row(WriteError::Overflow) => arithmetic_overflow(),
+        EncodeError::Row(WriteError::Oversized) => serialization("oversized inline KV delta value"),
+        EncodeError::Row(WriteError::SmallSpill) => {
+            serialization("small KV delta value was not inlined")
+        },
+        EncodeError::References => {
+            model_error(&crate::storage_model::ModelError::NonCanonicalReferences)
+        },
+    })
 }
 
 pub(super) fn decode_head(id: ObjectId, record: &ObjectRecord) -> StorageResult<Head> {

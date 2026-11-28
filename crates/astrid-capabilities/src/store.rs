@@ -53,7 +53,7 @@ fn marker_text(encoded: &[u8; 36]) -> CapabilityResult<&str> {
 }
 
 /// Tombstone value for presence-only KV entries (revoked/used markers).
-const PRESENCE_MARKER: &[u8] = &[1];
+const PRESENCE_MARKER: &[u8] = &authority::PRESENCE_MARKER;
 
 /// Capability store with both session and persistent storage.
 ///
