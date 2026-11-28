@@ -372,14 +372,13 @@ where
             .checked_add(frame_len)
             .ok_or(DurableError::EncodingOverflow)?;
         if frame_end > file_len {
-            if offset < protected_len {
-                return Err(corrupt(
-                    file_name,
-                    offset,
-                    "published frame payload is truncated",
-                ));
-            }
-            truncate_tail(get_file(reader), offset)?;
+            truncate_unpublished_tail_or_fail(
+                get_file(reader),
+                policy,
+                offset,
+                false,
+                corrupt(file_name, offset, "published frame payload is truncated"),
+            )?;
             break;
         }
         let payload = read_frame_payload(reader, payload_len)?;
