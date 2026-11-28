@@ -12,19 +12,16 @@ pub(super) struct Child<I,T> {
     pub(super) totals: T,
 }
 
-impl<I:Eq,T:Eq> Child<I,T> {
-    pub(super) fn matches(&self, object:&I, lower:&[u8], level:u16, totals:&T) -> (ok:bool)
-        requires vstd::laws_eq::obeys_concrete_eq::<I>(), vstd::laws_eq::obeys_concrete_eq::<T>(),
+impl<I,T> Child<I,T> {
+    pub(super) fn matches(&self,object:&I,lower:&[u8],level:u16,totals:&T,
+        equal_id:impl FnOnce(&I,&I)->bool,equal_totals:impl FnOnce(&T,&T)->bool) -> (ok:bool)
+        requires equal_id.requires((&self.object,object)),equal_totals.requires((&self.totals,totals)),
+            forall|r:bool| #[trigger] equal_id.ensures((&self.object,object),r) ==> r == (self.object == *object),
+            forall|r:bool| #[trigger] equal_totals.ensures((&self.totals,totals),r) ==> r == (self.totals == *totals),
         ensures ok == (self.object == *object && self.lower_bound@ == lower@ &&
             self.level == level && self.totals == *totals),
     {
-        proof { reveal(vstd::laws_eq::obeys_concrete_eq); }
-        let same_object = I::eq(&self.object,object);
-        assert(same_object == (self.object == *object));
-        if !same_object || self.level != level { return false; }
-        let same_totals = T::eq(&self.totals,totals);
-        assert(same_totals == (self.totals == *totals));
-        if !same_totals { return false; }
+        if !equal_id(&self.object,object) || self.level != level || !equal_totals(&self.totals,totals) {return false;}
         matches!(encoding::bytewise_cmp(&self.lower_bound,lower),std::cmp::Ordering::Equal)
     }
 }

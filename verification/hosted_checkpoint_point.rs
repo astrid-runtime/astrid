@@ -23,6 +23,23 @@ fn checked_leaf(rows:Vec<Row>,totals:NodeTotals,key:&[u8],i:usize) {
     }
 }
 
+// The selected index remains identifiable before canonical order is established.
+fn raw_branch(a:ObjectId,b:ObjectId,c:ObjectId) {
+    let t = NodeTotals {entries:0,logical_bytes:0,quota_bytes:0};
+    let ptrs = vec![
+        Child {lower_bound:vec![30u8],object:a,level:0,totals:t},
+        Child {lower_bound:vec![10u8],object:b,level:0,totals:t},
+        Child {lower_bound:vec![20u8],object:c,level:0,totals:t},
+    ];
+    let key = [15u8];
+    let i = point::child(&ptrs,&key);
+    proof {
+        reveal_with_fuel(crate::encoding::below,2);
+        reveal_with_fuel(point::cut,4);
+        assert(i == 1 && ptrs@[i as int].object == b);
+    }
+}
+
 fn wire_order(query:u8,first:ObjectId,middle:ObjectId,last:ObjectId) {
     let zero = NodeTotals {entries:0,logical_bytes:0,quota_bytes:0};
     let pointers = vec![

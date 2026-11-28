@@ -231,8 +231,8 @@ def consumer_defects():
         ("child identity", "to == Page::Child(rows@[i])", "to is Child"),
         ("level decrement", "child.level as nat+1 == level &&", "true &&"),
         ("leaf result", "&& slot(rows@,key,v)", "&& true"),
-        ("load refusal", "Err(Error::Source(e)) => read.ensures((at.0,&at.1),Err(e))", "Err(Error::Source(e)) => true"),
-        ("refused branch address", "k == id(at.1) && exists", "exists"),
+        ("load refusal", "Err(Error::Source(e)) => read.ensures((at.0,id(at.1)),Err(e))", "Err(Error::Source(e)) => true"),
+        ("refused branch address", "Err(Error::Branch(k)) => k == id(at.1) && exists", "Err(Error::Branch(k)) => exists"),
     ]:
         yield (
             f"point descent loses {label}", descent,
@@ -243,8 +243,18 @@ def consumer_defects():
         lambda s: replace_once(s, "Page::Root(id) => id == handle.object", "Page::Root(_) => true"),
         Path("verification/hosted_checkpoint_page.rs"),
     )
+    for label, clause, weaker in [
+        ("authenticated handle", "checkpoint_page::agrees(at.1,handle) && handle.node.contents() == body", "handle.node.contents() == body"),
+        ("mismatch address", "Err(Error::Mismatch(k)) => k == id(at.1) && exists", "Err(Error::Mismatch(k)) => exists"),
+        ("mismatch evidence", "&& !checkpoint_page::agrees(at.1,h)", ""),
+    ]:
+        yield (
+            f"point descent loses {label}", descent,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_checkpoint_descent.rs"),
+        )
     point = Path("crates/astrid-storage/src/kv/tree/checkpoint_point.rs")
     for label, clause, weaker in [
+        ("raw selected index", "index == self::index(children@,key@),", "true,"),
         ("hit key", "(#[trigger] input@[i]).key@ == key@ && input@[i].value == v", "(#[trigger] input@[i]).value == v"),
         ("hit slot", "(#[trigger] input@[i]).key@ == key@ && input@[i].value == v", "(#[trigger] input@[i]).key@ == key@"),
         ("canonical membership", "(#[trigger] input@[i]).key@ == key@ ==> out == Some(input@[i].value)", "(#[trigger] input@[i]).key@ == key@ ==> true"),

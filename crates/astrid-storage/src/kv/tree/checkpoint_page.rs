@@ -154,15 +154,33 @@ pub(super) fn read<I:Copy+Eq,T:Copy+Eq,V,E,F:FnOnce(I)->Result<Handle<I,T,V>,E>,
 {
     let id = page.object();
     let h = fetch(id)?;
-    let accepted = match page {
-        Page::Root(expected) => {
-            proof { reveal(vstd::laws_eq::obeys_concrete_eq); }
-            I::eq(expected,&h.object)
-        },
-        Page::Child(expected) => expected.matches(&h.object,h.node.minimum_key(),h.node.level(),&h.node.totals()),
+    let ghost source = h;
+    assert(fetch.ensures((object(*page),),Ok(source)));
+    let same_id = |a:&I,b:&I| -> (yes:bool) ensures yes == (*a == *b) {
+        proof {reveal(vstd::laws_eq::obeys_concrete_eq);}
+        I::eq(a,b)
     };
-    if !accepted { return Err(mismatch(id)); }
-    Ok(match h.node {
+    let same_totals = |a:&T,b:&T| -> (yes:bool) ensures yes == (*a == *b) {
+        proof {reveal(vstd::laws_eq::obeys_concrete_eq);}
+        T::eq(a,b)
+    };
+    match admit(page,h,same_id,same_totals) {Some(body) => Ok(body), None => Err(mismatch(id))}
+}
+
+pub(super) fn admit<I:Copy,T:Copy,V,DI:FnOnce(&I,&I)->bool,DT:FnOnce(&T,&T)->bool>(page:&Page<I,T>,h:Handle<I,T,V>,
+    equal_id:DI,equal_totals:DT) -> (out:Option<Contents<I,T,V>>)
+    requires forall|a:&I,b:&I| #[trigger] equal_id.requires((a,b)),
+        forall|a:&T,b:&T| #[trigger] equal_totals.requires((a,b)),
+        forall|a:&I,b:&I,r:bool| #[trigger] equal_id.ensures((a,b),r) ==> r == (*a == *b),
+        forall|a:&T,b:&T,r:bool| #[trigger] equal_totals.ensures((a,b),r) ==> r == (*a == *b),
+    ensures out == if agrees(*page,h) {Some(h.node.contents())} else {None},
+{
+    let accepted = match page {
+        Page::Root(expected) => equal_id(expected,&h.object),
+        Page::Child(expected) => expected.matches(&h.object,h.node.minimum_key(),h.node.level(),&h.node.totals(),equal_id,equal_totals),
+    };
+    if !accepted { return None; }
+    Some(match h.node {
         Node::Leaf(l) => Contents::Leaf(l.entries),
         Node::Branch(b) => Contents::Branch(b.level,b.children),
     })

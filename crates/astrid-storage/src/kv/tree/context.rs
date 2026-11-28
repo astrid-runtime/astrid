@@ -78,17 +78,16 @@ where
         root: Option<ObjectId>,
         key: &[u8],
     ) -> StorageResult<Option<ValueSlot>> {
-        use super::{checkpoint_descent, checkpoint_page};
-        checkpoint_descent::lookup(self, root, key, |context, page| {
-            let contents = checkpoint_page::read(
-                page,
-                |object| context.node(object),
-                |object| invalid(object, "persistent KV child summary disagrees"),
-            )?;
-            Ok((context, contents))
+        use super::checkpoint_descent;
+        checkpoint_descent::lookup(self, root, key, |context, object| {
+            let handle = context.node(object)?;
+            Ok((context, handle))
         })
         .map_err(|error| match error {
             checkpoint_descent::Error::Source(error) => error,
+            checkpoint_descent::Error::Mismatch(object) => {
+                invalid(object, "persistent KV child summary disagrees")
+            },
             checkpoint_descent::Error::Branch(object) => {
                 invalid(object, "invalid persistent KV branch descent")
             },

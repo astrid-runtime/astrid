@@ -73,6 +73,13 @@ pub(super) enum ReadError<E> {
 #[cfg(verus_keep_ghost)]
 type DecodedNode = Node<ObjectId,NodeTotals,ValueSlot>;
 
+pub(super) open spec fn ordered(node:DecodedNode) -> bool {
+    match node {
+        Node::Leaf(l) => super::checkpoint_leaf_summary::ordered(l.entries@,l.entries.len() as nat),
+        Node::Branch(b) => super::checkpoint_summary::ordered(b.children@,b.children.len() as nat),
+    }
+}
+
 pub(super) open spec fn parsed<E,F:Fn(&[u8])->Result<(),E>>(
     record:&ObjectRecord, node:DecodedNode, validate:F,
 ) -> bool {
@@ -126,7 +133,7 @@ pub(super) fn read<E,F:Fn(&[u8])->Result<(),E>+Copy>(
         out matches Ok(handle) ==> ({
         let fields = record.contents();
         &&& fields.1 == version.number() && fields.4 == 0 && fields.5 == ObjectClass::Metadata
-        &&& handle.object == id && parsed(record,handle.node,validate)
+        &&& handle.object == id && parsed(record,handle.node,validate) && ordered(handle.node)
         &&& record.retained_cost() <= u64::MAX
         &&& record.retained_cost() <= NODE_MAX_RETAINED_BYTES || match handle.node {
             Node::Leaf(l) => l.entries.len() <= 1,

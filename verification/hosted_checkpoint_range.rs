@@ -54,7 +54,8 @@ fn authenticate(child:&Child<u64,u64>, object:u64, lower:&[u8], level:u16, total
     ensures accepted == (child.object == object && child.lower_bound@ == lower@ &&
         child.level == level && child.totals == totals),
 {
-    child.matches(&object,lower,level,&totals)
+    let equal = |a:&u64,b:&u64| -> (yes:bool) ensures yes == (*a == *b) {*a == *b};
+    child.matches(&object,lower,level,&totals,equal,equal)
 }
 
 // The decoder receives the object ID from the popped pointer, with the same

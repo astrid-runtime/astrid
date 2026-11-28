@@ -23,6 +23,7 @@ proof fn ordered_pair(rows:Seq<Row>,i:int,j:int)
 }
 
 /// A hit always has the requested key. Canonical order also rules out false misses.
+#[verifier::rlimit(20)]
 pub(super) fn leaf(input:Vec<Row>,key:&[u8]) -> (out:Option<ValueSlot>)
     ensures
         out matches Some(v) ==> exists|i:int| 0 <= i < input.len() &&
@@ -74,10 +75,27 @@ proof fn bounds(rows:Seq<Pointer>,i:int,j:int)
     }
 }
 
+/// The actual binary-search cut, also defined for unordered raw pointers.
+pub(super) open spec fn cut(rows:Seq<Pointer>,key:Seq<u8>,lo:int,hi:int) -> int
+    decreases hi-lo,
+{
+    if lo < 0 || hi > rows.len() || lo >= hi {lo}
+    else {
+        let mid = lo + (hi-lo)/2;
+        if encoding::below(key,rows[mid].lower_bound@) {cut(rows,key,lo,mid)} else {cut(rows,key,mid+1,hi)}
+    }
+}
+
+pub(super) open spec fn index(rows:Seq<Pointer>,key:Seq<u8>) -> int {
+    let n = cut(rows,key,0,rows.len() as int);
+    if n == 0 {0} else {n-1}
+}
+
 /// Route to the last child whose lower bound is at or below the key.
 /// Keys before the first fence use the first child, including for insertion.
 pub(super) fn child(children:&[Pointer],key:&[u8]) -> (index:usize)
     ensures
+        index == self::index(children@,key@),
         children.len() == 0 ==> index == 0,
         children.len() > 0 ==> index < children.len(),
         checkpoint_summary::ordered(children@,children.len() as nat) ==> {
@@ -91,6 +109,7 @@ pub(super) fn child(children:&[Pointer],key:&[u8]) -> (index:usize)
     let mut hi = children.len();
     while lo < hi
         invariant lo <= hi <= children.len(),
+            cut(children@,key@,0,children.len() as int) == cut(children@,key@,lo as int,hi as int),
             checkpoint_summary::ordered(children@,children.len() as nat) ==> {
                 &&& forall|i:int| 0 <= i < lo ==> !encoding::below(key@,(#[trigger] children@[i]).lower_bound@)
                 &&& forall|i:int| hi <= i < children.len() ==> encoding::below(key@,(#[trigger] children@[i]).lower_bound@)
@@ -98,6 +117,8 @@ pub(super) fn child(children:&[Pointer],key:&[u8]) -> (index:usize)
         decreases hi-lo,
     {
         let mid = lo.saturating_add(hi.saturating_sub(lo)/2);
+        assert(cut(children@,key@,lo as int,hi as int) == if encoding::below(key@,children@[mid as int].lower_bound@) {
+            cut(children@,key@,lo as int,mid as int)} else {cut(children@,key@,mid as int+1,hi as int)});
         if encoding::bytewise_less(key,&children[mid].lower_bound) {
             proof {
                 if checkpoint_summary::ordered(children@,children.len() as nat) {
