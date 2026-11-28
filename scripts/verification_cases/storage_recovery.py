@@ -168,6 +168,22 @@ def consumer_defects():
             f"replay application loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
         )
+    spill = Path("crates/astrid-storage/src/kv/tree/spill_record.rs")
+    for label, clause, weaker in [
+        ("opaque writer bytes", "r.contents() == (ObjectKind::KvLeaf,version.number(),data@", "true || r.contents() == (ObjectKind::KvLeaf,version.number(),data@"),
+        ("owning file", "fields.3[0].fields() == (CONTENT@,file,super::ReferenceKind::Owns)", "true"),
+        ("reference refusal", "out == if !(r.0 is KvLeaf)", "r.3[0].fields().2 != super::ReferenceKind::Owns || out == if !(r.0 is KvLeaf)"),
+        ("file identity", "else {Ok(r.3[0].fields().1)}", "else {out}"),
+        ("inline bytes", "out matches Ok(v) && v@ == data@", "out.is_ok()"),
+        ("loaded bytes", "valid_payload(&r,plain,length) && v@ == r.contents().2", "valid_payload(&r,plain,length)"),
+        ("load error", "load.ensures((object,),Err(e)) ||", "true || load.ensures((object,),Err(e)) ||"),
+        ("invalid spill identity", "id == object &&", "true &&"),
+        ("chunk callback", "chunk.ensures((object,length,&r),Ok(v))", "true"),
+    ]:
+        yield (
+            f"spill recovery loses {label}", spill,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_spill_record.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

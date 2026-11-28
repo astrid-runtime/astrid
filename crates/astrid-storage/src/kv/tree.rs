@@ -78,6 +78,7 @@ mod performance_tests;
 mod publication;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod retirement_tests;
+mod spill_record;
 mod validation;
 
 pub(crate) use self::handoff::seed_owner_memo_if_live;

@@ -52,9 +52,7 @@ fn old_large_opaque_value_remains_readable() {
     let principal = "alice".to_owned();
     let mut context = TreeContext::new(&engine, &principal);
     let bytes = bytes();
-    let object = context
-        .insert(value_record(bytes.clone()).unwrap())
-        .unwrap();
+    let object = context.insert(value_record(bytes.clone())).unwrap();
     let value = ValueSlot::Spilled {
         object,
         length: bytes.len() as u64,
@@ -481,7 +479,7 @@ fn chunked_value_rejects_unequal_staged_body_without_overwriting() {
         .find(|(_, record)| record.kind() == ObjectKind::Chunk)
         .unwrap()
         .0;
-    let poison = value_record(b"stage collision".to_vec()).unwrap();
+    let poison = value_record(b"stage collision".to_vec());
     let engine = InMemoryEngine::new(StagingCollisionIdentity {
         poison: poison.clone(),
         target,
@@ -637,7 +635,7 @@ fn assert_staged_and_missing_reads(
             .load_shared_content_objects(&[chunk, missing])
             .is_err()
     );
-    let record = value_record(b"unpublished staged payload".to_vec()).unwrap();
+    let record = value_record(b"unpublished staged payload".to_vec());
     let staged = context.insert(record.clone()).unwrap();
     let mixed = context
         .load_shared_content_objects(&[chunk, staged, chunk])
@@ -678,7 +676,7 @@ fn opaque_validation_preserves_the_materializing_decoder_predicate() {
     let engine = InMemoryEngine::new(TestIdentity);
     let principal = "alice".to_owned();
     let mut context = TreeContext::new(&engine, &principal);
-    let record = value_record(vec![42; 2048]).unwrap();
+    let record = value_record(vec![42; 2048]);
     let valid = context.insert(record.clone()).unwrap();
     context
         .validate_value(&ValueSlot::Spilled {

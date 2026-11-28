@@ -60,16 +60,8 @@ impl NodeHandle {
     }
 }
 
-pub(super) fn value_record(bytes: Vec<u8>) -> StorageResult<ObjectRecord> {
-    ObjectRecord::new(
-        ObjectKind::KvLeaf,
-        FORMAT_VERSION,
-        bytes,
-        Vec::new(),
-        0,
-        ObjectClass::Data,
-    )
-    .map_err(|error| model_error(&error))
+pub(super) fn value_record(bytes: Vec<u8>) -> ObjectRecord {
+    super::spill_record::opaque(FORMAT_VERSION, bytes)
 }
 
 pub(super) fn leaf_record(entries: &[LeafEntry]) -> StorageResult<ObjectRecord> {
@@ -183,30 +175,13 @@ pub(super) fn decode_node(id: ObjectId, record: &ObjectRecord) -> StorageResult<
     })
 }
 
-pub(super) fn decode_value(
-    id: ObjectId,
-    expected_length: u64,
-    record: &ObjectRecord,
-) -> StorageResult<Vec<u8>> {
-    Ok(spilled_opaque_payload(id, expected_length, record)?.to_vec())
-}
-
 pub(super) fn spilled_opaque_payload(
     id: ObjectId,
     expected_length: u64,
     record: &ObjectRecord,
 ) -> StorageResult<&[u8]> {
-    if record.kind() != ObjectKind::KvLeaf
-        || record.format_version() != FORMAT_VERSION
-        || record.class() != ObjectClass::Data
-        || record.logical_bytes() != 0
-        || !record.references().is_empty()
-        || u64::try_from(record.canonical_bytes().len()).ok() != Some(expected_length)
-        || expected_length <= u64::try_from(INLINE_VALUE_MAX).unwrap_or(u64::MAX)
-    {
-        return Err(invalid(id, "invalid spilled KV value"));
-    }
-    Ok(record.canonical_bytes())
+    super::spill_record::payload(record, FORMAT_VERSION, expected_length)
+        .ok_or_else(|| invalid(id, "invalid spilled KV value"))
 }
 
 fn leaf_error(
