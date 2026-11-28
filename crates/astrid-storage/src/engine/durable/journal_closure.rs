@@ -13,6 +13,7 @@ use vstd::{
     std_specs::{
         btree::{btree_map_inv, btree_set_inv},
         iter::IteratorSpec,
+        cmp::OrdSpec,
     },
 };
 
@@ -117,40 +118,89 @@ pub(super) fn commits<P:Ord>(history:&BTreeMap<P,(RootState,u64)>) -> (ids:BTree
     }
 }
 
-/// Drop journal offsets while preserving every principal's complete root state.
-pub(super) fn project<P:Ord,C:Fn(&P)->P>(history:&BTreeMap<P,(RootState,u64)>,copy:C) -> (roots:BTreeMap<P,RootState>)
-    requires btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
-        forall|p:&P| #[trigger] copy.requires((p,)),
-        forall|p:&P,q:P| #[trigger] copy.ensures((p,),q) ==> *p == q,
-    ensures btree_map_inv(&roots), roots@ == history@.map_values(|entry:(RootState,u64)| entry.0),
+/// Certify the bulk-built root map against the journal in principal order.
+/// No property of the key copier or collection builder is needed on success.
+pub(super) fn project<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,roots:BTreeMap<P,RootState>) -> (out:Option<BTreeMap<P,RootState>>)
+    requires btree_map_inv(history),btree_map_inv(&roots),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+    ensures match out {
+        Some(map) => map == roots && map@ == history@.map_values(|entry:(RootState,u64)| entry.0),
+        None => roots@ != history@.map_values(|entry:(RootState,u64)| entry.0),
+    },
 {
-    let mut roots = BTreeMap::new();
-    let mut it = history.iter();
-    let ghost all = it.remaining();
+    if history.len() != roots.len() {return None;}
+    let mut input = history.iter();
+    let mut output = roots.iter();
+    let ghost src = input.remaining();
+    let ghost dst = output.remaining();
+    let ghost a = src.map_values(|kv:(&P,&(RootState,u64))| *kv.0);
+    let ghost b = dst.map_values(|kv:(&P,&RootState)| *kv.0);
     let ghost mut n:int = 0;
     loop
-        invariant all.len() == history.len(),0 <= n <= all.len(),it.remaining() == all.skip(n),
-            all.unref().to_set() == history@.kv_pairs(),btree_map_inv(&roots),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
-            forall|p:&P| #[trigger] copy.requires((p,)),
-            forall|p:&P,q:P| #[trigger] copy.ensures((p,),q) ==> *p == q,
-            forall|p:P| #[trigger] roots@.contains_key(p) ==> history@.contains_key(p) && roots@[p] == history@[p].0,
-            forall|i:int| 0 <= i < n ==> roots@.contains_key(#[trigger] *all[i].0),
+        invariant 0 <= n <= src.len(),src.len() == history.len(),src.len()==dst.len(),
+            input.remaining()==src.skip(n), output.remaining()==dst.skip(n),
+            src.unref().to_set()==history@.kv_pairs(),dst.unref().to_set()==roots@.kv_pairs(),
+            a == src.map_values(|kv:(&P,&(RootState,u64))| *kv.0),
+            b == dst.map_values(|kv:(&P,&RootState)| *kv.0),
+            vstd::std_specs::btree::increasing_seq(a),vstd::std_specs::btree::increasing_seq(b),
+            obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+            forall|j:int| 0 <= j < n ==> #[trigger] src[j].0 == dst[j].0 && src[j].1.0 == *dst[j].1,
         decreases history.len()-n,
     {
-        let Some((owner,entry)) = it.next() else {
-            assert(n == all.len());
-            assert forall|p:P| #[trigger] history@.contains_key(p) implies roots@.contains_key(p) by {
+        let Some((principal,entry)) = input.next() else {
+            assert(n==src.len());
+            assert forall|p:P| #[trigger] history@.contains_key(p) implies roots@.contains_key(p) && roots@[p]==history@[p].0 by {
                 let pair = (p,history@[p]);
-                assert(all.unref().to_set().contains(pair));
-                let i = all.unref().index_of(pair);
-                assert(all.unref()[i]==pair && *all[i].0==p);
+                assert(src.unref().to_set().contains(pair));
+                let j = src.unref().index_of(pair);
+                assert(src.unref()[j]==pair && dst.unref()[j]==(p,pair.1.0));
+                assert(roots@.kv_pairs().contains((p,pair.1.0)));
+            }
+            assert forall|p:P| #[trigger] roots@.contains_key(p) implies history@.contains_key(p) by {
+                let pair = (p,roots@[p]);
+                assert(dst.unref().to_set().contains(pair));
+                let j = dst.unref().index_of(pair);
+                assert(dst.unref()[j]==pair && *src[j].0==p);
+                assert(history@.kv_pairs().contains(src.unref()[j]));
             }
             assert(roots@ =~= history@.map_values(|entry:(RootState,u64)| entry.0));
-            return roots;
+            return Some(roots);
         };
-        assert(all.unref()[n]==(*owner,*entry));
-        assert(history@.kv_pairs().contains((*owner,*entry)));
-        roots.insert(copy(owner),entry.0);
+        let (owner,root) = output.next()?;
+        proof {
+            reveal(vstd::laws_cmp::obeys_cmp_ord);
+            if roots@ == history@.map_values(|entry:(RootState,u64)| entry.0) {
+                assert(src.unref()[n]==(*principal,*entry) && dst.unref()[n]==(*owner,*root));
+                assert(a[n]==*principal && b[n]==*owner);
+                assert(history@.kv_pairs().contains((*principal,*entry)));
+                assert(roots@.kv_pairs().contains((*owner,*root)));
+                if *principal != *owner {
+                    let x = (*principal,roots@[*principal]);
+                    let y = (*owner,history@[*owner]);
+                    assert(dst.unref().to_set().contains(x) && src.unref().to_set().contains(y));
+                    let i = dst.unref().index_of(x);
+                    let j = src.unref().index_of(y);
+                    assert(b[i]==a[n] && a[j]==b[n]);
+                    reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+                    if i < n { assert(a[i]==b[i] && a[i].cmp_spec(&a[n]) is Less); }
+                    else if j < n { assert(a[j]==b[j] && b[j].cmp_spec(&b[n]) is Less); }
+                    else {
+                        assert(i>n && j>n);
+                        assert(b[n].cmp_spec(&b[i]) is Less && a[n].cmp_spec(&a[j]) is Less);
+                    }
+                    assert(false);
+                }
+                assert(entry.0==*root);
+            }
+        }
+        match P::cmp(principal,owner) {std::cmp::Ordering::Equal => {}, _ => return None}
+        assert(principal.cmp_spec(owner) is Equal);
+        if !entry.0.same(*root) {return None;}
+        assert(*owner == *principal);
+        assert(src[n] == (principal,entry) && dst[n] == (owner,root));
+        assert forall|j:int| 0 <= j < n+1 implies #[trigger] src[j].0 == dst[j].0 && src[j].1.0 == *dst[j].1 by {
+            if j < n { assert(src[j].0 == dst[j].0 && src[j].1.0 == *dst[j].1); }
+            else { assert(j==n && entry.0==*root); }
+        }
         proof { n=n+1; };
     }
 }

@@ -381,6 +381,8 @@ pub enum DurableError {
     },
     /// Another process or engine instance holds the store lock.
     LockHeld(PathBuf),
+    /// The constructed principal-to-root map disagreed with the recovered journal.
+    InvalidRootProjection,
     /// Recovery limits were zero or not representable by this process.
     InvalidLimits,
     /// A complete stored frame failed structural or checksum validation.
@@ -454,6 +456,8 @@ impl fmt::Display for DurableError {
             Self::LockHeld(path) => {
                 write!(formatter, "principal store is locked: {}", path.display())
             },
+            Self::InvalidRootProjection => formatter
+                .write_str("constructed principal root map disagrees with the recovered journal"),
             Self::InvalidLimits => {
                 formatter.write_str("recovery frame limit must be non-zero and process-addressable")
             },
@@ -606,10 +610,7 @@ where
     }
 
     fn get(&self, principal: &P) -> Option<RootState> {
-        self.entries
-            .load()
-            .get(principal)
-            .map(|root| **root.value.load())
+        root_transition::sample(&self.entries.load(), principal, |slot| **slot.value.load())
     }
 
     fn publish(&self, principal: &P, root: RootState) {

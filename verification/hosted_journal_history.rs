@@ -802,10 +802,9 @@ fn install_buffer<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRec
     out
 }
 
-fn preload_closure<P:Ord,C:Fn(&P)->P,M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
-    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,history:&BTreeMap<P,(RootState,u64)>,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I,copy:C) -> (out:Option<(BTreeMap<P,RootState>,WaveState)>)
-    requires (forall|p:&P| #[trigger] copy.requires((p,))),
-        (forall|p:&P,q:P| #[trigger] copy.ensures((p,),q) ==> *p == q),btree_map_inv(index),btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+fn preload_closure<P:Ord,M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,history:&BTreeMap<P,(RootState,u64)>,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I,candidate:BTreeMap<P,RootState>) -> (out:Option<(BTreeMap<P,RootState>,WaveState)>)
+    requires btree_map_inv(&candidate),btree_map_inv(index),btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
         obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
         forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
@@ -933,7 +932,10 @@ fn preload_closure<P:Ord,C:Fn(&P)->P,M:crate::positional_read::Media,H:Fn([u8;8]
                     }
                     assert(known@ =~= table@.dom());
                 }
-                    let projected = crate::journal_closure::project(history,copy);
+                    let Some(projected) = crate::journal_closure::project(history,candidate) else {
+                        assert(candidate@ != history@.map_values(|entry:(RootState,u64)| entry.0));
+                        return None;
+                    };
                     Some((projected,(table,known)))
                 },
                 Err(e) => {

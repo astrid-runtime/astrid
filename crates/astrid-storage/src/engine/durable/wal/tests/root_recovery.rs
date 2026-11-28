@@ -647,7 +647,19 @@ fn indexed_preload_reaches_shared_descendants_and_ignores_nonowning_targets() {
             (owner, (root, 100 + owner))
         }),
     );
-    let projected = crate::engine::durable::journal_closure::project(&history, |owner| *owner);
+    let projected = history
+        .iter()
+        .map(|(owner, (root, _))| (*owner, *root))
+        .collect::<BTreeMap<_, _>>();
+    let project = |candidate| crate::engine::durable::journal_closure::project(&history, candidate);
+    let mut wrong_generation = projected.clone();
+    wrong_generation.insert(3, projected[&1]);
+    assert!(project(wrong_generation).is_none());
+    let mut wrong_owner = projected.clone();
+    wrong_owner.remove(&1);
+    wrong_owner.insert(4, projected[&1]);
+    assert!(project(wrong_owner).is_none());
+    let projected = project(projected).unwrap();
     assert_eq!(projected.len(), history.len());
     for (owner, (root, _)) in &history {
         assert_eq!(projected.get(owner), Some(root));

@@ -150,12 +150,22 @@ pub(super) fn advance(actual: Option<Version>, expected: Option<Version>) -> (de
     }
 }
 
+/// Read only the slot selected by the requested principal from this map snapshot.
+pub(super) fn sample<P:Ord,S,R,F:FnOnce(&S)->R>(roots:&BTreeMap<P,S>,owner:&P,read:F) -> (out:Option<R>)
+    requires obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),btree_map_inv(roots),
+        roots@.contains_key(*owner) ==> read.requires((&roots@[*owner],)),
+    ensures out.is_some() == roots@.contains_key(*owner),
+        out matches Some(value) ==> read.ensures((&roots@[*owner],),value),
+{
+    roots.get(owner).map(read)
+}
+
 /// Read the entry for this principal from the published root map.
 pub(super) fn published<P:Ord,R:Copy>(roots:&BTreeMap<P,R>, owner:&P) -> (root:Option<R>)
     requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), btree_map_inv(roots),
     ensures root == if roots@.contains_key(*owner) { Some(roots@[*owner]) } else { None },
 {
-    roots.get(owner).copied()
+    sample(roots,owner,|slot:&R| -> (value:R) ensures value == *slot, {*slot})
 }
 
 /// Group preparation observes the latest accepted entry for this owner.

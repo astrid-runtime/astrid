@@ -272,6 +272,29 @@ fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published
         })
 }
 
+/// Combine both lifecycle observations with the lookup used by the live
+/// ArcSwap reader. A successful nonempty sample observes the selected slot.
+fn published_sample<P:Ord,S,F:Fn(&S)->crate::RootState>(slots:&std::collections::BTreeMap<P,S>,owner:&P,
+    before:bool,after:bool,observe:F) -> (out:Option<crate::ready_root::ReadyKvRoot>)
+    requires vstd::std_specs::btree::btree_map_inv(slots),
+        vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
+        forall|s:&S| #[trigger] observe.requires((s,)),
+    ensures out.is_some() == (before && after),
+        out matches Some(sample) ==> sample.sampled().is_some() == slots@.contains_key(*owner) &&
+            (sample.sampled() matches Some(root) ==> observe.ensures((&slots@[*owner],),root)),
+{
+    let load = |p:&P| -> (r:Option<crate::RootState>)
+        ensures r.is_some() == slots@.contains_key(*p),
+            r matches Some(root) ==> observe.ensures((&slots@[*p],),root),
+    {
+        crate::root_transition::sample(slots,p,|slot:&S| -> (root:crate::RootState)
+            ensures observe.ensures((slot,),root), {observe(slot)})
+    };
+    crate::ready_root::ReadyKvRoot::sample_ready(owner,
+        || -> (ok:bool) ensures ok == before, {before},load,
+        || -> (ok:bool) ensures ok == after, {after})
+}
+
 /// Recover no row from another root, even when a limit discards multiple FIFO entries.
 fn trim_point<F>(previous:Arc<crate::hot_snapshot::OwnerSnapshot>,wanted:Option<crate::RootState>,
     take:F,limit:usize,key:&Vec<u8>) -> (out:Option<Option<Vec<u8>>>)

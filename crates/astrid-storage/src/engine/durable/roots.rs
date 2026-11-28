@@ -98,10 +98,13 @@ where
         recovery_closure_error(error, root_offset)
     })?;
     let validated = validate_preloaded(recovered, &preload)?;
-    Ok((
-        super::journal_closure::project(recovered, P::clone),
-        validated,
-    ))
+    let candidate = recovered
+        .iter()
+        .map(|(owner, (root, _))| (owner.clone(), *root))
+        .collect();
+    let roots = super::journal_closure::project(recovered, candidate)
+        .ok_or(DurableError::InvalidRootProjection)?;
+    Ok((roots, validated))
 }
 
 pub(super) fn validate_preloaded<P: Ord>(
