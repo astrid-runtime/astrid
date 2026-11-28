@@ -225,6 +225,18 @@ def consumer_defects():
             f"staged record source loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_record_source.rs"),
         )
+    mutations = Path("crates/astrid-storage/src/kv/tree/mutation_replay.rs")
+    for label, clause, weaker in [
+        ("initial state", "states[0] == initial", "true"),
+        ("encoded mutation", "f.ensures(((#[trigger] states[i]),tree,id,&rows[i]),Ok(states[i+1]))", "f.ensures(((#[trigger] states[i]),tree,id,&rows[i]),Ok(states[i+1])) || f.ensures((states[i],tree,id,&rows[0]),Ok(states[i+1]))"),
+        ("last state", "states.len() == rows.len()+1 && states.last() == s", "states.len() == rows.len()+1"),
+        ("all mutations", "states.len() == rows.len()+1 && states.last() == s", "states.last() == s"),
+        ("failing mutation", "apply.ensures((states.last(),tree,id,&rows@[states.len()-1]),Err(e))", "true"),
+    ]:
+        yield (
+            f"ordered mutation replay loses {label}", mutations,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_replay_values.rs"),
+        )
     reader = Path("crates/astrid-storage/src/engine/durable/read_admission.rs")
     for label, clause, weaker in [
         ("stale retry", "Ok(None) => self.generation != expected,", "Ok(None) => true,"),

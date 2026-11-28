@@ -452,34 +452,41 @@ where
     P: Ord,
     E: KvProjectionEngine<P>,
 {
-    for mutation in mutations {
-        use super::delta_totals::ApplyError;
-        overlay
-            .apply(totals, mutation, |key, slot, needs_checkpoint| {
-                super::replay_values::resolve(
-                    &mut *context,
-                    tree,
-                    key,
-                    slot.as_ref(),
-                    needs_checkpoint,
-                    |context, base, address| {
-                        let prior = context.get(base, address)?;
-                        Ok((context, prior))
+    super::mutation_replay::run(
+        (context, overlay, totals),
+        tree,
+        object,
+        mutations,
+        |(context, overlay, totals), tree, object, mutation| {
+            use super::delta_totals::ApplyError;
+            overlay
+                .apply(totals, mutation, |key, slot, needs_checkpoint| {
+                    super::replay_values::resolve(
+                        &mut *context,
+                        tree,
+                        key,
+                        slot.as_ref(),
+                        needs_checkpoint,
+                        |context, base, address| {
+                            let prior = context.get(base, address)?;
+                            Ok((context, prior))
+                        },
+                        |context, value| context.value_bytes(value),
+                    )
+                })
+                .map_err(|error| match error {
+                    ApplyError::Load(e) => e,
+                    ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
+                        invalid(object, "KV delta contains a no-op mutation")
                     },
-                    |context, value| context.value_bytes(value),
-                )
-            })
-            .map_err(|error| match error {
-                ApplyError::Load(e) => e,
-                ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
-                    invalid(object, "KV delta contains a no-op mutation")
-                },
-                ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
-                    replay_accounting_error(e)
-                },
-            })?;
-    }
-    Ok(())
+                    ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
+                        replay_accounting_error(e)
+                    },
+                })?;
+            Ok((context, overlay, totals))
+        },
+    )
+    .map(|_| ())
 }
 
 fn replay_accounting_error(error: super::delta_totals::Error) -> StorageError {

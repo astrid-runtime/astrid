@@ -77,4 +77,84 @@ fn addressed(root:&mut Option<Arc<traversal::Node>>, accounting:&mut crate::chec
             (if delete {None} else {Some(seq![22u8])}));
     }
 }
+type RowsState = (Option<Arc<traversal::Node>>,crate::checkpoint_totals::NodeTotals);
+
+fn ordered_rows<E,F>(initial:RowsState,tree:Option<ObjectId>,id:ObjectId,rows:&[Mutation],load:F)
+    -> (out:Result<RowsState,totals::ApplyError<E>>)
+    where F:Fn(&Vec<u8>,&Option<ValueSlot>,bool)->Result<(values::Bytes,values::Bytes),E>+Copy,
+    requires traversal::ordered(initial.0),forall|k:&Vec<u8>,v:&Option<ValueSlot>,need:bool| #[trigger] load.requires((k,v,need)),
+    ensures exists|h:Seq<RowsState>| h.len() >= 1 && h[0] == initial && h.len() <= rows.len()+1 &&
+        (forall|i:int| 0 <= i < h.len()-1 ==> #[trigger] overlay_update::applied(h[i].0,h[i+1].0,
+            &rows@[i],h[i].1,h[i+1].1,load,Ok(()))) &&
+        match out { Ok(s) => h.len()==rows.len()+1 && s == h.last(),
+            Err(e) => h.len() <= rows.len() && overlay_update::applied(h.last().0,h.last().0,
+                &rows@[h.len()-1],h.last().1,h.last().1,load,Err(e)) },
+{
+    use crate::mutation_replay::{self,prefix};
+    let step = |s:RowsState,_:Option<ObjectId>,_:ObjectId,row:&Mutation| -> (out:Result<RowsState,totals::ApplyError<E>>)
+        requires traversal::ordered(s.0),
+        ensures match out {
+            Ok(next) => overlay_update::applied(s.0,next.0,row,s.1,next.1,load,Ok(())),
+            Err(e) => overlay_update::applied(s.0,s.0,row,s.1,s.1,load,Err(e)),
+        }
+    {
+        let (mut root,mut accounting) = s;
+        match overlay_update::apply(&mut root,&mut accounting,row,load) {
+            Ok(()) => Ok((root,accounting)),
+            Err(e) => {assert(root == s.0 && accounting == s.1);Err(e)},
+        }
+    };
+    assert forall|h:Seq<RowsState>| #[trigger] prefix(initial,tree,id,rows@,h,step) && h.len() <= rows.len() implies
+        step.requires((h.last(),tree,id,&rows@[h.len()-1])) by {
+        if h.len()>1 {
+            let i = h.len() as int-2;
+            assert(step.ensures((h[i],tree,id,&rows@[i]),Ok(h[i+1])));
+        }
+    }
+    let out = mutation_replay::run(initial,tree,id,rows,step);
+    proof {
+        let h = choose|h:Seq<RowsState>| #[trigger] prefix(initial,tree,id,rows@,h,step) && match out {
+            Ok(s) => h.len()==rows.len()+1 && h.last()==s,
+            Err(e) => h.len()<=rows.len() && step.ensures((h.last(),tree,id,&rows@[h.len()-1]),Err(e)),
+        };
+        assert forall|i:int| 0 <= i < h.len()-1 implies #[trigger] overlay_update::applied(h[i].0,h[i+1].0,
+            &rows@[i],h[i].1,h[i+1].1,load,Ok(())) by {
+            assert(step.ensures((h[i],tree,id,&rows@[i]),Ok(h[i+1])));
+        }
+    }
+    out
+}
+
+fn two_ordered(tree:ObjectId,object:ObjectId,fail_first:bool,fail_second:bool) {
+    use crate::mutation_replay::{self,prefix};
+    let a = Mutation {key:vec![1u8],value:None}; let b = Mutation {key:vec![2u8],value:None};
+    let rows = [a,b];
+    assert(rows@[0].key@ =~= seq![1u8] && rows@[1].key@ =~= seq![2u8]);
+    let step = |state:u8,base:Option<ObjectId>,row:ObjectId,m:&Mutation| -> (r:Result<u8,u8>)
+        ensures r == if base != Some(tree) || row != object {Err(9u8)}
+            else if state == 0 && m.key@ == seq![1u8] {if fail_first {Err(3u8)} else {Ok(1u8)}}
+            else if state == 1 && m.key@ == seq![2u8] {if fail_second {Err(4u8)} else {Ok(2u8)}}
+            else {Err(8u8)},
+    {
+        let Some(t) = base else {return Err(9);};
+        if !tree.same(&t) || !row.same(&object) {return Err(9);}
+        if m.key.len()!=1 {return Err(8);}
+        let k = m.key[0];
+        assert((k==1) == (m.key@ =~= seq![1u8]) && (k==2) == (m.key@ =~= seq![2u8]));
+        if state==0 && k==1 {if fail_first {Err(3)} else {Ok(1)}}
+        else if state==1 && k==2 {if fail_second {Err(4)} else {Ok(2)}} else {Err(8)}
+    };
+    let out = mutation_replay::run(0,Some(tree),object,&rows,step);
+    proof {
+        let h = choose|h:Seq<u8>| #[trigger] prefix(0u8,Some(tree),object,rows@,h,step) && match out {
+            Ok(s) => h.len()==rows.len()+1 && h.last()==s,
+            Err(e) => h.len()<=rows.len() && step.ensures((h.last(),Some(tree),object,&rows@[h.len()-1]),Err(e)),
+        };
+        assert(prefix(0u8,Some(tree),object,rows@,h,step));
+        if h.len()>=2 {assert(step.ensures((h[0],Some(tree),object,&rows@[0]),Ok(h[1])));}
+        if h.len()==3 {assert(step.ensures((h[1],Some(tree),object,&rows@[1]),Ok(h[2])));}
+        assert(out == (if fail_first {Err(3u8)} else if fail_second {Err(4u8)} else {Ok(2u8)}));
+    }
+}
+
 }

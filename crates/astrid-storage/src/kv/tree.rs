@@ -77,6 +77,7 @@ mod legacy_avl;
 mod maintenance;
 mod memo;
 mod memo_admission;
+mod mutation_replay;
 mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
