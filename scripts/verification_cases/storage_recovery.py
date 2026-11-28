@@ -136,6 +136,7 @@ def consumer_defects():
             Path("verification/hosted_journal_history.rs"),
         )
     for label, clause, weaker in [
+        ("returned record provenance", "#[trigger] read_record((k,index@[k]),t@[k],read)", "exists|r:ObjectRecord| #[trigger] read_record((k,index@[k]),r,read)"),
         ("request uniqueness", "rows@.map(|_,row:(ObjectId,ArenaLocation)| row.0).no_duplicates() &&", "true &&"),
         ("missing identity", "Err(Error::Missing(k)) => missing_failure(roots@,index@,k)", "Err(Error::Missing(k)) => !index@.contains_key(k)"),
     ]:

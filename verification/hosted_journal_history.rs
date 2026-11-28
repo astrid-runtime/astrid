@@ -726,7 +726,7 @@ proof fn dispatched_wave<V:Fn(WaveState,&[ReadRow],u64,u64)->Result<WaveState,()
 spec fn media_record(image:Seq<u8>,row:ReadRow,scheme:root_wire::Scheme,r:crate::ObjectRecord) -> bool {
     let at = row.1.offset as int + 52;
     let body = image.subrange(at,at+row.1.payload_len);
-    &&& at+row.1.payload_len <= image.len()
+    &&& 40 <= row.1.payload_len && at+row.1.payload_len <= image.len()
     &&& crate::verified_record::record_at(body,40,scheme,r)
     &&& row.0.digest()==body.subrange(8,40)
 }
@@ -752,6 +752,10 @@ proof fn dispatched_record<V:Fn(WaveState,&[ReadRow],u64,u64)->Result<WaveState,
         dispatched(rows,lo,start,prior,limit,visit);
     if j < lo {
         dispatched_record(rows,j,lo,start,prior,limit,visit,image,scheme);
+        assert(prior.0@.submap_of(state.0@));
+        assert(prior.0@.contains_key(rows[j].0));
+        assert(state.0@.contains_key(rows[j].0));
+        assert(prior.0@[rows[j].0] == state.0@[rows[j].0]);
     } else {
         assert(part@[j-lo]==rows[j]);
     }
@@ -779,6 +783,10 @@ fn install_buffer<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRec
                 let ghost at = loc.offset as int + 52;
                 assert(crate::indexed_frame::fits(span@,base,loc));
                 assert(p@ =~= image@.subrange(at,at+loc.payload_len));
+                assert(crate::verified_record::tag(p@,0,format.scheme));
+                assert(40 <= loc.payload_len);
+                assert(crate::verified_record::record_at(p@,40,format.scheme,r));
+                assert(id.digest()==p@.subrange(8,40));
                 Ok((r,p))
             },
             Err(_) => Err(()),
@@ -874,6 +882,14 @@ fn preload_closure<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;3
         Ok(table) => {
             assert(table@.dom().union(Set::empty()) =~= table@.dom());
             assert(crate::journal_preload::covered(roots@,table@,Set::empty()));
+            assert forall|k:crate::ObjectId| table@.contains_key(k) implies
+                #[trigger] media_record(media.image(),(k,index@[k]),format.scheme,table@[k]) by {
+                assert(crate::journal_preload::read_record((k,index@[k]),table@[k],read));
+                let (prior,batch,after,next,j) = choose|prior:PreloadTable,batch:&[ReadRow],after:PreloadTable,next:PendingIds,j:int|
+                    0 <= j < batch.len() && #[trigger] batch@[j] == (k,index@[k]) && after@.contains_key(k) && after@[k]==table@[k] &&
+                    #[trigger] read.ensures((prior,batch),Ok((after,next)));
+                assert(media_record(media.image(),batch@[j],format.scheme,after@[k]));
+            }
             assert(roots@.subset_of(table@.dom()));
             assert(table@.dom().subset_of(index@.dom()));
             assert forall|k:crate::ObjectId| table@.contains_key(k) implies #[trigger] outgoing(table@,k).subset_of(table@.dom()) by {};

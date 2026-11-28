@@ -122,6 +122,7 @@ fn read_branch<F:Fn(&[u8])->Result<(),()>+Copy>(id:ObjectId,object:&crate::Objec
     }
 }
 
+#[verifier::spinoff_prover]
 #[verifier::rlimit(45)]
 fn complete(left:ObjectId,right:ObjectId,id:ObjectId,v:crate::ObjectFormatVersion,integrated:bool) -> (out:Result<Branch<ObjectId,NodeTotals>,header::RecordError<()>>)
     ensures out matches Ok(b) && b.children.len() == 2 && b.level == 1 && b.children@[0].object == left &&

@@ -214,6 +214,14 @@ pub(super) open spec fn read_failure<E,V:Fn(Table,&[Row])->Result<(Table,Frontie
         #[trigger] read.ensures((t,r),Err(e))
 }
 
+/// Each returned record comes from a successful read of its indexed row.
+pub(super) open spec fn read_record<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
+    row:Row,record:ObjectRecord,read:V) -> bool {
+    exists|prior:Table,batch:&[Row],after:Table,next:Frontier,j:int|
+        0 <= j < batch.len() && #[trigger] batch@[j] == row && after@.contains_key(row.0) && after@[row.0] == record &&
+        #[trigger] read.ensures((prior,batch),Ok((after,next)))
+}
+
 /// Continue until every owning edge is resident. A successful read of a
 /// nonempty frontier must strictly increase the resident subset of the index.
 pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
@@ -224,7 +232,8 @@ pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
         forall|t:Table,r:&[Row],u:Table,n:Frontier| #[trigger] read.ensures((t,r),Ok((u,n))) ==>
             btree_map_inv(&u) && btree_set_inv(&n) && wave(t@,selected(r@),u@,n@),
     ensures match out {
-        Ok(t) => btree_map_inv(&t) && t@.dom().subset_of(index@.dom()) &&
+        Ok(t) => (forall|k:ObjectId| t@.contains_key(k) ==> #[trigger] read_record((k,index@[k]),t@[k],read)) &&
+            btree_map_inv(&t) && t@.dom().subset_of(index@.dom()) &&
             covered(roots@,t@,Set::empty()) && reachable_only(roots@,t@,Set::empty()),
         Err(Error::Missing(k)) => missing_failure(roots@,index@,k),
         Err(Error::Read(e)) => read_failure(roots@,index@,read,e),
@@ -235,6 +244,7 @@ pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
     loop
         invariant btree_map_inv(index),btree_map_inv(&table),btree_set_inv(&pending),
             obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+            forall|k:ObjectId| table@.contains_key(k) ==> #[trigger] read_record((k,index@[k]),table@[k],read),
             forall|k:ObjectId| pending@.contains(k) ==> #[trigger] discovered(roots@,table@,k),
             table@.dom().subset_of(index@.dom()),covered(roots@,table@,pending@),reachable_only(roots@,table@,pending@),
             forall|t:Table,r:&[Row]| btree_map_inv(&t) && t@.dom().disjoint(selected(r@)) &&
@@ -273,6 +283,7 @@ pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
             return Ok(table);
         }
         let batch = rows.as_slice();
+        let ghost prior = table;
         let (updated,next) = match read(table,batch) {
             Ok(pair)=>pair,
             Err(e)=>{
@@ -293,6 +304,17 @@ pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
                 assert(index@.contains_key(rows@[j].0));
             }
             assert(wave(earlier,keys,table@,pending@));
+            assert forall|k:ObjectId| table@.contains_key(k) implies #[trigger] read_record((k,index@[k]),table@[k],read) by {
+                if earlier.contains_key(k) {
+                    assert(earlier[k]==table@[k]);
+                    assert(read_record((k,index@[k]),earlier[k],read));
+                } else {
+                    assert(keys.contains(k) && ids.contains(k));
+                    let j = choose|j:int| 0 <= j < ids.len() && ids[j]==k;
+                    assert(batch@[j]==(k,index@[k]));
+                    assert(read.ensures((prior,batch),Ok((updated,next))));
+                }
+            }
             advance(roots@,earlier,frontier,table@,pending@);
             assert forall|k:ObjectId| pending@.contains(k) implies #[trigger] discovered(roots@,table@,k) by {
                 let id = choose|id:ObjectId| keys.contains(id) && #[trigger] outgoing(table@,id).contains(k);
