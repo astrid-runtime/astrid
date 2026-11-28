@@ -453,6 +453,8 @@ fn reconcile_charge(object:ObjectId,prior:u64,declared:u64,depth:u64,length:u64)
     }
 }
 
+#[verifier::spinoff_prover]
+#[verifier::rlimit(35)]
 fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64,deny:bool,via_envelope:bool) {
     use crate::{delta_batch as batch,delta_header as header,delta_recovery as recovery};
     let h = header::Header {depth:1,delta_bytes:3,entries,quota_bytes:quota,count:1};
@@ -464,14 +466,15 @@ fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64
     assert(ok.is_ok());
     let ghost wire = bytes@;
     let ghost links = refs@;
-    let record = ObjectRecord::from_fields(crate::ObjectKind::NamespaceMap,crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap(),
+    let version=crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap();
+    let record = ObjectRecord::from_fields(crate::ObjectKind::NamespaceMap,version,
         bytes,refs,logical,crate::ObjectClass::Metadata).unwrap();
     let validate = |_k:&[u8]| -> (e:Option<u8>) ensures e == if deny {Some(7u8)} else {None} {
         if deny {Some(7u8)} else {None}
     };
     let got = if via_envelope {
         use crate::{delta_chain::Head,projection_record};
-        match projection_record::decode(&record,crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap(),&[],validate) {
+        match projection_record::decode(&record,version,&[],validate) {
             Ok(Head::Delta {previous,depth,delta_bytes,mutations,totals}) =>
                 Ok(recovery::Recovered {previous,depth,delta_bytes,rows:mutations,totals}),
             Err(projection_record::Error::Delta(e)) => Err(e),
