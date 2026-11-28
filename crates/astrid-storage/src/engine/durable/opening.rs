@@ -213,7 +213,8 @@ where
             limits,
             policy.transaction_wal.is_enabled(),
             faults.as_ref(),
-        )?;
+        )
+        .and_then(super::recovery::checkpoint_recovered_wal)?;
         Ok(Self::from_recovered(
             None,
             None,
@@ -286,7 +287,8 @@ where
             limits,
             options.policy.transaction_wal.is_enabled(),
             options.faults.as_ref(),
-        )?;
+        )
+        .and_then(super::recovery::checkpoint_recovered_wal)?;
 
         Ok(Self::from_recovered(
             Some(path),
