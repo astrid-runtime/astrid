@@ -43,7 +43,7 @@ impl admission::Arena for Candidate<'_> {
     closed spec fn entries(&self) -> vstd::iset::ISet<(ObjectId,ArenaLocation)> {
         vstd::iset::ISet::new(|p:(ObjectId,ArenaLocation)| reader::matches(self.media.image(),self.magic,self.version,p.1,self.scheme,p.0,self.limit))
     }
-    closed spec fn tails(&self) -> Set<ArenaLocation> { Set::empty().insert(self.checked_tail) }
+    closed spec fn tails(&self) -> vstd::iset::ISet<ArenaLocation> { vstd::iset::ISet::empty().insert(self.checked_tail) }
     closed spec fn reliable(&self) -> bool {true}
 
     fn entry(&mut self, id:ObjectId, loc:ArenaLocation) -> bool {
@@ -85,6 +85,29 @@ fn recover(candidate:IndexState, complete:bool, bytes:&[u8],checked_tail:ArenaLo
         {match write_error {Some(e) => Err(e),None => if value.arena_len == expected_len {Ok(())} else {Err(99)}}})
 }
 
+#[verifier::opaque]
+spec fn edge(rows:Seq<(ObjectId,ArenaLocation)>,i:int) -> int {admission::frontier(rows,i)}
+
+/// Given uniqueness at each shared offset, compare the two walks by induction.
+proof fn aligned_prefix(rows:Seq<(ObjectId,ArenaLocation)>,walk:Seq<(ObjectId,ArenaLocation)>,n:int,end:int)
+    requires 0<=n<=walk.len(), edge(rows,rows.len() as int)==end,
+        forall|i:int| 0<=i<rows.len() ==> rows[i].1.offset==#[trigger] edge(rows,i),
+        forall|i:int| 0<=i<walk.len() ==> walk[i].1.offset==#[trigger] edge(walk,i) && walk[i].1.offset<end,
+        forall|i:int| 0<=i<walk.len() && i<rows.len() && (#[trigger] walk[i]).1.offset==rows[i].1.offset ==> walk[i]==rows[i],
+    ensures n<=rows.len(),forall|i:int| 0<=i<n ==> #[trigger] walk[i]==rows[i],
+    decreases n,
+{
+    if n>0 {
+        let i=n-1;
+        aligned_prefix(rows,walk,i,end);
+        if i>0 {assert(rows[i-1]==walk[i-1]);}
+        assert(edge(rows,i)==edge(walk,i)) by {reveal(edge);}
+        assert(walk[i].1.offset<end);
+        assert(i<rows.len());
+        assert(rows[i]==walk[i]);
+    }
+}
+
 /// A walk starting at byte zero and following the lengths in the actual frame
 /// headers cannot find a tagged object omitted by an accepted checkpoint.
 proof fn physical_prefix(bytes:Seq<u8>, rows:Seq<(ObjectId,ArenaLocation)>,
@@ -102,24 +125,21 @@ proof fn physical_prefix(bytes:Seq<u8>, rows:Seq<(ObjectId,ArenaLocation)>,
     assert forall|k:int| 0 <= k < rows.len() implies (#[trigger] rows[k]).1.offset == admission::frontier(rows,k) by {
         assert(admission::bridges(vstd::iset::ISet::empty(),admission::frontier(rows,k),rows[k].1.offset as int));
     }
-    assert(admission::frontier(rows,rows.len() as int) == bytes.len());
-    if n > 0 {
-        let i = n-1;
-        physical_prefix(bytes,rows,walk,i,magic,version,scheme,limit);
-        if i > 0 {assert(walk[i-1] == rows[i-1]);}
-        assert(admission::frontier(rows,i) == admission::frontier(walk,i));
-        if i == rows.len() {assert(admission::frontier(rows,i) == bytes.len());}
-        if i < rows.len() {assert(rows[i].1.offset == admission::frontier(rows,i));}
-        let (id,loc) = walk[i];
+    assert forall|i:int| 0<=i<walk.len() && i<rows.len() && (#[trigger] walk[i]).1.offset==rows[i].1.offset
+        implies walk[i]==rows[i] by {
+        let (id,loc)=walk[i];
+        let (cached,at)=rows[i];
         assert(reader::matches(bytes,magic,version,loc,scheme,id,limit));
-        assert(i < rows.len());
-        let (cached,at) = rows[i];
-        assert(at.offset == loc.offset);
         assert(reader::matches(bytes,magic,version,at,scheme,cached,limit));
         assert(at.checksum =~= loc.checksum);
         ObjectId::same_digest(cached,id);
-        assert(walk[i] == rows[i]);
     }
+    assert forall|i:int| 0<=i<walk.len() implies (#[trigger] walk[i]).1.offset==admission::frontier(walk,i) &&
+        walk[i].1.offset<bytes.len() by {
+        assert(reader::matches(bytes,magic,version,walk[i].1,scheme,walk[i].0,limit));
+    }
+    reveal(edge);
+    aligned_prefix(rows,walk,n,bytes.len() as int);
 }
 
 proof fn includes_physical_objects(bytes:Seq<u8>, map:Map<ObjectId,ArenaLocation>,
@@ -231,7 +251,7 @@ fn written(id:ObjectId, expected:ObjectId, magic:[u8;8], version:u16, scheme:Sch
 }
 /// The same positional frame driver used by the cache tail validator. A successful
 /// tail read binds the placement, header and digest to bytes on this handle.
-fn physical_tail<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+pub(super) fn physical_tail<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
     media:&M,loc:ArenaLocation,magic:[u8;8],version:u16,limit:u64,hash:H) -> (ok:bool)
     requires forall|n:u64,p:&[u8]| #[trigger] hash.requires((magic,n,p)),
     ensures ok ==> {

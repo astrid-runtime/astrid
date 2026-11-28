@@ -147,6 +147,22 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), observer,
         )
     media = Path("crates/astrid-storage/src/engine/durable/format/positional_read.rs")
+    duplicate_recovery = Path("verification/hosted_duplicate_recovery.rs")
+    admission = Path("crates/astrid-storage/src/engine/durable/index/admission.rs")
+    copies = Path("crates/astrid-storage/src/engine/durable/format/duplicates.rs")
+    for label, before, after, expected in [
+        ("bounded header", "let start=crate::positional_read::extent(at,52,end).ok()?;", "let start=at;", copies),
+        ("bounded payload", "extent(start,d.payload_len,end)", "extent(start,d.payload_len,u64::MAX)", duplicate_recovery),
+        ("duplicate comparison", "physical_gap(s.media,s.hash,s.magic,s.version,s.limit,map,self.scheme,at,end)", "at<=end", admission),
+        ("indexed identity", "self.source.version,loc,self.scheme,id,self.source.limit).is_ok()", "self.source.version,loc,self.scheme,id,self.source.limit).is_ok() || true", admission),
+        ("tail validation", "ok\n    }\n}\n\nspec fn admitted_state", "true\n    }\n}\n\nspec fn admitted_state", admission),
+        ("completion", "admission::IndexState::validated(candidate,complete,measured,arena)", "admission::IndexState::validated(candidate,true,measured,arena)", duplicate_recovery),
+        ("receipt", "VolumeRecovery::Persisted(at,h,v)=>(at,h,Some(v))", "VolumeRecovery::Persisted(at,h,v)=>(at,h,None)", duplicate_recovery),
+    ]:
+        yield (
+            f"physical checkpoint reopen loses {label}", duplicate_recovery,
+            lambda s, a=before, b=after: replace_once(s, a, b), expected,
+        )
     checkpoint = Path("verification/hosted_checkpoint_recovery.rs")
     for label, source, before, after, consumer in [
         ("header offset", media, "exact(media,offset,header_buf)", "exact(media,0,header_buf)", media),

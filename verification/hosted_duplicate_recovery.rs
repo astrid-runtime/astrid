@@ -55,7 +55,7 @@ impl admission::Arena for Arena<'_> {
             &&& duplicates::named(self.media.frames()[at],self.scheme,p.0)
         })
     }
-    closed spec fn tails(&self) -> Set<ArenaLocation> {Set::empty().insert(self.tail)}
+    closed spec fn tails(&self) -> vstd::iset::ISet<ArenaLocation> {vstd::iset::ISet::empty().insert(self.tail)}
     closed spec fn reliable(&self) -> bool {true}
     fn gap(&mut self,map:&BTreeMap<ObjectId,ArenaLocation>,at:u64,end:u64) -> bool {
         checked_gap(&self.media,map,self.scheme,at,end)
@@ -280,6 +280,205 @@ fn twins(candidate:admission::IndexState,arena:&mut Arena,id:ObjectId,first:Aren
         }
     }
     admission::IndexState::validated(Some(candidate),true,measured,arena)
+}
+
+/// The digest implementation is a host dependency. Both copies are still
+/// compared byte for byte by the production duplicate walker.
+trait FrameDigest {
+    spec fn digest(&self,magic:[u8;8],length:u64,data:Seq<u8>) -> [u8;32];
+    fn calculate(&self,magic:[u8;8],length:u64,data:&[u8]) -> (sum:[u8;32])
+        ensures sum==self.digest(magic,length,data@);
+}
+
+struct Physical<'a,M:crate::positional_read::Media,H:FrameDigest> {
+    media:&'a M, hash:&'a H, magic:[u8;8], version:u16, limit:u64,
+}
+
+impl<M:crate::positional_read::Media,H:FrameDigest> Physical<'_,M,H> {
+    spec fn size(&self,at:u64) -> u64 {
+        vstd::bytes::spec_u64_from_le_bytes(self.media.image().subrange(at as int+12,at as int+20))
+    }
+
+    spec fn body(&self,at:u64) -> Seq<u8> {
+        self.media.image().subrange(at as int+52,at as int+52+self.size(at))
+    }
+
+    spec fn valid(&self,at:u64) -> bool {
+        let n=self.size(at);
+        let sum=self.hash.digest(self.magic,n,self.body(at));
+        &&& at as int+52+n<=self.media.image().len() && n<=self.limit
+        &&& crate::checkpoint_reader::header_matches(self.media.image().subrange(at as int,at as int+52),
+            self.magic,self.version,ArenaLocation{offset:at,payload_len:n,checksum:sum})
+    }
+}
+
+impl<M:crate::positional_read::Media,H:FrameDigest> Media for Physical<'_,M,H> {
+    closed spec fn frames(&self) -> Contents {
+        vstd::imap::IMap::new(|at:u64| self.valid(at),|at:u64| self.body(at))
+    }
+    closed spec fn dependable(&self) -> bool {false}
+
+    fn bounded(&mut self,at:u64,end:u64) -> (out:Option<Vec<u8>>) {
+        let media=self.media;
+        let hash=self.hash;
+        let magic=self.magic;
+        let version=self.version;
+        let limit=self.limit;
+        let start=crate::positional_read::extent(at,52,end).ok()?;
+        let decode=|h:&[u8;52]| -> (d:Result<crate::arena_frame::DecodedFrameHeader,()>)
+            ensures d matches Ok(v) ==> start as int+v.payload_len<=end && v.payload_len<=limit &&
+                crate::checkpoint_reader::header_matches(h@,magic,version,ArenaLocation{offset:at,payload_len:v.payload_len,checksum:v.checksum}),
+        {
+            let d=crate::arena_frame::positioned_header(h,magic,version,limit).map_err(|_| ())?;
+            crate::positional_read::extent(start,d.payload_len,end).map_err(|_| ())?;
+            Ok(d)
+        };
+        let validate=|d:crate::arena_frame::DecodedFrameHeader,p:&[u8]| -> (r:Result<[u8;32],()>)
+            ensures r matches Ok(sum) ==> p.len()==d.payload_len && sum==d.checksum && sum==hash.digest(magic,d.payload_len,p@),
+        {
+            let calc=|m:[u8;8],n:u64,b:&[u8]| -> (s:[u8;32]) ensures s==hash.digest(m,n,b@), {hash.calculate(m,n,b)};
+            crate::arena_frame::check_payload(d,magic,p,calc).map_err(|_| ())
+        };
+        let (p,sum)=crate::positional_read::frame(media,at,decode,validate).ok()?;
+        proof {
+            let image=media.image();
+            let header=image.subrange(at as int,at as int+52);
+            assert(header.subrange(12,20) =~= image.subrange(at as int+12,at as int+20));
+            assert(self.size(at)==p.len());
+            assert(self.body(at)==p@);
+            assert(self.valid(at));
+        }
+        Some(p)
+    }
+}
+
+/// Each admitted gap is tiled by authenticated frames on the one arena image.
+/// At each step the map's earlier physical payload equals the duplicate.
+fn physical_gap<M:crate::positional_read::Media,H:FrameDigest>(media:&M,hash:&H,magic:[u8;8],version:u16,
+    limit:u64,map:&BTreeMap<ObjectId,ArenaLocation>,scheme:Scheme,start:u64,end:u64) -> (ok:bool)
+    requires btree_map_inv(map),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+    ensures ok ==> duplicates::tiled((Physical{media,hash,magic,version,limit}).frames(),map@,scheme,start,end),
+{
+    duplicates::check(&mut Physical{media,hash,magic,version,limit},map,scheme,start,end)
+}
+
+struct CachedArena<'a,M:crate::positional_read::Media,H:FrameDigest,R:crate::checkpoint_reader::Input> {
+    source:Physical<'a,M,H>, entries:R, scheme:Scheme,
+}
+
+impl<M:crate::positional_read::Media,H:FrameDigest,R:crate::checkpoint_reader::Input>
+    admission::Arena for CachedArena<'_,M,H,R> {
+    closed spec fn gaps(&self,map:Map<ObjectId,ArenaLocation>) -> vstd::iset::ISet<(int,int)> {
+        gaps(self.source.frames(),map,self.scheme)
+    }
+    closed spec fn entries(&self) -> vstd::iset::ISet<(ObjectId,ArenaLocation)> {
+        vstd::iset::ISet::new(|p:(ObjectId,ArenaLocation)| crate::checkpoint_reader::matches(self.entries.image(),
+            self.source.magic,self.source.version,p.1,self.scheme,p.0,self.source.limit))
+    }
+    closed spec fn tails(&self) -> vstd::iset::ISet<ArenaLocation> {
+        vstd::iset::ISet::new(|loc:ArenaLocation| self.source.valid(loc.offset) && self.source.size(loc.offset)==loc.payload_len &&
+            self.source.hash.digest(self.source.magic,loc.payload_len,self.source.body(loc.offset))==loc.checksum)
+    }
+    closed spec fn reliable(&self) -> bool {false}
+
+    fn gap(&mut self,map:&BTreeMap<ObjectId,ArenaLocation>,at:u64,end:u64) -> bool {
+        let s=&self.source;
+        physical_gap(s.media,s.hash,s.magic,s.version,s.limit,map,self.scheme,at,end)
+    }
+    fn entry(&mut self,id:ObjectId,loc:ArenaLocation) -> bool {
+        crate::checkpoint_reader::check(&mut self.entries,self.source.magic,self.source.version,loc,self.scheme,id,self.source.limit).is_ok()
+    }
+    fn tail(&mut self,loc:ArenaLocation) -> bool {
+        let s=&self.source;
+        let hash=s.hash;
+        let calc=|m:[u8;8],n:u64,p:&[u8]| -> (out:[u8;32]) ensures out==hash.digest(m,n,p@), {hash.calculate(m,n,p)};
+        let ok=crate::hosted_checkpoint_recovery::physical_tail(s.media,loc,s.magic,s.version,s.limit,calc);
+        proof {if ok {
+            let start=loc.offset as int;
+            let header=s.media.image().subrange(start,start+52);
+            assert(header.subrange(12,20) =~= s.media.image().subrange(start+12,start+20));
+            assert(s.size(loc.offset)==loc.payload_len);
+            assert(s.valid(loc.offset));
+        }}
+        ok
+    }
+}
+
+spec fn admitted_state<M:crate::positional_read::Media,H:FrameDigest>(
+    s:admission::IndexState,physical:Physical<M,H>,scheme:Scheme,measured:u64) -> bool {
+    &&& s.arena_len==measured
+    &&& admission::covered_with(s.objects@,measured,gaps(physical.frames(),s.objects@,scheme))
+    &&& forall|pair:(ObjectId,ArenaLocation)| #[trigger] s.objects@.kv_pairs().contains(pair) ==>
+        crate::checkpoint_reader::matches(physical.media.image(),physical.magic,physical.version,pair.1,scheme,pair.0,physical.limit)
+    &&& match s.arena_tail {
+        Some(loc)=>physical.valid(loc.offset) && physical.size(loc.offset)==loc.payload_len &&
+            physical.hash.digest(physical.magic,loc.payload_len,physical.body(loc.offset))==loc.checksum,
+        None=>measured==0,
+    }
+}
+
+fn admit_cached<M:crate::positional_read::Media,H:FrameDigest,R:crate::checkpoint_reader::Input>(
+    candidate:Option<admission::IndexState>,complete:bool,measured:u64,arena:&mut CachedArena<M,H,R>)
+    -> (out:Option<admission::IndexState>)
+    requires candidate matches Some(c) ==> btree_map_inv(&c.objects),
+        obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        old(arena).entries.image()==old(arena).source.media.image(),measured==old(arena).entries.image().len(),
+    ensures out matches Some(s) ==> candidate==Some(s) && complete &&
+        admitted_state(s,old(arena).source,old(arena).scheme,measured),
+{
+    admission::IndexState::validated(candidate,complete,measured,arena)
+}
+
+/// Cache-hit recovery retains the index actually admitted by the production
+/// validator and the journal fence, then rereads every reachable object.
+#[verifier::spinoff_prover]
+fn reopen_cached<A:crate::positional_read::Media,H:FrameDigest,T:crate::checkpoint_reader::Input,
+    R:crate::frame_repair::FrameReader,M:crate::frame_repair::Medium,V:crate::frontier::JournalContainer,
+    P:Ord,D,C,G,I,F,O>(candidate:Option<admission::IndexState>,complete:bool,measured:u64,arena:&A,entries:T,hash:&H,
+    reader:&mut R,journal:&mut M,capture:O,end:u64,protected:u64,batch:u64,limit:u64,scheme:Scheme,
+    decode:D,recode:C,hash_frame:G,identify:I,project:F)
+    -> (out:Option<(crate::hosted_recovered_roots::Loaded<P>,admission::IndexState,Option<V>)>)
+    where D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy,G:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+        I:Fn(&crate::ObjectRecord)->[u8;32]+Copy,F:FnOnce(&BTreeMap<P,(crate::RootState,u64)>)->BTreeMap<P,crate::RootState>,
+        O:FnOnce(&M)->V,
+    requires candidate matches Some(s) ==> btree_map_inv(&s.objects),
+        entries.image()==arena.image(),measured==arena.image().len(),
+        old(reader).target()==old(journal).target(),arena.target().0==old(reader).target().0,arena.target().1!=old(reader).target().1,
+        !old(journal).syncs_file(),old(reader).image()==old(journal).durable(),old(journal).durable()==old(journal).bytes(),
+        old(reader).position()==0,protected<=end==old(reader).image().len(),
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|m:&M| m.target()==old(journal).target() && !m.syncs_file() ==> #[trigger] capture.requires((m,)),
+        forall|m:&M,v:V| #[trigger] capture.ensures((m,),v) ==> (v.container_id(),v.region_id())==m.target() && v.journal_image()==m.bytes(),
+        forall|b:&[u8]| #[trigger] decode.requires((b,)),forall|p:&P| #[trigger] recode.requires((p,)),
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash_frame.requires((m,n,p)),
+        forall|m:[u8;8],n:u64,p:&[u8],sum:[u8;32]| #[trigger] hash_frame.ensures((m,n,p),sum) ==> sum==hash.digest(m,n,p@),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|h:&BTreeMap<P,(crate::RootState,u64)>| #[trigger] project.requires((h,)),
+        forall|h:&BTreeMap<P,(crate::RootState,u64)>,t:BTreeMap<P,crate::RootState>| #[trigger] project.ensures((h,),t) ==> btree_map_inv(&t),
+    ensures out matches Some((v,s,fence)) ==> {
+        let physical=Physical{media:arena,hash,magic:crate::arena_frame::ARENA_MAGIC,version:crate::arena_frame::FRAME_VERSION,limit};
+        &&& complete && candidate==Some(s) && admitted_state(s,physical,scheme,measured)
+        &&& final(journal).target()==old(reader).target() && protected<=v.end<=end
+        &&& final(journal).bytes()==old(reader).image().take(v.end as int)
+        &&& match fence {
+            Some(f)=>v.end<end && (f.container_id(),f.region_id())==final(journal).target() && f.durable_image()==final(journal).bytes(),
+            None=>v.end==end && final(journal).durable()==final(journal).bytes(),
+        }
+        &&& crate::hosted_journal_scan::recovered(v.history@,final(journal).bytes(),v.end,limit,scheme,decode,recode,hash_frame)
+        &&& crate::hosted_recovered_roots::retained(&v,arena.image(),s.objects@,scheme)
+    },
+{
+    use crate::hosted_journal_scan::{recover_volume,VolumeRecovery};
+    let source=Physical{media:arena,hash,magic:crate::arena_frame::ARENA_MAGIC,version:crate::arena_frame::FRAME_VERSION,limit};
+    let mut cache=CachedArena{source,entries,scheme};
+    let state=admit_cached(candidate,complete,measured,&mut cache)?;
+    let (at,history,fence)=match recover_volume(reader,journal,end,protected,limit,scheme,decode,recode,hash_frame,capture) {
+        VolumeRecovery::Unmodified(h)=>{assert(journal.bytes().take(end as int) =~= journal.bytes());(end,h,None)},
+        VolumeRecovery::Persisted(at,h,v)=>(at,h,Some(v)),
+        _=>return None,
+    };
+    let loaded=crate::hosted_recovered_roots::load_history(history,at,arena,&state.objects,batch,limit,scheme,hash_frame,identify,project)?;
+    Some((loaded,state,fence))
 }
 
 }

@@ -44,7 +44,7 @@ pub(super) trait Arena {
             ok ==> bridges(old(self).gaps(map@),at as int,end as int),
             old(self).reliable() && bridges(old(self).gaps(map@),at as int,end as int) ==> ok;
     spec fn entries(&self) -> vstd::iset::ISet<(ObjectId,ArenaLocation)>;
-    spec fn tails(&self) -> Set<ArenaLocation>;
+    spec fn tails(&self) -> vstd::iset::ISet<ArenaLocation>;
     spec fn reliable(&self) -> bool;
     fn entry(&mut self, id:ObjectId, loc:ArenaLocation) -> (ok:bool)
         ensures final(self).entries() == old(self).entries(), final(self).tails() == old(self).tails(),
@@ -193,7 +193,7 @@ proof fn match_prefix(actual:Rows,witness:Rows,n:int)
 }
 
 pub(super) open spec fn consistent(map:Map<ObjectId,ArenaLocation>, tail:Option<ArenaLocation>,
-    covered:u64, measured:u64, entries:vstd::iset::ISet<(ObjectId,ArenaLocation)>, tails:Set<ArenaLocation>) -> bool {
+    covered:u64, measured:u64, entries:vstd::iset::ISet<(ObjectId,ArenaLocation)>, tails:vstd::iset::ISet<ArenaLocation>) -> bool {
     &&& covered == measured
     &&& forall|p:(ObjectId,ArenaLocation)| #[trigger] map.kv_pairs().contains(p) ==> entries.contains(p)
     &&& match tail {Some(loc) => tails.contains(loc),None => covered == 0}

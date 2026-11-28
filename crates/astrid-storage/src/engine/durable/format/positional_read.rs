@@ -116,6 +116,21 @@ pub(super) fn with_span<M:Media,T,E,F:FnOnce(&[u8],u64)->Result<T,E>>(media:&M,o
     }
 }
 
+pub(super) enum ExtentError { Overflow, Truncated }
+
+/// Refuse a bounded read before issuing I/O outside the captured prefix.
+pub(super) fn extent(start:u64,len:u64,end:u64) -> (out:Result<u64,ExtentError>)
+    ensures match out {
+        Ok(next)=>next==start as int+len && next<=end,
+        Err(ExtentError::Overflow)=>start as int+len>u64::MAX,
+        Err(ExtentError::Truncated)=>end<start as int+len<=u64::MAX,
+    },
+{
+    let Some(next)=start.checked_add(len) else {return Err(ExtentError::Overflow);};
+    if next>end {return Err(ExtentError::Truncated);}
+    Ok(next)
+}
+
 pub(super) enum FrameError<I,E> { Header(Error<I>), Invalid(E), Capacity, Payload(Error<I>) }
 
 pub(super) open spec fn located<M:Media,E,D,V>(media:&M,offset:u64,decode:D,validate:V,p:Vec<u8>,sum:[u8;32]) -> bool

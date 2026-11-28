@@ -5,8 +5,8 @@ use std::io::{Read as _, Seek as _};
 use super::{
     DurableError, DurableFrameRange, DurableIo, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE,
     FRAME_VERSION, RecoveryLimits, SeekFrom, corrupt, frame_checksum, frame_checksum_hasher,
-    io_error, read_exact_at, scan_frames_with_source, validate_positioned_header,
-    validate_positioned_payload,
+    io_error, positional_error, positional_read, scan_frames_with_source,
+    validate_positioned_header, validate_positioned_payload,
 };
 use crate::engine::durable::frame_repair::{self, Damage, FrameReader};
 
@@ -41,16 +41,13 @@ pub(super) fn read_frame_preserving_cursor_within<F: DurableIo>(
 ) -> Result<Vec<u8>, DurableError> {
     // Reject before any media read so load_previous cannot observe bytes past
     // the captured fence, including a concurrent append tail.
-    let header_end = offset
-        .checked_add(FRAME_HEADER_LEN)
-        .ok_or(DurableError::EncodingOverflow)?;
-    if header_end > captured_end {
-        return Err(corrupt(
-            file_name,
-            offset,
-            "published frame header is truncated",
-        ));
-    }
+    use positional_read::{ExtentError, FrameError};
+    let extent_error = |error, detail| match error {
+        ExtentError::Overflow => DurableError::EncodingOverflow,
+        ExtentError::Truncated => corrupt(file_name, offset, detail),
+    };
+    let payload_offset = positional_read::extent(offset, FRAME_HEADER_LEN, captured_end)
+        .map_err(|e| extent_error(e, "published frame header is truncated"))?;
 
     let position = if source.durable_read_at_preserves_cursor() {
         None
@@ -62,65 +59,34 @@ pub(super) fn read_frame_preserving_cursor_within<F: DurableIo>(
         )
     };
 
-    let restore = |source: &mut F, position: Option<u64>| -> Result<(), DurableError> {
-        if let Some(position) = position {
-            source
-                .seek(SeekFrom::Start(position))
-                .map_err(|error| io_error("restore durable scan read-ahead position", error))?;
-        }
-        Ok(())
-    };
-
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    if let Err(error) = read_exact_at(source, &mut header, offset) {
-        restore(source, position)?;
-        return Err(io_error("read durable scan source header", error));
-    }
-    let decoded = match validate_positioned_header(file_name, magic, offset, &header, limits) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            restore(source, position)?;
-            return Err(error);
+    let result = positional_read::frame(
+        source,
+        offset,
+        |header| {
+            let decoded = validate_positioned_header(file_name, magic, offset, header, limits)?;
+            positional_read::extent(payload_offset, decoded.payload_len, captured_end)
+                .map_err(|e| extent_error(e, "published frame payload is truncated"))?;
+            Ok(decoded)
         },
-    };
-    let Some(frame_len) = FRAME_HEADER_LEN.checked_add(decoded.payload_len) else {
-        restore(source, position)?;
-        return Err(DurableError::EncodingOverflow);
-    };
-    let Some(frame_end) = offset.checked_add(frame_len) else {
-        restore(source, position)?;
-        return Err(DurableError::EncodingOverflow);
-    };
-    if frame_end > captured_end {
-        restore(source, position)?;
-        return Err(corrupt(
-            file_name,
-            offset,
-            "published frame payload is truncated",
-        ));
+        |decoded, payload| validate_positioned_payload(file_name, magic, offset, decoded, payload),
+    );
+    if let Some(position) = position {
+        source
+            .seek(SeekFrom::Start(position))
+            .map_err(|error| io_error("restore durable scan read-ahead position", error))?;
     }
-
-    let Ok(payload_usize) = usize::try_from(decoded.payload_len) else {
-        restore(source, position)?;
-        return Err(DurableError::EncodingOverflow);
-    };
-    let mut payload = Vec::new();
-    if payload.try_reserve_exact(payload_usize).is_err() {
-        restore(source, position)?;
-        return Err(DurableError::EncodingOverflow);
-    }
-    payload.resize(payload_usize, 0);
-    let Some(payload_offset) = offset.checked_add(FRAME_HEADER_LEN) else {
-        restore(source, position)?;
-        return Err(DurableError::EncodingOverflow);
-    };
-    if let Err(error) = read_exact_at(source, &mut payload, payload_offset) {
-        restore(source, position)?;
-        return Err(io_error("read durable scan source payload", error));
-    }
-    restore(source, position)?;
-    validate_positioned_payload(file_name, magic, offset, decoded, &payload)?;
-    Ok(payload)
+    result
+        .map(|(payload, _)| payload)
+        .map_err(|error| match error {
+            FrameError::Header(e) => {
+                io_error("read durable scan source header", positional_error(e))
+            },
+            FrameError::Payload(e) => {
+                io_error("read durable scan source payload", positional_error(e))
+            },
+            FrameError::Invalid(e) => e,
+            FrameError::Capacity => DurableError::EncodingOverflow,
+        })
 }
 
 /// Live recovery may truncate an unpublished torn tail; committed ranges never mutate.
