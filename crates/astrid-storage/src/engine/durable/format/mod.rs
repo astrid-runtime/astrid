@@ -196,12 +196,19 @@ fn validate_positioned_header(
     header: &[u8; FRAME_HEADER_LEN_USIZE],
     limits: RecoveryLimits,
 ) -> Result<DecodedFrameHeader, DurableError> {
-    if !arena_frame::magic_matches(header, magic) {
-        return Err(corrupt(file_name, offset, "frame magic mismatch"));
-    }
-    let decoded = decode_frame_header(file_name, offset, header)?;
-    check_frame_payload_limit(file_name, offset, decoded.payload_len, limits)?;
-    Ok(decoded)
+    use arena_frame::PositionedHeaderError;
+    arena_frame::positioned_header(header, magic, FRAME_VERSION, limits.max_frame_bytes).map_err(
+        |error| match error {
+            PositionedHeaderError::Magic => corrupt(file_name, offset, "frame magic mismatch"),
+            PositionedHeaderError::Header(e) => frame_header_error(file_name, offset, &e),
+            PositionedHeaderError::Limit(declared) => DurableError::FrameTooLarge {
+                file: file_name,
+                offset,
+                declared,
+                limit: limits.max_frame_bytes,
+            },
+        },
+    )
 }
 
 fn check_frame_payload_limit(
@@ -335,15 +342,6 @@ pub(in crate::engine::durable) fn recovery_arena_scans() -> usize {
 }
 
 use super::arena_frame::{self, DecodedFrameHeader};
-
-fn decode_frame_header(
-    file_name: &'static str,
-    offset: u64,
-    header: &[u8; FRAME_HEADER_LEN_USIZE],
-) -> Result<DecodedFrameHeader, DurableError> {
-    arena_frame::decode_header(header, FRAME_VERSION)
-        .map_err(|error| frame_header_error(file_name, offset, &error))
-}
 
 fn frame_header_error(
     file_name: &'static str,

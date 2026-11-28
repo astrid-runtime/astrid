@@ -116,4 +116,58 @@ pub(super) fn with_span<M:Media,T,E,F:FnOnce(&[u8],u64)->Result<T,E>>(media:&M,o
     }
 }
 
+pub(super) enum FrameError<I,E> { Header(Error<I>), Invalid(E), Capacity, Payload(Error<I>) }
+
+pub(super) open spec fn located<M:Media,E,D,V>(media:&M,offset:u64,decode:D,validate:V,p:Vec<u8>,sum:[u8;32]) -> bool
+    where D:FnOnce(&[u8;52])->Result<super::arena_frame::DecodedFrameHeader,E>,
+        V:FnOnce(super::arena_frame::DecodedFrameHeader,&[u8])->Result<[u8;32],E>
+{
+        &&& offset as int+52+p.len() <= media.image().len()
+        &&& p@ == media.image().subrange(offset as int+52,offset as int+52+p.len())
+        &&& exists|h:&[u8;52],d:super::arena_frame::DecodedFrameHeader,b:&[u8]| b@==p@ &&
+            h@ == media.image().subrange(offset as int,offset as int+52) &&
+            #[trigger] decode.ensures((h,),Ok(d)) && d.payload_len==p.len() &&
+            #[trigger] validate.ensures((d,b),Ok(sum))
+}
+
+type FrameResult<I,E> = Result<(Vec<u8>,[u8;32]),FrameError<I,E>>;
+
+/// Read the header and its declared payload from the same positional handle.
+/// The validators receive exactly the bytes at the requested physical placement.
+pub(super) fn frame<M:Media,E,D,V>(media:&M,offset:u64,decode:D,validate:V)
+    -> (out:FrameResult<M::Error,E>)
+    where D:FnOnce(&[u8;52])->Result<super::arena_frame::DecodedFrameHeader,E>,
+        V:FnOnce(super::arena_frame::DecodedFrameHeader,&[u8])->Result<[u8;32],E>,
+    requires forall|h:&[u8;52]| #[trigger] decode.requires((h,)),
+        forall|d:super::arena_frame::DecodedFrameHeader,p:&[u8]| #[trigger] validate.requires((d,p)),
+    ensures out matches Ok((p,sum)) ==> located(media,offset,decode,validate,p,sum),
+{
+    let mut header=[0u8;52];
+    let header_buf=&mut header[..];
+    if let Err(e)=exact(media,offset,header_buf) {return Err(FrameError::Header(e));}
+    assert(header@ == media.image().subrange(offset as int,offset as int+52));
+    let decoded=match decode(&header) {Ok(h)=>h,Err(e)=>return Err(FrameError::Invalid(e))};
+    let Ok(len)=usize::try_from(decoded.payload_len) else {return Err(FrameError::Capacity);};
+    let mut data=Vec::new();
+    if data.try_reserve_exact(len).is_err() {return Err(FrameError::Capacity);}
+    data.resize(len,0);
+    let Some(start)=offset.checked_add(52) else {return Err(FrameError::Capacity);};
+    let payload_buf=data.as_mut_slice();
+    if let Err(e)=exact(media,start,payload_buf) {return Err(FrameError::Payload(e));}
+    if len==0 {assert(data@ =~= media.image().subrange(start as int,start as int));}
+    let bytes=data.as_slice();
+    let sum=match validate(decoded,bytes) {Ok(s)=>s,Err(e)=>return Err(FrameError::Invalid(e))};
+    assert(decode.ensures((&header,),Ok(decoded)));
+    assert(validate.ensures((decoded,bytes),Ok(sum)));
+    assert(bytes@==data@ && bytes.len()==decoded.payload_len);
+    assert(data@==media.image().subrange(start as int,start as int+data.len()));
+    assert(exists|h:&[u8;52],d:super::arena_frame::DecodedFrameHeader,b:&[u8]| b@==data@ &&
+        h@ == media.image().subrange(offset as int,offset as int+52) &&
+        #[trigger] decode.ensures((h,),Ok(d)) && d.payload_len==data.len() &&
+        #[trigger] validate.ensures((d,b),Ok(sum)));
+    assert(offset as int+52+data.len()<=media.image().len());
+    assert(located(media,offset,decode,validate,data,sum));
+    Ok((data,sum))
+}
+
 }

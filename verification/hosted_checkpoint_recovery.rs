@@ -152,7 +152,8 @@ fn admitted_objects(candidate:IndexState, complete:bool, bytes:&[u8], checked_ta
             &&& (#[trigger] walk[i]).1.offset == admission::frontier(walk,i)
             &&& reader::matches(bytes@,magic,version,walk[i].1,scheme,walk[i].0,limit)
         },
-    ensures out matches Some(s) ==> forall|i:int| 0 <= i < walk.len() ==> s.objects@.kv_pairs().contains(#[trigger] walk[i]),
+    ensures out matches Some(s) ==> s==candidate && complete && s.arena_len==bytes.len() &&
+        (forall|i:int| 0 <= i < walk.len() ==> s.objects@.kv_pairs().contains(#[trigger] walk[i])),
 {
     let mut arena = Candidate {media:Image {bytes,cursor:0},magic,version,scheme,limit,checked_tail};
     let out = IndexState::validated(Some(candidate),complete,bytes.len() as u64,&mut arena);
@@ -160,6 +161,34 @@ fn admitted_objects(candidate:IndexState, complete:bool, bytes:&[u8], checked_ta
         includes_physical_objects(bytes@,s.objects@,walk,magic,version,scheme,limit);
     }}
     out
+}
+
+/// A non-empty, contiguous cached index and the positional tail witness must
+/// describe the same arena bytes. The walk can name any prefix of those bytes.
+fn admit_physical_tail<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+    media:&M,bytes:&[u8],candidate:IndexState,complete:bool,magic:[u8;8],version:u16,scheme:Scheme,
+    limit:u64,hash:H,Ghost(walk):Ghost<Seq<(ObjectId,ArenaLocation)>>) -> (out:Option<IndexState>)
+    requires media.image()==bytes@,btree_map_inv(&candidate.objects),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|n:u64,p:&[u8]| #[trigger] hash.requires((magic,n,p)),
+        forall|i:int| 0<=i<walk.len() ==> {
+            &&& (#[trigger] walk[i]).1.offset==admission::frontier(walk,i)
+            &&& reader::matches(bytes@,magic,version,walk[i].1,scheme,walk[i].0,limit)
+        },
+    ensures out matches Some(s) ==> {
+        &&& s==candidate && complete && s.arena_len==bytes.len()
+        &&& forall|i:int| 0<=i<walk.len() ==> s.objects@.kv_pairs().contains(#[trigger] walk[i])
+        &&& s.arena_tail matches Some(loc) && {
+            let start=loc.offset as int;
+            let end=start+52+loc.payload_len;
+            &&& end<=media.image().len() && loc.payload_len<=limit
+            &&& reader::header_matches(bytes@.subrange(start,start+52),magic,version,loc)
+            &&& frame::hashed(hash,magic,bytes@.subrange(start+52,end),loc.checksum)
+        }
+    },
+{
+    let tail=candidate.arena_tail?;
+    if !physical_tail(media,tail,magic,version,limit,hash) {return None;}
+    admitted_objects(candidate,complete,bytes,tail,magic,version,scheme,limit,Ghost(walk))
 }
 
 /// At a nonzero offset, check the name and placement written by the arena
@@ -200,5 +229,42 @@ fn written(id:ObjectId, expected:ObjectId, magic:[u8;8], version:u16, scheme:Sch
     }
     verdict.is_ok()
 }
+/// The same positional frame driver used by the cache tail validator. A successful
+/// tail read binds the placement, header and digest to bytes on this handle.
+fn physical_tail<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+    media:&M,loc:ArenaLocation,magic:[u8;8],version:u16,limit:u64,hash:H) -> (ok:bool)
+    requires forall|n:u64,p:&[u8]| #[trigger] hash.requires((magic,n,p)),
+    ensures ok ==> {
+        let start=loc.offset as int;
+        let end=start+52+loc.payload_len;
+        &&& end<=media.image().len() && loc.payload_len<=limit
+        &&& reader::header_matches(media.image().subrange(start,start+52),magic,version,loc)
+        &&& frame::hashed(hash,magic,media.image().subrange(start+52,end),loc.checksum)
+    },
+{
+    let decode=|h:&[u8;52]| -> (d:Result<frame::DecodedFrameHeader,()>)
+        ensures d matches Ok(v) ==> v.payload_len<=limit &&
+            reader::header_matches(h@,magic,version,ArenaLocation{offset:loc.offset,payload_len:v.payload_len,checksum:v.checksum}),
+    {
+        frame::positioned_header(h,magic,version,limit).map_err(|_| ())
+    };
+    let validate=|d:frame::DecodedFrameHeader,p:&[u8]| -> (r:Result<[u8;32],()>)
+        ensures r matches Ok(sum) ==> sum==d.checksum && p.len()==d.payload_len && hash.ensures((magic,d.payload_len,p),sum),
+    {frame::check_payload(d,magic,p,hash).map_err(|_| ())};
+    let read=|at:u64| -> (r:Result<(Vec<u8>,[u8;32]),()>)
+        ensures r matches Ok((p,sum)) ==> {
+            let start=at as int;
+            &&& start+52+p.len()<=media.image().len() && p.len()<=limit
+            &&& p@==media.image().subrange(start+52,start+52+p.len())
+            &&& reader::header_matches(media.image().subrange(start,start+52),magic,version,
+                ArenaLocation{offset:at,payload_len:p.len() as u64,checksum:sum})
+            &&& frame::hashed(hash,magic,p@,sum)
+        },
+    {
+        crate::positional_read::frame(media,at,decode,validate).map_err(|_| ())
+    };
+    crate::arena_span::at_location(loc.offset,loc.payload_len,loc.checksum,read).is_ok()
+}
+
 
 }

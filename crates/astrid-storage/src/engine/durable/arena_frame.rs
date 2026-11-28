@@ -124,6 +124,28 @@ pub(super) fn decode_header(bytes:&[u8;52],version:u16) -> (out:Result<DecodedFr
     Ok(DecodedFrameHeader {payload_len:u64::from_le_bytes(length),checksum})
 }
 
+pub(super) enum PositionedHeaderError { Magic, Header(HeaderError), Limit(u64) }
+
+/// Decode the addressed frame header before allocating its declared payload.
+pub(super) fn positioned_header(bytes:&[u8;52],magic:[u8;8],version:u16,limit:u64)
+    -> (out:Result<DecodedFrameHeader,PositionedHeaderError>)
+    ensures out matches Ok(h) ==> {
+        &&& bytes@.take(8)==magic@ && bytes@.subrange(8,10)==seq![version as u8,(version>>8) as u8]
+        &&& bytes@[10]==0 && bytes@[11]==0 && h.payload_len<=limit
+        &&& h.payload_len==vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(12,20))
+        &&& h.checksum@==bytes@.subrange(20,52)
+    },
+{
+    if !magic_matches(bytes,magic) {return Err(PositionedHeaderError::Magic);}
+    let header=match decode_header(bytes,version) {
+        Ok(header)=>header,
+        Err(error)=>return Err(PositionedHeaderError::Header(error)),
+    };
+    if header.payload_len>limit {return Err(PositionedHeaderError::Limit(header.payload_len));}
+    assert(bytes@.subrange(8,10) =~= seq![version as u8,(version>>8) as u8]);
+    Ok(header)
+}
+
 pub(super) enum PayloadError { Length, Checksum }
 
 pub(super) fn check_payload<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:DecodedFrameHeader,magic:[u8;8],

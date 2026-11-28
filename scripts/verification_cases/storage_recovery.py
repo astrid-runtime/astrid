@@ -147,6 +147,17 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), observer,
         )
     media = Path("crates/astrid-storage/src/engine/durable/format/positional_read.rs")
+    checkpoint = Path("verification/hosted_checkpoint_recovery.rs")
+    for label, source, before, after, consumer in [
+        ("header offset", media, "exact(media,offset,header_buf)", "exact(media,0,header_buf)", media),
+        ("payload offset", media, "exact(media,start,payload_buf)", "exact(media,offset,payload_buf)", media),
+        ("validated bytes", media, "b@==p@ &&", "b.len()==p.len() &&", checkpoint),
+        ("tail refusal", checkpoint, "if !physical_tail(media,tail,magic,version,limit,hash)", "if false && !physical_tail(media,tail,magic,version,limit,hash)", checkpoint),
+    ]:
+        yield (
+            f"positional checkpoint frame loses {label}", source,
+            lambda s, a=before, b=after: replace_once(s, a, b), consumer,
+        )
     for label, clause, weaker in [
         ("absolute base", "interval(media,offset,size,data) && base == offset &&", "interval(media,offset,size,data) &&"),
         ("span bytes", "data@ == media.image().subrange(offset as int,offset as int + size)", "true"),
