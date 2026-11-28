@@ -197,6 +197,7 @@ def consumer_defects():
         )
     chain = Path("crates/astrid-storage/src/kv/tree/delta_chain.rs")
     for label, clause, weaker in [
+        ("per-index owner read", "ids(steps).no_duplicates(), step_read(owner,steps,end,read,i),", "ids(steps).no_duplicates(),"),
         ("checkpoint endpoint", "&&\n            read.ensures((owner,id),Ok(Head::Checkpoint {tree:c.tree,totals:c.totals}))", ""),
         ("genesis totals", "c.tree.is_none() && zero(c.totals)", "c.tree.is_none()"),
         ("head origin", "if steps.len() == 0 {next == Some(head)}", "if steps.len() == 0 {true}"),

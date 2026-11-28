@@ -67,4 +67,61 @@ fn selection(owner:u64,head:ObjectId,base:ObjectId,tree:ObjectId,cycle:bool,gene
         }
     }
 }
+
+fn two_deltas(owner:u64,head:ObjectId,older:ObjectId,base:ObjectId,tree:ObjectId,t:NodeTotals)
+    requires head != older,head != base,older != base,obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+{
+    let read = |p:&u64,k:ObjectId| -> (out:Result<Head,u8>)
+        ensures if *p != owner {out == Err(8u8)}
+            else if k == head || k == older {
+                out matches Ok(Head::Delta {previous,depth,delta_bytes,mutations,totals}) &&
+                    previous == Some(if k == head {older} else {base}) && depth == (if k == head {2u64} else {1u64}) &&
+                    delta_bytes == (if k == head {6u64} else {3u64}) && totals == t && mutations.len() == 1 &&
+                    mutations@[0].key@ == seq![110u8,0,if k == head {98u8} else {97u8}] && mutations@[0].value.is_none()
+            } else if k == base {out == Ok(Head::Checkpoint {tree:Some(tree),totals:t})} else {out == Err(7u8)} {
+        if *p != owner {return Err(8u8);}
+        let newest = k.same(&head);
+        if newest || k.same(&older) {
+            let row = crate::delta_mutation::Mutation {key:vec![110u8,0,if newest {98} else {97}],value:None};
+            Ok(Head::Delta {previous:Some(if newest {older} else {base}),depth:if newest {2} else {1},
+                delta_bytes:if newest {6} else {3},mutations:vec![row],totals:t})
+        } else if k.same(&base) {Ok(Head::Checkpoint {tree:Some(tree),totals:t})} else {Err(7u8)}
+    };
+    let result = chain::walk(&owner,head,read);
+    let ghost out = result;
+    proof {
+        let (rows,end) = match out {
+            Ok(c) => {
+                let end = choose|end:Option<ObjectId>| #[trigger] chain::complete(&owner,head,c,end,read);
+                (c.newest_first@,end)
+            },
+            Err(e) => {
+                let (s,k) = choose|s:Seq<chain::Step>,k:ObjectId| #[trigger] chain::stopped(&owner,head,s,k,read,e);
+                (s,Some(k))
+            },
+        };
+        assert(chain::follows(&owner,head,rows,end,read));
+        if rows.len() > 0 {chain::at(&owner,head,rows,end,read,0);}
+        if rows.len() > 1 {chain::at(&owner,head,rows,end,read,1);}
+        if rows.len() > 2 {chain::at(&owner,head,rows,end,read,2);assert(rows[2].object == base);}
+        assert(rows.len() <= 2);
+        match out {
+            Err(e) => {
+                if rows.len()==0 {assert(chain::ids(rows) =~= Seq::<ObjectId>::empty());}
+                else if rows.len()==1 {assert(chain::ids(rows) =~= seq![head]);}
+                else {assert(chain::ids(rows) =~= seq![head,older]);}
+                let (s,k) = choose|s:Seq<chain::Step>,k:ObjectId| #[trigger] chain::stopped(&owner,head,s,k,read,e);
+                assert(rows == s && end == Some(k));
+                assert(false);
+            },
+            Ok(c) => {
+                assert(c.newest_first@ == rows);
+                assert(chain::complete(&owner,head,c,end,read));
+                assert(rows.len() == 2 && end == Some(base) && c.tree == Some(tree) && c.totals == t);
+                assert(rows[0].object == head && rows[0].depth == 2 && rows[0].mutations@[0].key@ == seq![110u8,0,98u8]);
+                assert(rows[1].object == older && rows[1].depth == 1 && rows[1].mutations@[0].key@ == seq![110u8,0,97u8]);
+            },
+        }
+    }
+}
 }

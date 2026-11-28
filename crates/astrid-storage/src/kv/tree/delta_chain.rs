@@ -55,16 +55,19 @@ pub(super) open spec fn follows<P,E,L:Fn(&P,ObjectId)->Result<Head,E>>(owner:&P,
     }
 }
 
+pub(super) open spec fn step_read<P,E,L:Fn(&P,ObjectId)->Result<Head,E>>(
+    owner:&P,rows:Seq<Step>,end:Option<ObjectId>,read:L,i:int) -> bool {
+    let r = rows[i];
+    let previous = if i+1 < rows.len() {Some(rows[i+1].object)} else {end};
+    read.ensures((owner,r.object),Ok(Head::Delta {previous,depth:r.depth,delta_bytes:r.delta_bytes,
+        mutations:r.mutations,totals:r.totals}))
+}
+
 /// Every returned row is the result of reading its address under the original owner.
 pub(super) proof fn at<P,E,L:Fn(&P,ObjectId)->Result<Head,E>>(owner:&P,head:ObjectId,
     steps:Seq<Step>,end:Option<ObjectId>,read:L,i:int)
     requires follows(owner,head,steps,end,read),0 <= i < steps.len(),
-    ensures steps[0].object == head, ids(steps).no_duplicates(), {
-        let r = steps[i];
-        let next = if i+1 < steps.len() {Some(steps[i+1].object)} else {end};
-        read.ensures((owner,r.object),Ok(Head::Delta {previous:next,depth:r.depth,delta_bytes:r.delta_bytes,
-            mutations:r.mutations,totals:r.totals}))
-    },
+    ensures steps[0].object == head, ids(steps).no_duplicates(), step_read(owner,steps,end,read,i),
     decreases steps.len(),
 {
     let prior = steps.drop_last();
