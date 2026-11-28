@@ -59,6 +59,8 @@ pub(in crate::engine::durable) trait DurableIo:
     fn durable_metadata(&self) -> io::Result<StoreMetadata>;
     fn durable_set_len(&self, length: u64) -> io::Result<()>;
     fn durable_sync_data(&self) -> io::Result<()>;
+    /// Persist a repaired tail on its owning file or volume container.
+    fn durable_sync_repaired_tail(&self) -> io::Result<()>;
     fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
 
     /// Emit exactly the known-length stream, without performing the final flush.
@@ -216,6 +218,13 @@ impl DurableIo for File {
         self.sync_data()
     }
 
+    fn durable_sync_repaired_tail(&self) -> io::Result<()> {
+        match self {
+            Self::Native(file) => file.sync_data(),
+            Self::Volume(file) => file.sync_data(),
+        }
+    }
+
     fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
         self.read_at(buffer, offset)
     }
@@ -235,6 +244,10 @@ impl DurableIo for NativeFile {
     }
 
     fn durable_sync_data(&self) -> io::Result<()> {
+        self.sync_data()
+    }
+
+    fn durable_sync_repaired_tail(&self) -> io::Result<()> {
         self.sync_data()
     }
 

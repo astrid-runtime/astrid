@@ -62,6 +62,11 @@ impl DurableIo for ObservedStream {
     fn durable_sync_data(&self) -> io::Result<()> {
         self.file.durable_sync_data()
     }
+
+    fn durable_sync_repaired_tail(&self) -> io::Result<()> {
+        self.file.durable_sync_repaired_tail()
+    }
+
     fn durable_read_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
         self.positional_reads
             .borrow_mut()

@@ -490,7 +490,7 @@ impl<F: DurableIo> frame_repair::Medium for RepairMedia<'_, F> {
 
     fn flush(&mut self) -> Result<(), DurableError> {
         self.file
-            .durable_sync_data()
+            .durable_sync_repaired_tail()
             .map_err(|source| io_error("flush durable tail truncation", source))
     }
 }
