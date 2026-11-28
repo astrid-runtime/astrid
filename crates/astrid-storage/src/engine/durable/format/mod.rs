@@ -251,7 +251,11 @@ impl<F: DurableIo> positional_read::Media for F {
 }
 
 fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<()> {
-    positional_read::exact(file, offset, buffer).map_err(|error| match error {
+    positional_read::exact(file, offset, buffer).map_err(positional_error)
+}
+
+fn positional_error(error: positional_read::Error<io::Error>) -> io::Error {
+    match error {
         positional_read::Error::Offset => io::Error::other("positional read offset overflow"),
         positional_read::Error::Length => io::Error::other("positional read length overflow"),
         positional_read::Error::Short => io::Error::new(
@@ -259,7 +263,7 @@ fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::
             "positional read reached end of file",
         ),
         positional_read::Error::Io(error) => error,
-    })
+    }
 }
 
 #[cfg(test)]

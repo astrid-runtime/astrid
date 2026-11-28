@@ -35,6 +35,32 @@ def consumer_defects():
             Path("verification/hosted_retirement_recovery.rs"),
         )
     reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
+    observer = Path("verification/hosted_arena_append.rs")
+    for label, clause, weaker in [
+        ("accepted prefix", "prefix@ == rows@.take(prefix.len() as int) &&", "true &&"),
+        ("failure offset", "fault == Some(rows@[prefix.len() as int].1.offset)", "true"),
+    ]:
+        yield (
+            f"sorted dispatch refusal loses {label}", observer,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), observer,
+        )
+    media = Path("crates/astrid-storage/src/engine/durable/format/positional_read.rs")
+    for label, clause, weaker in [
+        ("absolute base", "interval(media,offset,size,data) && base == offset &&", "interval(media,offset,size,data) &&"),
+        ("span bytes", "data@ == media.image().subrange(offset as int,offset as int + size)", "true"),
+        ("span extent", "data.len() == size && (size > 0", "true && (size > 0"),
+        ("successful decode", "Ok(value) => span_result(media,offset,size,consume,Ok(value))", "Ok(value) => true"),
+        ("consumer error", "Err(SpanError::Consumer(error)) => span_result(media,offset,size,consume,Err(error))", "Err(SpanError::Consumer(error)) => true"),
+        ("short read", "Err(SpanError::Read(Error::Short)) => offset as int + size > media.image().len()", "Err(SpanError::Read(Error::Short)) => true"),
+        ("offset overflow", "Err(SpanError::Read(Error::Offset)) => offset as int + size > u64::MAX", "Err(SpanError::Read(Error::Offset)) => true"),
+        ("provider error", "failed_within(media,offset,size as nat,e)", "true"),
+        ("impossible length error", "Err(SpanError::Read(Error::Length)) => false", "Err(SpanError::Read(Error::Length)) => true"),
+    ]:
+        yield (
+            f"positional span delivery loses {label}", media,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_record_model.rs"),
+        )
     for label, clause, weaker in [
         ("request multiplicity", "sorted@.to_multiset() == rows@.to_multiset(), sorted.len()", "true, sorted.len()"),
         ("physical order", "sorted@[i].1.offset <= sorted@[j].1.offset", "sorted@[i].1.offset <= u64::MAX"),

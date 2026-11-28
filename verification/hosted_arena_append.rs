@@ -289,11 +289,18 @@ type Observation<'a> = (crate::ObjectId,frame::ArenaLocation,crate::ObjectRecord
 /// Observe ordered delivery with the actual frame authenticator as decoder.
 /// All observations borrow payloads from the same physical span.
 #[verifier::loop_isolation(false)]
-fn observe_span<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+pub(super) fn observe_span<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
     rows:&[(crate::ObjectId,frame::ArenaLocation)],span:&'a [u8],base:u64,format:crate::indexed_frame::Format,
-    hash:H,identify:I,reject:Option<u64>)
+    hash:H,identify:I,reject:Option<u64>) -> (result:Result<Vec<Observation<'a>>,bool>)
     requires forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures result matches Ok(trace) ==> trace.len() == rows.len() &&
+        forall|j:int| 0 <= j < rows.len() ==> {
+            let (id,loc,r,p) = #[trigger] trace@[j];
+            id == rows@[j].0 && loc == rows@[j].1 &&
+            p@ == span@.subrange(loc.offset as int-base+52,loc.offset as int-base+52+loc.payload_len) &&
+            record::record_at(p@,40,format.scheme,r) && id.digest()==p@.subrange(8,40)
+        },
 {
     use crate::indexed_frame::{deliver,delivered,read};
     let decode = |id:crate::ObjectId,loc:frame::ArenaLocation| -> (out:Result<(crate::ObjectRecord,&'a [u8]),bool>)
@@ -358,6 +365,7 @@ fn observe_span<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecor
                 id == rows@[j].0 && loc == rows@[j].1 && Some(loc.offset)!=reject &&
                 record::record_at(p@,40,format.scheme,r) && id.digest()==p@.subrange(8,40)
             } by {};
+            Ok(trace)
         },
         Err(e) => { proof {
             assert(exists|i:int,states:Seq<Vec<Observation<'a>>>| 0 <= i < rows.len() &&
@@ -371,13 +379,13 @@ fn observe_span<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecor
                     exists|r:crate::ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((rows@[i].0,rows@[i].1),Ok((r,p))) &&
                         accept.ensures((states.last(),rows@[i].0,rows@[i].1,r,p),Err(e)));
             if e {assert(Some(rows@[i].1.offset)==reject);}
-        }},
+        } Err(e)},
     }
 }
 
 type IndexedRow = (crate::ObjectId,frame::ArenaLocation);
 
-proof fn dispatched_prefix<V:Fn(Vec<IndexedRow>,&[IndexedRow],u64,u64)->Result<Vec<IndexedRow>,Option<usize>>>(
+proof fn dispatched_prefix<V:Fn(Vec<IndexedRow>,&[IndexedRow],u64,u64)->Result<Vec<IndexedRow>,Option<Vec<IndexedRow>>>>(
     rows:Seq<IndexedRow>,end:int,start:Vec<IndexedRow>,trace:Vec<IndexedRow>,limit:u64,visit:V)
     requires 0 <= end <= rows.len(),crate::indexed_frame::dispatched(rows,end,start,trace,limit,visit),
         forall|before:Vec<IndexedRow>,part:&[IndexedRow],base:u64,size:u64,after:Vec<IndexedRow>|
@@ -397,26 +405,27 @@ proof fn dispatched_prefix<V:Fn(Vec<IndexedRow>,&[IndexedRow],u64,u64)->Result<V
 
 /// Observe the production dispatcher's physical requests. The reader rejects
 /// any mismatched address or extent and may independently fail at one offset.
-fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -> (out:Result<Vec<IndexedRow>,usize>)
+fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -> (out:Result<Vec<IndexedRow>,Vec<IndexedRow>>)
     requires forall|i:int| 0 <= i < rows.len() ==> #[trigger] crate::indexed_frame::frame_end(rows@[i].1) <= u64::MAX,
         forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].1.payload_len <= limit,
     ensures match out {
         Ok(trace) => trace@ == rows@,
-        Err(n) => n < rows.len() && fault == Some(rows@[n as int].1.offset),
+        Err(prefix) => prefix.len() < rows.len() && prefix@ == rows@.take(prefix.len() as int) &&
+            fault == Some(rows@[prefix.len() as int].1.offset),
     },
 {
     use crate::indexed_frame::{dispatch,dispatched,frame_end,DispatchError};
-    let visit = |before:Vec<IndexedRow>,part:&[IndexedRow],base:u64,size:u64| -> (out:Result<Vec<IndexedRow>,Option<usize>>)
+    let visit = |before:Vec<IndexedRow>,part:&[IndexedRow],base:u64,size:u64| -> (out:Result<Vec<IndexedRow>,Option<Vec<IndexedRow>>>)
         ensures match out {
             Ok(after) => after@ == before@ + part@,
-            Err(Some(n)) => n == before.len() && fault == Some(base),
+            Err(Some(prefix)) => prefix == before && fault == Some(base),
             Err(None) => part.len()==0 || base != part@[0].1.offset ||
                 base as int + size != frame_end(part@[part.len()-1].1),
         },
     {
         if part.is_empty() || part[0].1.offset != base ||
             part[part.len().saturating_sub(1)].1.end() != base.checked_add(size) {return Err(None);}
-        if fault == Some(base) {return Err(Some(before.len()));}
+        if fault == Some(base) {return Err(Some(before));}
         let mut trace = before;
         let mut n = 0usize;
         while n < part.len()
@@ -443,16 +452,16 @@ fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -
                 crate::indexed_frame::visit_failed(rows@,lo,state,limit,visit,e);
             dispatched_prefix(rows@,lo,start,prior,limit,visit);
             assert(prior@ =~= rows@.take(lo));
-            assert(e == Some(lo as usize) && fault == Some(rows@[lo].1.offset));
-            assert(exists|i:int| 0 <= i < rows.len() && e == Some(i as usize) && fault == Some(#[trigger] rows@[i].1.offset));
+            assert(e == Some(prior) && fault == Some(rows@[lo].1.offset));
+            assert(prior.len() == lo);
         } Err(e.unwrap())},
-        Err(_) => { assert(false); Err(0) },
+        Err(_) => { assert(false); Err(Vec::new()) },
     }
 }
 
 /// Sorting preserves every occurrence before positional dispatch.
 fn ordered_dispatch(requested:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>)
-    -> (out:Result<Vec<IndexedRow>,(Vec<IndexedRow>,usize)>)
+    -> (out:Result<Vec<IndexedRow>,(Vec<IndexedRow>,Vec<IndexedRow>)>)
     requires forall|i:int| 0 <= i < requested.len() ==> #[trigger] crate::indexed_frame::frame_end(requested@[i].1) <= u64::MAX,
         forall|i:int| 0 <= i < requested.len() ==> #[trigger] requested@[i].1.payload_len <= limit,
     ensures ({
@@ -460,9 +469,13 @@ fn ordered_dispatch(requested:&[IndexedRow],target:u64,limit:u64,fault:Option<u6
         &&& trace@.to_multiset() == requested@.to_multiset()
         &&& forall|i:int,j:int| #![trigger trace@[i],trace@[j]] 0 <= i < j < trace.len()
             ==> trace@[i].1.offset <= trace@[j].1.offset
-        &&& out matches Err((table,n)) ==> n < table.len() && fault == Some(table@[n as int].1.offset) &&
-            requested@.contains(table@[n as int]) &&
-            table@.take(n as int).to_multiset().add(table@.skip(n as int).to_multiset()) == requested@.to_multiset()
+        &&& out matches Err((table,prefix)) ==> {
+            let n = prefix.len() as int;
+            &&& n < table.len() && fault == Some(table@[n].1.offset)
+            &&& prefix@ == table@.take(n)
+            &&& exists|j:int| 0 <= j < requested.len() && #[trigger] requested@[j] == table@[n]
+            &&& prefix@.to_multiset().add(table@.skip(n).to_multiset()) == requested@.to_multiset()
+        }
     }),
 {
     use crate::indexed_frame::frame_end;
@@ -483,7 +496,8 @@ fn ordered_dispatch(requested:&[IndexedRow],target:u64,limit:u64,fault:Option<u6
     }
     match observe_dispatch(&rows,target,limit,fault) {
         Ok(trace) => Ok(trace),
-        Err(n) => {
+        Err(seen) => {
+            let n = seen.len();
             proof {
                 assert(rows@.contains(rows@[n as int]));
                 assert(rows@.to_multiset().count(rows@[n as int]) > 0);
@@ -493,7 +507,7 @@ fn ordered_dispatch(requested:&[IndexedRow],target:u64,limit:u64,fault:Option<u6
                 assert(prefix + suffix =~= rows@);
                 vstd::seq_lib::lemma_multiset_commutative(prefix,suffix);
             }
-            Err((rows,n))
+            Err((rows,seen))
         },
     }
 }

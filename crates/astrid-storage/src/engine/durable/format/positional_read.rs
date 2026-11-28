@@ -71,4 +71,48 @@ pub(super) fn exact<M:Media>(media:&M, offset:u64, buffer:&mut [u8]) -> (out:Res
     Ok(())
 }
 
+pub(super) enum SpanError<I,E> { Capacity, Read(Error<I>), Consumer(E) }
+
+pub(super) open spec fn interval<M:Media>(media:&M,offset:u64,size:u64,data:&[u8]) -> bool {
+    data.len() == size && (size > 0 ==> offset as int + size <= media.image().len() &&
+        data@ == media.image().subrange(offset as int,offset as int + size))
+}
+
+pub(super) open spec fn span_result<M:Media,T,E,F:FnOnce(&[u8],u64)->Result<T,E>>(
+    media:&M,offset:u64,size:u64,consume:F,result:Result<T,E>) -> bool {
+    exists|data:&[u8],base:u64| interval(media,offset,size,data) && base == offset &&
+        #[trigger] consume.ensures((data,base),result)
+}
+
+/// Call the consumer with the completed buffer and its absolute starting offset.
+pub(super) fn with_span<M:Media,T,E,F:FnOnce(&[u8],u64)->Result<T,E>>(media:&M,offset:u64,size:u64,
+    consume:F) -> (out:Result<T,SpanError<M::Error,E>>)
+    requires forall|data:&[u8]| interval(media,offset,size,data) ==> #[trigger] consume.requires((data,offset)),
+    ensures match out {
+        Ok(value) => span_result(media,offset,size,consume,Ok(value)),
+        Err(SpanError::Consumer(error)) => span_result(media,offset,size,consume,Err(error)),
+        Err(SpanError::Read(Error::Short)) => offset as int + size > media.image().len(),
+        Err(SpanError::Read(Error::Offset)) => offset as int + size > u64::MAX,
+        Err(SpanError::Read(Error::Length)) => false,
+        Err(SpanError::Read(Error::Io(e))) => failed_within(media,offset,size as nat,e),
+        Err(SpanError::Capacity) => true,
+    },
+{
+    let Ok(len) = usize::try_from(size) else {return Err(SpanError::Capacity);};
+    let mut data = Vec::new();
+    if data.try_reserve_exact(len).is_err() {return Err(SpanError::Capacity);}
+    data.resize(len,0);
+    let buffer = data.as_mut_slice();
+    if let Err(error) = exact(media,offset,buffer) {return Err(SpanError::Read(error));}
+    let bytes = data.as_slice();
+    assert(interval(media,offset,size,bytes));
+    let result = consume(bytes,offset);
+    assert(consume.ensures((bytes,offset),result));
+    assert(span_result(media,offset,size,consume,result));
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(SpanError::Consumer(error)),
+    }
+}
+
 }

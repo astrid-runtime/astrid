@@ -373,6 +373,70 @@ fn two_references(prefix:&[u8],suffix:&[u8],name:&[u8],other:&[u8],owner:[u8;32]
     Some(rows)
 }
 
+/// A zero-length span has no media bytes, even at offsets beyond EOF.
+fn empty_span<M:crate::positional_read::Media>(media:&M,offset:u64) {
+    use crate::positional_read::{with_span,SpanError};
+    let consume = |data:&[u8],base:u64| -> (out:Result<(usize,u64),()>)
+        ensures out == Ok((data.len(),base)),
+    { Ok((data.len(),base)) };
+    match with_span(media,offset,0,consume) {
+        Ok((len,at)) => { assert(len == 0 && at == offset); },
+        Err(SpanError::Consumer(_)) => { assert(false); },
+        Err(_) => {},
+    }
+}
+
+/// Follow an arbitrary selected row through allocation, exact positional
+/// reads, ordered delivery, and the real indexed frame decoder.
+fn media_delivery<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+    I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+    media:&M,start:u64,size:u64,rows:&[(crate::ObjectId,crate::arena_frame::ArenaLocation)],selected:usize,
+    format:crate::indexed_frame::Format,hash:H,identify:I)
+    requires selected < rows.len(),start <= rows@[selected as int].1.offset,
+        crate::indexed_frame::frame_end(rows@[selected as int].1) <= start as int + size,
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+{
+    use crate::positional_read::{with_span,SpanError,Error,interval,span_result};
+    let row = rows[selected];
+    let consume = |span:&[u8],base:u64| -> (out:Result<crate::ObjectRecord,bool>)
+        ensures match out {
+            Ok(r) => {
+                let at = row.1.offset as int-base+52;
+                let body = span@.subrange(at,at+row.1.payload_len);
+                record::record_at(body,40,format.scheme,r) && row.0.digest() == body.subrange(8,40)
+            },
+            Err(e) => e == (span.len() as int != size || base != start),
+        },
+    {
+        if span.len() as u64 != size || base != start {return Err(true);}
+        let mut observed = match crate::hosted_arena_append::observe_span(rows,span,base,format,hash,identify,None) {
+            Ok(t) => t, Err(_) => return Err(false),
+        };
+        let (_,_,r,_) = observed.swap_remove(selected);
+        Ok(r)
+    };
+    match with_span(media,start,size,consume) {
+        Ok(r) => { proof {
+            assert(span_result(media,start,size,consume,Ok(r)));
+            let data = choose|data:&[u8]| interval(media,start,size,data) &&
+                #[trigger] consume.ensures((data,start),Ok(r));
+            let at = row.1.offset as int+52;
+            let body = media.image().subrange(at,at+row.1.payload_len);
+            assert(data@.subrange(at-start,at-start+row.1.payload_len) =~= body);
+            assert(record::record_at(body,40,format.scheme,r) && row.0.digest()==body.subrange(8,40));
+        }},
+        Err(SpanError::Consumer(e)) => { assert(!e); },
+        Err(SpanError::Read(Error::Io(e))) => {
+            assert(exists|at:u64| start <= at < start as int + size && #[trigger] media.io_error(at,e));
+        },
+        Err(SpanError::Read(Error::Short)) => {assert(start as int + size > media.image().len());},
+        Err(SpanError::Read(Error::Offset)) => {assert(start as int + size > u64::MAX);},
+        Err(SpanError::Read(Error::Length)) => {assert(false);},
+        Err(SpanError::Capacity) => {},
+    }
+}
+
 /// Follow the coalesced reader's absolute offset through envelope validation
 /// and typed decoding, including short positional reads from a stable provider.
 fn indexed_region<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]>(

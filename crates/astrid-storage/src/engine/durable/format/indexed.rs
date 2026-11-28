@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 
+use super::positional_read::{SpanError, with_span};
+
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN,
     FRAME_VERSION, ObjectId, ObjectRecord, PersistentObjectIdentity, RecoveryLimits, corrupt,
-    frame_checksum, io_error, read_exact_at, read_frame_at,
+    frame_checksum, io_error, read_frame_at,
 };
 
 #[cfg(test)]
@@ -108,24 +110,25 @@ pub(in crate::engine::durable) fn visit_indexed_objects<
         |visitor, rows, span_start, span_len| {
             #[cfg(test)]
             spans.set(spans.get().saturating_add(1));
-            let span_len = usize::try_from(span_len).map_err(|_| DurableError::EncodingOverflow)?;
-            let mut span = Vec::new();
-            span.try_reserve_exact(span_len)
-                .map_err(|_| DurableError::EncodingOverflow)?;
-            span.resize(span_len, 0);
-            read_exact_at(arena, &mut span, span_start)
-                .map_err(|source| io_error("read coalesced durable frames", source))?;
-            super::indexed_frame::deliver(
-                rows,
-                visitor,
-                |id, location| {
-                    decode_indexed_frame(&span, span_start, id, location, identity, limits)
-                },
-                |visitor, id, location, record, payload| {
-                    visitor(id, location, record, payload)?;
-                    Ok(visitor)
-                },
-            )
+            with_span(arena, span_start, span_len, |span, base| {
+                super::indexed_frame::deliver(
+                    rows,
+                    visitor,
+                    |id, location| decode_indexed_frame(span, base, id, location, identity, limits),
+                    |visitor, id, location, record, payload| {
+                        visitor(id, location, record, payload)?;
+                        Ok(visitor)
+                    },
+                )
+            })
+            .map_err(|error| match error {
+                SpanError::Capacity => DurableError::EncodingOverflow,
+                SpanError::Read(error) => io_error(
+                    "read coalesced durable frames",
+                    super::positional_error(error),
+                ),
+                SpanError::Consumer(error) => error,
+            })
         },
     )
     .map_err(|error| match error {

@@ -433,6 +433,37 @@ fn coalesced_delivery_preserves_order_and_stops_at_the_first_failure() {
 }
 
 #[test]
+fn partial_coalesced_read_propagates_io_error_before_delivery() {
+    use crate::engine::durable::tests::TestIdentity;
+    let mut source = ObservedSource::new();
+    source.write_all(&[0; 7]).unwrap();
+    let row = (
+        ObjectId::new([0x51; 32]),
+        ArenaLocation {
+            offset: 0,
+            payload_len: 4,
+            checksum: [0; 32],
+        },
+    );
+    source.short_limit = 7;
+    source.unreadable = Some(7..8);
+    source.error_kind = io::ErrorKind::PermissionDenied;
+    let failure = visit_indexed_objects(
+        &source,
+        &[row],
+        u64::MAX,
+        &TestIdentity,
+        RecoveryLimits::process_addressable(),
+        |_, _, _, _| panic!("a partially filled span cannot deliver its first object"),
+    );
+    assert!(
+        matches!(failure, Err(DurableError::Io { source, .. }) if source.kind() == io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(source.reads.borrow().len(), 2);
+    assert_eq!(source.reads.borrow()[1].0, 7);
+}
+
+#[test]
 fn indexed_object_hashes_frame_once_and_still_checks_index_and_object_identity() {
     use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
     use crate::storage_model::ObjectIdentity;
