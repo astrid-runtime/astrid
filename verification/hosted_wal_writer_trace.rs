@@ -368,13 +368,57 @@ fn durable_begin_root<S:crate::group_frontier::BufferedWal,M:crate::positional_r
     Some((marker,body,base.checked_add(relative)?))
 }
 
-/// Recover the same owner and roots from a published WAL and fold the validated
-/// descriptor into canonical journal bytes. The two files use independent offsets.
-fn durable_journal_fold<S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M,H,F,
+/// Write a recovered payload with the canonical root magic, version, checksum and physical length.
+fn append_replayed_payload<J:crate::arena_frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+    file:&mut J,payload:&[u8],hash:H,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>)
+    requires payload.len() as int+52<=isize::MAX, old(file).image().len()<=u64::MAX,
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((crate::arena_frame::ROOT_MAGIC,n,b)),
+        forall|b:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::arena_frame::ROOT_MAGIC,b.len() as u64,b),v) ==> v==(digest@)(b@),
+        forall|e:J::Error| !#[trigger] old(file).seek_failed(e),
+        forall|e:J::Error| !#[trigger] J::write_failed(old(file).target(),e),
+    ensures final(file).target()==old(file).target() && final(file).image()==old(file).image()+
+        crate::arena_frame::header_bytes(crate::arena_frame::ROOT_MAGIC,crate::arena_frame::FRAME_VERSION,
+            payload.len() as u64,(digest@)(payload@))+payload@,
+{
+    use crate::arena_frame::{self as frame,ROOT_MAGIC,FRAME_VERSION,BatchError};
+    let batch=[payload];
+    let select=crate::hosted_acknowledged_root::select_body;
+    let ghost prior=file.image();
+    let base=Ghost(prior.len() as u64);
+    let rows=match frame::append_batch(file,&batch,select,hash,ROOT_MAGIC,FRAME_VERSION,(Vec::new(),Vec::new())) {
+        Ok(rows)=>rows,
+        Err(BatchError::Overflow)=>{
+            proof {
+                let (buf,r,b)=choose|buf:Seq<u8>,r:Seq<frame::ArenaLocation>,b:&[u8]|
+                    #[trigger] frame::refused_at(&batch,select,hash,base@,ROOT_MAGIC,FRAME_VERSION,Seq::empty(),buf,r,b);
+                reveal_with_fuel(frame::packed,2);
+                assert(r.len()==0 && buf.len()==0 && b@==payload@);
+            }
+            assert(false);unreached()
+        },
+        Err(_)=>{assert(false);unreached()},
+    };
+    proof {
+        let encoded=choose|bytes:Seq<u8>| file.image()==prior+bytes &&
+            #[trigger] frame::packed(&batch,select,hash,base@,ROOT_MAGIC,FRAME_VERSION,Seq::empty(),bytes,rows@);
+        reveal_with_fuel(frame::packed,2);
+        let loc=rows@[0];
+        let start=loc.offset as int-base@;
+        let body=choose|b:&[u8]| #[trigger] select.ensures((&batch@[0],),b) && b.len()==loc.payload_len &&
+            hash.ensures((ROOT_MAGIC,loc.payload_len,b),loc.checksum) &&
+            encoded==encoded.take(start)+frame::header_bytes(ROOT_MAGIC,FRAME_VERSION,loc.payload_len,loc.checksum)+b@;
+        assert(body@==payload@);
+        assert(encoded.take(start).len()==0);
+        assert(file.image() =~= prior+frame::header_bytes(ROOT_MAGIC,FRAME_VERSION,payload.len() as u64,(digest@)(payload@))+payload@);
+    }
+}
+
+/// Recover the WAL root, then append its canonical frame to an independent root journal.
+fn durable_journal_fold<J:crate::arena_frame::BatchFile,S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M,H,F,
     P:Ord+Copy,K:FnOnce(Owner)->P,N:FnOnce(&P)->Owner>(sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,
     expected:Option<RootState>,replacement:RootState,chunk:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
     finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,sink:S,base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,
-    key_of:K,name_of:N,key:P,history:&mut BTreeMap<P,(RootState,u64)>)
+    key_of:K,name_of:N,key:P,history:&mut BTreeMap<P,(RootState,u64)>,file:&mut J,journal_digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>)
     -> (out:Option<Decision<RootState,Vec<u8>>>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
     requires sequence!=0,begin.len() as int+138+288<=usize::MAX,
@@ -393,7 +437,16 @@ fn durable_journal_fold<S:crate::group_frontier::BufferedWal,M:crate::positional
         name_of.requires((&key,)),forall|o:Owner| #[trigger] name_of.ensures((&key,),o) ==> o.bytes()==owner.bytes(),
         forall|o:Owner| o.bytes()==owner.bytes() ==> #[trigger] key_of.requires((o,)),
         forall|o:Owner,p:P| o.bytes()==owner.bytes() && #[trigger] key_of.ensures((o,),p) ==> p==key,
-    ensures btree_map_inv(final(history)), ({
+        old(file).image().len()<=u64::MAX,
+        forall|e:J::Error| !#[trigger] old(file).seek_failed(e),
+        forall|e:J::Error| !#[trigger] J::write_failed(old(file).target(),e),
+        forall|b:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::arena_frame::ROOT_MAGIC,b.len() as u64,b),v) ==> v==(journal_digest@)(b@),
+    ensures btree_map_inv(final(history)), final(file).target()==old(file).target(),
+        final(file).image()==match out {
+            Some(Decision::Applied(bytes))=>old(file).image()+crate::arena_frame::header_bytes(
+                crate::arena_frame::ROOT_MAGIC,crate::arena_frame::FRAME_VERSION,bytes.len() as u64,(journal_digest@)(bytes@))+bytes@,
+            _=>old(file).image(),
+        }, ({
         let original=old(history)@;
         let actual=if original.contains_key(key) {Some(original[key].0)} else {None};
         let generation=match expected {None=>0int,Some(r)=>r.generation.value() as int+1};
@@ -428,7 +481,82 @@ fn durable_journal_fold<S:crate::group_frontier::BufferedWal,M:crate::positional
     {Some(key_of(owner_codec::decode(bytes)?))};
     let recode=|p:&P| -> (out:Vec<u8>) requires *p==key, ensures out@==name@, {name_of(p).encode()};
     let bound=table::BoundJournal::bind(&record.principal,record.expected,record.replacement,offset,decode,recode)?;
-    bound.fold(history,scheme)
+    let decision=bound.fold(history,scheme)?;
+    if let Decision::Applied(ref bytes)=decision {
+        assert(bytes@==encoded@);
+        append_replayed_payload(file,bytes,hash,journal_digest);
+    }
+    Some(decision)
+}
+
+/// Replay one applicable root and retire its WAL against the canonical handles
+/// supplied by recovery. Joining those handles preserves the actual journal identity
+/// and its image after the writer has appended the frame.
+fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,
+    Open:FnOnce(&S)->M,H,F,P:Ord+Copy,K:FnOnce(Owner)->P,N:FnOnce(&P)->Owner,
+    A:crate::recovery_barrier::Files,Join:FnOnce(&J)->A,W:Copy,C:crate::group_frontier::ResizeWal,
+    Bind:FnOnce(W,&A)->C,R:FnOnce(C)->Result<C,C::Error>>(
+    sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,expected:Option<RootState>,replacement:RootState,
+    chunk:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
+    sink:S,base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,key_of:K,name_of:N,key:P,
+    history:&mut BTreeMap<P,(RootState,u64)>,mut file:J,journal_digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
+    join:Join,wal:W,bind:Bind,rewind:R,wal_target:Ghost<spec_fn(W)->(int,Seq<u8>)>)
+    -> (out:Option<Result<Result<C,crate::group_frontier::CheckpointError<C::Error>>,crate::recovery_barrier::Error<A::Error>>>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
+    requires sequence!=0,begin.len() as int+138+288<=usize::MAX,
+        sink.at_end(),sink.buffered_image().len()==base,base as int+begin.len()+138+288<=u64::MAX,
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v==(checksum@)(p@),
+        forall|p:&[u8]| #[trigger] finish.requires((p,)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v==(digest@)(p@),
+        forall|s:&S| #[trigger] reopen.requires((s,)),
+        forall|s:&S,m:M| #[trigger] reopen.ensures((s,),m) ==> m.image()==s.stable_image() && (target@)(m)==s.wal_target() &&
+            forall|at:u64,e:M::Error| base<=at<base as int+begin.len()+138+288 ==> !#[trigger] m.io_error(at,e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.append_error(e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.drain_error(e),
+        forall|s:S,e:S::Error| s.wal_target()==sink.wal_target() ==> !#[trigger] s.sync_error(e),
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),btree_map_inv(old(history)),
+        name_of.requires((&key,)),forall|o:Owner| #[trigger] name_of.ensures((&key,),o) ==> o.bytes()==owner.bytes(),
+        forall|o:Owner| o.bytes()==owner.bytes() ==> #[trigger] key_of.requires((o,)),
+        forall|o:Owner,p:P| o.bytes()==owner.bytes() && #[trigger] key_of.ensures((o,),p) ==> p==key,
+        file.image().len()<=u64::MAX,
+        forall|e:J::Error| !#[trigger] file.seek_failed(e),
+        forall|e:J::Error| !#[trigger] J::write_failed(file.target(),e),
+        forall|b:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::arena_frame::ROOT_MAGIC,b.len() as u64,b),v) ==> v==(journal_digest@)(b@),
+        file.target()!=sink.wal_target(),(wal_target@)(wal)==sink.wal_target(),
+        forall|j:&J| #[trigger] join.requires((j,)),
+        forall|j:&J,a:A| #[trigger] join.ensures((j,),a) ==> a.roots_target()==j.target() &&
+            a.pending().get(crate::recovery_barrier::Target::Roots)==Some(j.image()) &&
+            a.pending().contains_key(crate::recovery_barrier::Target::Arena) &&
+            (a.has_representations() ==> a.pending().contains_key(crate::recovery_barrier::Target::Representations)) &&
+            (a.volume_id() matches Some(id) ==> id==j.target().0),
+        forall|a:&A| #[trigger] bind.requires((wal,a)),
+        forall|a:&A,c:C| #[trigger] bind.ensures((wal,a),c) ==> c.wal_target()==(wal_target@)(wal) &&
+            c.roots_target()==a.roots_target() && c.volume_wal()==a.volume_id().is_some() && (a.volume_id() matches Some(id) ==> id==c.wal_target().0) &&
+            c.canonical_pending()==a.pending() && c.canonical_stable()==a.durable(),
+        forall|c:C| #[trigger] rewind.requires((c,)),
+        forall|c:C,r:C| #[trigger] rewind.ensures((c,),Ok(r)) ==> r.wal_target()==c.wal_target() && r.roots_target()==c.roots_target() &&
+            r.volume_wal()==c.volume_wal() && r.canonical_pending()==c.canonical_pending() &&
+            r.canonical_stable()==c.canonical_stable() && r.buffered_image()==c.buffered_image(),
+    ensures ({
+        let prior=old(history)@;
+        let current=if prior.contains_key(key) {Some(prior[key].0)} else {None};
+        let generation=match expected {None=>0int,Some(root)=>root.generation.value() as int+1};
+        let applied=current==expected && current!=Some(replacement) && replacement.generation.value()==generation;
+        let wire=crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement);
+        let header=crate::arena_frame::header_bytes(crate::arena_frame::ROOT_MAGIC,crate::arena_frame::FRAME_VERSION,wire.len() as u64,(journal_digest@)(wire));
+        &&& out.is_some()==applied
+        &&& final(history)@==if applied {prior.insert(key,(replacement,(base as int+72+begin.len()) as u64))} else {prior}
+        &&& out matches Some(Ok(Ok(c))) ==> c.roots_target()==file.target() && c.wal_target()==sink.wal_target() && c.stable_image()==Seq::<u8>::empty() &&
+            c.canonical_stable().get(crate::recovery_barrier::Target::Roots)==Some(file.image()+header+wire)
+    }),
+{
+    let decision=durable_journal_fold(sequence,begin,owner,scheme,expected,replacement,chunk,hash,checksum,finish,digest,
+        sink,base,reopen,target,key_of,name_of,key,history,&mut file,journal_digest)?;
+    if let Decision::Applied(_)=decision {
+        let mut files=join(&file);
+        Some(crate::hosted_recovery_barrier::recovered_checkpoint(&mut files,wal,bind,rewind,wal_target))
+    } else { None }
 }
 
 spec fn version(r:root_wire::Root) -> Version {

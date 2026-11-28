@@ -148,7 +148,7 @@ fn read_group_transition<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[
     (record,bytes)
 }
 
-fn select_body<'a>(body:&'a &'a [u8]) -> (out:&'a [u8]) ensures out@==(*body)@ { *body }
+pub(crate) fn select_body<'a>(body:&'a &'a [u8]) -> (out:&'a [u8]) ensures out@==(*body)@ { *body }
 
 /// The prior recovered history is independent of the live writer. A stale history must reject
 /// the otherwise intact frame and leave every owner unchanged.

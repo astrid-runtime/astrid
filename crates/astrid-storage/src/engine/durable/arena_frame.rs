@@ -4,6 +4,9 @@ use vstd::prelude::*;
 
 verus! {
 
+pub(super) const ROOT_MAGIC:[u8;8] = *b"ASTROOT\0";
+pub(super) const FRAME_VERSION:u16 = 1;
+
 pub(super) const WIDTH: usize = 52;
 pub(super) const CHECKSUM_START:usize = 20;
 
@@ -232,6 +235,77 @@ pub(super) fn encode_batch<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])-
         i=i.saturating_add(1);
     }
     Some((encoded,rows))
+}
+
+/// Sequential writes to an isolated canonical file or volume region.
+pub(super) trait BatchFile {
+    type Error;
+    spec fn image(&self) -> Seq<u8>;
+    spec fn target(&self) -> (int,Seq<u8>);
+    spec fn cursor(&self) -> int;
+    spec fn seek_failed(&self,e:Self::Error) -> bool;
+    spec fn write_failed(target:(int,Seq<u8>),e:Self::Error) -> bool;
+    fn seek_end(&mut self) -> (out:Result<u64,Self::Error>)
+        ensures final(self).target()==old(self).target(),final(self).image()==old(self).image(),
+            out matches Err(e) ==> old(self).seek_failed(e),
+            out matches Ok(base) ==> base==old(self).image().len() && final(self).cursor()==base;
+    fn write_bytes(&mut self,bytes:&[u8]) -> (out:Result<(),Self::Error>)
+        requires old(self).cursor()==old(self).image().len(),
+        ensures final(self).target()==old(self).target(),
+            out matches Err(e) ==> Self::write_failed(old(self).target(),e),
+            out.is_ok() ==> final(self).image()==old(self).image()+bytes@ &&
+                final(self).cursor()==final(self).image().len();
+}
+
+pub(super) type FrameBatch = (Vec<u8>,Vec<ArenaLocation>);
+
+pub(super) enum BatchError<E> { Seek(E), Overflow, Write(E) }
+
+pub(super) fn prepare_at_end<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,S:BatchFile>(
+    file:&mut S,input:&'a [T],select:F,hash:H,magic:[u8;8],version:u16,buffers:(Vec<u8>,Vec<ArenaLocation>))
+    -> (out:Result<FrameBatch,BatchError<S::Error>>)
+    requires buffers.0.len()==0,buffers.1.len()==0,
+        forall|i:int| 0<=i<input.len() ==> #[trigger] select.requires((&input@[i],)),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+    ensures final(file).target()==old(file).target(), final(file).image()==old(file).image(),
+        out matches Err(BatchError::Seek(e)) ==> old(file).seek_failed(e),
+        !(out matches Err(BatchError::Write(_))),
+        out matches Err(BatchError::Overflow) ==> exists|prior:Seq<u8>,r:Seq<ArenaLocation>,b:&[u8]|
+            #[trigger] refused_at(input,select,hash,old(file).image().len() as u64,magic,version,Seq::empty(),prior,r,b),
+        out matches Ok((bytes,rows)) ==> final(file).cursor()==old(file).image().len() &&
+            rows.len()==input.len() && packed(input,select,hash,old(file).image().len() as u64,magic,version,Seq::empty(),bytes@,rows@),
+{
+    let base=match file.seek_end() { Ok(n)=>n,Err(e)=>return Err(BatchError::Seek(e)) };
+    assert(buffers.0@ =~= Seq::<u8>::empty());
+    assert(base==old(file).image().len() as u64);
+    match encode_batch(input,select,hash,base,magic,version,buffers) {
+        Some(batch)=>Ok(batch),None=>Err(BatchError::Overflow),
+    }
+}
+
+/// The locations become available only after the encoded bytes reach the same file.
+pub(super) fn append_batch<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,S:BatchFile>(
+    file:&mut S,input:&'a [T],select:F,hash:H,magic:[u8;8],version:u16,buffers:(Vec<u8>,Vec<ArenaLocation>))
+    -> (out:Result<Vec<ArenaLocation>,BatchError<S::Error>>)
+    requires buffers.0.len()==0,buffers.1.len()==0,
+        forall|i:int| 0<=i<input.len() ==> #[trigger] select.requires((&input@[i],)),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+    ensures final(file).target()==old(file).target(),
+        out matches Ok(rows) ==> rows.len()==input.len() && final(file).cursor()==final(file).image().len() &&
+            exists|bytes:Seq<u8>| final(file).image()==old(file).image()+bytes &&
+                #[trigger] packed(input,select,hash,old(file).image().len() as u64,magic,version,Seq::empty(),bytes,rows@),
+        out matches Err(BatchError::Seek(e)) ==> old(file).seek_failed(e) && final(file).image()==old(file).image(),
+        out matches Err(BatchError::Write(e)) ==> S::write_failed(old(file).target(),e),
+        out matches Err(BatchError::Overflow) ==> final(file).image()==old(file).image() &&
+            exists|prior:Seq<u8>,r:Seq<ArenaLocation>,b:&[u8]|
+                #[trigger] refused_at(input,select,hash,old(file).image().len() as u64,magic,version,Seq::empty(),prior,r,b),
+{
+    let (bytes,rows)=prepare_at_end(file,input,select,hash,magic,version,buffers)?;
+    assert(packed(input,select,hash,old(file).image().len() as u64,magic,version,Seq::empty(),bytes@,rows@));
+    match file.write_bytes(bytes.as_slice()) {
+        Ok(())=>{assert(file.image()==old(file).image()+bytes@);Ok(rows)},
+        Err(e)=>Err(BatchError::Write(e)),
+    }
 }
 
 impl PreparedFrame {

@@ -85,15 +85,15 @@ fn retire_wal<S:crate::group_frontier::ResizeWal,R:FnOnce(S)->Result<S,S::Error>
     -> (out:Result<S,crate::group_frontier::CheckpointError<S::Error>>)
     requires forall|s:S| #[trigger] rewind.requires((s,)),
         forall|s:S,r:S| #[trigger] rewind.ensures((s,),Ok(r)) ==>
-            r.wal_target()==s.wal_target() && r.volume_wal()==s.volume_wal() &&
+            r.roots_target()==s.roots_target() && r.wal_target()==s.wal_target() && r.volume_wal()==s.volume_wal() &&
             r.canonical_pending()==s.canonical_pending() && r.canonical_stable()==s.canonical_stable() &&
             r.buffered_image()==s.buffered_image(),
-    ensures out matches Ok(s) ==> s.wal_target()==sink.wal_target() && s.stable_image()==Seq::<u8>::empty() &&
+    ensures out matches Ok(s) ==> s.roots_target()==sink.roots_target() && s.wal_target()==sink.wal_target() && s.stable_image()==Seq::<u8>::empty() &&
         s.canonical_stable()==(if sink.volume_wal() {sink.canonical_pending()} else {sink.canonical_stable()}),
 {
     use crate::group_frontier::{checkpoint_io,resize_buffered,publish_buffer};
     checkpoint_io(sink,|mut s:S| -> (out:Result<S,S::Error>)
-        ensures out matches Ok(t) ==> t.wal_target()==s.wal_target() && t.volume_wal()==s.volume_wal() &&
+        ensures out matches Ok(t) ==> t.roots_target()==s.roots_target() && t.wal_target()==s.wal_target() && t.volume_wal()==s.volume_wal() &&
             t.canonical_pending()==s.canonical_pending() && t.buffered_image()==Seq::<u8>::empty() &&
             t.canonical_stable()==(if s.volume_wal() {s.canonical_pending()} else {s.canonical_stable()}),
         {
@@ -101,7 +101,7 @@ fn retire_wal<S:crate::group_frontier::ResizeWal,R:FnOnce(S)->Result<S,S::Error>
             assert(s.buffered_image() =~= Seq::<u8>::empty());
             Ok(s)
         },rewind,|mut s:S| -> (out:Result<S,S::Error>)
-        ensures out matches Ok(t) ==> t.wal_target()==s.wal_target() && t.stable_image()==s.buffered_image() &&
+        ensures out matches Ok(t) ==> t.roots_target()==s.roots_target() && t.wal_target()==s.wal_target() && t.stable_image()==s.buffered_image() &&
             t.canonical_stable()==(if s.volume_wal() {s.canonical_pending()} else {s.canonical_stable()}),
         {
             publish_buffer(&mut s)?;
@@ -110,22 +110,23 @@ fn retire_wal<S:crate::group_frontier::ResizeWal,R:FnOnce(S)->Result<S,S::Error>
 }
 
 /// Match the writer to the canonical handles that recovery just handed off.
-fn recovered_checkpoint<M:Files,W:Copy,S:crate::group_frontier::ResizeWal,F:FnOnce(W,&M)->S,R:FnOnce(S)->Result<S,S::Error>>(
+pub(crate) fn recovered_checkpoint<M:Files,W:Copy,S:crate::group_frontier::ResizeWal,F:FnOnce(W,&M)->S,R:FnOnce(S)->Result<S,S::Error>>(
     files:&mut M,wal:W,bind:F,rewind:R,target:Ghost<spec_fn(W)->(int,Seq<u8>)>)
     -> (out:Result<Result<S,crate::group_frontier::CheckpointError<S::Error>>,Error<M::Error>>)
     requires old(files).pending().contains_key(Target::Arena),old(files).pending().contains_key(Target::Roots),
         old(files).has_representations() ==> old(files).pending().contains_key(Target::Representations),
         forall|m:&M| #[trigger] bind.requires((wal,m)),
         forall|m:&M,s:S| #[trigger] bind.ensures((wal,m),s) ==> s.wal_target()==(target@)(wal) &&
-            s.volume_wal()==m.volume_id().is_some() && (m.volume_id() matches Some(id) ==> id==s.wal_target().0) &&
+            s.roots_target()==m.roots_target() && s.volume_wal()==m.volume_id().is_some() && (m.volume_id() matches Some(id) ==> id==s.wal_target().0) &&
             s.canonical_pending()==m.pending() && s.canonical_stable()==m.durable(),
         forall|s:S| #[trigger] rewind.requires((s,)),
         forall|s:S,r:S| #[trigger] rewind.ensures((s,),Ok(r)) ==>
-            r.wal_target()==s.wal_target() && r.volume_wal()==s.volume_wal() &&
+            r.roots_target()==s.roots_target() && r.wal_target()==s.wal_target() && r.volume_wal()==s.volume_wal() &&
             r.canonical_pending()==s.canonical_pending() && r.canonical_stable()==s.canonical_stable() &&
             r.buffered_image()==s.buffered_image(),
     ensures out matches Ok(Ok(s)) ==> {
         let stable=s.canonical_stable(); let pending=old(files).pending();
+        &&& s.roots_target()==old(files).roots_target()
         &&& s.wal_target()==(target@)(wal) && s.stable_image()==Seq::<u8>::empty()
         &&& old(files).volume_id() matches Some(id) ==> s.wal_target().0==id
         &&& stable.get(Target::Arena)==pending.get(Target::Arena)

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import authority, file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, storage_recovery, workspace_commit
+from . import authority, file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, storage_journal_checkpoint, storage_recovery, workspace_commit
 from .common import (
     AUTHORITY,
     MODEL,
@@ -395,6 +395,7 @@ def consumer_defects():
     vectors = Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs")
     readback = Path("verification/hosted_arena_append.rs")
     yield from storage_recovery.consumer_defects()
+    yield from storage_journal_checkpoint.consumer_defects()
     for name, source, original, changed, target in [
         ("omits the frame header width", append, "offset.checked_add(WIDTH as u64)?.checked_add(size)?", "offset.checked_add(size)?", append),
         ("reverses a vector pair", vectors, "parts.push(P::borrow(header));\n        parts.push(P::borrow(payload));", "parts.push(P::borrow(payload));\n        parts.push(P::borrow(header));", vectors),
