@@ -22,6 +22,11 @@ fn open_decoded<V>(page:Page<u64,u64>,observed:u64,node:Node<u64,u64,V>)
         |requested:u64| -> (error:u64) ensures error == requested, { requested })
 }
 
+fn root_identity<V>(id:u64,observed:u64,node:Node<u64,u64,V>) {
+    let result = open_decoded(Page::Root(id),observed,node);
+    assert(result == if id == observed {Ok(node.contents())} else {Err(id)});
+}
+
 fn failed_fetch(page:Page<u64,u64>) -> (out:Result<Contents<u64,u64,u64>,u64>)
     ensures out == Err(object(page)),
 {

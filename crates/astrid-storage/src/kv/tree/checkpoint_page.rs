@@ -134,7 +134,7 @@ pub(super) open spec fn object<I,T>(page:Page<I,T>) -> I {
 }
 pub(super) open spec fn agrees<I,T:Copy,V>(page:Page<I,T>,handle:Handle<I,T,V>) -> bool {
     match page {
-        Page::Root(_) => true,
+        Page::Root(id) => id == handle.object,
         Page::Child(c) => c.object == handle.object && c.lower_bound@ == handle.node.lower() &&
             c.level == handle.node.height() && c.totals == handle.node.summary(),
     }
@@ -155,7 +155,10 @@ pub(super) fn read<I:Copy+Eq,T:Copy+Eq,V,E,F:FnOnce(I)->Result<Handle<I,T,V>,E>,
     let id = page.object();
     let h = fetch(id)?;
     let accepted = match page {
-        Page::Root(_) => true,
+        Page::Root(expected) => {
+            proof { reveal(vstd::laws_eq::obeys_concrete_eq); }
+            I::eq(expected,&h.object)
+        },
         Page::Child(expected) => expected.matches(&h.object,h.node.minimum_key(),h.node.level(),&h.node.totals()),
     };
     if !accepted { return Err(mismatch(id)); }

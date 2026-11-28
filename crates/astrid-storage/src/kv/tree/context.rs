@@ -75,24 +75,24 @@ where
     /// Authoritative leaf lookup used by ordinary and certified point-reads.
     pub(super) fn get_slot(
         &mut self,
-        mut root: Option<ObjectId>,
+        root: Option<ObjectId>,
         key: &[u8],
     ) -> StorageResult<Option<ValueSlot>> {
-        while let Some(object) = root {
-            let handle = self.node(object)?;
-            match handle.node {
-                Node::Leaf(leaf) => {
-                    return Ok(super::checkpoint_point::leaf(leaf.entries, key));
-                },
-                Node::Branch(branch) => {
-                    let index = child_index(&branch.children, key);
-                    let child = &branch.children[index];
-                    self.validate_pointer(child)?;
-                    root = Some(child.object);
-                },
-            }
-        }
-        Ok(None)
+        use super::{checkpoint_descent, checkpoint_page};
+        checkpoint_descent::lookup(self, root, key, |context, page| {
+            let contents = checkpoint_page::read(
+                page,
+                |object| context.node(object),
+                |object| invalid(object, "persistent KV child summary disagrees"),
+            )?;
+            Ok((context, contents))
+        })
+        .map_err(|error| match error {
+            checkpoint_descent::Error::Source(error) => error,
+            checkpoint_descent::Error::Branch(object) => {
+                invalid(object, "invalid persistent KV branch descent")
+            },
+        })
     }
 
     pub(super) fn projected_get(
@@ -574,10 +574,6 @@ where
         }
         self.records.retain(|object, _| reachable.contains(object));
     }
-}
-
-pub(super) fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {
-    super::checkpoint_point::child(children, key)
 }
 
 fn page_retained(record: &ObjectRecord) -> StorageResult<u64> {

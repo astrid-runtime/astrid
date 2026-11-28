@@ -36,6 +36,7 @@ mod adapter;
 use crate::storage_model::ReferenceKind;
 mod checkpoint_branch;
 mod checkpoint_child;
+mod checkpoint_descent;
 mod checkpoint_entries;
 mod checkpoint_header;
 mod checkpoint_key_field;

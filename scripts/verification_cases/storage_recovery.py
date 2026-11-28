@@ -209,6 +209,24 @@ def consumer_defects():
             f"delta chain loses {label}", chain,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_chain.rs"),
         )
+    descent = Path("crates/astrid-storage/src/kv/tree/checkpoint_descent.rs")
+    for label, clause, weaker in [
+        ("scheduled root", "== (initial,Page::Root(root))", "== (if path.len()==0 {at} else {path[0].0})"),
+        ("child identity", "to == Page::Child(rows@[i])", "to is Child"),
+        ("level decrement", "child.level as nat+1 == level &&", "true &&"),
+        ("leaf result", "&& slot(rows@,key,v)", "&& true"),
+        ("load refusal", "Err(Error::Source(e)) => read.ensures((at.0,&at.1),Err(e))", "Err(Error::Source(e)) => true"),
+        ("refused branch address", "k == id(at.1) && exists", "exists"),
+    ]:
+        yield (
+            f"point descent loses {label}", descent,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_checkpoint_descent.rs"),
+        )
+    yield (
+        "point descent loses loaded root identity", Path("crates/astrid-storage/src/kv/tree/checkpoint_page.rs"),
+        lambda s: replace_once(s, "Page::Root(id) => id == handle.object", "Page::Root(_) => true"),
+        Path("verification/hosted_checkpoint_page.rs"),
+    )
     point = Path("crates/astrid-storage/src/kv/tree/checkpoint_point.rs")
     for label, clause, weaker in [
         ("hit key", "(#[trigger] input@[i]).key@ == key@ && input@[i].value == v", "(#[trigger] input@[i]).value == v"),
