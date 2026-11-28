@@ -389,7 +389,7 @@ where
         let scheme = active.scheme;
         let previous = active.previous_principal.as_deref();
         let (transition, _body_length) = decode_root_body(body, scheme, &self.codec, offset)?;
-        if previous.is_some_and(|previous| previous >= transition.principal()) {
+        if !super::root_history::follows(previous, transition.principal()) {
             return Err(WalError::OrderingViolation);
         }
         let measured = Measured::append(active.counts, DataKind::Root, body).map_err(|error| {

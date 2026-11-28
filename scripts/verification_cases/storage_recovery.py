@@ -25,13 +25,25 @@ def consumer_defects():
     for label, clause, weaker in [
         ("buffered append bytes", "final(self).buffered_image()==old(self).buffered_image()+bytes@", "true"),
         ("stable WAL image", "out.is_ok() ==> final(sink).stable_image()==old(sink).buffered_image(),", "out.is_ok() ==> true,"),
-        ("stable WAL target", "ensures final(sink).wal_target()==old(sink).wal_target(),", "ensures true,"),
+        ("stable WAL target", "ensures final(sink).wal_target()==old(sink).wal_target(),\n        out.is_ok()", "ensures true,\n        out.is_ok()"),
         ("append error origin", "out matches Err(e) ==> old(self).append_error(e),", "out matches Err(e) ==> true,"),
     ]:
         yield (
             f"buffered WAL readback loses {label}", frontier,
             lambda s, a=clause, b=weaker: replace_once(s, a, b),
             Path("verification/hosted_wal_writer_trace.rs"),
+        )
+
+    for label, clause, weaker in [
+        ("target", "ensures final(sink).wal_target()==old(sink).wal_target(), ({", "ensures true, ({"),
+        ("attempt images", "final(sink).resizes()==called || (out.is_err() && final(sink).resizes()==old(sink).resizes())", "out.is_err() || final(sink).resizes()==called"),
+        ("retained canonical images", "final(sink).canonical_stable()==canonical && final(sink).buffered_image().len()==length", "final(sink).buffered_image().len()==length"),
+        ("retained WAL prefix", "final(sink).buffered_image()==old(sink).buffered_image().take(length as int)", "true"),
+    ]:
+        yield (
+            f"canonical WAL resize loses {label}", frontier,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_recovery_barrier.rs"),
         )
 
     wal_history = Path("crates/astrid-storage/src/engine/durable/wal/root_history.rs")
@@ -45,6 +57,17 @@ def consumer_defects():
         yield (
             f"published WAL fold loses {label}", wal_history,
             lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_wal_writer_trace.rs"),
+        )
+
+    order = "match previous {None=>true,Some(before)=>crate::byte_order::below(before@,name@)}"
+    for label, weaker in [
+        ("duplicate rejection", f"({order}) ==> accepted"),
+        ("valid input acceptance", f"accepted ==> ({order})"),
+    ]:
+        yield (
+            f"WAL root order loses {label}", wal_history,
+            lambda s, b=weaker: replace_once(s, f"ensures accepted=={order}", f"ensures {b}"),
             Path("verification/hosted_wal_writer_trace.rs"),
         )
 
@@ -914,10 +937,10 @@ def consumer_defects():
     for label, clause, weaker in [
         ("WAL identity", "stable.wal() == wal", "true"),
         ("handoff result", "ensures finish.ensures((self.wal(),),value)", "ensures true"),
-        ("represented order", "final(files).calls() == all && final(files).durable() == both.insert", "final(files).durable() == both.insert"),
-        ("unrepresented order", "final(files).calls() == roots && final(files).durable() == both", "final(files).durable() == both"),
+        ("represented order", "final(files).calls() == all && (old(files).volume_id().is_none() ==> final(files).durable() == both.insert", "(old(files).volume_id().is_none() ==> final(files).durable() == both.insert"),
+        ("unrepresented order", "final(files).calls() == roots && (old(files).volume_id().is_none() ==> final(files).durable() == both", "(old(files).volume_id().is_none() ==> final(files).durable() == both"),
         ("represented images", "final(files).durable() == both.insert(x,old(files).pending()[x])", "true"),
-        ("unrepresented images", "final(files).durable() == both}", "true}"),
+        ("unrepresented images", "final(files).durable() == both)}", "true)}"),
         ("arena failure", "Err(Error::Arena(_)) => final(files).calls() == arena", "Err(Error::Arena(_)) => true"),
         ("roots failure", "Err(Error::Roots(_)) => final(files).calls() == roots", "Err(Error::Roots(_)) => true"),
         ("representations failure", "old(files).has_representations() && final(files).calls() == all", "true"),

@@ -82,14 +82,19 @@ impl super::super::frontier::BufferedWal for BufWriter<super::super::File> {
     }
 }
 
+impl super::super::frontier::ResizeWal for BufWriter<super::super::File> {
+    fn resize_region(&mut self, length: u64) -> io::Result<()> {
+        self.get_mut().set_len(length)
+    }
+}
+
 impl WalSink for BufWriter<super::super::File> {
     fn sync_data(&mut self) -> io::Result<()> {
         super::super::frontier::publish_buffer(self)
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
-        self.flush()?;
-        self.get_mut().set_len(len)
+        super::super::frontier::resize_buffered(self, len)
     }
 }
 
@@ -360,7 +365,7 @@ where
             scheme,
             &self.codec,
         )?;
-        if previous.is_some_and(|previous| previous >= principal_bytes.as_slice()) {
+        if !super::root_history::follows(previous, principal_bytes.as_slice()) {
             return Err(WalError::OrderingViolation);
         }
         let measured =

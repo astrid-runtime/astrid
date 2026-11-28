@@ -346,15 +346,14 @@ where
     C: PrincipalCodec<P>,
 {
     let mut wal_validated = BTreeSet::new();
-    let mut root_history =
-        recover_root_history::<P, _, _>(roots, codec, identity.scheme(), limits)?;
+    let root_history = recover_root_history::<P, _, _>(roots, codec, identity.scheme(), limits)?;
     recover_wal(
         wal_file,
         arena,
         roots,
         index,
         &mut wal_validated,
-        &mut root_history,
+        root_history,
         representations,
         identity.clone(),
         codec.clone(),
@@ -426,13 +425,13 @@ impl super::recovery_barrier::Files for CanonicalFiles<'_> {
     }
 }
 
-pub(super) fn stabilize_files<W>(
+pub(super) fn prepare_recovered_files<W>(
     arena: &mut super::File,
     roots: &mut super::File,
     representations: Option<&mut super::representations::RepresentationStore>,
     faults: Option<&dyn FaultInjector>,
     wal: W,
-) -> Result<super::recovery_barrier::Stable<W>, DurableError> {
+) -> Result<super::recovery_barrier::Prepared<W>, DurableError> {
     use super::recovery_barrier::{Error, stabilize};
     stabilize(
         &mut CanonicalFiles {
@@ -531,14 +530,14 @@ where
                 ))
             } else {
                 self.recover_media().and_then(|(mut recovered, wal)| {
-                    let stable = stabilize_files(
+                    let prepared = prepare_recovered_files(
                         &mut recovered.files.arena,
                         &mut recovered.files.roots,
                         recovered.representations.as_mut(),
                         Some(self.faults.as_ref()),
                         wal,
                     )?;
-                    stable.finish(|wal| checkpoint_recovered_wal((recovered, wal)))
+                    prepared.finish(|wal| checkpoint_recovered_wal((recovered, wal)))
                 })
             };
             let recovered = recovered.and_then(|(recovered, wal)| {

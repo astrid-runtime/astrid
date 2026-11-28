@@ -163,7 +163,7 @@ pub(crate) fn recover_wal<P, I, C>(
     roots: &mut File,
     index: &mut BTreeMap<ObjectId, ArenaLocation>,
     validated: &mut BTreeSet<ObjectId>,
-    root_history: &mut BTreeMap<P, (RootState, u64)>,
+    mut root_history: BTreeMap<P, (RootState, u64)>,
     representations: Option<&mut RepresentationStore>,
     identity: SharedIdentity<I>,
     codec: SharedPrincipalCodec<C>,
@@ -190,7 +190,7 @@ where
             roots,
             index,
             validated,
-            root_history,
+            &mut root_history,
             representations.as_deref_mut(),
             &replay_identity,
             &replay_codec,
@@ -206,17 +206,21 @@ where
         .map_err(durable_error)?
         .map_reader(|file| BufWriter::with_capacity(super::super::WAL_WRITE_BUFFER_BYTES, file));
 
-    // A committed WAL transaction is authoritative only after every
-    // canonical file it may have changed is stable.  If no transaction was
-    // present this still makes the tail truncation ordering explicit.
-    let stable =
-        super::super::recovery::stabilize_files(arena, roots, representations, None, resume)?;
+    // Preserve the committed WAL prefix while the canonical files are flushed.
+    // A buffered volume WAL syncs the container before it trims an incomplete tail.
+    let prepared = super::super::recovery::prepare_recovered_files(
+        arena,
+        roots,
+        representations,
+        None,
+        resume,
+    )?;
 
     // The caller still has to validate the repaired representation and root
     // closures. It checkpoints this resumed writer only after every such
     // authority check succeeds, so a failed recovery keeps the WAL evidence
     // available for the next attempt.
-    stable.finish(|resume| resume.into_writer(limits).map_err(durable_error))
+    prepared.finish(|resume| resume.into_writer(limits).map_err(durable_error))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

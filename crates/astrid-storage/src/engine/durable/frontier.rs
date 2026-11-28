@@ -138,15 +138,26 @@ pub(super) trait WalOutput {
                 final(self).buffered_image()==old(self).buffered_image()+bytes@;
 }
 
+#[cfg(verus_keep_ghost)]
+pub(super) type CanonicalImages = Map<super::recovery_barrier::Target, Seq<u8>>;
+
 pub(super) trait BufferedWal:WalOutput {
+    spec fn volume_wal(&self) -> bool;
+    spec fn canonical_pending(&self) -> CanonicalImages;
+    spec fn canonical_stable(&self) -> CanonicalImages;
+    spec fn resizes(&self) -> Seq<(u64,CanonicalImages)>;
     spec fn file_image(&self) -> Seq<u8>;
     spec fn stable_image(&self) -> Seq<u8>;
     spec fn drain_error(&self,e:Self::Error) -> bool;
     spec fn sync_error(&self,e:Self::Error) -> bool;
     fn drain(&mut self) -> (out:Result<WalDrain,Self::Error>)
         ensures final(self).wal_target()==old(self).wal_target(),
-            out matches Ok(WalDrain::File) ==> final(self).file_image()==old(self).buffered_image(),
-            out matches Ok(WalDrain::Container) ==> final(self).stable_image()==old(self).buffered_image(),
+            final(self).resizes()==old(self).resizes(),
+            final(self).canonical_pending()==old(self).canonical_pending(),
+            final(self).volume_wal()==old(self).volume_wal(),
+            out.is_ok() ==> final(self).file_image()==old(self).buffered_image(),
+            out matches Ok(WalDrain::File) ==> !old(self).volume_wal() && final(self).canonical_stable()==old(self).canonical_stable(),
+            out matches Ok(WalDrain::Container) ==> old(self).volume_wal() && final(self).canonical_stable()==old(self).canonical_pending() && final(self).stable_image()==old(self).buffered_image(),
             out matches Err(e) ==> old(self).drain_error(e);
     fn sync_file(&mut self) -> (out:Result<(),Self::Error>)
         ensures final(self).wal_target()==old(self).wal_target(),
@@ -165,6 +176,29 @@ pub(super) fn publish_buffer<S:BufferedWal>(sink:&mut S) -> (out:Result<(),S::Er
         WalDrain::File=>sink.sync_file(),
         WalDrain::Container=>Ok(()),
     }
+}
+
+pub(super) trait ResizeWal:BufferedWal {
+    fn resize_region(&mut self,length:u64) -> (out:Result<(),Self::Error>)
+        ensures final(self).wal_target()==old(self).wal_target(),
+            final(self).resizes()==old(self).resizes().push((length,old(self).canonical_stable())),
+            out.is_ok() ==> final(self).canonical_stable()==old(self).canonical_stable() &&
+                final(self).buffered_image().len()==length &&
+                (length<=old(self).file_image().len() ==> final(self).buffered_image()==old(self).file_image().take(length as int));
+}
+
+/// The buffered writer flushes before changing the WAL length on resume and checkpoint.
+pub(super) fn resize_buffered<S:ResizeWal>(sink:&mut S,length:u64) -> (out:Result<(),S::Error>)
+    ensures final(sink).wal_target()==old(sink).wal_target(), ({
+        let canonical=if old(sink).volume_wal() {old(sink).canonical_pending()} else {old(sink).canonical_stable()};
+        let called=old(sink).resizes().push((length,canonical));
+        &&& final(sink).resizes()==called || (out.is_err() && final(sink).resizes()==old(sink).resizes())
+        &&& out.is_ok() ==> final(sink).canonical_stable()==canonical && final(sink).buffered_image().len()==length &&
+            (length<=old(sink).buffered_image().len() ==> final(sink).buffered_image()==old(sink).buffered_image().take(length as int))
+    }),
+{
+    sink.drain()?;
+    sink.resize_region(length)
 }
 
 pub(super) enum PublicationError<E> { Active, Empty, Sync(E) }

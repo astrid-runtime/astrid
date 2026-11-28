@@ -15,6 +15,13 @@ use vstd::{
 
 verus! {
 
+/// Every subsequent root in a WAL transaction must have a strictly larger canonical name.
+pub(super) fn follows(previous:Option<&[u8]>,name:&[u8]) -> (accepted:bool)
+    ensures accepted==match previous {None=>true,Some(before)=>crate::byte_order::below(before@,name@)},
+{
+    match previous {None=>true,Some(before)=>crate::byte_order::bytewise_less(before,name)}
+}
+
 pub(super) enum Decision<R,J> {
     AlreadyPublished,
     Conflict(Option<R>),

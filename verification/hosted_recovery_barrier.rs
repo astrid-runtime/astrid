@@ -1,4 +1,4 @@
-//! Canonical media must be stable before handing the scanned WAL to its continuation.
+//! Track canonical media from replay through the next buffered WAL resize.
 use crate::recovery_barrier::{self as barrier,Error,Files,Target};
 use vstd::prelude::*;
 use crate::{ObjectId,RootState,recovered_closure as closure};
@@ -18,11 +18,11 @@ fn handoff<M:Files,W,V,F:FnOnce(W)->V>(files:&mut M,wal:W,finish:F) -> (out:Resu
         match out {
             Ok(result) => {
                 &&& finish.ensures((wal,),result)
-                &&& final(files).durable()[a] == old(files).pending()[a]
-                &&& final(files).durable()[r] == old(files).pending()[r]
+                &&& old(files).volume_id().is_none() ==> final(files).durable()[a] == old(files).pending()[a]
+                &&& old(files).volume_id().is_none() ==> final(files).durable()[r] == old(files).pending()[r]
                 &&& if old(files).has_representations() {
-                    final(files).calls() == third && final(files).durable()[x] == old(files).pending()[x]
-                } else {final(files).calls() == second && final(files).durable().get(x) == old(files).durable().get(x)}
+                    final(files).calls() == third && (old(files).volume_id().is_none() ==> final(files).durable()[x] == old(files).pending()[x])
+                } else {final(files).calls() == second && (old(files).volume_id().is_none() ==> final(files).durable().get(x) == old(files).durable().get(x))}
             },
             Err(Error::Arena(_)) => final(files).calls() == first,
             Err(Error::Roots(_)) => final(files).calls() == second,
@@ -33,6 +33,52 @@ fn handoff<M:Files,W,V,F:FnOnce(W)->V>(files:&mut M,wal:W,finish:F) -> (out:Resu
     let stable = barrier::stabilize(files,wal)?;
     Ok(stable.finish(finish))
 }
+/// Match the WAL to its canonical files, then observe the images at the actual
+/// truncate attempt. On a volume the buffered flush makes the canonical writes stable.
+fn checkpoint_resize<M:Files,W:Copy,S:crate::group_frontier::ResizeWal,F:FnOnce(W,&M)->S>(
+    files:&mut M,wal:W,bind:F,target:Ghost<spec_fn(W)->(int,Seq<u8>)>,wal_bytes:Ghost<Seq<u8>>,previous:Ghost<Seq<(u64,crate::group_frontier::CanonicalImages)>>,length:u64)
+    -> (out:Result<(S,Result<(),S::Error>),Error<M::Error>>)
+    requires length<=wal_bytes@.len(),old(files).pending().contains_key(Target::Arena),
+        old(files).pending().contains_key(Target::Roots),
+        old(files).has_representations() ==> old(files).pending().contains_key(Target::Representations),
+        forall|m:&M| #[trigger] bind.requires((wal,m)),
+        forall|m:&M,s:S| #[trigger] bind.ensures((wal,m),s) ==> s.wal_target()==(target@)(wal) && s.buffered_image()==wal_bytes@ &&
+            s.resizes()==previous@ && s.volume_wal()==m.volume_id().is_some() &&
+            (m.volume_id() matches Some(id) ==> id==s.wal_target().0) &&
+            s.canonical_pending()==m.pending() && s.canonical_stable()==m.durable(),
+    ensures out matches Ok((s,result)) ==> {
+        let attempts=s.resizes().skip(previous@.len() as int);
+        &&& s.resizes()==previous@+attempts
+        &&& s.wal_target()==(target@)(wal)
+        &&& old(files).volume_id() matches Some(id) ==> s.wal_target().0==id
+        &&& attempts.len()<=1
+        &&& (result.is_ok() ==> attempts.len()==1 && s.buffered_image()==wal_bytes@.take(length as int))
+        &&& attempts.len()==1 ==> {
+            let snapshot=attempts[0].1;
+            &&& attempts[0].0==length
+            &&& snapshot.contains_key(Target::Arena) && snapshot.contains_key(Target::Roots)
+            &&& old(files).has_representations() ==> snapshot.contains_key(Target::Representations)
+            &&& snapshot[Target::Arena]==old(files).pending()[Target::Arena]
+            &&& snapshot[Target::Roots]==old(files).pending()[Target::Roots]
+            &&& old(files).has_representations() ==> snapshot[Target::Representations]==old(files).pending()[Target::Representations]
+            &&& result.is_ok() ==> s.canonical_stable()==snapshot
+        }
+    },
+{
+    let prepared=barrier::stabilize(files,wal)?;
+    let original=prepared.finish(|w:W| -> (out:W) ensures out==w, {w});
+    let mut sink=bind(original,files);
+    let result=crate::group_frontier::resize_buffered(&mut sink,length);
+    proof {
+        let calls=sink.resizes();
+        if calls.len()>previous@.len() {
+            assert(calls.skip(previous@.len() as int) =~= seq![calls.last()]);
+        } else {assert(calls.skip(previous@.len() as int) =~= Seq::empty());}
+        assert(calls =~= previous@+calls.skip(previous@.len() as int));
+    }
+    Ok((sink,result))
+}
+
 /// A root and child enter the known set together only after the validator accepts their loaded records.
 fn validate_pair(known:&mut std::collections::BTreeSet<u64>,commit:u64,child:u64,at:u64,readable:bool,accepted:bool)
     -> (out:Result<(),u8>)

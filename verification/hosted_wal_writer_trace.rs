@@ -271,6 +271,35 @@ fn begin_root<H,F,T:FnOnce(Vec<u8>,usize,usize)->Option<Vec<u8>>>(sequence:u64,b
     Some((scan.marker,recovered,start as u64))
 }
 
+/// The scanner and writer compare adjacent canonical names. Even a repeat
+/// separated by other roots cannot occur in a transaction admitted in full.
+fn ordered_roots(names:&[Vec<u8>]) -> (accepted:bool)
+    ensures accepted==(forall|j:int,k:int| 0<=j<k<names.len() ==>
+        #[trigger] crate::byte_order::below(names@[j]@,names@[k]@)),
+        accepted ==> forall|j:int,k:int| 0<=j<k<names.len() ==> #[trigger] names@[j]@ != #[trigger] names@[k]@,
+{
+    let mut i=0usize;
+    while i<names.len()
+        invariant i<=names.len(),forall|j:int,k:int| 0<=j<k<i ==>
+            #[trigger] crate::byte_order::below(names@[j]@,names@[k]@),
+            forall|j:int,k:int| 0<=j<k<i ==> #[trigger] names@[j]@ != #[trigger] names@[k]@,
+        decreases names.len()-i,
+    {
+        let previous=if i==0 {None} else {Some(names[i-1].as_slice())};
+        if !table::follows(previous,&names[i]) {return false;}
+        proof {
+            assert forall|j:int| 0<=j<i implies #[trigger] crate::byte_order::below(names@[j]@,names@[i as int]@) by {
+                if j<i-1 {crate::byte_order::transitive(names@[j]@,names@[i-1]@,names@[i as int]@);}
+            }
+            assert forall|j:int| 0<=j<i implies #[trigger] names@[j]@ != names@[i as int]@ by {
+                crate::byte_order::strict_order(names@[j]@,names@[i as int]@);
+            }
+        }
+        i+=1;
+    }
+    true
+}
+
 /// Submit the writer's three framed records, publish the buffered WAL, and reread the
 /// submitted interval from the stable image of the same target.
 fn durable_begin_root<S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M,H,F>(
