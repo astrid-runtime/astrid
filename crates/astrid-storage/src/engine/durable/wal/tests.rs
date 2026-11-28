@@ -1195,6 +1195,31 @@ fn writer_is_poisoned_after_partial_write_or_sync_failure() {
 }
 
 #[test]
+fn checkpoint_sync_failure_prevents_writer_reuse() {
+    let sink = CountingSink {
+        fail_sync: true,
+        ..CountingSink::default()
+    };
+    let mut writer = new_writer(sink, RecoveryLimits::process_addressable());
+    assert!(matches!(
+        writer.checkpoint(),
+        Err(WalError::Io {
+            operation: "sync ASTWAL2 checkpoint",
+            ..
+        })
+    ));
+    assert!(matches!(
+        writer.begin(sequence(1), None),
+        Err(WalError::InvalidTransaction(_))
+    ));
+    assert!(matches!(
+        writer.checkpoint(),
+        Err(WalError::InvalidTransaction(_))
+    ));
+    assert_eq!(writer.into_inner().syncs, 1);
+}
+
+#[test]
 fn no_total_record_or_logical_byte_cap_is_imposed() {
     let mut writer = new_writer(
         DiscardSink::default(),

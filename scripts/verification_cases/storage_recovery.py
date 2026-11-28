@@ -46,6 +46,18 @@ def consumer_defects():
             Path("verification/hosted_recovery_barrier.rs"),
         )
 
+    for label, clause, weaker in [
+        ("completed sync", "&& sync.ensures((r,),Ok(s)),", ","),
+        ("canonical images after sync", "out.is_ok() ==> final(sink).canonical_stable()==(if old(sink).volume_wal() {old(sink).canonical_pending()} else {old(sink).canonical_stable()}),", "out.is_ok() ==> true,"),
+        ("media kind after resize", "final(sink).volume_wal()==old(sink).volume_wal() && final(sink).canonical_pending()==old(sink).canonical_pending()", "final(sink).canonical_pending()==old(sink).canonical_pending()"),
+        ("pending images after resize", "final(sink).volume_wal()==old(sink).volume_wal() && final(sink).canonical_pending()==old(sink).canonical_pending()", "final(sink).volume_wal()==old(sink).volume_wal()"),
+    ]:
+        yield (
+            f"retired WAL loses {label}", frontier,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_recovery_barrier.rs"),
+        )
+
     wal_history = Path("crates/astrid-storage/src/engine/durable/wal/root_history.rs")
     for label, clause, weaker in [
         ("descriptor offset", "(n,e,r,at)==(name@,expected,replacement,offset)", "(n,e,r)==(name@,expected,replacement)"),

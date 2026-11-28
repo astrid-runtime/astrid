@@ -161,13 +161,14 @@ pub(super) trait BufferedWal:WalOutput {
             out matches Err(e) ==> old(self).drain_error(e);
     fn sync_file(&mut self) -> (out:Result<(),Self::Error>)
         ensures final(self).wal_target()==old(self).wal_target(),
-            out.is_ok() ==> final(self).stable_image()==old(self).file_image(),
+            out.is_ok() ==> final(self).stable_image()==old(self).file_image() && final(self).canonical_stable()==old(self).canonical_stable(),
             out matches Err(e) ==> old(self).sync_error(e);
 }
 
 pub(super) fn publish_buffer<S:BufferedWal>(sink:&mut S) -> (out:Result<(),S::Error>)
     ensures final(sink).wal_target()==old(sink).wal_target(),
         out.is_ok() ==> final(sink).stable_image()==old(sink).buffered_image(),
+        out.is_ok() ==> final(sink).canonical_stable()==(if old(sink).volume_wal() {old(sink).canonical_pending()} else {old(sink).canonical_stable()}),
         out matches Err(e) ==> old(sink).drain_error(e) ||
             exists|drained:S| drained.wal_target()==old(sink).wal_target() &&
                 drained.file_image()==old(sink).buffered_image() && #[trigger] drained.sync_error(e),
@@ -182,6 +183,7 @@ pub(super) trait ResizeWal:BufferedWal {
     fn resize_region(&mut self,length:u64) -> (out:Result<(),Self::Error>)
         ensures final(self).wal_target()==old(self).wal_target(),
             final(self).resizes()==old(self).resizes().push((length,old(self).canonical_stable())),
+            out.is_ok() ==> final(self).volume_wal()==old(self).volume_wal() && final(self).canonical_pending()==old(self).canonical_pending(),
             out.is_ok() ==> final(self).canonical_stable()==old(self).canonical_stable() &&
                 final(self).buffered_image().len()==length &&
                 (length<=old(self).file_image().len() ==> final(self).buffered_image()==old(self).file_image().take(length as int));
@@ -193,12 +195,49 @@ pub(super) fn resize_buffered<S:ResizeWal>(sink:&mut S,length:u64) -> (out:Resul
         let canonical=if old(sink).volume_wal() {old(sink).canonical_pending()} else {old(sink).canonical_stable()};
         let called=old(sink).resizes().push((length,canonical));
         &&& final(sink).resizes()==called || (out.is_err() && final(sink).resizes()==old(sink).resizes())
+        &&& out.is_ok() ==> final(sink).volume_wal()==old(sink).volume_wal() && final(sink).canonical_pending()==old(sink).canonical_pending()
         &&& out.is_ok() ==> final(sink).canonical_stable()==canonical && final(sink).buffered_image().len()==length &&
             (length<=old(sink).buffered_image().len() ==> final(sink).buffered_image()==old(sink).buffered_image().take(length as int))
     }),
 {
     sink.drain()?;
     sink.resize_region(length)
+}
+
+pub(super) enum CheckpointError<E> { Truncate(E), Rewind(E), Sync(E) }
+
+/// Thread one sink through the three checkpoint calls. Only a completed sync releases it.
+pub(super) fn checkpoint_io<S,E,T,R,F>(sink:S,truncate:T,rewind:R,sync:F)
+    -> (out:Result<S,CheckpointError<E>>)
+    where T:FnOnce(S)->Result<S,E>,R:FnOnce(S)->Result<S,E>,F:FnOnce(S)->Result<S,E>,
+    requires truncate.requires((sink,)),
+        forall|t:S| #[trigger] truncate.ensures((sink,),Ok(t)) ==> rewind.requires((t,)),
+        forall|t:S,r:S| truncate.ensures((sink,),Ok(t)) && #[trigger] rewind.ensures((t,),Ok(r)) ==> sync.requires((r,)),
+    ensures
+        out matches Ok(s) ==> exists|t:S,r:S| truncate.ensures((sink,),Ok(t)) && #[trigger] rewind.ensures((t,),Ok(r)) && sync.ensures((r,),Ok(s)),
+        out matches Err(CheckpointError::Truncate(e)) ==> truncate.ensures((sink,),Err(e)),
+        out matches Err(CheckpointError::Rewind(e)) ==> exists|t:S| #[trigger] truncate.ensures((sink,),Ok(t)) && rewind.ensures((t,),Err(e)),
+        out matches Err(CheckpointError::Sync(e)) ==> exists|t:S,r:S| truncate.ensures((sink,),Ok(t)) && #[trigger] rewind.ensures((t,),Ok(r)) && sync.ensures((r,),Err(e)),
+{
+    let truncated=match truncate(sink) {Ok(s)=>s,Err(e)=>return Err(CheckpointError::Truncate(e))};
+    let rewound=match rewind(truncated) {
+        Ok(s)=>s,
+        Err(e)=>{
+            proof {
+                assert(truncate.ensures((sink,),Ok(truncated)));
+                assert(rewind.ensures((truncated,),Err(e)));
+            }
+            return Err(CheckpointError::Rewind(e));
+        },
+    };
+    proof {
+        assert(truncate.ensures((sink,),Ok(truncated)));
+        assert(rewind.ensures((truncated,),Ok(rewound)));
+    }
+    match sync(rewound) {
+        Ok(s)=>{assert(sync.ensures((rewound,),Ok(s)));Ok(s)},
+        Err(e)=>{assert(sync.ensures((rewound,),Err(e)));Err(CheckpointError::Sync(e))},
+    }
 }
 
 pub(super) enum PublicationError<E> { Active, Empty, Sync(E) }

@@ -1,4 +1,4 @@
-use super::super::frontier::{PublicationError, sync_pending};
+use super::super::frontier::{CheckpointError, PublicationError, checkpoint_io, sync_pending};
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -466,27 +466,30 @@ where
                 "cannot checkpoint an active or unpublished WAL transaction",
             ));
         }
-        if let Err(source) = self.sink.set_len(0) {
+        checkpoint_io(
+            &mut self.sink,
+            |sink| {
+                sink.set_len(0)?;
+                Ok(sink)
+            },
+            |sink| {
+                sink.seek(SeekFrom::Start(0))?;
+                Ok(sink)
+            },
+            |sink| {
+                sink.sync_data()?;
+                Ok(sink)
+            },
+        )
+        .map_err(|error| {
             self.poisoned = true;
-            return Err(WalError::Io {
-                operation: "truncate ASTWAL2 checkpoint",
-                source,
-            });
-        }
-        if let Err(source) = self.sink.seek(SeekFrom::Start(0)) {
-            self.poisoned = true;
-            return Err(WalError::Io {
-                operation: "seek ASTWAL2 checkpoint",
-                source,
-            });
-        }
-        if let Err(source) = self.sink.sync_data() {
-            self.poisoned = true;
-            return Err(WalError::Io {
-                operation: "sync ASTWAL2 checkpoint",
-                source,
-            });
-        }
+            let (operation, source) = match error {
+                CheckpointError::Truncate(e) => ("truncate ASTWAL2 checkpoint", e),
+                CheckpointError::Rewind(e) => ("seek ASTWAL2 checkpoint", e),
+                CheckpointError::Sync(e) => ("sync ASTWAL2 checkpoint", e),
+            };
+            WalError::Io { operation, source }
+        })?;
         self.last_sequence = None;
         self.append_offset = WalOffset::new(0);
         Ok(())
