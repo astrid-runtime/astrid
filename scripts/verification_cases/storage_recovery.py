@@ -225,6 +225,19 @@ def consumer_defects():
             f"staged record source loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_record_source.rs"),
         )
+    reservations = Path("crates/astrid-storage/src/ownership/reservation_validation.rs")
+    for label, clause, weaker in [
+        ("retired owner exclusion", "rows@.contains_key(k) ==> !owners@.contains_key(k) &&", "rows@.contains_key(k) ==> true &&"),
+        ("existing fleet", "(rows@[k].fleet matches Some(f) ==> fleets@.contains_key(f)))", "true)"),
+        ("unique retained name", "named(rows@,j,n,name) ==> i==j", "named(rows@,j,n,name) ==> true"),
+        ("missing fleet refusal", "Err(Error::Fleet(f)) => !fleets@.contains_key(f) &&", "Err(Error::Fleet(f)) => true &&"),
+        ("owned generation refusal", "rows@.contains_key(k) && owners@.contains_key(k),", "rows@.contains_key(k),"),
+        ("duplicate identities", "Err(Error::Alias(n,i,j)) => i!=j &&", "Err(Error::Alias(n,i,j)) => true &&"),
+    ]:
+        yield (
+            f"retirement reservation validation loses {label}", reservations,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_retirement_recovery.rs"),
+        )
     mutations = Path("crates/astrid-storage/src/kv/tree/mutation_replay.rs")
     for label, clause, weaker in [
         ("initial state", "states[0] == initial", "true"),

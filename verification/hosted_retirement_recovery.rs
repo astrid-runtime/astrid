@@ -50,6 +50,57 @@ fn recover(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64
     crate::recovery::replay(reservations,directory,stores)
 }
 
+fn label(a:&u64) -> (r:&str) ensures r == (if *a==1 {"first"} else {"second"})
+{if *a==1 {"first"} else {"second"}}
+
+// Validate the same two reserved generations subsequently consumed by startup.
+fn validate_then_restore(duplicate:bool,owned:bool,missing_fleet:bool,legacy:bool,stores:&mut Stores)
+    requires old(stores).valid(), vstd::laws_cmp::obeys_cmp::<&str>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<&str>(),
+{
+    use crate::reservation_validation::{validate,Error,named,projected};
+    let mut rows = BTreeMap::<u64,Reservation>::new();
+    let mut owners = BTreeMap::<u64,()>::new();let mut fleets = BTreeMap::<u64,()>::new();
+    let mut directory = HashMap::<u64,u64>::new();
+    rows.insert(11,Reservation {alias:if legacy {None} else {Some(1)},fleet:None});
+    rows.insert(12,Reservation {alias:Some(if duplicate {1} else {2}),fleet:Some(9)});
+    if owned {owners.insert(12,());}
+    if !missing_fleet {fleets.insert(9,());}
+    directory.insert(11,7); directory.insert(12,8);
+    proof {reveal_strlit("first");reveal_strlit("second");}
+    let first = label(&1);let second = label(&2);
+    assert(label.ensures((&1u64,),first) && label.ensures((&2u64,),second));
+    assert(rows@.contains_key(11) && rows@.contains_key(12));
+    assert(rows@[11].alias == (if legacy {None} else {Some(1u64)}) && rows@[12].alias == Some(if duplicate {1u64} else {2u64}));
+    assert(directory@.get(11) == Some(7) && directory@.get(12) == Some(8));
+    let result = validate(&rows,&owners,&fleets,label);
+    assert(projected(rows@[12],label) == Some(if duplicate {"first"} else {"second"}));
+    assert(projected(rows@[11],label) == (if legacy {None} else {Some("first")}));
+    match result {
+        Ok(()) => {
+            assert(!owners@.contains_key(12) && fleets@.contains_key(9));
+            assert(!owned && !missing_fleet);
+            if duplicate && !legacy {
+                assert(named(rows@,11u64,"first",label) && named(rows@,12u64,"first",label));
+                assert(false);
+            }
+            let _ = recover(&rows,&directory,stores);
+            assert(exists|uid:u64| #[trigger] rows@.contains_key(uid) && (rows@[uid].alias==Some(7u64) || directory@.get(uid)==Some(7u64))) by {assert(rows@.contains_key(11));}
+            assert(exists|uid:u64| #[trigger] rows@.contains_key(uid) && (rows@[uid].alias==Some(8u64) || directory@.get(uid)==Some(8u64))) by {assert(rows@.contains_key(12));}
+            assert(stores.authority(7) == (true,true,None) && stores.authority(8) == (true,true,None));
+            assert(stores.authority(if duplicate {1} else {2}) == (true,true,None));
+            if !legacy {assert(stores.authority(1) == (true,true,None));}
+        },
+        Err(Error::Fleet(f)) => {
+            let ghost k=choose|k:u64| #[trigger] rows@.contains_key(k) && rows@[k].fleet == Some(f);
+            assert(k==12 && f==9 && missing_fleet);
+        },
+        Err(Error::Owned(k)) => {assert(k==12 && owned);},
+        Err(Error::Alias(n,a,b)) => {
+            assert(named(rows@,a,n,label) && named(rows@,b,n,label));
+            assert((a==11 && b==12)||(a==12 && b==11));assert(duplicate && !legacy);
+        },
+    }
+}
 // Stage the same reservation consumed by startup. Persistence must still
 // establish that the acknowledged candidate is the recovered graph.
 fn reserve_then_recover(rows:&mut BTreeMap<u64,Reservation>,uid:u64,requested:u64,fleet:Option<u64>,

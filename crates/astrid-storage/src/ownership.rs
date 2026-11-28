@@ -21,6 +21,7 @@ mod deletion;
 mod derived;
 mod pending;
 mod recovery;
+mod reservation_validation;
 use crate::principal_directory::recovery_aliases;
 pub use recovery::RetirementSink;
 mod provision;
@@ -211,6 +212,7 @@ impl OwnershipSnapshot {
     }
 
     fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
+        use reservation_validation::Error;
         self.validate_accountable_users()?;
         self.validate_user_bindings(principals)?;
         if self.format_version != GRAPH_FORMAT_VERSION {
@@ -268,28 +270,21 @@ impl OwnershipSnapshot {
             }
         }
         self.validate_principal_owners(principals)?;
-        let mut deletion_aliases = BTreeMap::new();
-        for (principal_uid, reservation) in &self.principal_deletions {
-            if let Some(fleet) = reservation.fleet
-                && !self.fleets.contains_key(&fleet)
-            {
-                return Err(OwnershipError::FleetNotFound(fleet));
-            }
-            if self.principal_ownership.contains_key(principal_uid) {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} is both owned and reserved for deletion"
-                )));
-            }
-            if let Some(alias) = &reservation.alias
-                && let Some(existing_uid) =
-                    deletion_aliases.insert(alias.as_str().to_owned(), *principal_uid)
-            {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal deletion alias {alias} is reserved by both {existing_uid} and {principal_uid}"
-                )));
-            }
-        }
-        Ok(())
+        reservation_validation::validate(
+            &self.principal_deletions,
+            &self.principal_ownership,
+            &self.fleets,
+            PrincipalId::as_str,
+        )
+        .map_err(|error| match error {
+            Error::Fleet(fleet) => OwnershipError::FleetNotFound(fleet),
+            Error::Owned(uid) => OwnershipError::CorruptGraph(format!(
+                "principal {uid} is both owned and reserved for deletion"
+            )),
+            Error::Alias(alias, existing, uid) => OwnershipError::CorruptGraph(format!(
+                "principal deletion alias {alias} is reserved by both {existing} and {uid}"
+            )),
+        })
     }
 }
 
