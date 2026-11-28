@@ -4,8 +4,8 @@ use std::io::{Read as _, Seek as _};
 
 use super::{
     DurableError, DurableFrameRange, DurableIo, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE,
-    FRAME_VERSION, RecoveryLimits, SeekFrom, arena_frame, corrupt, decode_frame_header,
-    frame_checksum, frame_checksum_hasher, io_error, read_exact_at, scan_frames_with_source,
+    FRAME_VERSION, RecoveryLimits, SeekFrom, arena_frame, corrupt, frame_checksum,
+    frame_checksum_hasher, io_error, read_exact_at, scan_frames_with_source,
     validate_positioned_header, validate_positioned_payload,
 };
 use crate::engine::durable::frame_repair::{self, Damage, FrameReader};
@@ -307,81 +307,62 @@ where
     let limits = policy.limits;
     let file_len = policy.file_len;
     while offset < file_len {
-        let remaining = file_len
-            .checked_sub(offset)
-            .ok_or(DurableError::EncodingOverflow)?;
-        if remaining < FRAME_HEADER_LEN {
-            repair_tail(
-                get_file(reader),
-                policy,
-                offset,
-                Damage::Incomplete,
-                corrupt(file_name, offset, "published frame header is truncated"),
-            )?;
-            break;
-        }
-        let header = reader.header()?;
-        if !arena_frame::magic_matches(&header, magic) {
-            repair_tail(
-                get_file(reader),
-                policy,
-                offset,
-                Damage::Suspect {
-                    known_interior: false,
-                },
-                corrupt(file_name, offset, "frame magic mismatch"),
-            )?;
-            break;
-        }
-        let decoded = decode_frame_header(file_name, offset, &header)?;
-        let payload_len = decoded.payload_len;
-        let frame_end =
-            match frame_repair::extent(offset, file_len, payload_len, limits.max_frame_bytes) {
-                frame_repair::Extent::Complete(end) => end,
-                frame_repair::Extent::Overflow => return Err(DurableError::EncodingOverflow),
-                frame_repair::Extent::Oversize { interior } => {
-                    repair_tail(
-                        get_file(reader),
-                        policy,
-                        offset,
+        use frame_repair::{FrameError, TailError};
+        let frame = match frame_repair::next_frame(
+            reader,
+            offset,
+            file_len,
+            magic,
+            FRAME_VERSION,
+            limits.max_frame_bytes,
+            frame_checksum,
+        ) {
+            Ok(frame) => frame,
+            Err(FrameError::Io(error)) => return Err(error),
+            Err(FrameError::Overflow) => return Err(DurableError::EncodingOverflow),
+            Err(FrameError::Header(error)) => {
+                return Err(super::frame_header_error(file_name, offset, &error));
+            },
+            Err(FrameError::Tail(error)) => {
+                let (damage, cause) = match error {
+                    TailError::HeaderShort => (
+                        Damage::Incomplete,
+                        corrupt(file_name, offset, "published frame header is truncated"),
+                    ),
+                    TailError::PayloadShort => (
+                        Damage::Incomplete,
+                        corrupt(file_name, offset, "published frame payload is truncated"),
+                    ),
+                    TailError::Magic => (
+                        Damage::Suspect {
+                            known_interior: false,
+                        },
+                        corrupt(file_name, offset, "frame magic mismatch"),
+                    ),
+                    TailError::Oversize { size, interior } => (
                         Damage::Suspect {
                             known_interior: interior,
                         },
                         DurableError::FrameTooLarge {
                             file: file_name,
                             offset,
-                            declared: payload_len,
+                            declared: size,
                             limit: limits.max_frame_bytes,
                         },
-                    )?;
-                    break;
-                },
-                frame_repair::Extent::Incomplete => {
-                    repair_tail(
-                        get_file(reader),
-                        policy,
-                        offset,
-                        Damage::Incomplete,
-                        corrupt(file_name, offset, "published frame payload is truncated"),
-                    )?;
-                    break;
-                },
-            };
-        let Some(payload) = frame_repair::read_payload(reader, decoded, magic, frame_checksum)?
-        else {
-            repair_tail(
-                get_file(reader),
-                policy,
-                offset,
-                Damage::Suspect {
-                    known_interior: false,
-                },
-                corrupt(file_name, offset, "frame checksum mismatch"),
-            )?;
-            break;
+                    ),
+                    TailError::Checksum => (
+                        Damage::Suspect {
+                            known_interior: false,
+                        },
+                        corrupt(file_name, offset, "frame checksum mismatch"),
+                    ),
+                };
+                repair_tail(get_file(reader), policy, offset, damage, cause)?;
+                break;
+            },
         };
-        accept(offset, &payload, get_file(reader))?;
-        offset = frame_end;
+        accept(offset, &frame.body, get_file(reader))?;
+        offset = frame.end;
     }
     Ok(())
 }

@@ -264,12 +264,25 @@ def consumer_defects():
          "crate::arena_frame::hashed(hash,crate::arena_frame::ARENA_MAGIC,row.1@,index@[row.0].checksum)",
          "index@[row.0].payload_len==row.1.len()", named_batch),
         ("container decision", reopen,
-         "if let crate::frontier::JournalFlush::AwaitingContainer(())=receipt.flush",
-         "if let crate::frontier::JournalFlush::StableFile=receipt.flush", reopen),
+         "if let crate::frontier::JournalFlush::AwaitingContainer(())=flush",
+         "if let crate::frontier::JournalFlush::StableFile=flush", reopen),
         ("known set", reopen, "ColdRead::Loaded(media,table,known)",
          "ColdRead::Loaded(media,table,std::collections::BTreeSet::new())", reopen),
     ]:
         yield (
             f"cold native reread loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
+        )
+
+    repair = Path("crates/astrid-storage/src/engine/durable/frame_repair.rs")
+    for label, source, clause, weakness in [
+        ("frame cursor", reopen, "at=f.end;", "at=end;"),
+        ("wire-derived index", reopen, "    Ok(index)\n}", "    Ok(BTreeMap::new())\n}"),
+        ("frame magic", repair, "if !frame::magic_matches(&h,magic)", "if false && !frame::magic_matches(&h,magic)"),
+        ("current frame offset", reopen, "index_fresh(&mut index,at,body", "index_fresh(&mut index,start,body"),
+        ("gapless extent", arena_batch, "index.insert(rows[i].0,loc);", "if i>0 {index.insert(rows[i].0,loc);}"),
+    ]:
+        yield (
+            f"cold arena scan loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )

@@ -54,6 +54,18 @@ pub(super) open spec fn arena_entry(loc:crate::ArenaLocation,raw:Seq<u8>,image:S
         crate::arena_frame::ARENA_MAGIC,crate::arena_frame::FRAME_VERSION,loc.payload_len,loc.checksum)+raw
 }
 
+pub(super) open spec fn boundary(index:Map<ObjectId,crate::ArenaLocation>,keys:Seq<ObjectId>,n:int,start:u64) -> int {
+    if n==0 {start as int} else {let loc=index[keys[n-1]];loc.offset as int+52+loc.payload_len}
+}
+
+pub(super) open spec fn layout(index:Map<ObjectId,crate::ArenaLocation>,keys:Seq<ObjectId>,start:u64,end:nat) -> bool {
+    &&& keys.no_duplicates() && keys.to_set()==index.dom()
+    &&& boundary(index,keys,keys.len() as int,start)==end
+    &&& forall|j:int| 0<=j<keys.len() ==> (#[trigger] index[keys[j]]).offset==boundary(index,keys,j,start)
+}
+
+pub(super) open spec fn keys(rows:Seq<(ObjectId,Vec<u8>)>) -> Seq<ObjectId> {rows.map_values(|r:(ObjectId,Vec<u8>)| r.0)}
+
 /// Append one canonical arena batch and pair every identity with the location
 /// returned for that payload. Only synchronized locations are released for indexing.
 #[verifier::spinoff_prover]
@@ -68,6 +80,7 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
         out matches Err(ArenaError::Sync(e)) ==> A::sync_failed(old(arena).target(),e),
         out matches Ok((index,flush)) ==> {
             &&& flush is StableFile ==> final(arena).stable()==final(arena).image()
+            &&& layout(index@,keys(rows@),old(arena).image().len() as u64,final(arena).image().len())
             &&& btree_map_inv(&index)
             &&& final(arena).image().take(old(arena).image().len() as int)==old(arena).image()
             &&& forall|i:int| 0<=i<rows.len() ==> {
@@ -111,6 +124,7 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
     let mut i=0usize;
     while i<locations.len()
         invariant i<=locations.len(),btree_map_inv(&index),
+            forall|j:int| 0<=j<i ==> index@[#[trigger] rows@[j].0]==locations@[j],
             forall|j:int| 0<=j<i ==> index@.contains_key(#[trigger] rows@[j].0) &&
                 arena_entry(index@[rows@[j].0],rows@[j].1@,arena.image(),prior.len()) &&
                 frame::hashed(hash,frame::ARENA_MAGIC,rows@[j].1@,index@[rows@[j].0].checksum),
@@ -128,8 +142,45 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
             assert(arena_entry(loc,rows@[i as int].1@,arena.image(),prior.len()));
             assert(frame::hashed(hash,frame::ARENA_MAGIC,rows@[i as int].1@,loc.checksum));
         }
+        let ghost previous=index@;
         index.insert(rows[i].0,loc);
+        assert forall|j:int| 0<=j<=i implies index@[#[trigger] rows@[j].0]==locations@[j] by {
+            if j<i {
+                assert(rows@[j].0!=rows@[i as int].0);
+                assert(previous[rows@[j].0]==locations@[j]);
+            }
+        }
         i+=1;
+    }
+    proof {
+        let ids=keys(rows@);
+        assert(ids.to_set() =~= index@.dom()) by {
+            assert forall|k:ObjectId| index@.contains_key(k) implies ids.contains(k) by {
+                let i=choose|i:int| 0<=i<rows.len() && #[trigger] rows@[i].0==k;
+                assert(ids[i]==k);
+            }
+            assert forall|k:ObjectId| ids.contains(k) implies index@.contains_key(k) by {
+                let i=ids.index_of(k);assert(rows@[i].0==k);
+            }
+        }
+        assert forall|j:int,k:int| 0<=j<k<ids.len() implies ids[j]!=ids[k] by {assert(rows@[j].0!=rows@[k].0);}
+        assert(ids.no_duplicates());
+        if locations.len()>0 {
+            let loc=locations@.last();
+            let at=loc.offset as int-base;
+            let b=choose|b:&[u8]| #[trigger] payload_of.ensures((&rows@[locations.len()-1],),b) && b.len()==loc.payload_len &&
+                hash.ensures((frame::ARENA_MAGIC,loc.payload_len,b),loc.checksum) &&
+                packed==packed.take(at)+frame::header_bytes(frame::ARENA_MAGIC,frame::FRAME_VERSION,loc.payload_len,loc.checksum)+b@;
+            vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+            assert(frame::header_bytes(frame::ARENA_MAGIC,frame::FRAME_VERSION,loc.payload_len,loc.checksum).len()==52);
+            assert(index@[ids[locations.len()-1]]==loc);
+        }
+        assert(boundary(index@,ids,ids.len() as int,base)==arena.image().len());
+        assert forall|j:int| 0<=j<ids.len() implies (#[trigger] index@[ids[j]]).offset==boundary(index@,ids,j,base) by {
+            assert(index@[rows@[j].0]==locations@[j]);
+            crate::hosted_acknowledged_root::packed_row(rows,payload_of,hash,base,frame::ARENA_MAGIC,frame::FRAME_VERSION,Seq::empty(),packed,locations@,j);
+            if j>0 {assert(index@[rows@[j-1].0]==locations@[j-1]);}
+        }
     }
     Ok((index,flush))
 }

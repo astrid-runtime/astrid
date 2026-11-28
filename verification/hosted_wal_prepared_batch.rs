@@ -378,7 +378,7 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::R
         out matches Err(RecoveryError::Arena(ArenaError::Sync(e))) ==> A::sync_failed(old(arena).target(),e),
         ((out matches Ok((_,r)) && r.flush is StableFile) || (out matches Err(RecoveryError::Closure(crate::frontier::JournalFlush::StableFile,_)))) ==> final(arena).stable()==final(arena).image(),
         out matches Ok((t,receipt)) ==> receipt.covers(graph.records@,scheme,limit,checksum) &&
-        receipt.target@==final(arena).target() && receipt.image@==final(arena).image() &&
+        receipt.target@==final(arena).target() && receipt.image@==final(arena).image() && receipt.start@==old(arena).image().len() &&
         final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
         crate::closure_walk::closed(p.journal.replacement.commit,Set::empty(),
             crate::hosted_kv_root_publication::owning_edges(t@),t@.dom()) &&
@@ -479,7 +479,8 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::R
             assert(arena_entry(index@[row.0],row.1@,arena.image(),old(arena).image().len()));
         }
     }
-    let receipt=ArenaReceipt{index,flush,target:Ghost(arena.target()),image:Ghost(arena.image())};
+    let receipt=ArenaReceipt{index,flush,target:Ghost(arena.target()),image:Ghost(arena.image()),
+        start:Ghost(old(arena).image().len() as u64),order:Ghost(recovered_arena::keys(payloads@))};
     proof {
         assert forall|k:ObjectId| #[trigger] receipt.index@.contains_key(k) implies {
             let loc=receipt.index@[k];let src=graph.records@[k];let raw=crate::recovered_record::encoding(scheme,k,src);

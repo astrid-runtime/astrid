@@ -164,6 +164,64 @@ pub(super) fn scan_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],Ghost(sourc
         Err(Error::Overflow) => { assert(false); unreachable!() },
     }
 }
+/// Consume the authenticated bytes as the native arena index scanner does.
+/// The expected record and identity are used only to describe the result.
+#[verifier::spinoff_prover]
+pub(super) fn index_fresh<H:Fn(&ObjectRecord)->[u8;32],C:FnOnce(u64,&[u8])->[u8;32]>(
+    index:&mut std::collections::BTreeMap<ObjectId,crate::ArenaLocation>,offset:u64,frame:&[u8],
+    scheme:Scheme,hash:H,checksum:C,Ghost(source):Ghost<ObjectRecord>,Ghost(id):Ghost<ObjectId>)
+    -> (out:Result<crate::ArenaLocation,crate::recovered_record::IndexError>)
+    requires vstd::std_specs::btree::btree_map_inv(old(index)),vstd::laws_cmp::obeys_cmp::<ObjectId>(),
+        vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),!old(index)@.contains_key(id),
+        scheme.algorithm@!=seq![0u8,0u8],scheme.construction@!=seq![0u8,0u8],ObjectRecord::labels_ordered(source.contents().3),
+        frame@==crate::recovered_record::encoding(scheme,id,source),
+        forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
+        forall|r:&ObjectRecord,d:[u8;32]| same_fields(*r,source) && #[trigger] hash.ensures((r,),d) ==> d@==id.digest(),
+        checksum.requires((frame.len() as u64,frame)),
+    ensures vstd::std_specs::btree::btree_map_inv(final(index)), match out {
+        Ok(loc)=>loc.offset==offset && loc.payload_len==frame.len() && checksum.ensures((loc.payload_len,frame),loc.checksum) &&
+            final(index)@==old(index)@.insert(id,loc),
+        Err(e)=>final(index)@==old(index)@ && source.contents().3.len()>0 &&
+            e matches crate::recovered_record::IndexError::Record(crate::recovered_record::Error::Decode(
+                wire::DecodeError::Record(wire::BodyError::Allocation))),
+    },
+{
+    use crate::recovered_record::{self as scan,IndexError,Error};
+    let _length=frame.len();
+    proof {canonical_shape(frame@,source,scheme,id);}
+    let identify=|r:&ObjectRecord| -> (key:ObjectId)
+        ensures exists|d:[u8;32]| #[trigger] hash.ensures((r,),d) && key.digest()==d@,
+    {ObjectId::new(hash(r))};
+    let out=scan::index(index,offset,frame,scheme,identify,checksum);
+    proof {
+        match &out {
+            Ok(loc)=>{
+                let key=choose|key:ObjectId| #[trigger] scan::authenticated(frame@,scheme,key,identify) &&
+                    if old(index)@.contains_key(key) {scan::agrees(old(index)@[key],*loc) && index@==old(index)@}
+                    else {index@==old(index)@.insert(key,*loc)};
+                ObjectId::same_digest(key,id);
+            },
+            Err(IndexError::Collision(key))=>{ObjectId::same_digest(*key,id);},
+            Err(IndexError::Record(Error::Identity))=>{
+                let (r,key)=choose|r:ObjectRecord,key:ObjectId| wire::record_at(frame@,40,scheme,r) &&
+                    #[trigger] identify.ensures((&r,),key) && key.digest()!=frame@.subrange(8,40);
+                unique_record(frame@,scheme,r,source);
+                assert(false);
+            },
+            Err(IndexError::Record(Error::Canonical))=>{
+                let (r,key)=choose|r:ObjectRecord,key:ObjectId| wire::record_at(frame@,40,scheme,r) &&
+                    key.digest()==frame@.subrange(8,40) && #[trigger] identify.ensures((&r,),key) && frame@!=scan::encoding(scheme,key,r);
+                ObjectId::same_digest(key,id);
+                unique_record(frame@,scheme,r,source);
+                equal_reference_encoding(r.contents().3,source.contents().3,r.contents().3.len(),scheme);
+                assert(false);
+            },
+            _=>{},
+        }
+    }
+    out
+}
+
 /// An arbitrary canonical production record, including every labelled edge,
 /// recovers its original meaning from the complete encoder output.
 #[verifier::rlimit(45)]

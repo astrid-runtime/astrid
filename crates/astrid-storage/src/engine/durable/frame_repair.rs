@@ -89,6 +89,86 @@ pub(super) fn read_payload<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
     }
 }
 
+pub(super) enum FrameError<E> {
+    Io(E), Header(super::arena_frame::HeaderError), Overflow, Tail(TailError),
+}
+
+pub(super) enum TailError {
+    HeaderShort, Magic, Oversize {size:u64,interior:bool}, PayloadShort, Checksum,
+}
+
+pub(super) struct ScannedFrame { pub(super) end:u64,pub(super) body:Vec<u8> }
+
+pub(super) open spec fn header_at(image:Seq<u8>,offset:u64) -> Seq<u8> {
+    image.subrange(offset as int,offset as int+52)
+}
+
+/// Read one frame at the logical cursor. Tail repair and callback errors are
+/// handled by the caller; only an authenticated complete frame can be emitted.
+#[verifier::spinoff_prover]
+pub(super) fn next_frame<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
+    reader:&mut R,offset:u64,end:u64,magic:[u8;8],version:u16,limit:u64,hash:H)
+    -> (out:Result<ScannedFrame,FrameError<R::Error>>)
+    requires old(reader).position()==offset,offset<end<=old(reader).image().len(),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+    ensures final(reader).target()==old(reader).target(),final(reader).image()==old(reader).image(),{
+        let at=offset as int;let image=old(reader).image();let h=header_at(image,offset);
+        let n=vstd::bytes::spec_u64_from_le_bytes(h.subrange(12,20));
+        let next=at+52+n;let body=image.subrange(at+52,next);
+        let matches=h.take(8)==magic@;
+        let current=h[8]==version as u8 && h[9]==(version >> 8) as u8;
+        let clear=h[10]==0 && h[11]==0;
+        match out {
+            Ok(f)=>at+52<=end && matches && current && clear && n<=limit && at<f.end==next<=end &&
+                final(reader).position()==f.end && f.body@==body && f.body.len()==n &&
+                exists|b:&[u8],sum:[u8;32]| b@==body && sum@==h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
+            Err(FrameError::Tail(TailError::HeaderShort))=>end<at+52,
+            Err(FrameError::Tail(TailError::Magic))=>at+52<=end && !matches,
+            Err(FrameError::Header(super::arena_frame::HeaderError::Version))=>matches && !current,
+            Err(FrameError::Header(super::arena_frame::HeaderError::Reserved))=>matches && current && !clear,
+            Err(FrameError::Tail(TailError::Oversize{size,interior}))=>size==n && n>limit && interior==(next<=end),
+            Err(FrameError::Overflow)=>n<=limit && next>u64::MAX,
+            Err(FrameError::Tail(TailError::PayloadShort))=>n<=limit && end<next<=u64::MAX,
+            Err(FrameError::Tail(TailError::Checksum))=>next<=end && exists|b:&[u8],sum:[u8;32]| b@==body &&
+                sum@!=h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
+            Err(FrameError::Io(e))=>old(reader).failed(at,52,e) || exists|r:R| r.image()==image &&
+                r.target()==old(reader).target() && r.position()==at+52 && #[trigger] r.failed(at+52,n,e),
+        }
+    },
+{
+    use super::arena_frame as frame;
+    if end.saturating_sub(offset)<super::arena_frame::WIDTH as u64 {return Err(FrameError::Tail(TailError::HeaderShort));}
+    let h=match reader.header() {Ok(h)=>h,Err(e)=>return Err(FrameError::Io(e))};
+    if !frame::magic_matches(&h,magic) {return Err(FrameError::Tail(TailError::Magic));}
+    let decoded=match frame::decode_header(&h,version) {Ok(d)=>d,Err(e)=>return Err(FrameError::Header(e))};
+    let next=match extent(offset,end,decoded.payload_len,limit) {
+        Extent::Complete(n)=>n,Extent::Incomplete=>return Err(FrameError::Tail(TailError::PayloadShort)),
+        Extent::Overflow=>return Err(FrameError::Overflow),
+        Extent::Oversize{interior}=>return Err(FrameError::Tail(TailError::Oversize{size:decoded.payload_len,interior})),
+    };
+    let ghost cursor=*reader;
+    match read_payload(reader,decoded,magic,hash) {
+        Ok(Some(body))=>{
+            proof {
+                let b=choose|b:&[u8]| b@==body@ && #[trigger] hash.ensures((magic,decoded.payload_len,b),decoded.checksum);
+                assert(frame::hashed(hash,magic,body@,decoded.checksum));
+            }
+            Ok(ScannedFrame{end:next,body})
+        },
+        Ok(None)=>{
+            proof {
+                let bytes=cursor.image().subrange(cursor.position(),reader.position());
+                let (p,sum)=choose|p:&[u8],sum:[u8;32]| p@==bytes && p.len()==decoded.payload_len &&
+                    sum!=decoded.checksum && #[trigger] hash.ensures((magic,decoded.payload_len,p),sum);
+                if sum@==decoded.checksum@ {assert(sum =~= decoded.checksum);}
+                assert(sum@!=decoded.checksum@);
+            }
+            Err(FrameError::Tail(TailError::Checksum))
+        },
+        Err(e)=>{assert(cursor.failed(offset as int+52,decoded.payload_len,e));Err(FrameError::Io(e))}
+    }
+}
+
 #[derive(Clone,Copy)]
 pub(super) enum Damage { Incomplete, Suspect { known_interior:bool } }
 

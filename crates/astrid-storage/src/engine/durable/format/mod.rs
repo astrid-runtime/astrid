@@ -349,14 +349,23 @@ fn decode_frame_header(
     offset: u64,
     header: &[u8; FRAME_HEADER_LEN_USIZE],
 ) -> Result<DecodedFrameHeader, DurableError> {
-    arena_frame::decode_header(header, FRAME_VERSION).map_err(|error| match error {
+    arena_frame::decode_header(header, FRAME_VERSION)
+        .map_err(|error| frame_header_error(file_name, offset, &error))
+}
+
+fn frame_header_error(
+    file_name: &'static str,
+    offset: u64,
+    error: &arena_frame::HeaderError,
+) -> DurableError {
+    match error {
         arena_frame::HeaderError::Version => {
             corrupt(file_name, offset, "unsupported frame version")
         },
         arena_frame::HeaderError::Reserved => {
             corrupt(file_name, offset, "reserved header bytes are non-zero")
         },
-    })
+    }
 }
 
 pub(super) fn append_frame<F: DurableIo>(
