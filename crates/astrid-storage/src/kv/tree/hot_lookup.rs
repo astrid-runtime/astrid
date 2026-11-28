@@ -58,6 +58,19 @@ pub(super) fn store_row(rows:&mut BTreeMap<Vec<u8>,CachedValue>,key:Vec<u8>,valu
     rows.insert(key,value);
 }
 
+pub(super) fn remove_row(rows:&mut BTreeMap<Vec<u8>,CachedValue>,key:&Vec<u8>) -> (out:Option<CachedValue>)
+    requires btree_map_inv(old(rows)),obeys_cmp::<Vec<u8>>(),obeys_cmp_deep_eq::<Vec<u8>>(),
+    ensures btree_map_inv(final(rows)),final(rows).deep_view() == old(rows).deep_view().remove(key@),
+        match out {
+            Some(v) => old(rows).deep_view().get(key@) == Some(v.bytes_view()),
+            None => !old(rows).deep_view().contains_key(key@),
+        },
+{
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
+    assert(key.deep_view() =~= key@);
+    rows.remove(key)
+}
+
 pub(super) fn row<'a>(rows:&'a BTreeMap<Vec<u8>,CachedValue>,key:&Vec<u8>) -> (out:Option<&'a CachedValue>)
     requires btree_map_inv(rows),obeys_cmp::<Vec<u8>>(),obeys_cmp_deep_eq::<Vec<u8>>(),
     ensures match out {
@@ -70,18 +83,23 @@ pub(super) fn row<'a>(rows:&'a BTreeMap<Vec<u8>,CachedValue>,key:&Vec<u8>) -> (o
     rows.get::<Vec<u8>>(key)
 }
 
+pub(super) fn same_root(observed:Option<RootState>,requested:Option<RootState>) -> (same:bool)
+    ensures same == (observed == requested),
+{
+    match (observed,requested) {
+        (Some(a),Some(b)) => a.same(b),
+        (None,None) => true,
+        _ => false,
+    }
+}
+
 /// The payload can itself represent an absent value cached at this root.
 pub(super) fn at_root<V,F>(observed:Option<RootState>,requested:Option<RootState>,key:&Vec<u8>,read:F)
     -> (out:Option<V>) where F:FnOnce(&Vec<u8>)->Option<V>,
     requires observed == requested ==> read.requires((key,)),
     ensures if observed == requested {read.ensures((key,),out)} else {out.is_none()},
 {
-    let same = match (observed,requested) {
-        (Some(a),Some(b)) => a.same(b),
-        (None,None) => true,
-        _ => false,
-    };
-    if same {read(key)} else {None}
+    if same_root(observed,requested) {read(key)} else {None}
 }
 
 pub(super) fn lookup<P:Ord,S,V,F>(owners:&BTreeMap<P,S>,owner:&P,requested:Option<RootState>,

@@ -189,6 +189,7 @@ INPUTS = [
     Path("verification/hosted_process_selection.rs"),
     Path("crates/astrid-storage/src/content/store/commit_candidate.rs"),
     Path("crates/astrid-storage/src/engine/kv/ready_root.rs"),
+    Path("crates/astrid-storage/src/kv/tree/hot_snapshot.rs"),
     Path("crates/astrid-storage/src/kv/tree/hot_lookup.rs"),
     Path("crates/astrid-storage/src/content/store/header_cache.rs"),
     Path("crates/astrid-storage/src/kv/tree/memo_admission.rs"),

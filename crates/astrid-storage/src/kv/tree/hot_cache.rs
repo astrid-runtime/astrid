@@ -12,10 +12,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
-use super::hot_lookup::CachedValue;
+use super::{hot_lookup::CachedValue, hot_snapshot::OwnerSnapshot};
 use crate::storage_model::RootState;
-
-const ENTRY_ACCOUNTING_BYTES: usize = 128;
 
 const fn nonzero_or_min(value: usize) -> NonZeroUsize {
     match NonZeroUsize::new(value) {
@@ -216,53 +214,6 @@ impl<P> Default for KvReadCacheConfig<P> {
 pub(super) enum HotRead {
     Hit(Option<Vec<u8>>),
     Miss,
-}
-
-impl CachedValue {
-    fn bytes(&self) -> usize {
-        match self {
-            Self::Present(value) => value.len(),
-            Self::Missing => 0,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct OwnerSnapshot {
-    root: Option<RootState>,
-    entries: BTreeMap<Vec<u8>, CachedValue>,
-    insertion_order: VecDeque<Vec<u8>>,
-    resident_bytes: usize,
-}
-
-impl OwnerSnapshot {
-    fn empty(root: Option<RootState>) -> Self {
-        Self {
-            root,
-            entries: BTreeMap::new(),
-            insertion_order: VecDeque::new(),
-            resident_bytes: 0,
-        }
-    }
-
-    fn entry_bytes(key: &[u8], value: &CachedValue) -> usize {
-        ENTRY_ACCOUNTING_BYTES
-            // The ordered map and FIFO each own one key allocation.
-            .saturating_add(key.len().saturating_mul(2))
-            .saturating_add(value.bytes())
-    }
-
-    fn remove_oldest(&mut self) -> bool {
-        let Some(key) = self.insertion_order.pop_front() else {
-            return false;
-        };
-        if let Some(value) = self.entries.remove(&key) {
-            self.resident_bytes = self
-                .resident_bytes
-                .saturating_sub(Self::entry_bytes(&key, &value));
-        }
-        true
-    }
 }
 
 struct OwnerCache {
@@ -513,27 +464,18 @@ where
             .snapshot
             .swap(Arc::new(OwnerSnapshot::empty(root)));
         let previous_bytes = previous.resident_bytes;
-        let mut next = if previous.root == root {
-            Arc::unwrap_or_clone(previous)
-        } else {
-            OwnerSnapshot::empty(root)
-        };
+        let mut next = OwnerSnapshot::for_root(previous, root, Arc::unwrap_or_clone);
 
-        if let Some(replaced) = next.entries.remove(&key) {
-            next.resident_bytes = next
-                .resident_bytes
-                .saturating_sub(OwnerSnapshot::entry_bytes(&key, &replaced));
+        if next.replace_row(&key, value, entry_bytes) {
             next.insertion_order.retain(|candidate| candidate != &key);
         }
-        next.resident_bytes = next.resident_bytes.saturating_add(entry_bytes);
-        super::hot_lookup::store_row(&mut next.entries, key.clone(), value);
         next.insertion_order.push_back(key);
 
         let mut previous_global = writer.resident_bytes.saturating_sub(previous_bytes);
-        while (next.entries.len() > self.entries_per_owner.get()
-            || next.resident_bytes > bounds.per_owner.get())
-            && next.remove_oldest()
-        {}
+        next.trim(|s| {
+            s.entries.len() > self.entries_per_owner.get()
+                || s.resident_bytes > bounds.per_owner.get()
+        });
 
         if previous_global.saturating_add(next.resident_bytes) > bounds.total.get() {
             let mut retained_order = VecDeque::with_capacity(writer.owner_order.len());
@@ -555,9 +497,7 @@ where
             }
             writer.owner_order = retained_order;
         }
-        while previous_global.saturating_add(next.resident_bytes) > bounds.total.get()
-            && next.remove_oldest()
-        {}
+        next.trim(|s| previous_global.saturating_add(s.resident_bytes) > bounds.total.get());
         writer.resident_bytes = previous_global.saturating_add(next.resident_bytes);
         owner_cache.snapshot.store(Arc::new(next));
         if owners_changed {

@@ -15,6 +15,8 @@ mod read_admission;
 mod resident;
 #[path = "../crates/astrid-storage/src/engine/kv/ready_root.rs"]
 mod ready_root;
+#[path = "../crates/astrid-storage/src/kv/tree/hot_snapshot.rs"]
+mod hot_snapshot;
 #[path = "../crates/astrid-storage/src/kv/tree/hot_lookup.rs"]
 mod hot_lookup;
 #[path = "../crates/astrid-storage/src/kv/tree/memo_admission.rs"]

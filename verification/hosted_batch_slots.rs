@@ -239,6 +239,67 @@ fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published
         })
 }
 
+/// Recover no row from another root, even when a limit discards multiple FIFO entries.
+fn trim_point<F>(previous:Arc<crate::hot_snapshot::OwnerSnapshot>,wanted:Option<crate::RootState>,
+    take:F,limit:usize,key:&Vec<u8>) -> (out:Option<Option<Vec<u8>>>)
+    where F:FnOnce(Arc<crate::hot_snapshot::OwnerSnapshot>)->crate::hot_snapshot::OwnerSnapshot,
+    requires vstd::std_specs::btree::btree_map_inv(&previous.entries),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        previous.root == wanted ==> take.requires((previous,)),
+        forall|s:crate::hot_snapshot::OwnerSnapshot| #[trigger] take.ensures((previous,),s) ==> s.same_image(&previous),
+    ensures out.is_some() ==> previous.root == wanted &&
+        cached_bytes(out) == previous.entries.deep_view().get(key@),
+        previous.root == wanted && previous.resident_bytes <= limit ==>
+            cached_bytes(out) == previous.entries.deep_view().get(key@),
+{
+    let mut next = crate::hot_snapshot::OwnerSnapshot::for_root(previous,wanted,take);
+    assert(next.root == wanted);
+    let ghost before = next;
+    next.trim(|s:&crate::hot_snapshot::OwnerSnapshot| -> (over:bool)
+        ensures over == (s.resident_bytes > limit), {s.resident_bytes > limit});
+    assert(next.root == wanted && next.resident_bytes <= before.resident_bytes);
+    assert(next.insertion_order@.len() == 0 || next.resident_bytes <= limit);
+    match crate::hot_lookup::row(&next.entries,key) {
+        Some(v) => Some(v.to_vec()),
+        None => None,
+    }
+}
+
+/// Even an arbitrary FIFO head can discard only its named byte key after replacement.
+fn replace_then_pop(snapshot:&mut crate::hot_snapshot::OwnerSnapshot,
+    key:&Vec<u8>,value:crate::hot_lookup::CachedValue,request:&Vec<u8>)
+    -> (out:Option<Option<Vec<u8>>>)
+    requires vstd::std_specs::btree::btree_map_inv(&old(snapshot).entries),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+    ensures final(snapshot).root == old(snapshot).root,
+        cached_bytes(out) == if old(snapshot).insertion_order@.len() > 0 && old(snapshot).insertion_order@[0]@ == request@ {None}
+            else if request@ == key@ {Some(value.bytes_view())} else {old(snapshot).entries.deep_view().get(request@)},
+{
+    let charge = crate::hot_snapshot::OwnerSnapshot::entry_bytes(key,&value);
+    assert(charge as int == crate::hot_snapshot::OwnerSnapshot::charge(key@,value.bytes_view()));
+    let ghost prior = snapshot.entries.deep_view();
+    let duplicate = snapshot.replace_row(key,value,charge);
+    assert(duplicate == prior.contains_key(key@));
+    let ghost next_charge = vstd::math::min(usize::MAX as int,charge as int +
+        if duplicate {vstd::math::max(0,old(snapshot).resident_bytes as int -
+            crate::hot_snapshot::OwnerSnapshot::charge(key@,prior[key@]))} else {old(snapshot).resident_bytes as int});
+    assert(snapshot.resident_bytes as int == next_charge);
+    let ghost table = snapshot.entries.deep_view();
+    let removed = snapshot.remove_oldest();
+    assert(removed == (old(snapshot).insertion_order@.len() > 0));
+    if removed {
+        let ghost head = old(snapshot).insertion_order@[0]@;
+        assert(snapshot.insertion_order@ == old(snapshot).insertion_order@.skip(1));
+        assert(snapshot.resident_bytes as int == if table.contains_key(head) {
+            vstd::math::max(0,next_charge-crate::hot_snapshot::OwnerSnapshot::charge(head,table[head]))
+        } else {next_charge});
+    } else {assert(snapshot.resident_bytes as int == next_charge);}
+    match crate::hot_lookup::row(&snapshot.entries,request) {
+        Some(v) => Some(v.to_vec()),
+        None => None,
+    }
+}
+
 fn fill_point<C>(owner:u64,namespace:&[u8],logical:&[u8],
     observation:Result<(Option<crate::RootState>,Option<Vec<u8>>),u64>,cache:C)
     -> (out:Result<Option<Vec<u8>>,u64>)

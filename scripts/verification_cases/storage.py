@@ -839,7 +839,7 @@ def hot_point_consumers():
         (cache, "value bytes", "self.bytes_view() == Some(v@)", "true"),
         (cache, "cached absence", "None => self.bytes_view().is_none()", "None => true"),
         (cache, "matching root", "{read.ensures((key,),out)}", "{true}"),
-        (cache, "stale root", "else {out.is_none()},\n{\n    let same", "else {true},\n{\n    let same"),
+        (cache, "stale root", "else {out.is_none()},\n{\n    if same_root", "else {true},\n{\n    if same_root"),
     ]:
         yield (
             f"hot point loses {label}", path,
@@ -860,6 +860,29 @@ def point_fill_consumers():
     ]:
         yield (
             f"point fill loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_batch_slots.rs"),
+        )
+
+
+def hot_snapshot_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/hot_snapshot.rs")
+    for label, clause, weaker in [
+        ("reused image", "{out.same_image(&previous)}", "{true}"),
+        ("vacant root", "else {out.vacant(root)}", "else {true}"),
+        ("row placement", "final(self).entries.deep_view() == old(self).entries.deep_view().insert(key@,value.bytes_view())", "true"),
+        ("duplicate selection", "replaced == old(self).entries.deep_view().contains_key(key@)", "true"),
+        ("prior FIFO", "final(self).insertion_order@ == old(self).insertion_order@,\n            final(self).resident_bytes", "true,\n            final(self).resident_bytes"),
+        ("FIFO head", "removed == (old(self).insertion_order@.len() > 0)", "true"),
+        ("evicted key", "final(self).entries.deep_view() == old(self).entries.deep_view().remove(old(self).insertion_order@[0]@)", "true"),
+        ("FIFO tail", "final(self).insertion_order@ == old(self).insertion_order@.skip(1)", "true"),
+        ("evicted charge", "final(self).resident_bytes as int == if removed", "final(self).resident_bytes as int <= if removed"),
+        ("bounded survivors", "final(self).entries.deep_view().get(k) == old(self).entries.deep_view().get(k)", "true"),
+        ("within-limit completeness", "!over.ensures((&*old(self),),true) ==> *final(self) == *old(self)", "true"),
+        ("trim exit", "final(self).insertion_order@.len() == 0 || over.ensures((&*final(self),),false)", "true"),
+    ]:
+        yield (
+            f"hot snapshot loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
             Path("verification/hosted_batch_slots.rs"),
         )
@@ -903,4 +926,5 @@ def checkpoint_decode_consumers():
     yield from publication_cache_consumers()
     yield from resident_cache_consumers()
     yield from hot_point_consumers()
+    yield from hot_snapshot_consumers()
     yield from point_fill_consumers()
