@@ -685,13 +685,14 @@ impl CapabilityStore {
         authority: &mut HashMap<TokenId, TokenStatus>,
         token_id: &TokenId,
     ) -> CapabilityResult<()> {
-        let mut status = authority::status(authority, token_id);
+        let status = authority::status(authority, token_id);
         Self::ensure_admission(status, token_id, true)?;
 
         // A canceled or ambiguous write can have committed. Requiring
         // durable absence atomically prevents a retry from winning twice.
+        let consumption = authority::Consumption::new(token_id);
         let won = if let Some(store) = &self.persistent_store {
-            let (namespace, id) = Marker::Consumed.address(token_id);
+            let (namespace, id) = consumption.address();
             let encoded = marker_key::encode(id.0.as_bytes());
             let key = marker_text(&encoded)?;
             store
@@ -701,8 +702,7 @@ impl CapabilityStore {
         } else {
             true
         };
-        let admitted = status.confirm_consumption(won);
-        authority.insert(token_id.clone(), status);
+        let admitted = consumption.finish(authority, won);
         if !admitted {
             return Err(CapabilityError::TokenAlreadyUsed {
                 token_id: token_id.to_string(),

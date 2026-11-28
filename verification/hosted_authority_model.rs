@@ -484,6 +484,30 @@ fn apply_consumption(status: &mut TokenStatus, won: bool) -> (admitted: bool)
     status.confirm_consumption(won)
 }
 
+/// Both CAS outcomes consume the addressed live token. A later attempt cannot win
+/// again, even when its caller presents a successful storage result.
+fn consume_marker_retry<K:Eq+std::hash::Hash+Clone>(
+    authority:&mut std::collections::HashMap<K,TokenStatus>,id:&K,peer:&K,won:bool,
+)
+    requires vstd::std_specs::hash::hash_map_inv(old(authority)),vstd::std_specs::hash::obeys_key_model::<K>(),
+        vstd::laws_eq::obeys_concrete_eq::<K>(),vstd::pervasive::obeys_clone_eq::<K>(), *peer != *id,
+{
+    let prior = crate::token_authority::status(authority,id);
+    let other = crate::token_authority::status(authority,peer);
+    let consume = crate::token_authority::Consumption::new(id);
+    let (namespace,target) = consume.address();
+    assert(namespace@ == "caps:used"@ && *target == *id);
+    let admitted = consume.finish(authority,won);
+    assert(admitted == (won && !prior.revoked() && !prior.used()));
+    let completed = crate::token_authority::status(authority,target);
+    assert(completed.used() && completed.revoked() == prior.revoked());
+    let retry = crate::token_authority::Consumption::new(target);
+    let repeated = retry.finish(authority,true);
+    assert(!repeated);
+    let unchanged = crate::token_authority::status(authority,peer);
+    assert(store_state(unchanged) == store_state(other));
+}
+
 /// The store's admission decision is the model's admission predicate.
 fn store_admission(status: TokenStatus, single_use: bool) -> (allowed: bool)
     ensures allowed == grant_admits(store_state(status), single_use),

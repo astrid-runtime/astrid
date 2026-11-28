@@ -25,6 +25,17 @@ def consumer_defects():
             lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
         )
     for label, clause in [
+        ("CAS address", "*out.1 == self.target()"),
+        ("admission", "admitted == (won && !revoked && !used)"),
+        ("live consumption", "final(authority)@[id].used()"),
+        ("prior revocation", "final(authority)@[id].revoked() == revoked"),
+        ("peer isolation", "final(authority)@ == old(authority)@.insert(id,final(authority)@[id])"),
+    ]:
+        yield (
+            f"single-use completion loses {label}", AUTHORITY,
+            lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
+        )
+    for label, clause in [
         ("writer identity", "ensures spells(id@, text@),"),
         ("reader identity", "ensures forall|id: [u8; 16]| #[trigger] spells(id@, text@) ==> out == Some(id),"),
     ]:

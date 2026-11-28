@@ -41,6 +41,42 @@ pub(super) fn fence_revocation<'a, K: Eq + Hash + Clone>(
     Marker::Revoked.address(id)
 }
 
+/// Bind a single-use marker address to the live entry updated after the CAS.
+pub(super) struct Consumption<'a,K> {
+    id: &'a K,
+}
+
+impl<'a,K: Eq + Hash + Clone> Consumption<'a,K> {
+    pub(super) closed spec fn target(&self) -> K { *self.id }
+
+    pub(super) fn new(id:&'a K) -> (out:Self)
+        ensures out.target() == *id,
+    { Self { id } }
+
+    pub(super) fn address(&self) -> (out:(&'static str,&'a K))
+        ensures out.0@ == "caps:used"@, *out.1 == self.target(),
+    { Marker::Consumed.address(self.id) }
+
+    pub(super) fn finish(self,authority:&mut HashMap<K,TokenStatus>,won:bool) -> (admitted:bool)
+        requires hash_map_inv(old(authority)),obeys_key_model::<K>(),vstd::laws_eq::obeys_concrete_eq::<K>(),
+            vstd::pervasive::obeys_clone_eq::<K>(),
+        ensures hash_map_inv(final(authority)), ({
+            let id = self.target();
+            let revoked = old(authority)@.contains_key(id) && old(authority)@[id].revoked();
+            let used = old(authority)@.contains_key(id) && old(authority)@[id].used();
+            &&& admitted == (won && !revoked && !used)
+            &&& final(authority)@.contains_key(id) && final(authority)@[id].used()
+            &&& final(authority)@[id].revoked() == revoked
+            &&& final(authority)@ == old(authority)@.insert(id,final(authority)@[id])
+        }),
+    {
+        let key = self.id.clone();
+        assert(vstd::pervasive::cloned(*self.id,key));
+        let slot = authority.entry(key).or_insert(TokenStatus::recover(false,false));
+        slot.confirm_consumption(won)
+    }
+}
+
 /// Rebuild the complete live map before the store becomes available.
 pub(super) fn recover_authority<K: Eq + Hash>(
     recorded: HashMap<K, Vec<Marker>>,
