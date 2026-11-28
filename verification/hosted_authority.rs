@@ -276,6 +276,8 @@ mod hosted_duplicate_recovery;
 mod hosted_record_roundtrip;
 mod hosted_closure_model;
 
+#[path = "../crates/astrid-storage/src/engine/durable/group/receipt.rs"]
+mod group_receipt;
 #[path = "../crates/astrid-storage/src/engine/durable/frontier.rs"]
 mod group_frontier;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"]

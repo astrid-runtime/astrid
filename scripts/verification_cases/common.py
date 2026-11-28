@@ -243,6 +243,7 @@ INPUTS = [
     OVERLAY,
     KV_ENCODING,
     GUEST_AUTHORITY,
+    Path("crates/astrid-storage/src/engine/durable/group/receipt.rs"),
     Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),

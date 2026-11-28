@@ -335,6 +335,70 @@ fn complete_group<B,D,T,E,P,F>(batch: B, persist: P, advance: F)
     staged.publish(advance)
 }
 
+struct ReceiptTrace {sent:Ghost<Seq<(u64,Result<u64,u64>)>>}
+
+impl crate::group_receipt::Delivery<u64,Result<u64,u64>> for ReceiptTrace {
+    closed spec fn sent(&self) -> Seq<(u64,Result<u64,u64>)> {self.sent@}
+    fn send(&mut self,receipt:u64,result:Result<u64,u64>) {
+        self.sent = Ghost(self.sent@.push((receipt,result)));
+    }
+}
+
+fn deliver_group<D,E,P,F>(batch:Vec<(u64,Result<u64,u64>)>,persist:P,advance:F)
+    where P:FnOnce(&Vec<(u64,Result<u64,u64>)>)->Result<D,E>,F:FnOnce(D)->Result<(),E>,
+    requires persist.requires((&batch,)),
+        forall|d:D| #[trigger] persist.ensures((&batch,),Ok(d)) ==> advance.requires((d,)),
+{
+    let ghost original = batch@;
+    if let Ok((released,())) = complete_group(batch,persist,advance) {
+        let mut trace = ReceiptTrace {sent:Ghost(Seq::empty())};
+        crate::group_receipt::deliver(&mut trace,released);
+        assert(trace.sent@ =~= original);
+    }
+}
+
+// A prior rejected request, the current published root, and an unsuccessful
+// peer all share one completion vector without exchanging receipts.
+fn mixed_receipts(prior:u64,submitted:u64,peer:u64,root:u64,error:u64) {
+    use crate::group_receipt::Accepted;
+    let mut done = vec![(prior,Err(error))];
+    let first = Accepted {prepared:root,receipt:submitted,observer:()};
+    first.published(&mut done,|r:u64| -> (o:u64) ensures o == r, {r});
+    let second = Accepted {prepared:(),receipt:peer,observer:()};
+    second.failed(&mut done,error);
+    let mut trace = ReceiptTrace {sent:Ghost(Seq::empty())};
+    crate::group_receipt::deliver(&mut trace,done);
+    assert(trace.sent@ =~= seq![(prior,Err(error)),(submitted,Ok(root)),(peer,Err(error))]);
+}
+
+// A completion replaces a pending leadership signal. Neither a second
+// completion nor a late promotion can replace the result before polling.
+fn receive_result<T>(first:T,late:T,after:T) {
+    use crate::group_receipt::{Action,Slot};
+    let mut slot = Slot::Waiting;
+    let empty = slot.poll();
+    assert(empty.is_none());
+    let promoted = slot.promote();
+    assert(promoted);
+    let duplicate = slot.promote();
+    assert(!duplicate);
+    let leadership = slot.poll();
+    assert(leadership == Some(Action::Lead));
+    let _ = slot.promote();
+    let ready = slot.complete(first);
+    assert(ready);
+    let overwrite = slot.complete(late);
+    let promote = slot.promote();
+    assert(!overwrite && !promote);
+    let received = slot.poll();
+    assert(received == Some(Action::Complete(first)));
+    let refill = slot.complete(after);
+    let reelect = slot.promote();
+    assert(!refill && !reelect);
+    let again = slot.poll();
+    assert(again.is_none());
+}
+
 /// An admitted live publication can be replayed from the prior root exactly
 /// once. A second replay sees the published version, even with the same digest
 /// as the prior generation.

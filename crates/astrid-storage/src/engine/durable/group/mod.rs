@@ -23,6 +23,7 @@ mod cache_admission_tests;
 #[cfg(test)]
 mod checkpoint_publication_tests;
 mod commit_cache;
+mod receipt;
 mod representations_maintenance;
 mod wal;
 
@@ -178,11 +179,8 @@ struct QueuedCommit<P> {
     observer: Option<Arc<dyn ProjectionObserver>>,
 }
 
-struct AcceptedCommit<P: Ord> {
-    prepared: Prepared<P>,
-    receipt: Arc<CommitReceipt>,
-    observer: Option<Arc<dyn ProjectionObserver>>,
-}
+type AcceptedCommit<P> =
+    receipt::Accepted<Prepared<P>, Arc<CommitReceipt>, Option<Arc<dyn ProjectionObserver>>>;
 
 #[derive(Clone, Copy)]
 struct PendingRepresentations<'a> {
@@ -205,50 +203,42 @@ impl<'a> PendingRepresentations<'a> {
     }
 }
 
-#[derive(Default)]
-struct ReceiptValue {
-    result: Option<Result<CommitOutcome, DurableError>>,
-    promoted: bool,
-}
+use receipt::Action as ReceiptAction;
 
 #[derive(Default)]
 struct CommitReceipt {
-    value: Mutex<ReceiptValue>,
+    value: Mutex<receipt::Slot<Result<CommitOutcome, DurableError>>>,
     ready: Condvar,
 }
 
-enum ReceiptAction {
-    Lead,
-    Complete(Result<CommitOutcome, DurableError>),
+struct WakeReceipts;
+
+impl receipt::Delivery<Arc<CommitReceipt>, Result<CommitOutcome, DurableError>> for WakeReceipts {
+    fn send(&mut self, receipt: Arc<CommitReceipt>, result: Result<CommitOutcome, DurableError>) {
+        receipt.complete(result);
+    }
 }
 
 impl CommitReceipt {
     fn complete(&self, result: Result<CommitOutcome, DurableError>) {
         let mut value = self.value.lock();
-        if value.result.is_none() {
-            value.promoted = false;
-            value.result = Some(result);
+        if value.complete(result) {
             self.ready.notify_one();
         }
     }
 
     fn promote(&self) {
         let mut value = self.value.lock();
-        if value.result.is_none() && !value.promoted {
-            value.promoted = true;
+        if value.promote() {
             self.ready.notify_one();
         }
     }
 
-    fn wait(&self) -> ReceiptAction {
+    fn wait(&self) -> ReceiptAction<Result<CommitOutcome, DurableError>> {
         let mut value = self.value.lock();
         loop {
-            if let Some(result) = value.result.take() {
-                return ReceiptAction::Complete(result);
-            }
-            if value.promoted {
-                value.promoted = false;
-                return ReceiptAction::Lead;
+            if let Some(action) = value.poll() {
+                return action;
             }
             self.ready.wait(&mut value);
         }
@@ -467,9 +457,7 @@ where
                 Err(error) => {
                     drop(inner);
                     complete_failed_group(&mut completions, accepted, error);
-                    for (receipt, result) in completions {
-                        receipt.complete(result);
-                    }
+                    receipt::deliver(&mut WakeReceipts, completions);
                     return;
                 },
             };
@@ -487,9 +475,7 @@ where
         // Releasing superseded value buffers can be expensive; the writer
         // must already be available to other principals.
         drop(retired_projections);
-        for (receipt, result) in completions {
-            receipt.complete(result);
-        }
+        receipt::deliver(&mut WakeReceipts, completions);
         self.warm_published_commits(published_commits);
         // Complete the batch before maintenance. New batches still serialize on
         // the same engine writer while a representation generation is replaced.
@@ -558,31 +544,29 @@ where
         match published {
             Ok((accepted, ())) => {
                 publication_poison.disarm();
-                for mut accepted in accepted {
-                    let (published, retired) =
-                        self.publish_durable_root(inner, &mut accepted.prepared);
-                    retired_projections.extend(retired);
-                    if let Some((id, payload)) = accepted.prepared.commit.take()
-                        && let Some(location) = inner.index.get(&id).copied()
-                        && inner.pending_wal.get_object(&id).is_none()
-                    {
-                        published_commits.insert(
-                            accepted.prepared.root.owner().clone(),
-                            PublishedCommitPayload {
-                                root: published,
-                                arena_generation: inner.arena_generation,
-                                location,
-                                payload,
-                            },
-                        );
-                    }
-                    completions.push((
-                        accepted.receipt,
-                        Ok(CommitOutcome {
+                for entry in accepted {
+                    entry.published(completions, |mut prepared| {
+                        let (published, retired) = self.publish_durable_root(inner, &mut prepared);
+                        retired_projections.extend(retired);
+                        if let Some((id, payload)) = prepared.commit.take()
+                            && let Some(location) = inner.index.get(&id).copied()
+                            && inner.pending_wal.get_object(&id).is_none()
+                        {
+                            published_commits.insert(
+                                prepared.root.owner().clone(),
+                                PublishedCommitPayload {
+                                    root: published,
+                                    arena_generation: inner.arena_generation,
+                                    location,
+                                    payload,
+                                },
+                            );
+                        }
+                        CommitOutcome {
                             root: published,
-                            objects_inserted: accepted.prepared.objects_inserted,
-                        }),
-                    ));
+                            objects_inserted: prepared.objects_inserted,
+                        }
+                    });
                 }
             },
             Err((accepted, error)) => {
@@ -899,10 +883,10 @@ fn complete_failed_group<P: Ord>(
 ) {
     let mut first = Some(error);
     for accepted in accepted {
-        completions.push((
-            accepted.receipt,
-            Err(first.take().unwrap_or(DurableError::RequiresRecovery)),
-        ));
+        accepted.failed(
+            completions,
+            first.take().unwrap_or(DurableError::RequiresRecovery),
+        );
     }
 }
 

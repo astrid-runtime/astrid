@@ -6,6 +6,23 @@ from .common import replace_once
 
 
 def consumer_defects():
+    receipt = Path("crates/astrid-storage/src/engine/durable/group/receipt.rs")
+    for label, original, weaker in [
+        ("published outcome", "#[trigger] publish.ensures((self.prepared,),out) &&", "true &&"),
+        ("published receipt", "final(done)@ == old(done)@.push((self.receipt,Ok(out)))", "final(done)@.len() == old(done)@.len()+1"),
+        ("failed receipt", "final(done)@ == old(done)@.push((self.receipt,Err(error)))", "final(done)@.len() == old(done)@.len()+1"),
+        ("first completion", "*final(self) == if notify {Self::Ready(result)} else {*old(self)}", "true"),
+        ("wake eligibility", "notify == (*old(self) is Waiting || *old(self) is Promoted)", "true"),
+        ("promotion", "*final(self) == if notify {Self::Promoted} else {*old(self)}", "true"),
+        ("leadership wake", "notify == (*old(self) is Waiting),", "true,"),
+        ("poll result", "out == match *old(self)", "true || out == match *old(self)"),
+        ("terminal state", "*final(self) == if *old(self) is Ready || *old(self) is Consumed {Self::Consumed} else {Self::Waiting}", "true"),
+        ("batch identity", "ensures final(sink).sent() == old(sink).sent() + batch@", "ensures final(sink).sent().len() == old(sink).sent().len() + batch.len()"),
+    ]:
+        yield (
+            f"group receipt loses {label}", receipt,
+            lambda s, a=original, b=weaker: replace_once(s, a, b), Path("verification/hosted_kv_model.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),
