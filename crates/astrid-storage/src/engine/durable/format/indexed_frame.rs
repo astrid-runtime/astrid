@@ -93,6 +93,49 @@ pub(super) fn coalesced(rows:&[(ObjectId,ArenaLocation)],first:usize,target:u64)
 
 type Row = (ObjectId,ArenaLocation);
 
+/// Order whole index entries by physical offset, retaining duplicate requests.
+#[verifier::loop_isolation(false)]
+pub(super) fn ordered(rows:&[Row]) -> (sorted:Vec<Row>)
+    ensures sorted@.to_multiset() == rows@.to_multiset(), sorted.len() == rows.len(),
+        forall|i:int,j:int| #![trigger sorted@[i],sorted@[j]]
+            0 <= i < j < sorted.len() ==> sorted@[i].1.offset <= sorted@[j].1.offset,
+{
+    let offset = |row:&Row| -> (key:u64) ensures key == row.1.offset { row.1.offset };
+    let mut entries = Vec::with_capacity(rows.len());
+    while entries.len() < rows.len()
+        invariant entries.len() <= rows.len(), entries@ == rows@.take(entries.len() as int),
+            forall|i:int| 0 <= i < entries.len() ==> offset.ensures((#[trigger] &rows@[i],),rows@[i].1.offset),
+        decreases rows.len()-entries.len(),
+    {
+        let row = &rows[entries.len()];
+        let key = offset(row);
+        assert(offset.ensures((&rows@[entries.len() as int],),rows@[entries.len() as int].1.offset));
+        entries.push((row.0,ArenaLocation {offset:key,..row.1}));
+        assert(entries@ =~= rows@.take(entries.len() as int));
+    }
+    assert(entries@ =~= rows@);
+    entries.as_mut_slice().sort_unstable_by_key(offset);
+    proof {
+        assert(entries@.to_multiset() == rows@.to_multiset());
+        rows@.to_multiset_ensures();
+        entries@.to_multiset_ensures();
+        assert forall|i:int| 0 <= i < entries.len() implies offset.ensures((#[trigger] &entries@[i],),entries@[i].1.offset) by {
+            let row = entries@[i];
+            assert(entries@.contains(row));
+            assert(entries@.to_multiset().count(row) > 0);
+            assert(rows@.to_multiset().count(row) > 0);
+            assert(rows@.contains(row));
+            let k = choose|k:int| 0 <= k < rows.len() && rows@[k] == row;
+            assert(offset.ensures((&rows@[k],),rows@[k].1.offset));
+        }
+        assert forall|i:int,j:int| #![trigger entries@[i],entries@[j]]
+            0 <= i < j < entries.len() implies entries@[i].1.offset <= entries@[j].1.offset by {
+            assert(vstd::std_specs::slice::key_le(offset,entries@[i],entries@[j]));
+        }
+    }
+    entries
+}
+
 pub(super) enum DispatchError<E> { Limit(ArenaLocation), Overflow, Visit(E) }
 
 pub(super) open spec fn batch(rows:Seq<Row>,lo:int,hi:int,limit:u64) -> bool {

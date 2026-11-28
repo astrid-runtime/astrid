@@ -97,8 +97,7 @@ pub(in crate::engine::durable) fn visit_indexed_objects<
     limits: RecoveryLimits,
     mut accept: impl FnMut(ObjectId, ArenaLocation, ObjectRecord, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
-    let mut ordered = requested.to_vec();
-    ordered.sort_unstable_by_key(|(_, location)| location.offset);
+    let ordered = super::indexed_frame::ordered(requested);
     #[cfg(test)]
     let spans = std::cell::Cell::new(0_usize);
     super::indexed_frame::dispatch(

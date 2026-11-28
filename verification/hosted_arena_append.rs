@@ -230,6 +230,7 @@ proof fn interval(fs:Seq<frame::PreparedFrame>,row:nat)
 
 /// The consumer accepts an arbitrary selected location in a multi-chunk
 /// batch, including when the original file starts at a nonzero offset.
+#[verifier::spinoff_prover]
 #[verifier::rlimit(20)]
 fn read_leaf<H:Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]>(
     fs:&[frame::PreparedFrame], row:usize, base:u64, batch_size:usize,
@@ -396,9 +397,10 @@ proof fn dispatched_prefix<V:Fn(Vec<IndexedRow>,&[IndexedRow],u64,u64)->Result<V
 
 /// Observe the production dispatcher's physical requests. The reader rejects
 /// any mismatched address or extent and may independently fail at one offset.
-fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>)
+fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -> (out:Option<Vec<IndexedRow>>)
     requires forall|i:int| 0 <= i < rows.len() ==> #[trigger] crate::indexed_frame::frame_end(rows@[i].1) <= u64::MAX,
         forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].1.payload_len <= limit,
+    ensures out matches Some(trace) ==> trace@ == rows@, fault.is_none() ==> out.is_some(),
 {
     use crate::indexed_frame::{dispatch,dispatched,frame_end,DispatchError};
     let visit = |before:Vec<IndexedRow>,part:&[IndexedRow],base:u64,size:u64| -> (out:Result<Vec<IndexedRow>,Option<usize>>)
@@ -431,7 +433,7 @@ fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>)
             dispatched_prefix(rows@,rows.len() as int,start,trace,limit,visit);
             assert(rows@.take(rows.len() as int) =~= rows@);
             assert(trace@ =~= rows@);
-        }},
+        } Some(trace)},
         Err(DispatchError::Visit(e)) => { proof {
             let (lo,prior) = choose|lo:int,state:Vec<IndexedRow>| 0 <= lo < rows.len() &&
                 #[trigger] dispatched(rows@,lo,start,state,limit,visit) &&
@@ -440,9 +442,37 @@ fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>)
             assert(prior@ =~= rows@.take(lo));
             assert(e == Some(lo as usize) && fault == Some(rows@[lo].1.offset));
             assert(exists|i:int| 0 <= i < rows.len() && e == Some(i as usize) && fault == Some(#[trigger] rows@[i].1.offset));
-        }},
-        Err(_) => { assert(false); },
+        } None},
+        Err(_) => { assert(false); None },
     }
+}
+
+/// Sorting preserves every occurrence before positional dispatch.
+fn ordered_dispatch(requested:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>)
+    requires forall|i:int| 0 <= i < requested.len() ==> #[trigger] crate::indexed_frame::frame_end(requested@[i].1) <= u64::MAX,
+        forall|i:int| 0 <= i < requested.len() ==> #[trigger] requested@[i].1.payload_len <= limit,
+{
+    use crate::indexed_frame::frame_end;
+    let rows = crate::indexed_frame::ordered(requested);
+    proof {
+        rows@.to_multiset_ensures();
+        requested@.to_multiset_ensures();
+        assert forall|i:int| 0 <= i < rows.len() implies
+            frame_end(#[trigger] rows@[i].1) <= u64::MAX && rows@[i].1.payload_len <= limit by {
+            let row = rows@[i];
+            assert(rows@.contains(row));
+            assert(rows@.to_multiset().count(row) > 0);
+            assert(requested@.to_multiset().count(row) > 0);
+            assert(requested@.contains(row));
+            let k = choose|k:int| 0 <= k < requested.len() && requested@[k] == row;
+            assert(frame_end(requested@[k].1) <= u64::MAX && requested@[k].1.payload_len <= limit);
+        }
+    }
+    if let Some(trace) = observe_dispatch(&rows,target,limit,fault) {
+        assert(trace@.to_multiset() == requested@.to_multiset());
+        assert forall|i:int,j:int| #![trigger trace@[i],trace@[j]] 0 <= i < j < trace.len()
+            implies trace@[i].1.offset <= trace@[j].1.offset by {};
+    } else { assert(fault.is_some()); }
 }
 
 /// Each successful positional read can cover exactly the next range of

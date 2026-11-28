@@ -390,6 +390,12 @@ fn coalesced_delivery_preserves_order_and_stops_at_the_first_failure() {
     let (outcome, seen) = visit(&requests, None, u64::MAX);
     outcome.unwrap();
     assert_eq!(seen, frames);
+    let duplicates = [requests[0], requests[2], requests[0], requests[1]];
+    let (outcome, seen) = visit(&duplicates, None, u64::MAX);
+    outcome.unwrap();
+    let mut expected = frames.clone();
+    expected.push(frames[2].clone());
+    assert_eq!(seen, expected);
     let (outcome, seen) = visit(&requests, Some(2), u64::MAX);
     assert!(matches!(outcome, Err(DurableError::EncodingOverflow)));
     assert_eq!(seen, frames[..2]);

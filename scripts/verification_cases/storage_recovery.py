@@ -36,6 +36,15 @@ def consumer_defects():
         )
     reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
     for label, clause, weaker in [
+        ("request multiplicity", "sorted@.to_multiset() == rows@.to_multiset(), sorted.len()", "true, sorted.len()"),
+        ("physical order", "sorted@[i].1.offset <= sorted@[j].1.offset", "sorted@[i].1.offset <= u64::MAX"),
+    ]:
+        yield (
+            f"ordered read input loses {label}", reader,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs"),
+        )
+    for label, clause, weaker in [
         ("initial state", "end == 0 && state == initial", "end == 0"),
         ("whole success prefix", "dispatched(rows@,rows.len() as int,initial,s,limit,visit)", "exists|end:int| #[trigger] dispatched(rows@,end,initial,s,limit,visit)"),
         ("span membership", "part@ == rows.subrange(lo,end) &&", "true &&"),
