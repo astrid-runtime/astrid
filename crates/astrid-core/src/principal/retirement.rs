@@ -78,6 +78,31 @@ pub fn restore_allowances<K: Eq + Hash, V, S: BuildHasher, G: BuildHasher>(
     fence(closed,receipt.principal);
 }
 
+/// Restore both allowance tables only when both exclusive borrows succeeded.
+///
+/// # Errors
+///
+/// Propagates the fence-table access error first, then the grant-table error.
+pub fn restore_accessible_allowances<K:Eq+Hash,V,S:BuildHasher,G:BuildHasher,E>(
+    receipt:RecoveredCapabilityFence<K>,closed:Result<&mut HashSet<K,S>,E>,
+    grants:Result<&mut HashMap<K,V,G>,E>,
+) -> (out:Result<(),E>)
+    requires builds_valid_hashers::<S>(), builds_valid_hashers::<G>(),
+        obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+        closed matches Ok(c) ==> hash_set_inv(c),
+        grants matches Ok(g) ==> hash_map_inv(g),
+    ensures out == match closed {Err(e)=>Err(e),Ok(_)=>match grants {Err(e)=>Err(e),Ok(_)=>Ok(())}},
+        closed matches Ok(c) ==> hash_set_inv(final(c)) &&
+            final(c)@ == if out.is_ok() {c@.insert(receipt.owner())} else {c@},
+        grants matches Ok(g) ==> hash_map_inv(final(g)) &&
+            final(g)@ == if out.is_ok() {g@.remove(receipt.owner())} else {g@},
+{
+    let closed = closed?;
+    let grants = grants?;
+    restore_allowances(receipt,closed,grants);
+    Ok(())
+}
+
 /// Reopen only the named principal after reclamation.
 pub fn release<K: Eq + Hash, S: BuildHasher>(set: &mut HashSet<K,S>, principal: &K)
     requires builds_valid_hashers::<S>(), hash_set_inv(old(set)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),

@@ -396,15 +396,34 @@ impl RetirementSink<u64> for StartupStores {
 
     fn restore(&mut self,k:u64) -> (r:Result<(),u64>) {
         let receipt = crate::principal_fences::restore_capability(&mut self.inner.capabilities,k);
-        if k == 7 {
-            self.failed = Some(k);
-            self.calls = Ghost(self.calls@.push((k,Some(k))));
-            return Err(k);
+        let grants = if k == 7 {Err(k)} else {Ok(&mut self.inner.grants)};
+        if let Err(e) = crate::principal_fences::restore_accessible_allowances(
+            receipt,Ok(&mut self.inner.allowances),grants,
+        ) {
+            self.failed = Some(e);
+            self.calls = Ghost(self.calls@.push((k,Some(e))));
+            return Err(e);
         }
-        crate::principal_fences::restore_allowances(receipt,&mut self.inner.allowances,&mut self.inner.grants);
         self.calls = Ghost(self.calls@.push((k,None)));
         Ok(())
     }
+}
+
+// Exercise both exclusive-access results, including distinct simultaneous failures.
+fn restore_with_poison(closed:&mut HashSet<u64>,grants:&mut HashMap<u64,u64>,cap:&mut HashSet<u64>,
+    alias:u64,bad_fence:bool,bad_grants:bool)
+    requires hash_set_inv(old(closed)),hash_set_inv(old(cap)),hash_map_inv(old(grants)),
+{
+    let receipt = crate::principal_fences::restore_capability(cap,alias);
+    let ghost before = closed@;
+    let ghost buckets = grants@;
+    let fence_access = if bad_fence {Err(1u8)} else {Ok(&mut *closed)};
+    let grant_access = if bad_grants {Err(2u8)} else {Ok(&mut *grants)};
+    let out = crate::principal_fences::restore_accessible_allowances(receipt,fence_access,grant_access);
+    assert(cap@.contains(alias));
+    assert(out == (if bad_fence {Err(1u8)} else if bad_grants {Err(2u8)} else {Ok(())}));
+    assert(closed@ == if out.is_ok() {before.insert(alias)} else {before});
+    assert(grants@ == if out.is_ok() {buckets.remove(alias)} else {buckets});
 }
 
 type PublishedAllowances = (HashSet<u64>,HashMap<u64,u64>);

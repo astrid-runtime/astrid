@@ -6,6 +6,20 @@ from .common import replace_once
 
 
 def consumer_defects():
+    fences = Path("crates/astrid-core/src/principal/retirement.rs")
+    for label, clause, weaker in [
+        ("error precedence", "out == match closed {Err(e)=>Err(e),Ok(_)=>match grants {Err(e)=>Err(e),Ok(_)=>Ok(())}}", "out.is_ok() == (closed.is_ok() && grants.is_ok())"),
+        ("successful access", "out == match closed {Err(e)=>Err(e),Ok(_)=>match grants {Err(e)=>Err(e),Ok(_)=>Ok(())}}", "out.is_ok() ==> closed.is_ok() && grants.is_ok()"),
+        ("capability owner", "{c@.insert(receipt.owner())}", "{final(c)@}"),
+        ("fence on error", "else {c@}", "else {final(c)@}"),
+        ("grant owner", "{g@.remove(receipt.owner())}", "{final(g)@}"),
+        ("grants on error", "else {g@}", "else {final(g)@}"),
+    ]:
+        yield (
+            f"exclusive allowance restore loses {label}", fences,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_retirement_recovery.rs"),
+        )
     publication = Path("crates/astrid-kernel/src/authority_recovery/publication.rs")
     for label, clause, weaker in [
         ("ownership read error", "Err(e) => out == Err(e)", "Err(e) => true"),

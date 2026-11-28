@@ -557,3 +557,52 @@ fn test_store_debug() {
     assert!(debug.contains("AllowanceStore"));
     assert!(debug.contains("count"));
 }
+
+#[test]
+fn retirement_restore_requires_both_unpoisoned_tables() {
+    fn poison<T>(lock: &RwLock<T>) {
+        let result = std::panic::catch_unwind(|| {
+            let _guard = lock.write().unwrap();
+            panic!("poison the private allowance table");
+        });
+        assert!(result.is_err());
+        assert!(lock.is_poisoned());
+    }
+
+    for (bad_fences, bad_grants) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut store = AllowanceStore::new();
+        for owner in [alice(), bob()] {
+            store
+                .add_allowance(make_allowance_for(
+                    owner,
+                    AllowancePattern::ServerTools {
+                        server: "fs".into(),
+                    },
+                    true,
+                ))
+                .unwrap();
+        }
+        if bad_fences {
+            poison(&store.retiring_principals);
+        }
+        if bad_grants {
+            poison(&store.allowances);
+        }
+        let mut capabilities = HashSet::new();
+        let receipt = retirement::restore_capability(&mut capabilities, alice());
+        let result = store.restore_principal_retirement(receipt);
+        let restored = !bad_fences && !bad_grants;
+        assert_eq!(result.is_ok(), restored);
+        if let Err(error) = result {
+            assert!(matches!(error, ApprovalError::Storage(_)));
+        }
+        let fences = store
+            .retiring_principals
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(fences.contains(&alice()), restored);
+        assert!(!fences.contains(&bob()));
+        assert_eq!(store.count_for(&alice()), usize::from(!restored));
+        assert_eq!(store.count_for(&bob()), 1);
+    }
+}

@@ -290,13 +290,12 @@ impl AllowanceStore {
         let closed = self
             .retiring_principals
             .get_mut()
-            .map_err(|e| ApprovalError::Storage(e.to_string()))?;
+            .map_err(|e| ApprovalError::Storage(e.to_string()));
         let grants = self
             .allowances
             .get_mut()
-            .map_err(|e| ApprovalError::Storage(e.to_string()))?;
-        retirement::restore_allowances(receipt, closed, grants);
-        Ok(())
+            .map_err(|e| ApprovalError::Storage(e.to_string()));
+        retirement::restore_accessible_allowances(receipt, closed, grants)
     }
 
     /// Release an in-process retirement fence after durable reclamation.
