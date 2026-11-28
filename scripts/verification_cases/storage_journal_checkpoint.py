@@ -21,3 +21,18 @@ def consumer_defects():
             f"checkpointed journal loses {label}", source,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), consumer,
         )
+
+    reader = Path("crates/astrid-storage/src/engine/durable/frame_repair.rs")
+    restart = Path("verification/hosted_acknowledged_root.rs")
+    for label, source, clause, weaker, target in [
+        ("header bytes", reader, "bytes@==old(self).image().subrange(old(self).position(),final(self).position()),\n            out matches Err(e) ==> old(self).failed(old(self).position(),52,e);", "true,\n            out matches Err(e) ==> old(self).failed(old(self).position(),52,e);", restart),
+        ("payload bytes", reader, "bytes@==old(reader).image().subrange(old(reader).position(),final(reader).position()) &&", "true &&", restart),
+        ("valid checksum", reader, "(exists|b:&[u8]| b@==bytes@ && #[trigger] hash.ensures((magic,header.payload_len,b),header.checksum)),", "true,", restart),
+        ("checksum refusal", reader, "sum!=header.checksum && #[trigger] hash.ensures", "#[trigger] hash.ensures", restart),
+        ("restart history", restart, "prior.insert(key,(next,start))} else {prior}", "final(restart)@} else {prior}", consumer),
+        ("conflicting restart", restart, "result matches Some(accepted) ==> accepted==(actual==expected && next.generation.value()==generation)", "result matches Some(accepted) ==> ((actual==expected && next.generation.value()==generation) ==> accepted)", consumer),
+    ]:
+        yield (
+            f"cold journal replay loses {label}", source,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
+        )

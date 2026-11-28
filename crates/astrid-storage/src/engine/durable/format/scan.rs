@@ -8,7 +8,7 @@ use super::{
     frame_checksum, frame_checksum_hasher, io_error, read_exact_at, scan_frames_with_source,
     validate_positioned_header, validate_positioned_payload,
 };
-use crate::engine::durable::frame_repair::{self, Damage};
+use crate::engine::durable::frame_repair::{self, Damage, FrameReader};
 
 /// Successful scans leave the cursor at the current append boundary. After
 /// an error the cursor is unspecified: callers must abandon or reposition the
@@ -320,10 +320,7 @@ where
             )?;
             break;
         }
-        let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-        reader
-            .read_exact(&mut header)
-            .map_err(|source| io_error("read durable frame header", source))?;
+        let header = reader.header()?;
         if !arena_frame::magic_matches(&header, magic) {
             repair_tail(
                 get_file(reader),
@@ -370,8 +367,8 @@ where
                     break;
                 },
             };
-        let payload = read_frame_payload(reader, payload_len)?;
-        if arena_frame::check_payload(decoded, magic, &payload, frame_checksum).is_err() {
+        let Some(payload) = frame_repair::read_payload(reader, decoded, magic, frame_checksum)?
+        else {
             repair_tail(
                 get_file(reader),
                 policy,
@@ -382,26 +379,35 @@ where
                 corrupt(file_name, offset, "frame checksum mismatch"),
             )?;
             break;
-        }
+        };
         accept(offset, &payload, get_file(reader))?;
         offset = frame_end;
     }
     Ok(())
 }
 
-fn read_frame_payload<F: std::io::Read>(
-    file: &mut F,
-    payload_len: u64,
-) -> Result<Vec<u8>, DurableError> {
-    let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(payload_usize)
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    payload.resize(payload_usize, 0);
-    file.read_exact(&mut payload)
-        .map_err(|source| io_error("read durable frame payload", source))?;
-    Ok(payload)
+impl<R: std::io::Read> FrameReader for std::io::BufReader<R> {
+    type Error = DurableError;
+
+    fn header(&mut self) -> Result<[u8; FRAME_HEADER_LEN_USIZE], DurableError> {
+        let mut bytes = [0; FRAME_HEADER_LEN_USIZE];
+        self.read_exact(&mut bytes)
+            .map_err(|source| io_error("read durable frame header", source))?;
+        Ok(bytes)
+    }
+
+    fn payload(&mut self, payload_len: u64) -> Result<Vec<u8>, DurableError> {
+        let payload_usize =
+            usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_usize)
+            .map_err(|_| DurableError::EncodingOverflow)?;
+        payload.resize(payload_usize, 0);
+        self.read_exact(&mut payload)
+            .map_err(|source| io_error("read durable frame payload", source))?;
+        Ok(payload)
+    }
 }
 
 struct RepairMedia<'a, F> {

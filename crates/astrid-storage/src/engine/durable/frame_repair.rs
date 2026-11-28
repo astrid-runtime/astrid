@@ -48,6 +48,47 @@ pub(super) fn extent(offset:u64,end:u64,len:u64,limit:u64) -> (out:Extent)
     }
 }
 
+/// The logical cursor excludes read-ahead held by the underlying buffered reader.
+pub(super) trait FrameReader {
+    type Error;
+    spec fn image(&self) -> Seq<u8>;
+    spec fn position(&self) -> int;
+    spec fn target(&self) -> (int,Seq<u8>);
+    spec fn failed(&self,at:int,size:u64,e:Self::Error) -> bool;
+    fn header(&mut self) -> (out:Result<[u8;52],Self::Error>)
+        ensures final(self).image()==old(self).image(),final(self).target()==old(self).target(),
+            out matches Ok(bytes) ==> final(self).position()==old(self).position()+52 &&
+                bytes@==old(self).image().subrange(old(self).position(),final(self).position()),
+            out matches Err(e) ==> old(self).failed(old(self).position(),52,e);
+    fn payload(&mut self,size:u64) -> (out:Result<Vec<u8>,Self::Error>)
+        ensures final(self).image()==old(self).image(),final(self).target()==old(self).target(),
+            out matches Ok(bytes) ==> bytes.len()==size && final(self).position()==old(self).position()+size &&
+                bytes@==old(self).image().subrange(old(self).position(),final(self).position()),
+            out matches Err(e) ==> old(self).failed(old(self).position(),size,e);
+}
+
+/// Pass the bytes read for this header to the scanner only after its checksum agrees.
+pub(super) fn read_payload<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
+    reader:&mut R,header:super::arena_frame::DecodedFrameHeader,magic:[u8;8],hash:H)
+    -> (out:Result<Option<Vec<u8>>,R::Error>)
+    requires forall|b:&[u8]| #[trigger] hash.requires((magic,header.payload_len,b)),
+    ensures final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),
+        out.is_ok() ==> final(reader).position()==old(reader).position()+header.payload_len,
+        out matches Err(e) ==> old(reader).failed(old(reader).position(),header.payload_len,e),
+        out matches Ok(Some(bytes)) ==> bytes.len()==header.payload_len &&
+            bytes@==old(reader).image().subrange(old(reader).position(),final(reader).position()) &&
+            (exists|b:&[u8]| b@==bytes@ && #[trigger] hash.ensures((magic,header.payload_len,b),header.checksum)),
+        out matches Ok(None) ==> exists|b:&[u8],sum:[u8;32]| b@==old(reader).image().subrange(old(reader).position(),final(reader).position()) &&
+            b.len()==header.payload_len && sum!=header.checksum && #[trigger] hash.ensures((magic,header.payload_len,b),sum),
+{
+    let bytes=reader.payload(header.payload_len)?;
+    let b=bytes.as_slice();
+    match super::arena_frame::check_payload(header,magic,b,hash) {
+        Ok(_)=>Ok(Some(bytes)),
+        Err(_)=>Ok(None),
+    }
+}
+
 #[derive(Clone,Copy)]
 pub(super) enum Damage { Incomplete, Suspect { known_interior:bool } }
 

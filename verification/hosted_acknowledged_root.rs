@@ -41,6 +41,80 @@ pub(super) fn parse_written(body:&[u8],name:&[u8],scheme:root_wire::Scheme,expec
     out
 }
 
+/// Consume the final canonical frame from the buffered reader at its actual
+/// offset. The restart history may disagree with the history used for WAL replay.
+pub(crate) fn read_recovered_root<R:crate::frame_repair::FrameReader,P:Ord+Copy,K:FnOnce(Owner)->P,N:FnOnce(&P)->Owner,
+    H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(reader:&mut R,start:u64,end:u64,limit:u64,
+    owner:Owner,key:P,key_of:K,name_of:N,scheme:root_wire::Scheme,expected:Option<RootState>,next:RootState,
+    hash:H,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,recorded:Ghost<[u8;32]>,restart:&mut BTreeMap<P,(RootState,u64)>) -> (result:Option<bool>)
+    requires old(reader).position()==start,end==old(reader).image().len(),({
+        let payload=journal::wire(owner.bytes(),scheme,expected,next);
+        let header=arena_frame::header_bytes(arena_frame::ROOT_MAGIC,arena_frame::FRAME_VERSION,payload.len() as u64,recorded@);
+        &&& start as int+52+payload.len()==end && payload.len()<=limit
+        &&& old(reader).image().subrange(start as int,end as int)==header+payload
+    }),
+        forall|r:R,e:R::Error| r.target()==old(reader).target() ==>
+            !#[trigger] r.failed(start as int,52,e),
+        forall|r:R,e:R::Error| r.target()==old(reader).target() ==> !#[trigger] r.failed(start as int+52,journal::wire(owner.bytes(),scheme,expected,next).len() as u64,e),
+        btree_map_inv(old(restart)),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        forall|o:Owner| o.bytes()==owner.bytes() ==> #[trigger] key_of.requires((o,)),
+        forall|o:Owner,p:P| o.bytes()==owner.bytes() && #[trigger] key_of.ensures((o,),p) ==> p==key,
+        name_of.requires((&key,)),forall|o:Owner| #[trigger] name_of.ensures((&key,),o) ==> o.bytes()==owner.bytes(),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((arena_frame::ROOT_MAGIC,n,b)),
+        forall|b:&[u8],sum:[u8;32]| #[trigger] hash.ensures((arena_frame::ROOT_MAGIC,b.len() as u64,b),sum) ==> sum==(digest@)(b@),
+    ensures btree_map_inv(final(restart)),final(reader).target()==old(reader).target(),
+        final(reader).position()==end && final(reader).image()==old(reader).image(), ({
+            let prior=old(restart)@;
+            let actual=if prior.contains_key(key) {Some(prior[key].0)} else {None};
+            let generation=match actual {None=>0int,Some(r)=>r.generation.value() as int+1};
+            &&& result.is_none()==(recorded@!=(digest@)(journal::wire(owner.bytes(),scheme,expected,next)))
+            &&& result matches Some(accepted) ==> accepted==(actual==expected && next.generation.value()==generation)
+            &&& final(restart)@==if result==Some(true) {prior.insert(key,(next,start))} else {prior}
+        }),
+{
+    use crate::arena_frame::{FRAME_VERSION,ROOT_MAGIC};
+    let ghost wire=journal::wire(owner.bytes(),scheme,expected,next);
+    let ghost hdr=arena_frame::header_bytes(ROOT_MAGIC,FRAME_VERSION,wire.len() as u64,recorded@);
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();assert(hdr.len()==52);}
+    let ghost before=*reader;
+    let h=match reader.header() {Ok(h)=>h,Err(e)=>{assert(before.failed(start as int,52,e));assert(false);unreached()}};
+    proof {
+        assert(h@ =~= hdr);
+        assert(h@.take(8) =~= ROOT_MAGIC@);
+        assert(h@.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(wire.len() as u64));
+        assert(h@.subrange(20,52) =~= recorded@@);
+    }
+    if !arena_frame::magic_matches(&h,ROOT_MAGIC) {assert(false);unreached()}
+    let decoded=match arena_frame::decode_header(&h,FRAME_VERSION) {Ok(d)=>d,Err(_)=>{assert(false);unreached()}};
+    assert(decoded.checksum =~= recorded@);
+    let frame_end=match crate::frame_repair::extent(start,end,decoded.payload_len,limit) {
+        crate::frame_repair::Extent::Complete(at)=>at,_=>{assert(false);unreached()}
+    };
+    proof {
+        assert(decoded.payload_len==wire.len());
+        assert(frame_end==end);
+        let tail=reader.image().subrange(start as int,end as int);
+        assert(tail.skip(52) =~= wire);
+        assert(reader.image().subrange(start as int+52,frame_end as int) =~= tail.skip(52));
+    }
+    let bytes=match crate::frame_repair::read_payload(reader,decoded,ROOT_MAGIC,hash) {
+        Ok(Some(v))=>v,Ok(None)=>return None,Err(_)=>{assert(false);unreached()}
+    };
+    proof {
+        let b=choose|b:&[u8]| b@==bytes@ && #[trigger] hash.ensures((ROOT_MAGIC,decoded.payload_len,b),decoded.checksum);
+        assert(b@==wire);
+        assert(hash.ensures((ROOT_MAGIC,b.len() as u64,b),decoded.checksum));
+        assert(decoded.checksum==(digest@)(b@));
+        assert(recorded@==(digest@)(wire));
+    }
+    let name=owner.encode();
+    let record=parse_written(&bytes,&name,scheme,expected,next);
+    let decode=|n:&[u8]| -> (r:Option<P>) requires n@==name@, ensures r==Some(key),
+        {Some(key_of(owner_codec::decode(n).unwrap()))};
+    let recode=|p:&P| -> (r:Vec<u8>) requires *p==key, ensures r@==name@, {name_of(p).encode()};
+    Some(record.replay(restart,scheme,start,&bytes,decode,recode).is_ok())
+}
+
 spec fn stored(name:Seq<u8>,scheme:root_wire::Scheme,e:Option<RootState>,r:RootState,magic:[u8;8],version:u16,
     digest:spec_fn([u8;8],u64,Seq<u8>)->[u8;32]) -> Seq<u8> {
     let payload=journal::wire(name,scheme,e,r);

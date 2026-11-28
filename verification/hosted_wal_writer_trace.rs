@@ -493,15 +493,16 @@ fn durable_journal_fold<J:crate::arena_frame::BatchFile,S:crate::group_frontier:
 /// supplied by recovery. Joining those handles preserves the actual journal identity
 /// and its image after the writer has appended the frame.
 fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,
-    Open:FnOnce(&S)->M,H,F,P:Ord+Copy,K:FnOnce(Owner)->P,N:FnOnce(&P)->Owner,
+    Open:FnOnce(&S)->M,H,F,P:Ord+Copy,K:FnOnce(Owner)->P+Copy,N:FnOnce(&P)->Owner+Copy,
     A:crate::recovery_barrier::Files,Join:FnOnce(&J)->A,W:Copy,C:crate::group_frontier::ResizeWal,
-    Bind:FnOnce(W,&A)->C,R:FnOnce(C)->Result<C,C::Error>>(
+    Bind:FnOnce(W,&A)->C,R:FnOnce(C)->Result<C,C::Error>,U:crate::frame_repair::FrameReader,Roots:FnOnce(&C)->(U,u64)>(
     sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,expected:Option<RootState>,replacement:RootState,
     chunk:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
     sink:S,base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,key_of:K,name_of:N,key:P,
-    history:&mut BTreeMap<P,(RootState,u64)>,mut file:J,journal_digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
-    join:Join,wal:W,bind:Bind,rewind:R,wal_target:Ghost<spec_fn(W)->(int,Seq<u8>)>)
-    -> (out:Option<Result<Result<C,crate::group_frontier::CheckpointError<C::Error>>,crate::recovery_barrier::Error<A::Error>>>)
+    history:&mut BTreeMap<P,(RootState,u64)>,initial_journal:J,journal_digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
+    join:Join,wal:W,bind:Bind,rewind:R,wal_target:Ghost<spec_fn(W)->(int,Seq<u8>)>,
+    start:u64,limit:u64,open_roots:Roots,restart:&mut BTreeMap<P,(RootState,u64)>)
+    -> (out:Option<Result<Result<(C,bool),crate::group_frontier::CheckpointError<C::Error>>,crate::recovery_barrier::Error<A::Error>>>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
     requires sequence!=0,begin.len() as int+138+288<=usize::MAX,
         sink.at_end(),sink.buffered_image().len()==base,base as int+begin.len()+138+288<=u64::MAX,
@@ -519,11 +520,11 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
         name_of.requires((&key,)),forall|o:Owner| #[trigger] name_of.ensures((&key,),o) ==> o.bytes()==owner.bytes(),
         forall|o:Owner| o.bytes()==owner.bytes() ==> #[trigger] key_of.requires((o,)),
         forall|o:Owner,p:P| o.bytes()==owner.bytes() && #[trigger] key_of.ensures((o,),p) ==> p==key,
-        file.image().len()<=u64::MAX,
-        forall|e:J::Error| !#[trigger] file.seek_failed(e),
-        forall|e:J::Error| !#[trigger] J::write_failed(file.target(),e),
+        initial_journal.image().len()<=u64::MAX,
+        forall|e:J::Error| !#[trigger] initial_journal.seek_failed(e),
+        forall|e:J::Error| !#[trigger] J::write_failed(initial_journal.target(),e),
         forall|b:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::arena_frame::ROOT_MAGIC,b.len() as u64,b),v) ==> v==(journal_digest@)(b@),
-        file.target()!=sink.wal_target(),(wal_target@)(wal)==sink.wal_target(),
+        initial_journal.target()!=sink.wal_target(),(wal_target@)(wal)==sink.wal_target(),
         forall|j:&J| #[trigger] join.requires((j,)),
         forall|j:&J,a:A| #[trigger] join.ensures((j,),a) ==> a.roots_target()==j.target() &&
             a.pending().get(crate::recovery_barrier::Target::Roots)==Some(j.image()) &&
@@ -538,6 +539,17 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
         forall|c:C,r:C| #[trigger] rewind.ensures((c,),Ok(r)) ==> r.wal_target()==c.wal_target() && r.roots_target()==c.roots_target() &&
             r.volume_wal()==c.volume_wal() && r.canonical_pending()==c.canonical_pending() &&
             r.canonical_stable()==c.canonical_stable() && r.buffered_image()==c.buffered_image(),
+        btree_map_inv(old(restart)),start==initial_journal.image().len(),
+        start as int+52+crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement).len()<=u64::MAX,
+        crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement).len()<=limit,
+        forall|c:&C| c.roots_target()==initial_journal.target() && c.canonical_stable().contains_key(crate::recovery_barrier::Target::Roots) &&
+            start<=c.canonical_stable()[crate::recovery_barrier::Target::Roots].len()<=u64::MAX ==> #[trigger] open_roots.requires((c,)),
+        forall|c:&C,pair:(U,u64)| #[trigger] open_roots.ensures((c,),pair) ==>
+            open_roots.requires((c,)) ==> pair.0.target()==c.roots_target() && pair.0.position()==start &&
+            Some(pair.0.image())==c.canonical_stable().get(crate::recovery_barrier::Target::Roots) &&
+            pair.1==pair.0.image().len(),
+        forall|r:U,e:U::Error| r.target()==initial_journal.target() ==> !#[trigger] r.failed(start as int,52,e),
+        forall|r:U,e:U::Error| r.target()==initial_journal.target() ==> !#[trigger] r.failed(start as int+52,crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement).len() as u64,e),
     ensures ({
         let prior=old(history)@;
         let current=if prior.contains_key(key) {Some(prior[key].0)} else {None};
@@ -545,17 +557,40 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
         let applied=current==expected && current!=Some(replacement) && replacement.generation.value()==generation;
         let wire=crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement);
         let header=crate::arena_frame::header_bytes(crate::arena_frame::ROOT_MAGIC,crate::arena_frame::FRAME_VERSION,wire.len() as u64,(journal_digest@)(wire));
+        let earlier=old(restart)@;
+        let cold=if earlier.contains_key(key) {Some(earlier[key].0)} else {None};
         &&& out.is_some()==applied
         &&& final(history)@==if applied {prior.insert(key,(replacement,(base as int+72+begin.len()) as u64))} else {prior}
-        &&& out matches Some(Ok(Ok(c))) ==> c.roots_target()==file.target() && c.wal_target()==sink.wal_target() && c.stable_image()==Seq::<u8>::empty() &&
-            c.canonical_stable().get(crate::recovery_barrier::Target::Roots)==Some(file.image()+header+wire)
+        &&& btree_map_inv(final(restart))
+        &&& final(restart)@==if out matches Some(Ok(Ok((_,true)))) {earlier.insert(key,(replacement,start))} else {earlier}
+        &&& out matches Some(Ok(Ok((c,accepted)))) ==> accepted==(cold==expected) && c.roots_target()==initial_journal.target() && c.wal_target()==sink.wal_target() && c.stable_image()==Seq::<u8>::empty() &&
+            c.canonical_stable().get(crate::recovery_barrier::Target::Roots)==Some(initial_journal.image()+header+wire)
     }),
 {
+    let mut file=initial_journal;
     let decision=durable_journal_fold(sequence,begin,owner,scheme,expected,replacement,chunk,hash,checksum,finish,digest,
         sink,base,reopen,target,key_of,name_of,key,history,&mut file,journal_digest)?;
     if let Decision::Applied(_)=decision {
         let mut files=join(&file);
-        Some(crate::hosted_recovery_barrier::recovered_checkpoint(&mut files,wal,bind,rewind,wal_target))
+        match crate::hosted_recovery_barrier::recovered_checkpoint(&mut files,wal,bind,rewind,wal_target) {
+            Err(e)=>Some(Err(e)),
+            Ok(Err(e))=>Some(Ok(Err(e))),
+            Ok(Ok(c))=>{
+                let ghost payload=crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement);
+                proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+                let (mut reader,end)=open_roots(&c);
+                proof {
+                    let wire=crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement);
+                    let header=crate::arena_frame::header_bytes(crate::arena_frame::ROOT_MAGIC,crate::arena_frame::FRAME_VERSION,wire.len() as u64,(journal_digest@)(wire));
+                    vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+                    assert(header.len()==52);
+                    assert(reader.image().subrange(start as int,end as int) =~= header+wire);
+                }
+                let accepted=crate::hosted_acknowledged_root::read_recovered_root(&mut reader,start,end,limit,
+                    owner,key,key_of,name_of,scheme,expected,replacement,hash,journal_digest,Ghost((journal_digest@)(payload)),restart).unwrap();
+                Some(Ok(Ok((c,accepted))))
+            },
+        }
     } else { None }
 }
 
