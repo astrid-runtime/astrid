@@ -23,6 +23,8 @@ mod cache_admission_tests;
 #[cfg(test)]
 mod checkpoint_publication_tests;
 mod commit_cache;
+#[cfg(test)]
+mod leader_lease_tests;
 mod receipt;
 mod representations_maintenance;
 mod wal;
@@ -137,33 +139,44 @@ impl<P> CommitGroup<P> {
 /// leave `leader_active` true forever and wedge later commits.
 struct LeaderLease<'a, P> {
     group: &'a Mutex<CommitGroup<P>>,
+    receipt: &'a Arc<CommitReceipt>,
     active: bool,
 }
 
 impl<'a, P> LeaderLease<'a, P> {
-    const fn new(group: &'a Mutex<CommitGroup<P>>) -> Self {
+    const fn new(group: &'a Mutex<CommitGroup<P>>, receipt: &'a Arc<CommitReceipt>) -> Self {
         Self {
             group,
+            receipt,
             active: true,
         }
     }
 
-    fn release(&mut self) -> Option<Arc<CommitReceipt>> {
+    fn release(&mut self) {
         if !self.active {
-            return None;
+            return;
         }
         self.active = false;
-        let mut guard = self.group.lock();
-        let group = &mut *guard;
-        QueuedCommit::successor(&group.queue, &mut group.leader_active)
+        let (departing, successor) = {
+            let mut group = self.group.lock();
+            let owns_front = group
+                .queue
+                .first()
+                .is_some_and(|next| Arc::ptr_eq(&next.receipt, self.receipt));
+            let group = &mut *group;
+            QueuedCommit::handoff(&mut group.queue, &mut group.leader_active, owns_front)
+        };
+        if let Some(next) = successor {
+            next.promote();
+        }
+        // A transaction may own a principal with a custom destructor.
+        drop(departing);
     }
 }
 
 impl<P> Drop for LeaderLease<'_, P> {
     fn drop(&mut self) {
-        if let Some(next) = self.release() {
-            next.promote();
-        }
+        self.release();
     }
 }
 
@@ -294,7 +307,7 @@ where
         };
         loop {
             if lead {
-                self.run_one_commit_group();
+                self.run_one_commit_group(&receipt);
             }
             match receipt.wait() {
                 ReceiptAction::Lead => {
@@ -340,8 +353,8 @@ where
         (entered_rx, release_tx)
     }
 
-    fn run_one_commit_group(&self) {
-        let mut lease = LeaderLease::new(&self.commit_group);
+    fn run_one_commit_group(&self, receipt: &Arc<CommitReceipt>) {
+        let mut lease = LeaderLease::new(&self.commit_group, receipt);
         if !self.group_policy.initial_delay().is_zero() {
             std::thread::sleep(self.group_policy.initial_delay());
         }
@@ -372,10 +385,7 @@ where
         };
         self.process_commit_group(batch);
 
-        let next_leader = lease.release();
-        if let Some(next) = next_leader {
-            next.promote();
-        }
+        lease.release();
     }
 
     fn process_commit_group(&self, batch: Vec<QueuedCommit<P>>) {

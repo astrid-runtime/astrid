@@ -373,6 +373,28 @@ fn mixed_receipts(prior:u64,submitted:u64,peer:u64,root:u64,error:u64) {
 
 // Submit two independent callers, hand off leadership without dequeuing,
 // drain their FIFO and prepare their transactions under the original observers.
+fn departing_leader(a:u64,b:u64,owns_front:bool) {
+    use crate::group_receipt::Submission;
+    use std::sync::Arc;
+    let first = Arc::new(a);
+    let second = Arc::new(b);
+    let mut queue = Vec::new();
+    let mut active = false;
+    Submission::enqueue(&mut queue,&mut active,a,&first,0u8);
+    Submission::enqueue(&mut queue,&mut active,b,&second,1u8);
+    let (removed,next) = Submission::handoff(&mut queue,&mut active,owns_front);
+    if owns_front {
+        assert(removed == Some(Submission {transaction:a,receipt:first,observer:0u8}));
+        assert(next == Some(second) && active && queue.len() == 1);
+        let (last,none) = Submission::handoff(&mut queue,&mut active,true);
+        assert(last == Some(Submission {transaction:b,receipt:second,observer:1u8}));
+        assert(none.is_none() && !active && queue.len() == 0);
+    } else {
+        assert(removed.is_none() && next == Some(first) && active && queue.len() == 2);
+        assert(queue@[1] == Submission {transaction:b,receipt:second,observer:1u8});
+    }
+}
+
 fn queued_callers(a:u64,b:u64,tx:u64,other:u64,observer:u64,peer_observer:u64,error:u64) {
     use crate::group_receipt::Submission;
     use std::sync::Arc;

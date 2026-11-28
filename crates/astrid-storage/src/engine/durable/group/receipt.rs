@@ -83,6 +83,20 @@ impl<T,R,B> Submission<T,R,B> {
         else {*active = false; None}
     }
 
+    /// The caller samples receipt allocation identity while holding the queue lock.
+    pub(super) fn handoff(queue:&mut Vec<Self>,active:&mut bool,owns_front:bool)
+        -> (out:(Option<Self>,Option<Arc<R>>))
+        requires *old(active),
+        ensures out.0 == if owns_front && old(queue).len() > 0 {Some(old(queue)@[0])} else {None},
+            final(queue)@ == if owns_front && old(queue).len() > 0 {old(queue)@.skip(1)} else {old(queue)@},
+            out.1 == if final(queue).len() > 0 {Some(final(queue)@[0].receipt)} else {None},
+            *final(active) == (final(queue).len() > 0),
+    {
+        let departing = if owns_front && !queue.is_empty() {Some(queue.remove(0))} else {None};
+        let next = Self::successor(queue,active);
+        (departing,next)
+    }
+
     pub(super) fn prepare<P,E,F:FnOnce(T,&B)->Result<P,E>>(self,prepare:F)
         -> (out:Preparation<P,R,B,E>)
         requires prepare.requires((self.transaction,&self.observer)),
