@@ -638,12 +638,23 @@ fn indexed_preload_reaches_shared_descendants_and_ignores_nonowning_targets() {
     let first = save(4, &[(shared, ReferenceKind::Owns)]);
     let second = save(5, &[(shared, ReferenceKind::Owns)]);
     let limits = RecoveryLimits::process_addressable();
-    let roots = [first, second, first];
+    let history = BTreeMap::from(
+        [(1, first), (2, second), (3, first)].map(|(owner, commit)| {
+            let root = RootState {
+                generation: RootGeneration::new(owner),
+                commit,
+            };
+            (owner, (root, 100 + owner))
+        }),
+    );
+    let roots = crate::engine::durable::journal_closure::commits(&history);
     stored.remove(&unrelated);
     assert_eq!(
-        preload_indexed_closures(&arena, &index, roots, &TestIdentity, limits).unwrap(),
+        preload_indexed_closures(&arena, &index, roots.clone(), &TestIdentity, limits).unwrap(),
         stored
     );
+    let admitted = crate::engine::durable::roots::validate_preloaded(&history, &stored).unwrap();
+    assert_eq!(admitted, stored.keys().copied().collect());
     index.remove(&leaf);
     assert!(
         matches!(preload_indexed_closures(&arena,&index,roots,&TestIdentity,limits),

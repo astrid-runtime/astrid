@@ -89,7 +89,7 @@ where
     let preload = preload_indexed_closures(
         arena,
         index,
-        recovered.values().map(|(root, _)| root.commit),
+        super::journal_closure::commits(&recovered),
         identity,
         limits,
     )

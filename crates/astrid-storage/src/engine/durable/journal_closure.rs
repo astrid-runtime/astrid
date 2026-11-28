@@ -10,7 +10,10 @@ use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::{
     laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
-    std_specs::btree::{btree_map_inv, btree_set_inv},
+    std_specs::{
+        btree::{btree_map_inv, btree_set_inv},
+        iter::IteratorSpec,
+    },
 };
 
 verus! {
@@ -74,6 +77,43 @@ fn read(table:&BTreeMap<ObjectId,ObjectRecord>,root:ObjectId,at:u64) -> (out:Res
             Err(Failure::Commit(at,root,load::CommitError::WrongKind(k)))
         },
         Err(load::CommitError::Missing) => {assert(false);Err(Failure::Commit(at,root,load::CommitError::Missing))}
+    }
+}
+
+/// Select exactly the commits named by the recovered principal table.
+pub(super) fn commits<P:Ord>(history:&BTreeMap<P,(RootState,u64)>) -> (ids:BTreeSet<ObjectId>)
+    requires btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+    ensures btree_set_inv(&ids),
+        forall|p:P| #[trigger] history@.contains_key(p) ==> ids@.contains(history@[p].0.commit),
+        forall|k:ObjectId| #[trigger] ids@.contains(k) ==> exists|p:P| history@.contains_key(p) && #[trigger] history@[p].0.commit == k,
+{
+    let mut ids = BTreeSet::new();
+    let mut it = history.iter();
+    let ghost all = it.remaining();
+    let ghost mut n:int = 0;
+    loop
+        invariant all.len() == history.len(),0 <= n <= all.len(),it.remaining() == all.skip(n),all.unref().to_set() == history@.kv_pairs(),
+            btree_set_inv(&ids),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+            forall|j:int| 0 <= j < n ==> ids@.contains(#[trigger] all[j].1.0.commit),
+            forall|k:ObjectId| #[trigger] ids@.contains(k) ==> exists|p:P| history@.contains_key(p) && #[trigger] history@[p].0.commit == k,
+        decreases history.len()-n,
+    {
+        let Some((_p,entry)) = it.next() else {
+            assert(n==all.len());
+            assert forall|p:P| #[trigger] history@.contains_key(p) implies ids@.contains(history@[p].0.commit) by {
+                let pair = (p,history@[p]);
+                assert(all.unref().to_set().contains(pair));
+                let i = all.unref().index_of(pair);
+                assert(all.unref()[i]==pair && *all[i].1==pair.1);
+            }
+            return ids;
+        };
+        assert(all.unref()[n]==(*_p,*entry));
+        assert(history@.kv_pairs().contains((*_p,*entry)));
+        assert(history@.contains_key(*_p) && history@[*_p]==*entry);
+        ids.insert(entry.0.commit);
+        proof { n=n+1; };
     }
 }
 

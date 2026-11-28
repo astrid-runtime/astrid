@@ -802,14 +802,19 @@ fn install_buffer<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRec
     out
 }
 
-fn preload_closure<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
-    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,roots:PendingIds,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I)
-    requires btree_map_inv(index),vstd::std_specs::btree::btree_set_inv(&roots),
+fn preload_closure<P:Ord,M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,history:&BTreeMap<P,(RootState,u64)>,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I) -> (out:Option<WaveState>)
+    requires btree_map_inv(index),btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
         obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
         forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures out matches Some((table,known)) ==> known@ == table@.dom() && known@.subset_of(index@.dom()) &&
+        (forall|k:crate::ObjectId| table@.contains_key(k) ==> #[trigger] media_record(media.image(),(k,index@[k]),format.scheme,table@[k])) &&
+        (forall|p:P| #[trigger] history@.contains_key(p) ==> exists|s:Set<crate::ObjectId>|
+            #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,s) && s.subset_of(known@)),
 {
     use crate::journal_preload::{preload,closed_on,selected,wave,outgoing,Error};
+    let roots = crate::journal_closure::commits(history);
     let limit = format.limit;
     let read = |t:PreloadTable,r:&[ReadRow]| -> (out:Result<(PreloadTable,PendingIds),()>)
         requires btree_map_inv(&t), t@.dom().disjoint(selected(r@)),r@.map(|_,row:ReadRow|row.0).no_duplicates(),
@@ -890,11 +895,49 @@ fn preload_closure<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;3
                     #[trigger] read.ensures((prior,batch),Ok((after,next)));
                 assert(media_record(media.image(),batch@[j],format.scheme,after@[k]));
             }
+            assert forall|p:P| #[trigger] history@.contains_key(p) implies table@.contains_key(history@[p].0.commit) by {};
             assert(roots@.subset_of(table@.dom()));
             assert(table@.dom().subset_of(index@.dom()));
             assert forall|k:crate::ObjectId| table@.contains_key(k) implies #[trigger] outgoing(table@,k).subset_of(table@.dom()) by {};
             assert forall|scope:Set<crate::ObjectId>| roots@.subset_of(scope) && #[trigger] closed_on(table@,scope)
                 implies table@.dom().subset_of(scope) by {};
+            match crate::journal_closure::validate(history,&table) {
+                Ok(known) => { proof {
+                    let graph = crate::closure_load::Preload(&table).edges();
+                    assert forall|k:crate::ObjectId| #[trigger] roots@.contains(k) implies known@.contains(k) by {
+                        let p = choose|p:P| history@.contains_key(p) && #[trigger] history@[p].0.commit == k;
+                        let nodes = choose|nodes:Set<crate::ObjectId>|
+                            #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,nodes) && nodes.subset_of(known@);
+                        assert(nodes.contains(k));
+                    }
+                    assert forall|k:crate::ObjectId| table@.contains_key(k) && known@.contains(k) implies
+                        #[trigger] outgoing(table@,k).subset_of(known@) by {
+                        let (p,nodes) = choose|p:P,nodes:Set<crate::ObjectId>| history@.contains_key(p) &&
+                            #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,nodes) && nodes.contains(k);
+                        let whole = choose|s:Set<crate::ObjectId>| #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,s) && s.subset_of(known@);
+                        assert(nodes.subset_of(whole));
+                        assert(graph.contains_key(k) && graph[k]==outgoing(table@,k));
+                        assert forall|child:crate::ObjectId| #[trigger] outgoing(table@,k).contains(child) implies known@.contains(child) by {
+                            assert(graph[k].contains(child) && whole.contains(k));
+                            assert(whole.contains(child));
+                        }
+                    }
+                    assert(closed_on(table@,known@));
+                    assert(roots@.subset_of(known@) && table@.dom().subset_of(known@));
+                    assert forall|k:crate::ObjectId| #[trigger] known@.contains(k) implies
+                        table@.contains_key(k) && media_record(media.image(),(k,index@[k]),format.scheme,table@[k]) by {
+                        let (p,s) = choose|p:P,s:Set<crate::ObjectId>| history@.contains_key(p) &&
+                            #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,s) && s.contains(k);
+                    }
+                    assert(known@ =~= table@.dom());
+                } Some((table,known)) },
+                Err(e) => {
+                    assert(exists|p:P| history@.contains_key(p) &&
+                        #[trigger] crate::journal_closure::refused(&table,history@[p].0.commit,history@[p].1,e));
+                    None
+                },
+            }
+
         },
         Err(Error::Missing(id)) => { proof {
             assert(!index@.contains_key(id));
@@ -902,12 +945,13 @@ fn preload_closure<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;3
                 #[trigger] crate::journal_preload::pending_failure(roots@,index@,t,f) &&
                 f.contains(id) && !t.contains_key(id) && (roots@.contains(id) ||
                     exists|parent:crate::ObjectId| t.contains_key(parent) && #[trigger] outgoing(t,parent).contains(id)));
-        }},
+        } None },
         Err(Error::Read(e)) => {
             assert(crate::journal_preload::read_failure(roots@,index@,read,e));
             assert(exists|t:PreloadTable,r:&[ReadRow]| r.len()>0 &&
                 (forall|i:int| 0 <= i < r.len() ==> index@.contains_key(#[trigger] r@[i].0) &&
                     index@[r@[i].0] == r@[i].1) && #[trigger] read.ensures((t,r),Err(e)));
+            None
         },
     }
 }

@@ -125,6 +125,15 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b),
             Path("verification/hosted_journal_history.rs"),
         )
+    for label, clause in [
+        ("owner coverage", "forall|p:P| #[trigger] history@.contains_key(p) ==> ids@.contains(history@[p].0.commit),"),
+        ("root provenance", "forall|k:ObjectId| #[trigger] ids@.contains(k) ==> exists|p:P| history@.contains_key(p) && #[trigger] history@[p].0.commit == k,\n{"),
+    ]:
+        yield (
+            f"restart root selection loses {label}", Path("crates/astrid-storage/src/engine/durable/journal_closure.rs"),
+            lambda s, a=clause: replace_once(s, a, "true," + ("\n{" if a.endswith("{") else "")),
+            Path("verification/hosted_journal_history.rs"),
+        )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
         ("installed record", "final(loaded)@ == old(loaded)@.insert(id,record)", "final(loaded)@.dom() == old(loaded)@.dom().insert(id)"),
