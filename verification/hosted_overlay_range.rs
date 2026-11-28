@@ -105,36 +105,40 @@ fn first_two(root: Option<&Arc<Node>>, start: &[u8], end: &[u8])
 
 /// Run the same cursor and map updates as a keys-only storage read, starting
 /// from any well-formed checkpoint presence map and ordered overlay root.
-fn apply_snapshot(root: Option<&Arc<Node>>, start: &[u8], end: &[u8], keys: &mut BTreeMap<Vec<u8>,bool>, target: &[u8])
+pub(super) fn apply_snapshot(root: Option<&Arc<Node>>, start: &[u8], end: &[u8], keys: &mut BTreeMap<Vec<u8>,bool>)
     requires traversal::ordered(traversal::deref_option(root)), btree_map_inv(old(keys)),
         obeys_cmp::<Vec<u8>>(), obeys_cmp_deep_eq::<Vec<u8>>(),
-    ensures final(keys).deep_view().get(target@) == ({
-        let found = traversal::lookup_spec(traversal::deref_option(root),target@);
-        if encoding::range_contains(start@,end@,target@) && found.is_some() { Some(found.unwrap().is_some()) }
-        else { old(keys).deep_view().get(target@) }
+    ensures btree_map_inv(final(keys)),forall|key:Seq<u8>| #[trigger] final(keys).deep_view().get(key) == ({
+        let found = traversal::lookup_spec(traversal::deref_option(root),key);
+        if encoding::range_contains(start@,end@,key) && found.is_some() { Some(found.unwrap().is_some()) }
+        else { old(keys).deep_view().get(key) }
     }),
 {
     let ghost tree = traversal::deref_option(root);
     let ghost entries = rows(tree,start@,end@);
-    let ghost found = traversal::lookup_spec(tree,target@);
     overlay_range::apply_presence(root,start,end,keys);
-    proof {
-        assert forall|v:Option<Vec<u8>>| #[trigger] names(entries,target@,v) ==
-            (encoding::range_contains(start@,end@,target@) && found == Some(v)) by {
-            overlay_range::membership(tree,start@,end@,target@,v);
-            traversal::lookup_membership(tree,target@,v);
+    assert forall|key:Seq<u8>| #[trigger] keys.deep_view().get(key) == ({
+        let found = traversal::lookup_spec(tree,key);
+        if encoding::range_contains(start@,end@,key) && found.is_some() {Some(found.unwrap().is_some())}
+        else {old(keys).deep_view().get(key)}
+    }) by {
+        let found = traversal::lookup_spec(tree,key);
+        assert forall|v:Option<Vec<u8>>| #[trigger] names(entries,key,v) ==
+            (encoding::range_contains(start@,end@,key) && found == Some(v)) by {
+            overlay_range::membership(tree,start@,end@,key,v);
+            traversal::lookup_membership(tree,key,v);
         }
         let present = found.is_some() && found.unwrap().is_some();
-        assert forall|i:int| 0 <= i < entries.len() && #[trigger] entries[i].key@ == target@ implies
-            entries[i].value.is_some() == present by { assert(names(entries,target@,entries[i].value)); }
-        fold_target(old(keys).deep_view(),entries,target@,present);
-        if has_key(entries,target@) {
-            let i = choose|i:int| 0 <= i < entries.len() && #[trigger] entries[i].key@ == target@;
-            assert(names(entries,target@,entries[i].value));
+        assert forall|i:int| 0 <= i < entries.len() && #[trigger] entries[i].key@ == key implies
+            entries[i].value.is_some() == present by { assert(names(entries,key,entries[i].value)); }
+        fold_target(old(keys).deep_view(),entries,key,present);
+        if has_key(entries,key) {
+            let i = choose|i:int| 0 <= i < entries.len() && #[trigger] entries[i].key@ == key;
+            assert(names(entries,key,entries[i].value));
         }
-        if found.is_some() && encoding::range_contains(start@,end@,target@) {
-            assert(names(entries,target@,found.unwrap()));
-            let i = choose|i:int| 0 <= i < entries.len() && (#[trigger] entries[i]).key@ == target@ && entries[i].value == found.unwrap();
+        if found.is_some() && encoding::range_contains(start@,end@,key) {
+            assert(names(entries,key,found.unwrap()));
+            let i = choose|i:int| 0 <= i < entries.len() && (#[trigger] entries[i]).key@ == key && entries[i].value == found.unwrap();
         }
     }
 }

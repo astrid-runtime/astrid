@@ -292,6 +292,93 @@ fn mixed_image_fence<E,F:Fn(&[u8])->Result<Id,E>+Copy>(revoked:&Presence,consume
     Ok(recovered_admission(groups,target,single_use))
 }
 
+/// Point presence when the immutable overlay shadows the checkpoint. A
+/// tombstone is an overlay observation and clears a checkpoint marker.
+spec fn current_presence(table:Map<Seq<u8>,bool>,root:Option<std::sync::Arc<crate::traversal::Node>>,key:Seq<u8>) -> bool {
+    match crate::traversal::lookup_spec(root,key) {
+        Some(value) => value.is_some(),
+        None => table.get(key) == Some(true),
+    }
+}
+
+spec fn confined(table:&Presence,ns:Seq<u8>) -> bool {
+    forall|k:Seq<u8>| table.deep_view().get(k) == Some(true) ==> #[trigger] crate::encoding::matches_prefix(k,ns + seq![0u8])
+}
+
+fn apply_marker_overlay(table:&mut Presence,root:Option<&std::sync::Arc<crate::traversal::Node>>,ns:&[u8])
+    requires vstd::std_specs::btree::btree_map_inv(old(table)),vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),
+        vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),crate::traversal::ordered(crate::traversal::deref_option(root)),
+        confined(old(table),ns@),
+    ensures vstd::std_specs::btree::btree_map_inv(final(table)),
+        forall|k:Vec<u8>| final(table)@.get(k) == Some(true) ==> #[trigger] crate::encoding::matches_prefix(k@,ns@ + seq![0u8]),
+        forall|suffix:Seq<u8>| (#[trigger] final(table).deep_view().get(ns@ + seq![0u8] + suffix) == Some(true)) ==
+            current_presence(old(table).deep_view(),crate::traversal::deref_option(root),ns@ + seq![0u8] + suffix),
+{
+    let start = crate::encoding::composite(ns,&[]);
+    let end = crate::encoding::prefix_end(ns,&[]);
+    crate::hosted_overlay_range::apply_snapshot(root,&start,&end,table);
+    assert forall|k:Vec<u8>| table@.get(k) == Some(true) implies #[trigger] crate::encoding::matches_prefix(k@,ns@ + seq![0u8]) by {
+        crate::hosted_key_projection::visible(table,k@);
+        assert(table.deep_view().get(k@) == Some(true));
+        if !crate::encoding::matches_prefix(k@,start@) {
+            assert(!crate::encoding::range_contains(start@,end@,k@));
+            assert(old(table).deep_view().get(k@) == Some(true));
+        }
+    }
+    assert forall|suffix:Seq<u8>| (#[trigger] table.deep_view().get(ns@ + seq![0u8] + suffix) == Some(true)) ==
+        current_presence(old(table).deep_view(),crate::traversal::deref_option(root),ns@ + seq![0u8] + suffix) by {
+        let k = start@ + suffix;
+        assert(crate::encoding::matches_prefix(k,start@));
+        assert(crate::encoding::range_contains(start@,end@,k));
+    }
+}
+
+spec fn snapshot_refusal<E,F:Fn(&[u8])->Result<Id,E>>(revoked:Map<Seq<u8>,bool>,consumed:Map<Seq<u8>,bool>,
+    rev_root:Option<std::sync::Arc<crate::traversal::Node>>,used_root:Option<std::sync::Arc<crate::traversal::Node>>,
+    legacy:F,e:E) -> bool {
+    exists|k:&[u8]| #[trigger] legacy.ensures((k,),Err(e)) &&
+        (current_presence(revoked,rev_root,"caps:revoked".spec_bytes()+seq![0u8]+k@) ||
+         current_presence(consumed,used_root,"caps:used".spec_bytes()+seq![0u8]+k@))
+}
+
+/// Each namespace can have its own captured header. State explicitly which
+/// immutable checkpoint and overlay determine the initial admission.
+fn reopen_with_overlays<E,F:Fn(&[u8])->Result<Id,E>+Copy>(mut revoked:Presence,mut consumed:Presence,
+    rev_root:Option<&std::sync::Arc<crate::traversal::Node>>,used_root:Option<&std::sync::Arc<crate::traversal::Node>>,
+    target:Id,single_use:bool,legacy:F) -> (out:Result<Admission,E>)
+    requires vstd::std_specs::btree::btree_map_inv(&revoked),vstd::std_specs::btree::btree_map_inv(&consumed),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        crate::traversal::ordered(crate::traversal::deref_option(rev_root)),crate::traversal::ordered(crate::traversal::deref_option(used_root)),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+        confined(&revoked,"caps:revoked".spec_bytes()),confined(&consumed,"caps:used".spec_bytes()),
+    ensures out matches Ok(decision) ==> forall|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) ==> ({
+        &&& current_presence(revoked.deep_view(),crate::traversal::deref_option(rev_root),"caps:revoked".spec_bytes()+seq![0u8]+text) ==> decision is Revoked
+        &&& single_use && current_presence(consumed.deep_view(),crate::traversal::deref_option(used_root),"caps:used".spec_bytes()+seq![0u8]+text) ==> !(decision is Allowed)
+    }),
+        match out { Err(e) => snapshot_refusal(revoked.deep_view(),consumed.deep_view(),crate::traversal::deref_option(rev_root),
+            crate::traversal::deref_option(used_root),legacy,e), _ => true },
+{
+    let kinds = Marker::recovery_order();
+    let rev_ns = kinds[0].namespace().as_bytes();
+    let used_ns = kinds[1].namespace().as_bytes();
+    assert(rev_ns@ == "caps:revoked".spec_bytes() && used_ns@ == "caps:used".spec_bytes());
+    let ghost rev_before = revoked.deep_view();
+    let ghost used_before = consumed.deep_view();
+    apply_marker_overlay(&mut revoked,rev_root,rev_ns);
+    apply_marker_overlay(&mut consumed,used_root,used_ns);
+    let result = mixed_image_fence(&revoked,&consumed,target,single_use,legacy);
+    proof {
+        if let Err(e) = &result {
+            let k = choose|k:&[u8]| #[trigger] failed_key(&revoked,&consumed,legacy,*e,k);
+            assert(revoked.deep_view().get("caps:revoked".spec_bytes()+seq![0u8]+k@) == Some(true) ||
+                consumed.deep_view().get("caps:used".spec_bytes()+seq![0u8]+k@) == Some(true));
+            assert(snapshot_refusal(rev_before,used_before,crate::traversal::deref_option(rev_root),
+                crate::traversal::deref_option(used_root),legacy,*e));
+        }
+    }
+    result
+}
+
 /// If a canceled CAS installed its marker, the next attempt reads that entry
 /// at the same physical address even when live completion never ran.
 fn retry_after_unobserved_marker(live:&mut HashMap<Id,token_authority::TokenStatus>,target:Id,

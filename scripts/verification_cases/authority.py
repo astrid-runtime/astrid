@@ -318,6 +318,10 @@ def marker_batch_consumers():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), mixed,
         )
     for label, path, clause, weaker in [
+        ("overlay precedence", "verification/hosted_overlay_range.rs", "{ Some(found.unwrap().is_some()) }",
+         "{ final(keys).deep_view().get(key) }"),
+        ("checkpoint fallback", "verification/hosted_overlay_range.rs", "else { old(keys).deep_view().get(key) }",
+         "else { final(keys).deep_view().get(key) }"),
         ("canonical encoding", "crates/astrid-capabilities/src/store/marker_key.rs", "ensures a == b,", "ensures true,"),
         ("physical source", "verification/hosted_key_projection.rs",
          "keys.deep_view().get(namespace@ + seq![0u8] + #[trigger] logical@[i]@) == Some(true)",

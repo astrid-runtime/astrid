@@ -15,7 +15,7 @@ proof fn byte_view(key: Vec<u8>)
     ensures key.deep_view() == key@,
 { assert(key.deep_view() =~= key@); }
 
-proof fn visible(keys: &BTreeMap<Vec<u8>,bool>, bytes: Seq<u8>)
+pub(super) proof fn visible(keys: &BTreeMap<Vec<u8>,bool>, bytes: Seq<u8>)
     requires btree_map_inv(keys), obeys_cmp_deep_eq::<Vec<u8>>(),
     ensures (keys.deep_view().get(bytes) == Some(true)) ==
         (exists|key:Vec<u8>| #[trigger] keys@.get(key) == Some(true) && key@ == bytes),
