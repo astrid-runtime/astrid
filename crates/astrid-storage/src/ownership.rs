@@ -19,6 +19,7 @@ use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 
 mod deletion;
 mod derived;
+mod graph_read;
 mod pending;
 mod recovery;
 mod reservation_validation;
@@ -365,8 +366,12 @@ impl OwnershipStore {
     ///
     /// Fails closed on storage errors, malformed bytes, or broken invariants.
     pub async fn load(&self) -> Result<OwnershipSnapshot, OwnershipError> {
-        let raw = self.storage.get(GRAPH_KEY).await?;
-        self.decode(raw.as_deref())
+        self.decode_read(
+            self.storage
+                .get(GRAPH_KEY)
+                .await
+                .map_err(OwnershipError::from),
+        )
     }
 
     /// Register one durable human identity, idempotently.
@@ -662,15 +667,22 @@ impl OwnershipStore {
     }
 
     fn decode(&self, raw: Option<&[u8]>) -> Result<OwnershipSnapshot, OwnershipError> {
-        let graph = raw.map_or_else(
-            || Ok(OwnershipSnapshot::default()),
+        self.decode_read(Ok(raw))
+    }
+
+    fn decode_read<B: AsRef<[u8]>>(
+        &self,
+        read: Result<Option<B>, OwnershipError>,
+    ) -> Result<OwnershipSnapshot, OwnershipError> {
+        graph_read::admit(
+            read,
+            OwnershipSnapshot::default,
             |bytes| {
-                serde_json::from_slice(bytes)
+                serde_json::from_slice(bytes.as_ref())
                     .map_err(|error| OwnershipError::Serialization(error.to_string()))
             },
-        )?;
-        graph.validate(&self.principals)?;
-        Ok(graph)
+            |graph| graph.validate(&self.principals),
+        )
     }
 
     fn require_manager(fleet: &FleetRecord, actor: UserUid) -> Result<(), OwnershipError> {

@@ -240,6 +240,19 @@ def consumer_defects():
             f"addressed batch replay loses {label}", batch,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_overlay_batch.rs"),
         )
+    graph = Path("crates/astrid-storage/src/ownership/graph_read.rs")
+    for label, clause, weaker in [
+        ("storage refusal", "Err(e) => out==Err(e),", "Err(e) => out.is_err(),"),
+        ("missing input", "None=>missing.ensures((),g)", "None=>true"),
+        ("decoded graph", "Some(bytes)=>decode.ensures((bytes,),Ok(g))", "Some(bytes)=>true"),
+        ("validation", "selected(raw,missing,decode,g) && validate.ensures((&g,),Ok(()))", "selected(raw,missing,decode,g)"),
+        ("decoder refusal", "raw matches Some(bytes) && decode.ensures((bytes,),Err(e))", "raw.is_some()"),
+        ("validation refusal", "selected(raw,missing,decode,g) && validate.ensures((&g,),Err(e))", "selected(raw,missing,decode,g)"),
+    ]:
+        yield (
+            f"startup graph admission loses {label}", graph,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_retirement_recovery.rs"),
+        )
     reservations = Path("crates/astrid-storage/src/ownership/reservation_validation.rs")
     for label, clause, weaker in [
         ("retired owner exclusion", "rows@.contains_key(k) ==> !owners@.contains_key(k) &&", "rows@.contains_key(k) ==> true &&"),

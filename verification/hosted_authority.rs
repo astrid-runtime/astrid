@@ -551,6 +551,8 @@ mod principal_fences;
 #[path = "../crates/astrid-storage/src/ownership/pending.rs"]
 mod pending_deletions;
 use pending_deletions as pending;
+#[path = "../crates/astrid-storage/src/ownership/graph_read.rs"]
+mod graph_read;
 #[path = "../crates/astrid-storage/src/ownership/reservation_validation.rs"]
 mod reservation_validation;
 use principal_binding::recovery_aliases;

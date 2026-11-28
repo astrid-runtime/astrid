@@ -640,14 +640,17 @@ async fn malformed_persisted_graph_fails_closed() {
     let backend = Arc::new(MemoryKvStore::new());
     let raw: Arc<dyn KvStore> = backend.clone();
     let store = OwnershipStore::new(raw, PrincipalDirectory::default()).unwrap();
-    backend
-        .set(OWNERSHIP_NAMESPACE, GRAPH_KEY, b"not-json".to_vec())
-        .await
-        .unwrap();
-    assert!(matches!(
-        store.load().await,
-        Err(OwnershipError::Serialization(_))
-    ));
+    assert_eq!(store.load().await.unwrap(), OwnershipSnapshot::default());
+    for bytes in [b"".as_slice(), b"not-json"] {
+        backend
+            .set(OWNERSHIP_NAMESPACE, GRAPH_KEY, bytes.to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load().await,
+            Err(OwnershipError::Serialization(_))
+        ));
+    }
 }
 
 #[tokio::test]

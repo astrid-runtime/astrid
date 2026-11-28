@@ -101,6 +101,67 @@ fn validate_then_restore(duplicate:bool,owned:bool,missing_fleet:bool,legacy:boo
         },
     }
 }
+struct Graph {
+    rows:BTreeMap<u64,Reservation>,
+    owners:BTreeMap<u64,()>,
+    fleets:BTreeMap<u64,()>,
+}
+impl Graph {
+    spec fn valid_maps(&self) -> bool {
+        vstd::std_specs::btree::btree_map_inv(&self.rows) && vstd::std_specs::btree::btree_map_inv(&self.owners) &&
+        vstd::std_specs::btree::btree_map_inv(&self.fleets)
+    }
+    spec fn empty(&self) -> bool { self.rows@.is_empty() && self.owners@.is_empty() && self.fleets@.is_empty() }
+    spec fn consistent(&self) -> bool {
+        &&& forall|k:u64| #[trigger] self.rows@.contains_key(k) ==> !self.owners@.contains_key(k) &&
+            (self.rows@[k].fleet matches Some(f) ==> self.fleets@.contains_key(f))
+        &&& forall|k:u64,j:u64,n:&str| #[trigger] crate::reservation_validation::named(self.rows@,k,n,label) &&
+            #[trigger] crate::reservation_validation::named(self.rows@,j,n,label) ==> k==j
+    }
+}
+// The decoder is a boundary. Only its result for these bytes may reach either fence.
+fn admitted_graph<D:FnOnce(&[u8])->Result<Graph,u8>>(raw:Result<Option<&[u8]>,u8>,decode:D,
+    directory:&HashMap<u64,u64>,stores:&mut Stores) -> (out:Result<Graph,u8>)
+    requires old(stores).valid(),hash_map_inv(directory),vstd::laws_cmp::obeys_cmp::<&str>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<&str>(),
+        raw matches Ok(Some(bytes)) ==> decode.requires((bytes,)),
+        forall|b:&[u8],g:Graph| #[trigger] decode.ensures((b,),Ok(g)) ==> g.valid_maps(),
+    ensures match out {
+        Ok(g) => g.consistent() && (raw==Ok(None) && g.empty() || (raw matches Ok(Some(b)) && decode.ensures((b,),Ok(g)))) &&
+            forall|a:u64| #[trigger] final(stores).authority(a) == if crate::recovery::reserved(g.rows@,directory@,a) {
+                (true,true,None) } else {old(stores).authority(a)},
+        Err(e) => *final(stores)==*old(stores) &&
+            (raw==Err(e) || (raw matches Ok(Some(b)) && (decode.ensures((b,),Err(e)) ||
+                exists|g:Graph| #[trigger] decode.ensures((b,),Ok(g)) && !g.consistent() && e==3u8))),
+    },
+{
+    let empty = || -> (g:Graph) ensures g.valid_maps() && g.empty(),
+        {Graph {rows:BTreeMap::new(),owners:BTreeMap::new(),fleets:BTreeMap::new()}};
+    let validate = |g:&Graph| -> (r:Result<(),u8>) requires g.valid_maps(), ensures r == (if g.consistent() {Ok(())} else {Err(3u8)}),
+    {
+        match crate::reservation_validation::validate(&g.rows,&g.owners,&g.fleets,label) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                proof {
+                    match e {
+                        crate::reservation_validation::Error::Fleet(f) => {
+                            let k=choose|k:u64| #[trigger] g.rows@.contains_key(k) && g.rows@[k].fleet==Some(f);
+                            assert(g.rows@.contains_key(k));
+                        },
+                        crate::reservation_validation::Error::Owned(k) => {assert(g.rows@.contains_key(k));},
+                        crate::reservation_validation::Error::Alias(n,k,j) => {
+                            assert(crate::reservation_validation::named(g.rows@,k,n,label) && crate::reservation_validation::named(g.rows@,j,n,label));
+                        },
+                    }
+                }
+                Err(3)
+            },
+        }
+    };
+    let g=crate::graph_read::admit(raw,empty,decode,validate)?;
+    let _=recover(&g.rows,directory,stores);
+    Ok(g)
+}
+
 // Stage the same reservation consumed by startup. Persistence must still
 // establish that the acknowledged candidate is the recovered graph.
 fn reserve_then_recover(rows:&mut BTreeMap<u64,Reservation>,uid:u64,requested:u64,fleet:Option<u64>,
