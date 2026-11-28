@@ -122,7 +122,8 @@ pub(crate) fn read_kv<P,E,L>(owner:&P,root:RootState,v:ObjectFormatVersion,load:
         &&& load.ensures((owner,g.state_id),Ok(g.state)) && structural(*g.state,ObjectKind::PrincipalState,v)
         &&& match pair.1 {
             None => kv_edge(*g.state).is_none(),
-            Some(id) => kv_edge(*g.state) matches Some(edge) && edge.fields() == (KV@,id,super::ReferenceKind::Owns),
+            Some(id) => kv_edge(*g.state) matches Some(edge) && g.state.contents().3.contains(edge) &&
+                edge.fields() == (KV@,id,super::ReferenceKind::Owns),
         }
     }),
         out matches Err(KvError::Graph(Error::Invalid(id,reason))) ==> invalid_at(owner,root,v,load,id,reason),

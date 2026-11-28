@@ -123,6 +123,20 @@ def defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), trace,
         )
 
+    journal = Path("verification/hosted_journal_history.rs")
+    for label, path, clause, weaker in [
+        ("root generation and commit", journal, "roots@[p] == history@[p].0", "true"),
+        ("owning closure", journal, "crate::journal_preload::closed_on(table@,table@.dom()) &&", "true &&"),
+        ("physical record identity", journal,
+         "#[trigger] media_record(media.image(),(k,index@[k]),format.scheme,table@[k])) &&",
+         "index@.contains_key(k)) &&"),
+        ("selected component row", source, "g.state.contents().3.contains(edge) &&", "true &&"),
+    ]:
+        yield (
+            f"recovered header provenance loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), journal,
+        )
+
     projection = Path("crates/astrid-storage/src/kv/tree/memo_projection.rs")
     for label, clause, weaker in [
         ("success address", "#[trigger] resolve.ensures((owner,id),Ok(t))",

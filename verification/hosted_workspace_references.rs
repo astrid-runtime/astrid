@@ -54,7 +54,7 @@ fn captured_kv<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersio
 
 // Start with physical rows in the canonical record arrays, without assuming
 // the component selected by either binary search.
-fn kv_from_canonical_rows<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersion,
+pub(super) fn kv_from_canonical_rows<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersion,
     commit:std::sync::Arc<crate::ObjectRecord>,state_id:ObjectId,state:std::sync::Arc<crate::ObjectRecord>,
     head:ObjectId,load:L,table:Ghost<spec_fn(P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>>,
     Ghost(ci):Ghost<int>,Ghost(si):Ghost<int>)

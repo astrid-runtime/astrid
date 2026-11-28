@@ -72,7 +72,7 @@ pub(super) fn read_root<P,G,T,E,L,Z,D>(owner:&P,root:super::RootState,graph:L,em
     where L:FnOnce(&P,super::RootState)->Result<(G,Option<ObjectId>),E>,
         Z:FnOnce()->T,D:FnOnce(&P,ObjectId)->Result<T,E>,
     requires graph.requires((owner,root)),empty.requires(()),
-        forall|id:ObjectId| #[trigger] resolve.requires((owner,id)),
+        forall|g:G,id:ObjectId| #[trigger] graph.ensures((owner,root),Ok((g,Some(id)))) ==> resolve.requires((owner,id)),
     ensures out matches Ok((g,t)) ==> at_component(owner,root,graph,empty,resolve,g,t),
         out matches Err(e) ==> graph.ensures((owner,root),Err(e)) ||
             exists|g:G,id:ObjectId| #[trigger] graph.ensures((owner,root),Ok((g,Some(id)))) &&

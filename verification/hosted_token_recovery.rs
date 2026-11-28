@@ -629,6 +629,71 @@ fn decode_then_reopen<'a,P,S,B,V,T,W,E,L,M,I,K,D,A,R,C,F>(owner:&'a P,head:crate
     }
 }
 
+enum CapturedError<E> { Graph(crate::header_graph::KvError<E>), Reopen(ReopenError<E>) }
+
+// A cold header and the canonical marker load must use the physical component row of this owner.
+fn reopen_captured_root<'a,P,S,B,V,T,W,E,L,M,I,K,D,A,R,C,F,G>(owner:&'a P,head:crate::ObjectId,kind:Marker,
+    target:Id,single_use:bool,other:&(crate::memo_projection::Projection<B>,V),load:L,measure:M,start:I,
+    values:(K,D),translate:A,rev_read:R,used_read:C,legacy:F,Ghost(text):Ghost<Seq<u8>>,Ghost(path):Ghost<Seq<crate::ObjectId>>,
+    root:crate::RootState,v:crate::ObjectFormatVersion,graph_load:G,commit:std::sync::Arc<crate::ObjectRecord>,
+    state_id:crate::ObjectId,state:std::sync::Arc<crate::ObjectRecord>,
+    table:Ghost<spec_fn(P,crate::ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>>,
+    Ghost(ci):Ghost<int>,Ghost(si):Ghost<int>)
+    -> (out:Result<Option<Admission>,CapturedError<E>>)
+    where L:Fn(&P,crate::ObjectId)->Result<crate::delta_chain::Head,E>,
+        M:FnOnce(&P,Option<crate::ObjectId>)->Result<crate::projection_recovery::Measured<B,V>,E>,I:FnOnce(&'a P)->S,
+        K:Fn(S,Option<crate::ObjectId>,&Vec<u8>)->Result<(S,Option<Vec<u8>>),E>+Copy,
+        D:Fn(S,&crate::checkpoint_value::ValueSlot)->Result<(S,Vec<u8>),E>+Copy,A:Fn(crate::ObjectId,crate::delta_totals::ApplyError<E>)->E,
+        R:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,
+        C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
+        G:Fn(&P,crate::ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>,
+    requires forall|id:crate::ObjectId| #[trigger] graph_load.requires((owner,id)),
+        forall|id:crate::ObjectId,x:Result<std::sync::Arc<crate::ObjectRecord>,E>|
+            #[trigger] graph_load.ensures((owner,id),x) ==> x==(table@)(*owner,id),
+        (table@)(*owner,root.commit)==Ok(commit), (table@)(*owner,state_id)==Ok(state),
+        crate::header_graph::structural(*commit,crate::ObjectKind::Commit,v),
+        crate::header_graph::structural(*state,crate::ObjectKind::PrincipalState,v),
+        crate::ObjectRecord::labels_ordered(commit.contents().3),crate::ObjectRecord::labels_ordered(state.contents().3),
+        0<=ci<commit.contents().3.len(),commit.contents().3[ci].fields()==(b"state"@,state_id,crate::ReferenceKind::Owns),
+        0<=si<state.contents().3.len(),state.contents().3[si].fields()==(b"kv"@,head,crate::ReferenceKind::Owns),
+        vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|p:&P,id:crate::ObjectId| #[trigger] load.requires((p,id)),
+        forall|tree:Option<crate::ObjectId>| #[trigger] measure.requires((owner,tree)),start.requires((owner,)),
+        forall|s:S,t:Option<crate::ObjectId>,key:&Vec<u8>| #[trigger] values.0.requires((s,t,key)),
+        forall|s:S,v:&crate::checkpoint_value::ValueSlot| #[trigger] values.1.requires((s,v)),
+        forall|id:crate::ObjectId,e:crate::delta_totals::ApplyError<E>| #[trigger] translate.requires((id,e)),
+        checkpoint::readable(rev_read),checkpoint::readable(used_read),other.0.overlay.ordered_snapshot(),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+        marker_key::spells(target@,text),
+        crate::projection_recovery::retained(owner,head,path,load,ns_bytes(kind)+seq![0u8]+text,true),
+    ensures out matches Ok(found) ==> (found matches Some(a) &&
+            (kind is Revoked ==> a is Revoked) && (single_use ==> !(a is Allowed))),
+        out matches Err(e) ==> e is Reopen,
+{
+    let graph=|p:&P,r:crate::RootState| -> (q:Result<(crate::header_graph::Graph,Option<crate::ObjectId>),CapturedError<E>>)
+        requires *p==*owner && r==root,
+        ensures q matches Ok((g,Some(id))) && id==head && g.commit==commit && g.state_id==state_id && g.state==state,
+    {
+        match crate::hosted_workspace_references::kv_from_canonical_rows(p,r,v,commit,state_id,state,head,graph_load,table,Ghost(ci),Ghost(si)) {
+            Ok(pair)=>Ok(pair),Err(e)=>Err(CapturedError::Graph(e)),
+        }
+    };
+    let resolve=|p:&P,id:crate::ObjectId| -> (q:Result<Option<Admission>,CapturedError<E>>)
+        requires *p==*owner && id==head,
+        ensures q matches Ok(found) ==> (found matches Some(a) && (kind is Revoked ==> a is Revoked) && (single_use ==> !(a is Allowed))),
+            q matches Err(e) ==> e is Reopen,
+    {
+        match decode_then_reopen(owner,id,kind,target,single_use,other,load,measure,start,values,translate,
+            rev_read,used_read,legacy,Ghost(text),Ghost(path)) {
+            Ok(a)=>Ok(Some(a)),Err(e)=>Err(CapturedError::Reopen(e)),
+        }
+    };
+    match crate::memo_projection::read_root(owner,root,graph,||None,resolve) {
+        Ok((_,decision))=>Ok(decision),Err(e)=>Err(e),
+    }
+}
+
 /// Instantiate the page evidence for an actual decoded leaf and recover its
 /// marker with the full walker, merger and store replay.
 fn checkpoint_marker_decision(target:Id,kind:Marker) -> (out:Result<Admission,RecoveryError<()>>)

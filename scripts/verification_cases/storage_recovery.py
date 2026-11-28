@@ -741,6 +741,21 @@ def consumer_defects():
             lambda s, a=old, b=new: replace_once(s, a, b), consumer,
         )
 
+    for label, path, clause, weaker in [
+        ("cold refusal", replay,
+         "ensures out matches Ok(a) ==> (kind is Revoked ==> a is Revoked) && (single_use ==> !(a is Allowed)),",
+         "ensures out matches Ok(a) ==> (single_use ==> !(a is Allowed)),"),
+        ("component address", Path("verification/hosted_workspace_references.rs"),
+         "ensures out matches Ok((g,Some(id))) && id == head && g.commit == commit && g.state_id == state_id && g.state == state,",
+         "ensures out matches Ok((g,Some(id))) && g.commit == commit && g.state_id == state_id && g.state == state,"),
+        ("missing decision", replay, "Ok(a)=>Ok(Some(a)),Err(e)=>Err(CapturedError::Reopen(e)),",
+         "Ok(_)=>Ok(None),Err(e)=>Err(CapturedError::Reopen(e)),"),
+    ]:
+        yield (
+            f"cold captured admission loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), replay,
+        )
+
     checkpoint = Path("crates/astrid-storage/src/kv/tree/checkpoint_replay.rs")
     for label, clause, weaker in [
         ("root refusal", "(out is Err && out->Err_0 is Root) == (chain.tree != root)", "chain.tree != root ==> (out is Err && out->Err_0 is Root)"),
