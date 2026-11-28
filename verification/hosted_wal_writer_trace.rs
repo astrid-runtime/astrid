@@ -73,6 +73,29 @@ fn admit_sealed<P,C,H:Fn(&ObjectRecord)->ObjectId>(update:root_declaration::Upda
     declaration.admit_with_checkpoint(&receiver,same,identify,checkpoint)
 }
 
+/// The same identity session may consume exactly the hint constructed from
+/// the sealed declaration's own principal and commit. A peer never gets it.
+fn checkpoint_recipient<H:Fn(&ObjectRecord)->ObjectId>(update:root_declaration::Update<u64>,issuer:u64,receiver:u64,hash:H)
+    requires forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
+{
+    let commit = update.commit;
+    let declaration = root_declaration::Declaration::sealed(update,issuer);
+    let mut slot = None;
+    declaration.attach_checkpoint(&mut slot,|owner:&u64,id:ObjectId| -> (v:(u64,ObjectId))
+        ensures v == (*owner,id), {(*owner,id)});
+    let same = |a:&u64,b:&u64| -> (v:bool) ensures v == (*a == *b) {*a == *b};
+    let result = declaration.admit_with_checkpoint(&receiver,same,hash,&mut slot);
+    assert(issuer == receiver ==> result.is_ok());
+    if let Ok((accepted,hint)) = result {
+        assert(accepted == update);
+        assert(hint == if issuer == receiver {Some((update.principal,update.commit))} else {None});
+    }
+    let raw = root_declaration::Declaration::<u64,u64>::untrusted(issuer,None,commit,Vec::new());
+    let mut empty = None;
+    raw.attach_checkpoint(&mut empty,|_:&u64,_:ObjectId| 42u64);
+    assert(empty.is_none());
+}
+
 /// The journal callback receives the root retained across closure validation.
 fn journal_selected<P,E,T,F,W>(selected:root_transition::SelectedRoot<P>,encoder:F,write:W)
     -> (out:Result<(root_transition::PreparedRoot<P,RootState>,T),E>)

@@ -50,6 +50,16 @@ def consumer_defects():
             f"root publication loses {label}", transition,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_kv_model.rs"),
         )
+    declaration = Path("crates/astrid-storage/src/engine/root_declaration.rs")
+    for label, clause in [
+        ("sealed checkpoint origin", "make.ensures((&self.payload().principal,self.payload().commit),hint)"),
+        ("untrusted checkpoint exclusion", "IdentityProof::Untrusted => *final(slot) == *old(slot)"),
+    ]:
+        weaker = "IdentityProof::Untrusted => true" if label.startswith("untrusted") else "true"
+        yield (
+            label, declaration, lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_wal_writer_trace.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

@@ -112,11 +112,10 @@ impl<P> RootTransaction<P> {
 
     pub(crate) fn with_kv_checkpoint_publication(
         mut self,
-        publication: impl FnOnce() -> crate::kv::KvCheckpointPublication,
+        publication: impl FnOnce(&P, ObjectId) -> crate::kv::KvCheckpointPublication,
     ) -> Self {
-        if self.declaration.is_sealed() {
-            self.kv_checkpoint_publication = Some(publication());
-        }
+        self.declaration
+            .attach_checkpoint(&mut self.kv_checkpoint_publication, publication);
         self
     }
 

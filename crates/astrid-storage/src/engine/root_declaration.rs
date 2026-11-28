@@ -28,9 +28,20 @@ impl<P,A> Declaration<P,A> {
         ensures *u == self.payload(),
     { &self.update }
 
-    pub(super) fn is_sealed(&self) -> (sealed:bool)
-        ensures sealed == (self.proof_source() is Engine),
-    { matches!(self.identity,IdentityProof::Engine(_)) }
+    /// Only an engine-sealed declaration can attach a cache publication. Its
+    /// factory receives the owner and commit from this declaration.
+    pub(super) fn attach_checkpoint<C,F:FnOnce(&P,ObjectId)->C>(&self,slot:&mut Option<C>,make:F)
+        requires self.proof_source() is Engine ==> make.requires((&self.payload().principal,self.payload().commit)),
+        ensures match self.proof_source() {
+            IdentityProof::Engine(_) => *final(slot) matches Some(hint) &&
+                make.ensures((&self.payload().principal,self.payload().commit),hint),
+            IdentityProof::Untrusted => *final(slot) == *old(slot),
+        },
+    {
+        if matches!(self.identity,IdentityProof::Engine(_)) {
+            *slot = Some(make(&self.update.principal,self.update.commit));
+        }
+    }
 
     /// The native identity session provides the authority paired with its hasher.
     pub(super) fn sealed(update:Update<P>,authority:A) -> (out:Self)

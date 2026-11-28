@@ -124,11 +124,11 @@ fn only_issuing_durable_engine_publishes_the_sealed_checkpoint() {
     let sealed = || {
         session
             .seal_transaction(owner.clone(), None, id, vec![(id, record.clone())])
-            .with_kv_checkpoint_publication(|| {
+            .with_kv_checkpoint_publication(|declared_owner, declared_commit| {
                 KvCheckpointPublication::new(
                     Arc::clone(&cache),
-                    owner.clone(),
-                    id,
+                    declared_owner.clone(),
+                    declared_commit,
                     Projection::empty(),
                     TreeValidation::EMPTY,
                     cache.memo_epoch(),

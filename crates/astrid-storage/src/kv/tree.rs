@@ -503,8 +503,7 @@ where
         else {
             return Ok(false);
         };
-        let commit = transaction.commit();
-        let transaction = transaction.with_kv_checkpoint_publication(|| {
+        let transaction = transaction.with_kv_checkpoint_publication(|owner, commit| {
             KvCheckpointPublication::new(
                 Arc::clone(&self.validation),
                 owner.clone(),
