@@ -261,7 +261,7 @@ where
         let totals = tree.map_or(Ok(NodeTotals::default()), |tree| {
             Ok(self.node(tree)?.node.totals())
         })?;
-        let head = self.insert(checkpoint_record(tree, totals)?)?;
+        let head = self.insert(checkpoint_record(tree, totals))?;
         self.finish_head(header, head)
     }
 
@@ -390,7 +390,7 @@ where
         }
         tail.reverse();
 
-        let mut head = self.insert(checkpoint_record(tree, checkpoint_totals)?)?;
+        let mut head = self.insert(checkpoint_record(tree, checkpoint_totals))?;
         let mut overlay = super::overlay::OverlayMap::default();
         let mut depth = 0_u64;
         let mut delta_bytes = 0_u64;

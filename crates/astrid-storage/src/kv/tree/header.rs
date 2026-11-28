@@ -8,7 +8,7 @@ use crate::storage_model::{
 };
 use parking_lot::Mutex;
 
-use super::delta::{Mutation, Projection, decode_head};
+use super::delta::{Mutation, Projection};
 use super::memo::MemoSnapshot;
 use super::node::NodeTotals;
 use super::overlay::OverlayMap;
@@ -346,8 +346,19 @@ where
     use super::delta_chain::{self, Step};
     let validated_trees = &validation_cache.trees;
     let chain = delta_chain::walk(owner, head_id, |principal, object| {
-        let record = load_typed(engine, principal, object, ObjectKind::NamespaceMap)?;
-        decode_head(object, &record)
+        use super::projection_record::{self, LoadError};
+        projection_record::read_at(
+            principal,
+            object,
+            FORMAT_VERSION,
+            super::ROOT_LABEL,
+            |p, id| load_typed(engine, p, id, ObjectKind::NamespaceMap),
+            |key| super::validation::validate_composite_key(object, key).err(),
+        )
+        .map_err(|error| match error {
+            LoadError::Source(e) => e,
+            LoadError::Record(id, e) => super::delta::projection_error(id, e),
+        })
     })
     .map_err(|error| match error {
         delta_chain::Error::Cycle(id) => invalid(id, "KV delta chain contains a cycle"),

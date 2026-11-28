@@ -76,6 +76,7 @@ mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
+mod projection_record;
 mod publication;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod retirement_tests;

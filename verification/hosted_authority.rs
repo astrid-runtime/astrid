@@ -347,6 +347,9 @@ mod delta_recovery;
 mod delta_totals;
 #[path = "../crates/astrid-storage/src/kv/tree/spill_record.rs"]
 mod spill_record;
+#[path = "../crates/astrid-storage/src/kv/tree/projection_record.rs"]
+mod projection_record;
+mod hosted_projection_record;
 mod hosted_spill_record;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_batch.rs"]
 mod delta_batch;

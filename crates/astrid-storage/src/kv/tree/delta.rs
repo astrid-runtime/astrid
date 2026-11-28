@@ -1,8 +1,6 @@
 //! Canonical write-ahead projection records over immutable KV checkpoints.
 
-use crate::storage_model::{
-    ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel,
-};
+use crate::storage_model::{ObjectClass, ObjectId, ObjectKind, ObjectRecord};
 
 use super::node::NodeTotals;
 #[cfg(test)]
@@ -13,11 +11,12 @@ use super::{FORMAT_VERSION, ROOT_LABEL};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::invalid;
 
-const CHECKPOINT: u8 = 0;
-const DELTA: u8 = 1;
 #[cfg(test)]
 use super::delta_mutation::{DELETE, INLINE, SPILLED};
 use super::delta_mutation::{DecodeError, EdgeError, ReadError, WriteError};
+#[cfg(test)]
+use super::projection_record::CHECKPOINT;
+use super::projection_record::DELTA;
 
 pub(super) use super::delta_mutation::Mutation;
 
@@ -48,26 +47,8 @@ impl Projection {
 
 pub(super) use super::delta_chain::Head;
 
-pub(super) fn checkpoint_record(
-    tree: Option<ObjectId>,
-    totals: NodeTotals,
-) -> StorageResult<ObjectRecord> {
-    let mut canonical = Vec::with_capacity(17);
-    canonical.push(CHECKPOINT);
-    canonical.extend_from_slice(&totals.entries.to_le_bytes());
-    canonical.extend_from_slice(&totals.quota_bytes.to_le_bytes());
-    let references = tree
-        .map(|tree| vec![ObjectReference::owns(ROOT_LABEL.to_vec().into(), tree)])
-        .unwrap_or_default();
-    ObjectRecord::new(
-        ObjectKind::NamespaceMap,
-        FORMAT_VERSION,
-        canonical,
-        references,
-        totals.logical_bytes,
-        ObjectClass::Metadata,
-    )
-    .map_err(|error| model_error(&error))
+pub(super) fn checkpoint_record(tree: Option<ObjectId>, totals: NodeTotals) -> ObjectRecord {
+    super::projection_record::checkpoint(FORMAT_VERSION, ROOT_LABEL, tree, totals)
 }
 
 pub(super) fn delta_record(
@@ -121,47 +102,26 @@ pub(super) fn delta_record(
 }
 
 pub(super) fn decode_head(id: ObjectId, record: &ObjectRecord) -> StorageResult<Head> {
-    if record.kind() != ObjectKind::NamespaceMap
-        || record.format_version() != FORMAT_VERSION
-        || record.class() != ObjectClass::Metadata
-    {
-        return Err(invalid(id, "invalid KV projection head"));
-    }
-    let mut cursor = Cursor::new(id, record.canonical_bytes());
-    match cursor.u8()? {
-        CHECKPOINT => decode_checkpoint(id, record, cursor),
-        DELTA => decode_delta(id, record),
-        _ => Err(invalid(id, "invalid KV projection head tag")),
-    }
+    use super::projection_record;
+    projection_record::decode(record, FORMAT_VERSION, ROOT_LABEL, |key| {
+        validate_composite_key(id, key).err()
+    })
+    .map_err(|error| projection_error(id, error))
 }
 
-fn decode_checkpoint(
+pub(super) fn projection_error(
     id: ObjectId,
-    record: &ObjectRecord,
-    mut cursor: Cursor<'_>,
-) -> StorageResult<Head> {
-    let totals = NodeTotals {
-        entries: cursor.u64()?,
-        logical_bytes: record.logical_bytes(),
-        quota_bytes: cursor.u64()?,
-    };
-    cursor.done()?;
-    let tree = match record.reference(&ReferenceLabel::new(ROOT_LABEL)) {
-        None if record.references().is_empty() => None,
-        Some(reference)
-            if reference.kind() == ReferenceKind::Owns && record.references().len() == 1 =>
-        {
-            Some(reference.target())
-        },
-        _ => return Err(invalid(id, "invalid KV checkpoint root reference")),
-    };
-    Ok(Head::Checkpoint { tree, totals })
-}
-
-fn decode_delta(id: ObjectId, record: &ObjectRecord) -> StorageResult<Head> {
-    use super::delta_recovery::{self, Error};
-    let head = delta_recovery::decode(record, |key| validate_composite_key(id, key).err())
-        .map_err(|error| match error {
+    error: super::projection_record::Error<StorageError>,
+) -> StorageError {
+    use super::delta_recovery::Error;
+    use super::projection_record::Error as RecordError;
+    match error {
+        RecordError::Type => invalid(id, "invalid KV projection head"),
+        RecordError::Tag => invalid(id, "invalid KV projection head tag"),
+        RecordError::Root => invalid(id, "invalid KV checkpoint root reference"),
+        RecordError::Truncated => invalid(id, "truncated KV projection head"),
+        RecordError::Trailing => invalid(id, "trailing KV projection head bytes"),
+        RecordError::Delta(error) => match error {
             Error::Truncated => invalid(id, "truncated KV projection head"),
             Error::Count => invalid(id, "KV projection count is too large"),
             Error::Empty => invalid(id, "empty KV delta head"),
@@ -177,14 +137,8 @@ fn decode_delta(id: ObjectId, record: &ObjectRecord) -> StorageResult<Head> {
             Error::Audit(super::delta_batch::AuditError::References) => {
                 invalid(id, "unexpected KV delta reference")
             },
-        })?;
-    Ok(Head::Delta {
-        previous: head.previous,
-        depth: head.depth,
-        delta_bytes: head.delta_bytes,
-        mutations: head.rows,
-        totals: head.totals,
-    })
+        },
+    }
 }
 
 pub(super) fn mutation_payload_bytes(mutations: &[Mutation]) -> StorageResult<u64> {
@@ -235,56 +189,6 @@ fn serialization(message: &str) -> StorageError {
 
 fn model_error(error: &crate::storage_model::ModelError) -> StorageError {
     StorageError::Serialization(error.to_string())
-}
-
-struct Cursor<'a> {
-    id: ObjectId,
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Cursor<'a> {
-    const fn new(id: ObjectId, bytes: &'a [u8]) -> Self {
-        Self {
-            id,
-            bytes,
-            offset: 0,
-        }
-    }
-
-    fn take(&mut self, length: usize) -> StorageResult<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or_else(arithmetic_overflow)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| invalid(self.id, "truncated KV projection head"))?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn array<const N: usize>(&mut self) -> StorageResult<[u8; N]> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| invalid(self.id, "truncated KV projection integer"))
-    }
-
-    fn u8(&mut self) -> StorageResult<u8> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u64(&mut self) -> StorageResult<u64> {
-        Ok(u64::from_le_bytes(self.array()?))
-    }
-
-    fn done(self) -> StorageResult<()> {
-        if self.offset != self.bytes.len() {
-            return Err(invalid(self.id, "trailing KV projection head bytes"));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

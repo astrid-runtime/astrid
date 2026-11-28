@@ -208,6 +208,21 @@ def consumer_defects():
             f"delta chain loses {label}", chain,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_chain.rs"),
         )
+    envelope = Path("crates/astrid-storage/src/kv/tree/projection_record.rs")
+    for label, clause, weaker, target in [
+        ("checkpoint physical bytes", "f.2 == checkpoint_bytes(totals) && f.4", "f.4", "hosted_projection_record"),
+        ("checkpoint root", "f.3[0].fields() == (label@,id,super::ReferenceKind::Owns)", "true", "hosted_projection_record"),
+        ("type refusal", "{out == Err(Error::Type)}", "{true}", "hosted_projection_record"),
+        ("unknown tag", "else {out == Err(Error::Tag)}", "else {true}", "hosted_projection_record"),
+        ("checkpoint trailing", "bytes.len() > 17 {out == Err(Error::Trailing)}", "bytes.len() > 17 {true}", "hosted_projection_record"),
+        ("load source", "=> load.ensures((owner,id),Err(e))", "=> true", "hosted_projection_record"),
+        ("decoded load", "valid(&*r,version,label,check,Ok(h))", "true", "hosted_projection_record"),
+        ("delta contents", "#[trigger] delta::admitted(record,check,r,b,refs,p)", "true || #[trigger] delta::admitted(record,check,r,b,refs,p)", "hosted_delta_mutation"),
+    ]:
+        yield (
+            f"projection envelope loses {label}", envelope,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path(f"verification/{target}.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

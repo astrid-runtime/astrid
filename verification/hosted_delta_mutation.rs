@@ -316,7 +316,7 @@ fn reconcile_charge(object:ObjectId,prior:u64,declared:u64,depth:u64,length:u64)
     }
 }
 
-fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64,deny:bool) {
+fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64,deny:bool,via_envelope:bool) {
     use crate::{delta_batch as batch,delta_header as header,delta_recovery as recovery};
     let h = header::Header {depth:1,delta_bytes:3,entries,quota_bytes:quota,count:1};
     let mut bytes = vec![1u8];
@@ -332,7 +332,15 @@ fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64
     let validate = |_k:&[u8]| -> (e:Option<u8>) ensures e == if deny {Some(7u8)} else {None} {
         if deny {Some(7u8)} else {None}
     };
-    let got = recovery::decode(&record,validate);
+    let got = if via_envelope {
+        use crate::{delta_chain::Head,projection_record};
+        match projection_record::decode(&record,crate::ObjectFormatVersion::new(4).unwrap(),&[],validate) {
+            Ok(Head::Delta {previous,depth,delta_bytes,mutations,totals}) =>
+                Ok(recovery::Recovered {previous,depth,delta_bytes,rows:mutations,totals}),
+            Err(projection_record::Error::Delta(e)) => Err(e),
+            _ => unreached(),
+        }
+    } else {recovery::decode(&record,validate)};
     proof {
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         assert(wire.subrange(1,37) =~= h.wire());
