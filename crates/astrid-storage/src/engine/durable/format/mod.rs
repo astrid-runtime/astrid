@@ -292,8 +292,7 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
     #[cfg(test)]
     RECOVERY_ARENA_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
     let scheme = identity.scheme();
-    let mut index = BTreeMap::<ObjectId, ArenaLocation>::new();
-    let mut tail = None;
+    let mut index = recovered_record::ArenaIndex::new();
     scan_frames_with_protected_prefix(
         arena,
         ARENA_FILE,
@@ -302,36 +301,35 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
         protected_len,
         |offset, payload, _source| {
             use recovered_record::{Error, IndexError};
-            let location = recovered_record::index(
-                &mut index,
-                offset,
-                payload,
-                scheme.into(),
-                |r| identity.identify(r),
-                |length, bytes| frame_checksum(ARENA_MAGIC, length, bytes),
-            )
-            .map_err(|error| match error {
-                IndexError::Record(Error::Decode(e)) => {
-                    corrupt(ARENA_FILE, offset, body_error_detail(e))
-                },
-                IndexError::Record(Error::Identity) => {
-                    corrupt(ARENA_FILE, offset, "object identity mismatch")
-                },
-                IndexError::Record(Error::Overflow) => DurableError::EncodingOverflow,
-                IndexError::Record(Error::Canonical) => {
-                    corrupt(ARENA_FILE, offset, "object frame is not canonical")
-                },
-                IndexError::Collision(id) => DurableError::RecoveryModel {
-                    file: ARENA_FILE,
+            index
+                .accept(
                     offset,
-                    source: ModelError::ObjectCollision(id),
-                },
-            })?;
-            tail = Some(location);
+                    payload,
+                    scheme.into(),
+                    |r| identity.identify(r),
+                    |length, bytes| frame_checksum(ARENA_MAGIC, length, bytes),
+                )
+                .map_err(|error| match error {
+                    IndexError::Record(Error::Decode(e)) => {
+                        corrupt(ARENA_FILE, offset, body_error_detail(e))
+                    },
+                    IndexError::Record(Error::Identity) => {
+                        corrupt(ARENA_FILE, offset, "object identity mismatch")
+                    },
+                    IndexError::Record(Error::Overflow) => DurableError::EncodingOverflow,
+                    IndexError::Record(Error::Canonical) => {
+                        corrupt(ARENA_FILE, offset, "object frame is not canonical")
+                    },
+                    IndexError::Collision(id) => DurableError::RecoveryModel {
+                        file: ARENA_FILE,
+                        offset,
+                        source: ModelError::ObjectCollision(id),
+                    },
+                })?;
             Ok(())
         },
     )?;
-    Ok((index, tail))
+    Ok(index.finish())
 }
 
 #[cfg(test)]

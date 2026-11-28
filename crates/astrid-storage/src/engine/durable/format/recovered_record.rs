@@ -115,4 +115,49 @@ pub(super) fn index<F,H>(map:&mut BTreeMap<ObjectId,ArenaLocation>,offset:u64,pa
     Ok(loc)
 }
 
+/// The index keeps the first matching object. The physical tail tracks the
+/// most recently accepted frame, including matching duplicates.
+pub(super) struct ArenaIndex {
+    entries:BTreeMap<ObjectId,ArenaLocation>,
+    tail:Option<ArenaLocation>,
+}
+
+impl ArenaIndex {
+    pub(super) closed spec fn entries(&self) -> Map<ObjectId,ArenaLocation> { self.entries@ }
+    pub(super) closed spec fn tail(&self) -> Option<ArenaLocation> { self.tail }
+    pub(super) closed spec fn valid(&self) -> bool { btree_map_inv(&self.entries) }
+
+    pub(super) fn new() -> (v:Self)
+        ensures v.entries()==Map::<ObjectId,ArenaLocation>::empty(),v.tail().is_none(),v.valid(),
+    { Self{entries:BTreeMap::new(),tail:None} }
+
+    pub(super) fn accept<F:FnOnce(&ObjectRecord)->ObjectId,H:FnOnce(u64,&[u8])->[u8;32]>(
+        &mut self,at:u64,data:&[u8],scheme:Scheme,identify:F,checksum:H) -> (out:Result<(),IndexError>)
+        requires old(self).valid(),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+            forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),checksum.requires((data.len() as u64,data)),
+        ensures final(self).valid(), match out {
+            Ok(())=>final(self).tail() matches Some(loc) && loc.offset==at && loc.payload_len==data.len() &&
+                checksum.ensures((loc.payload_len,data),loc.checksum) &&
+                exists|id:ObjectId| #[trigger] authenticated(data@,scheme,id,identify) &&
+                    if old(self).entries().contains_key(id) {agrees(old(self).entries()[id],loc) && final(self).entries()==old(self).entries()}
+                    else {final(self).entries()==old(self).entries().insert(id,loc)},
+            Err(e)=>final(self).entries()==old(self).entries() && final(self).tail()==old(self).tail() &&
+                match e {
+                    IndexError::Record(err)=>refused(data@,scheme,identify,err),
+                    IndexError::Collision(id)=>old(self).entries().contains_key(id) && authenticated(data@,scheme,id,identify) &&
+                        exists|sum:[u8;32]| #[trigger] checksum.ensures((data.len() as u64,data),sum) &&
+                            (old(self).entries()[id].payload_len!=data.len() || old(self).entries()[id].checksum!=sum),
+                },
+        },
+    {
+        let location=index(&mut self.entries,at,data,scheme,identify,checksum)?;
+        self.tail=Some(location);
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> (out:(BTreeMap<ObjectId,ArenaLocation>,Option<ArenaLocation>))
+        ensures out.0@==self.entries(),out.1==self.tail(),self.valid() ==> btree_map_inv(&out.0),
+    { (self.entries,self.tail) }
+}
+
 }

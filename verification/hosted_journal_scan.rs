@@ -187,8 +187,10 @@ pub(crate) fn recover_live<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D,C
                         if e is HeaderShort {
                             let r=choose|r:R| r.target()==reader.target() && r.image()==reader.image() && r.position()==at &&
                                 #[trigger] crate::frame_repair::classified(&r,reader,at,end,ROOT_MAGIC,FRAME_VERSION,limit,hash,Err(FrameError::Tail(e)));
-                            assert(end<at as int+52);
+                            assert(r.image()==old(media).bytes());
+                        assert(end<at as int+52);
                             assert forall|next:u64| at<next implies !(#[trigger] crate::frame_probe::protects::<M>(r.image(),ROOT_MAGIC,end,limit,next)) by {};
+                        assert(!crate::frame_repair::has_later::<M>(old(media).bytes(),at,end,ROOT_MAGIC,limit));
                         }
                         retain_prefix(table@,reader.image(),at,limit,scheme,decode,recode,hash);
                     }

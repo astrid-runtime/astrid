@@ -174,6 +174,7 @@ fn incomplete_payload<M:crate::frame_repair::Medium>(media:&mut M,physical:u64,p
 {
     use crate::frame_repair as r;
     let w = r::window(physical,r::Bound::Live(protected)).unwrap();
+    assert(w.end==physical);
     match r::extent(at,w.end,len,limit) {
         r::Extent::Incomplete => {},
         _ => {assert(false);return Ok(false);},

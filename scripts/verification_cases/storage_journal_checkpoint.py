@@ -376,6 +376,17 @@ def consumer_defects():
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )
 
+    arena_index = Path("crates/astrid-storage/src/engine/durable/format/recovered_record.rs")
+    for label, clause, weakness in [
+        ("physical offset", "index(&mut self.entries,at,data", "index(&mut self.entries,0,data"),
+        ("last accepted frame", "self.tail=Some(location);", "if self.tail.is_none() {self.tail=Some(location);}"),
+        ("complete index", "{ (self.entries,self.tail) }", "{ (BTreeMap::new(),self.tail) }"),
+    ]:
+        yield (
+            f"native arena index loses {label}", arena_index,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), arena_index,
+        )
+
     loaded = Path("verification/hosted_recovered_roots.rs")
     for label, source, clause, weakness in [
         ("persisted end", loaded, "history:Ghost(history@),end:at", "history:Ghost(history@),end"),
