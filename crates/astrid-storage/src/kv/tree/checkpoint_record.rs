@@ -171,6 +171,8 @@ pub(super) fn read<E,F:Fn(&[u8])->Result<(),E>+Copy>(
                     let (h,s) = choose|h:Header,s:usize| #[trigger] header::present(data@,header::Kind::Branch,h,s)
                         && h.outcome(data,edges,s,validate,Ok(b));
                     assert(h.field_outcome(record.contents().2,record.contents().3,s,validate,Ok(b)));
+                    assert(h.valid(edges.len()) && b.level == h.level && b.children.len() == h.count);
+                    assert(b.level > 0 && b.children.len() >= 2);
                     let pos = choose|p:Seq<usize>| #[trigger] super::checkpoint_branch::layout(
                         data@,edges@,s,data.len() as usize,b.level,b.children@,p,validate);
                     assert forall|i:int| 0 <= i < b.children.len() implies
@@ -225,7 +227,8 @@ pub(super) open spec fn scheduled_result<E,F:Fn(&[u8])->Result<(),E>>(
                 !(record.contents().0 is KvLeaf) && !(record.contents().0 is KvBranch),
             _ => true,
         },
-        Err(ScheduledError::Summary) => exists|n:DecodedNode| #[trigger] parsed(record,n,validate) &&
+        Err(ScheduledError::Summary) => record.contents().1 == version.number() && exists|n:DecodedNode|
+            #[trigger] parsed(record,n,validate) && ordered(n) && descending(n) &&
             !checkpoint_page::agrees(*page,Handle {object:checkpoint_page::object(*page),node:n}),
     }
 }

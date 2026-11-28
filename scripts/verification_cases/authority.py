@@ -308,8 +308,9 @@ def live_token_consumers():
 def marker_batch_consumers():
     membership = Path("verification/hosted_checkpoint_membership.rs")
     for label, clause, weaker in [
+        ("reader stability", "requires stable(read),\n    ensures image", "requires true,\n    ensures image"),
         ("leaf row", "contains(rows@,rows@.len(),key,start,end)\n    } else", "true\n    } else"),
-        ("selected child", "scheduled(c@,0,start,end).contains(pages.drop_last().last())", "true"),
+        ("selected child", "scheduled(c@,0,start,end).contains(pages.drop_last().last())\n        &&&", "true\n        &&&"),
         ("complete path", "&&& path(read,pages.drop_last(),key,start,end)",
          "&&& (pages.len() == 2 || path(read,pages.drop_last(),key,start,end))"),
     ]:

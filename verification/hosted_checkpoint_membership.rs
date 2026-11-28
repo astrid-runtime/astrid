@@ -14,6 +14,12 @@ pub(super) open spec fn stable<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E
         #[trigger] read.ensures((p,),Ok(a)) && #[trigger] read.ensures((p,),Ok(b)) ==> a == b
 }
 
+proof fn same_page<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(
+    read:R,p:Page<I,T>,a:Contents<I,T,V>,b:Contents<I,T,V>)
+    requires stable(read),read.ensures((p,),Ok(a)),read.ensures((p,),Ok(b)),
+    ensures a == b,
+{}
+
 // The last element is the current page. Dropping it consumes one branch edge.
 pub(super) open spec fn path<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(read:R,pages:Seq<Page<I,T>>,
     key:Seq<u8>,start:Seq<u8>,end:Seq<u8>) -> bool
@@ -45,6 +51,16 @@ pub(super) proof fn derive<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(r
         if has(p) {
             let pages = choose|pages:Seq<Page<I,T>>| pages.len()>0 && pages.last()==p && #[trigger] path(read,pages,key,start,end);
             reveal_with_fuel(path,2);
+            if pages.len()==1 {
+                let seen = choose|x:Vec<Entry<V>>| #[trigger] read.ensures((p,),Ok(Contents::Leaf(x))) &&
+                    contains(x@,x@.len(),key,start,end);
+                same_page(read,p,Contents::Leaf(rows),Contents::Leaf(seen));
+            } else {
+                let (h,c) = choose|h:u16,c:Vec<Child<I,T>>| #[trigger] read.ensures((p,),Ok(Contents::Branch(h,c))) &&
+                    scheduled(c@,0,start,end).contains(pages.drop_last().last());
+                same_page(read,p,Contents::Leaf(rows),Contents::Branch(h,c));
+                assert(false);
+            }
         } else if contains(rows@,rows@.len(),key,start,end) {
             let pages = seq![p];
             assert(pages.last()==p);
@@ -58,6 +74,15 @@ pub(super) proof fn derive<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(r
             let pages = choose|pages:Seq<Page<I,T>>| pages.len()>0 && pages.last()==p && #[trigger] path(read,pages,key,start,end);
             let rest = pages.drop_last();
             reveal_with_fuel(path,2);
+            if pages.len()==1 {
+                let seen = choose|x:Vec<Entry<V>>| #[trigger] read.ensures((p,),Ok(Contents::Leaf(x))) &&
+                    contains(x@,x@.len(),key,start,end);
+                same_page(read,p,Contents::Branch(h,c),Contents::Leaf(seen));
+                assert(false);
+            }
+            let (level,rows) = choose|level:u16,rows:Vec<Child<I,T>>| #[trigger] read.ensures((p,),Ok(Contents::Branch(level,rows))) &&
+                scheduled(rows@,0,start,end).contains(rest.last());
+            same_page(read,p,Contents::Branch(h,c),Contents::Branch(level,rows));
             assert(pages.len()>1);
             assert(rest.len() == pages.len()-1);
             assert(path(read,rest,key,start,end));

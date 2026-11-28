@@ -71,7 +71,7 @@ fn range_reader<E,F:Fn(&[u8])->Result<(),E>+Copy,L:FnOnce(ObjectId)->Result<Obje
         forall|i:int| 0 <= i < children.len() ==> (#[trigger] children@[i]).level as nat + 1 == level,
         out matches Ok(body) ==> exists|record:ObjectRecord| #[trigger] load.ensures((crate::checkpoint_page::object(*page),),Ok(record)) &&
             record.contents().1 == v.number() && exists|node:Node<ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>|
-                #[trigger] checkpoint_record::parsed(&record,node,validate) && node.contents() == body &&
+                #[trigger] checkpoint_record::parsed(&record,node,validate) && checkpoint_record::ordered(node) && node.contents() == body &&
                 crate::checkpoint_page::agrees(*page,Handle {object:crate::checkpoint_page::object(*page),node}),
         out matches Err(checkpoint_record::ScheduledError::Record(e)) ==> exists|record:ObjectRecord|
             #[trigger] load.ensures((crate::checkpoint_page::object(*page),),Ok(record)) &&
@@ -82,7 +82,8 @@ fn range_reader<E,F:Fn(&[u8])->Result<(),E>+Copy,L:FnOnce(ObjectId)->Result<Obje
         out matches Err(checkpoint_record::ScheduledError::Summary) ==> exists|record:ObjectRecord|
             #[trigger] load.ensures((crate::checkpoint_page::object(*page),),Ok(record)) &&
             exists|node:Node<ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>|
-                #[trigger] checkpoint_record::parsed(&record,node,validate) &&
+                #[trigger] checkpoint_record::parsed(&record,node,validate) && checkpoint_record::ordered(node) &&
+                checkpoint_record::descending(node) && record.contents().1 == v.number() &&
                 !crate::checkpoint_page::agrees(*page,Handle {object:crate::checkpoint_page::object(*page),node}),
         out matches Err(checkpoint_record::ScheduledError::Source(e)) ==> load.ensures((crate::checkpoint_page::object(*page),),Err(e)),
 { checkpoint_record::load_scheduled(page,v,load,validate) }
