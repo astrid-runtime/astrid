@@ -170,6 +170,101 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn queued_receipt_requests_use_policy_after_the_owner_change() {
+        use crate::kernel_router::{
+            ManagementRateLimiter, handle_request, install_batch::InstallBatchRegistry,
+        };
+        use astrid_core::{
+            identity::PrincipalUid, kernel_api::KernelRequest, profile::PrincipalProfile,
+        };
+        use astrid_events::ipc::{IpcPayload, Topic};
+
+        let home = tempfile::tempdir().unwrap();
+        let kernel = crate::test_kernel_with_home(AstridHome::from_path(home.path())).await;
+        let directory = kernel.principal_directory();
+        let mut limits = ManagementRateLimiter::from_kernel(&kernel);
+        let mut batches = InstallBatchRegistry::default();
+
+        for (alias, request) in [
+            (
+                "receipt-reader",
+                KernelRequest::GetCapsuleInstallResumeReceipt {
+                    id: "capsule".into(),
+                },
+            ),
+            (
+                "receipt-writer",
+                KernelRequest::PutCapsuleInstallResumeReceipt {
+                    receipt: receipt("capsule", 'a'),
+                },
+            ),
+        ] {
+            let owner = PrincipalId::new(alias).unwrap();
+            let old_uid = PrincipalUid::from_bytes(*blake3::hash(alias.as_bytes()).as_bytes());
+            let new_alias = PrincipalId::new(format!("{alias}-retired")).unwrap();
+            let new_uid =
+                PrincipalUid::from_bytes(*blake3::hash(new_alias.as_str().as_bytes()).as_bytes());
+            directory.register(owner.clone(), old_uid).unwrap();
+            let profile = PrincipalProfile {
+                grants: vec!["self:capsule:install".into()],
+                ..Default::default()
+            };
+            profile.save(&kernel.astrid_home, &owner).unwrap();
+            let mut rx = kernel
+                .event_bus
+                .subscribe_topic(Topic::kernel_response(alias).as_str());
+            let guard = kernel.admin_write_lock.lock().await;
+            let mut pending = std::pin::pin!(handle_request(
+                &kernel,
+                &mut limits,
+                &mut batches,
+                Topic::kernel_request(alias),
+                owner.clone(),
+                None,
+                request
+            ));
+            tokio::select! {
+                biased;
+                () = &mut pending => panic!("receipt ran while the owner change was pending"),
+                () = std::future::ready(()) => {}
+            }
+            directory.rename(old_uid, &owner, new_alias).unwrap();
+            directory.register(owner.clone(), new_uid).unwrap();
+            let disabled = PrincipalProfile {
+                enabled: false,
+                ..profile
+            };
+            disabled.save(&kernel.astrid_home, &owner).unwrap();
+            kernel.profile_cache.invalidate(&owner);
+            drop(guard);
+            pending.await;
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+                panic!("expected IPC response");
+            };
+            let IpcPayload::RawJson(value) = &message.payload else {
+                panic!("expected kernel response");
+            };
+            let response: KernelResponse = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                matches!(&response, KernelResponse::Error(reason) if reason.contains("disabled")),
+                "{response:?}"
+            );
+            assert!(
+                principal_store(&kernel, &owner)
+                    .unwrap()
+                    .get("capsule")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_receipt_is_explicit_absence() {
         let directory = tempfile::tempdir().expect("test home");
