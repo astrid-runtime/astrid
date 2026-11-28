@@ -157,11 +157,18 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
 }
 
 pub(super) fn decode_node(id: ObjectId, record: &ObjectRecord) -> StorageResult<NodeHandle> {
-    use super::checkpoint_record::{self, EnvelopeError, ReadError, SizeError};
-    checkpoint_record::read(id, record, FORMAT_VERSION, |k| {
+    super::checkpoint_record::read(id, record, FORMAT_VERSION, |k| {
         validate_composite_key(id, k)
     })
-    .map_err(|error| match error {
+    .map_err(|error| decode_error(id, error))
+}
+
+pub(super) fn decode_error(
+    id: ObjectId,
+    error: super::checkpoint_record::ReadError<StorageError>,
+) -> StorageError {
+    use super::checkpoint_record::{EnvelopeError, ReadError, SizeError};
+    match error {
         ReadError::Envelope(EnvelopeError::Header) => {
             invalid(id, "invalid persistent KV page header")
         },
@@ -172,7 +179,7 @@ pub(super) fn decode_node(id: ObjectId, record: &ObjectRecord) -> StorageResult<
             model_error(&crate::storage_model::ModelError::ArithmeticOverflow)
         },
         ReadError::Size(SizeError::Oversize) => invalid(id, "oversized persistent KV page"),
-    })
+    }
 }
 
 pub(super) fn spilled_opaque_payload(

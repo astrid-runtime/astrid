@@ -325,6 +325,8 @@ mod checkpoint_page;
 mod checkpoint_point;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_descent.rs"]
 mod checkpoint_descent;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_cache.rs"]
+mod checkpoint_cache;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_record.rs"]
 mod checkpoint_record;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_reference.rs"]

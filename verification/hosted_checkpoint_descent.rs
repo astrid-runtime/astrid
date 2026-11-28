@@ -66,20 +66,90 @@ fn trace(root:ObjectId,child:ObjectId,owner:u64,bad_root:bool,bad_level:bool,ref
         }
     }
 }
-fn decoded_leaf(owner:u64,root:ObjectId,record:&crate::ObjectRecord,version:crate::ObjectFormatVersion,key:&[u8])
-    requires record.contents().0 == crate::ObjectKind::KvLeaf,
+// The loader returns the same stale handle for any requested address.
+fn stale_root(root:ObjectId,stale:ObjectId)
+    requires root != stale,
+{
+    let fetch = |():(),_address:ObjectId| -> (out:Result<((),walk::Loaded),u8>)
+        ensures out.is_ok() && out->Ok_0.1.object == stale {
+        let totals = NodeTotals {entries:0,logical_bytes:0,quota_bytes:0};
+        Ok(((),Handle {object:stale,node:Node::Leaf(Leaf {entries:Vec::new(),totals})}))
+    };
+    let key = [0u8];
+    let result = walk::lookup((),Some(root),&key,fetch);
+    let ghost out = result;
+    proof {
+        reveal(walk::reached); reveal(walk::finished);
+        let (path,at) = choose|path:Seq<walk::Hop<()>>,at:((),walk::Address)|
+            #[trigger] walk::reached(path,(),root,at,key@,fetch) && walk::terminal(at,key@,fetch,out);
+        if path.len() != 0 {
+            assert(walk::step(path[0],if path.len()>1 {path[1].0} else {at},key@,fetch));
+            assert(false);
+        }
+        assert(out == Err(walk::Error::Mismatch(root)));
+    }
+}
+
+#[verifier::rlimit(25)]
+proof fn decoded_membership<V:Fn(&[u8])->Result<(),u8>>(record:&crate::ObjectRecord,h:walk::Loaded,rows:Vec<Row>,
+    key:Seq<u8>,validate:V,v:Option<ValueSlot>)
+    requires h.node is Leaf, h.node.contents() == Contents::Leaf(rows), crate::checkpoint_record::ordered(h.node),
+        walk::slot(rows@,key,v), exists|src:walk::Loaded| #[trigger] crate::checkpoint_cache::image(src) == crate::checkpoint_cache::image(h) &&
+            crate::checkpoint_record::parsed(record,src.node,validate),
+    ensures exists|src:walk::Loaded| #[trigger] crate::checkpoint_record::parsed(record,src.node,validate) &&
+        src.node is Leaf && (v.is_none() ==> forall|i:int| 0 <= i < src.node->Leaf_0.entries.len() ==>
+            (#[trigger] src.node->Leaf_0.entries@[i]).key@ != key),
+{
+    use crate::checkpoint_cache::{image,entry};
+    let src = choose|src:walk::Loaded| #[trigger] image(src) == image(h) && crate::checkpoint_record::parsed(record,src.node,validate);
+    let encoded = src.node->Leaf_0.entries;
+    assert(src.node is Leaf && h.node->Leaf_0.entries == rows);
+    assert(crate::checkpoint_leaf_summary::ordered(rows@,rows.len() as nat));
+    let ea = encoded@.map(|j:int,e| entry(e));
+    let eb = rows@.map(|j:int,e| entry(e));
+    assert(image(src).1 == crate::checkpoint_cache::Image::Leaf(ea,src.node->Leaf_0.totals));
+    assert(image(h).1 == crate::checkpoint_cache::Image::Leaf(eb,h.node->Leaf_0.totals));
+    assert(ea == eb);
+    assert(ea.len() == encoded@.len());
+    assert(eb.len() == rows@.len());
+    assert(encoded.len() == rows.len());
+    assert forall|i:int| 0 <= i < rows.len() && (#[trigger] rows@[i]).key@ == key implies v == Some(rows@[i].value) by {}
+    assert forall|i:int| 0 <= i < encoded.len() && v.is_none() implies (#[trigger] encoded@[i]).key@ != key by {
+        let a = encoded@.map(|j:int,e| entry(e));
+        let b = rows@.map(|j:int,e| entry(e));
+        assert(a[i] == b[i]);
+        assert(rows@[i].key@ != key);
+    }
+}
+
+#[verifier::rlimit(35)]
+fn decoded_leaf(owner:u64,root:ObjectId,record:&crate::ObjectRecord,version:crate::ObjectFormatVersion,key:&[u8],warm:bool)
+    requires vstd::laws_cmp::obeys_cmp::<ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),
+        record.contents().0 == crate::ObjectKind::KvLeaf,
 {
     use crate::checkpoint_record as physical;
+    use crate::checkpoint_cache::{Cache,image};
     let validate = |_k:&[u8]| -> (out:Result<(),u8>) ensures out == Ok(()) {Ok(())};
     let read = |p:u64,id:ObjectId| -> (out:Result<(u64,walk::Loaded),u8>)
         ensures if p != owner || id != root {out == Err(9u8)} else {
             out matches Ok((after,h)) ==> after == owner && h.object == root && h.node is Leaf &&
-                physical::ordered(h.node) && physical::parsed(record,h.node,validate)
+                physical::ordered(h.node) && exists|src:walk::Loaded| #[trigger] image(src) == image(h) &&
+                    physical::parsed(record,src.node,validate)
         }
     {
         if p != owner || !id.same(&root) {return Err(9);}
+        if warm {
+            let mut cache = Cache::new(&p);
+            let fresh = match cache.admit(id,record,version,validate) {Ok(h) => h,Err(_) => return Err(7)};
+            let cached = cache.lookup(id,version,|_:&u64,_:ObjectId| -> (r:Result<crate::ObjectRecord,u8>)
+                ensures r == Err(9u8) {Err(9)},validate);
+            let hit = match cached {Ok(h) => h,Err(_) => {assert(false);return Err(9)}};
+            assert(image(hit) == image(fresh));
+            assert(exists|src:walk::Loaded| #[trigger] image(src) == image(hit) && physical::parsed(record,src.node,validate)) by {assert(image(fresh) == image(hit) && physical::parsed(record,fresh.node,validate));}
+            return Ok((p,hit));
+        }
         match physical::read(id,record,version,validate) {
-            Ok(h) => {assert(h.node is Leaf); Ok((p,h))},
+            Ok(h) => {assert(h.node is Leaf); assert(exists|src:walk::Loaded| #[trigger] image(src) == image(h) && physical::parsed(record,src.node,validate)) by {assert(image(h) == image(h) && physical::parsed(record,h.node,validate));} Ok((p,h))},
             Err(_) => Err(7),
         }
     };
@@ -100,12 +170,7 @@ fn decoded_leaf(owner:u64,root:ObjectId,record:&crate::ObjectRecord,version:crat
                     walk::slot(rows@,key@,v);
                 let h = choose|h:walk::Loaded| #[trigger] read.ensures((owner,root),Ok((after,h))) &&
                     crate::checkpoint_page::agrees(at.1,h) && h.node.contents() == Contents::Leaf(rows);
-                assert(physical::parsed(record,h.node,validate) && h.node is Leaf && h.node->Leaf_0.entries == rows);
-                assert(crate::checkpoint_leaf_summary::ordered(rows@,rows.len() as nat));
-                assert forall|i:int| 0 <= i < rows.len() && (#[trigger] rows@[i]).key@ == key@ implies v == Some(rows@[i].value) by {}
-                if v.is_none() {
-                    assert forall|i:int| 0 <= i < rows.len() implies (#[trigger] rows@[i]).key@ != key@ by {}
-                }
+                decoded_membership(record,h,rows,key@,validate,v);
             },
             Err(e) => {assert(e is Source);}
         }

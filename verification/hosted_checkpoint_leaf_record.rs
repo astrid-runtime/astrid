@@ -7,8 +7,9 @@ use vstd::prelude::*;
 verus! {
 
 fn read_leaf<F:Fn(&[u8])->Result<(),()>+Copy>(id:crate::ObjectId,object:&crate::ObjectRecord,
-    version:crate::ObjectFormatVersion,accept:F) -> (out:Result<record::DecodedLeaf,Error<()>>)
-    requires forall|k:&[u8]| #[trigger] accept.requires((k,)), object.contents().0 == crate::ObjectKind::KvLeaf,
+    version:crate::ObjectFormatVersion,accept:F,warm:bool) -> (out:Result<record::DecodedLeaf,Error<()>>)
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|k:&[u8]| #[trigger] accept.requires((k,)), object.contents().0 == crate::ObjectKind::KvLeaf,
         object.contents().1 == version.number(),object.contents().4 == 0,object.contents().5 == crate::ObjectClass::Metadata,
         object.retained_cost() <= 4096,
     ensures match out {
@@ -17,10 +18,18 @@ fn read_leaf<F:Fn(&[u8])->Result<(),()>+Copy>(id:crate::ObjectId,object:&crate::
             record::body(object.contents().2,object.contents().3,s,h,accept,out),
     },
 {
-    let got = crate::checkpoint_record::read(id,object,version,accept);
+    let owner = 31u64;
+    let mut cache = crate::checkpoint_cache::Cache::new(&owner);
+    let got = if warm {cache.admit(id,object,version,accept)} else {crate::checkpoint_record::read(id,object,version,accept)};
     match got {
         Ok(handle) => {
             assert(handle.object == id);
+            if warm {
+                let hit = cache.lookup(id,version,|_:&u64,_:crate::ObjectId| -> (r:Result<crate::ObjectRecord,()>)
+                    ensures r == Err(()) { Err(()) },accept);
+                assert(hit.is_ok() && crate::checkpoint_cache::image(hit->Ok_0) == crate::checkpoint_cache::image(handle));
+                assert(crate::checkpoint_record::ordered(hit->Ok_0.node));
+            }
             match handle.node {
                 crate::checkpoint_page::Node::Leaf(l) => Ok(l),
                 crate::checkpoint_page::Node::Branch(_) => { assert(false); unreachable!() },
@@ -33,8 +42,50 @@ fn read_leaf<F:Fn(&[u8])->Result<(),()>+Copy>(id:crate::ObjectId,object:&crate::
     }
 }
 
+fn cold_read(owner:&u64,id:crate::ObjectId,object:crate::ObjectRecord,version:crate::ObjectFormatVersion)
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+{
+    use crate::{checkpoint_cache::{Cache,Error},checkpoint_record};
+    let mut cache = Cache::new(owner);
+    let validate = |_:&[u8]| -> (r:Result<(),u8>) ensures r == Ok(()) {Ok(())};
+    let ghost expected = object;
+    let fetch = |p:&u64,k:crate::ObjectId| -> (result:Result<crate::ObjectRecord,u8>)
+        requires p == owner && k == id, ensures result == Ok(expected), {Ok(object)};
+    let got = cache.lookup(id,version,fetch,validate);
+    match got {
+        Ok(h) => {
+            assert(checkpoint_record::parsed(&expected,h.node,validate));
+            assert(expected.contents().1 == version.number());
+        },
+        Err(Error::Decode(e)) => {
+            assert(checkpoint_record::refusal(&expected,validate,e));
+            assert(cache.contents().is_empty());
+        },
+        Err(Error::Load(_)) => {assert(false);},
+    }
+}
+
+// A failed read at another address leaves the warmed page available to its owner.
+fn isolated<'a>(owner:&'a u64,id:crate::ObjectId,other:crate::ObjectId,object:&crate::ObjectRecord,
+    version:crate::ObjectFormatVersion)
+    requires id != other, vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+{
+    use crate::checkpoint_cache::{Cache,Error,image};
+    let mut cache = Cache::new(owner);
+    let accept = |_:&[u8]| -> (r:Result<(),u8>) ensures r == Ok(()) {Ok(())};
+    let original = match cache.admit(id,object,version,accept) { Ok(h) => h,Err(_) => return };
+    let fail = |p:&u64,k:crate::ObjectId| -> (r:Result<crate::ObjectRecord,u8>)
+        requires *p == *owner && k == other, ensures r == Err(7u8), {Err(7)};
+    let missing = cache.lookup(other,version,fail,accept);
+    assert(missing == Err(Error::Load(7u8)));
+    let disabled = |_:&u64,_:crate::ObjectId| -> (r:Result<crate::ObjectRecord,u8>) ensures r == Err(9u8), {Err(9)};
+    let hit = cache.lookup(id,version,disabled,accept);
+    assert(hit.is_ok() && image(hit->Ok_0) == image(original) && hit->Ok_0.object == id);
+}
+
 #[verifier::rlimit(30)]
-fn written(claim:u64,id:crate::ObjectId,version:crate::ObjectFormatVersion,integrated:bool) -> (out:Result<record::DecodedLeaf,Error<()>>)
+fn written(claim:u64,id:crate::ObjectId,version:crate::ObjectFormatVersion,integrated:bool,warm:bool) -> (out:Result<record::DecodedLeaf,Error<()>>)
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
     ensures if claim != 4 { out == Err(Error::Summary(summary::Error::NonCanonical)) }
         else { out matches Ok(leaf) && leaf.entries.len() == 1 && leaf.totals.quota_bytes == 4 &&
             leaf.entries@[0].key@ == seq![110u8,0u8,97u8] &&
@@ -60,7 +111,7 @@ fn written(claim:u64,id:crate::ObjectId,version:crate::ObjectFormatVersion,integ
     let object = crate::ObjectRecord::from_fields(crate::ObjectKind::KvLeaf,version,bytes,refs,0,crate::ObjectClass::Metadata).unwrap();
     assert(object.retained_cost() <= 4096) by {reveal_with_fuel(crate::ObjectRecord::reference_charge,1);}
     let bytes = object.canonical_bytes(); let refs = object.references();
-    let out = if integrated {read_leaf(id,&object,version,accept)} else {record::read(bytes,refs,accept)};
+    let out = if integrated {read_leaf(id,&object,version,accept,warm)} else {record::read(bytes,refs,accept)};
     assert(bytes@ == payload && refs@ == links);
     proof {
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();

@@ -30,9 +30,8 @@ pub(super) use replacement::Replacement;
 
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,
-    principal: &'a P,
     records: BTreeMap<ObjectId, ObjectRecord>,
-    nodes: BTreeMap<ObjectId, NodeHandle>,
+    nodes: super::checkpoint_cache::Cache<'a, P>,
     identity_session: Option<KvIdentitySession<'a>>,
     marker: PhantomData<fn() -> P>,
 }
@@ -45,9 +44,8 @@ where
     pub(super) fn new(engine: &'a E, principal: &'a P) -> Self {
         Self {
             engine,
-            principal,
             records: BTreeMap::new(),
-            nodes: BTreeMap::new(),
+            nodes: super::checkpoint_cache::Cache::new(principal),
             identity_session: engine.kv_identity_session(),
             marker: PhantomData,
         }
@@ -112,8 +110,8 @@ where
     }
 
     /// Live principal bound to this context.
-    pub(super) const fn principal(&self) -> &P {
-        self.principal
+    pub(super) fn principal(&self) -> &P {
+        self.nodes.principal()
     }
 
     pub(super) fn build_sorted(
@@ -509,41 +507,61 @@ where
     }
 
     pub(super) fn node(&mut self, object: ObjectId) -> StorageResult<NodeHandle> {
-        if let Some(handle) = self.nodes.get(&object) {
-            return Ok(handle.clone());
-        }
-        let record = self.record(object)?;
-        let handle = decode_node(object, &record)?;
-        self.nodes.insert(object, handle.clone());
-        Ok(handle)
+        use super::checkpoint_cache::Error;
+        let records = &self.records;
+        let engine = self.engine;
+        self.nodes
+            .lookup(
+                object,
+                FORMAT_VERSION,
+                |principal, id| {
+                    Self::load_record(
+                        records,
+                        principal,
+                        id,
+                        ObjectRecord::owned_record,
+                        |owner, address| engine.load_kv_object_for(owner, address),
+                    )
+                },
+                |key| super::validation::validate_composite_key(object, key),
+            )
+            .map_err(|e| match e {
+                Error::Load(e) => e,
+                Error::Decode(e) => super::node::decode_error(object, e),
+            })
     }
 
     pub(super) fn record(&self, object: ObjectId) -> StorageResult<ObjectRecord> {
-        self.load_record(object, ObjectRecord::owned_record, |principal, id| {
-            self.engine.load_kv_object_for(principal, id)
-        })
+        Self::load_record(
+            &self.records,
+            self.principal(),
+            object,
+            ObjectRecord::owned_record,
+            |principal, id| self.engine.load_kv_object_for(principal, id),
+        )
     }
 
     fn load_record<T>(
-        &self,
+        records: &BTreeMap<ObjectId, ObjectRecord>,
+        principal: &P,
         object: ObjectId,
         copy: impl FnOnce(&ObjectRecord) -> T,
         engine: impl FnOnce(&P, ObjectId) -> Result<Option<T>, crate::engine::KvProjectionError>,
     ) -> StorageResult<T> {
         use super::record_source::{self, Error};
-        record_source::load(&self.records, self.principal, object, copy, engine).map_err(|error| {
-            match error {
-                Error::Source(error) => map_engine(&error),
-                Error::Missing(id) => map_engine(&ModelError::MissingObject(id).into()),
-            }
+        record_source::load(records, principal, object, copy, engine).map_err(|error| match error {
+            Error::Source(error) => map_engine(&error),
+            Error::Missing(id) => map_engine(&ModelError::MissingObject(id).into()),
         })
     }
 
     fn insert_node(&mut self, record: &ObjectRecord) -> StorageResult<NodeHandle> {
         let object = self.insert(record.clone())?;
-        let handle = decode_node(object, record)?;
-        self.nodes.insert(object, handle.clone());
-        Ok(handle)
+        self.nodes
+            .admit(object, record, FORMAT_VERSION, |key| {
+                super::validation::validate_composite_key(object, key)
+            })
+            .map_err(|e| super::node::decode_error(object, e))
     }
 
     pub(super) fn insert(&mut self, record: ObjectRecord) -> StorageResult<ObjectId> {

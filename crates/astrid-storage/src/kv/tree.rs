@@ -35,6 +35,7 @@ mod adapter;
 #[cfg(verus_keep_ghost)]
 use crate::storage_model::ReferenceKind;
 mod checkpoint_branch;
+mod checkpoint_cache;
 mod checkpoint_child;
 mod checkpoint_descent;
 mod checkpoint_entries;

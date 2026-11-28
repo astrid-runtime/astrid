@@ -301,6 +301,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/kv/tree/checkpoint_page.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_point.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_descent.rs"),
+    Path("crates/astrid-storage/src/kv/tree/checkpoint_cache.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_reference.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_totals.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_key_field.rs"),

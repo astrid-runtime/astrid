@@ -170,7 +170,9 @@ impl<P: Ord, E: KvProjectionEngine<P>> ContentSource for TreeContext<'_, P, E> {
     }
 
     fn load_shared_content_object(&self, id: ObjectId) -> StorageResult<Option<Arc<ObjectRecord>>> {
-        self.load_record(
+        Self::load_record(
+            &self.records,
+            self.principal(),
             id,
             super::super::record_source::shared,
             |principal, object| self.engine.load_shared_kv_object_for(principal, object),

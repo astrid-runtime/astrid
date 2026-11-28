@@ -225,6 +225,22 @@ def consumer_defects():
             f"staged record source loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_record_source.rs"),
         )
+    cache = Path("crates/astrid-storage/src/kv/tree/checkpoint_cache.rs")
+    for label, clause, weaker in [
+        ("hit contents", "image(final(self).contents()[id]) == image(h)", "true"),
+        ("hit availability", "final(self).contents() == old(self).contents() && out.is_ok()", "final(self).contents() == old(self).contents()"),
+        ("decoded source", "record::parsed(&r,h.node,validate) && r.contents().1 == version.number()", "r.contents().1 == version.number()"),
+        ("source format", "record::parsed(&r,h.node,validate) && r.contents().1 == version.number()", "record::parsed(&r,h.node,validate)"),
+        ("decode refusal", "&& record::refusal(&r,validate,e),", "&& true,"),
+        ("source refusal", "&& load.ensures((old(self).owner(),id),Err(e))", "&& true"),
+        ("initial contents", "c.contents() == Map::<ObjectId,Loaded>::empty(),", "true,"),
+        ("owner binding", "c.owner() == principal,", "true,"),
+        ("canonical hit", "out matches Ok(h) ==> h.object == id && record::ordered(h.node) &&", "out matches Ok(h) ==> h.object == id &&"),
+    ]:
+        yield (
+            f"decoded cache loses {label}", cache,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_checkpoint_leaf_record.rs"),
+        )
     descent = Path("crates/astrid-storage/src/kv/tree/checkpoint_descent.rs")
     for label, clause, weaker in [
         ("scheduled root", "== (initial,Page::Root(root))", "== (if path.len()==0 {at} else {path[0].0})"),
