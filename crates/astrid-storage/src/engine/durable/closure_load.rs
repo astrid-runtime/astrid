@@ -1,6 +1,6 @@
 //! Select the record used by a closure walk from the live transaction layers.
 use super::closure_walk::{self as walk, Edge, Source};
-use super::{ObjectId, ObjectRecord, ObjectReference};
+use super::{ObjectId, ObjectKind, ObjectRecord, ObjectReference};
 use std::collections::{BTreeMap, BTreeSet};
 use vstd::prelude::*;
 
@@ -76,33 +76,29 @@ impl Source<ObjectId> for Preload<'_> {
 }
 
 /// Recovery has no pending WAL object table or index fallback after preloading.
-pub(super) fn preloaded<K:Ord+Copy,I,R,E,F:FnOnce(&I)->R,M:FnOnce(K)->E>(
-    id:K,table:&BTreeMap<K,I>,copy:F,missing:M) -> (out:Result<R,E>)
+pub(super) fn preloaded<K:Ord+Copy,I>(id:K,table:&BTreeMap<K,I>) -> (out:Result<&I,K>)
     requires btree_map_inv(table),obeys_cmp::<K>(),obeys_cmp_concrete_eq::<K>(),
-        forall|v:&I| #[trigger] copy.requires((v,)),missing.requires((id,)),
     ensures match out {
-        Ok(r) => table@.contains_key(id) && copy.ensures((&table@[id],),r),
-        Err(e) => !table@.contains_key(id) && missing.ensures((id,),e),
+        Ok(r) => table@.contains_key(id) && *r == table@[id],
+        Err(e) => !table@.contains_key(id) && e == id,
     },
 {
-    match incoming(&id,table) {Some(record) => Ok(copy(record)),None => Err(missing(id))}
+    match incoming(&id,table) {Some(record) => Ok(record),None => Err(id)}
 }
 
 pub(super) open spec fn in_id_order(ids:Seq<ObjectId>) -> bool {
     exists|ordered:Seq<&ObjectId>| #[trigger] increasing_seq(ordered) && ids == ordered.unref()
 }
 
-pub(super) open spec fn row_ids(rows:Seq<(ObjectId,ObjectRecord)>) -> Seq<ObjectId> {
-    rows.map_values(|row:(ObjectId,ObjectRecord)| row.0)
+pub(super) open spec fn row_ids(rows:Seq<(ObjectId,&ObjectRecord)>) -> Seq<ObjectId> {
+    rows.map_values(|row:(ObjectId,&ObjectRecord)| row.0)
 }
 
 /// Materialize the least owning closure in the ordered set's iteration order.
-pub(super) fn materialize<F:Fn(&ObjectRecord)->ObjectRecord>(
-    table:&BTreeMap<ObjectId,ObjectRecord>,root:ObjectId,copy:F)
-    -> (out:Result<Vec<(ObjectId,ObjectRecord)>,walk::Failure<ObjectId,ObjectId>>)
+pub(super) fn materialize(
+    table:&BTreeMap<ObjectId,ObjectRecord>,root:ObjectId)
+    -> (out:Result<Vec<(ObjectId,&ObjectRecord)>,walk::Failure<ObjectId,ObjectId>>)
     requires Preload(table).valid(),
-        forall|v:&ObjectRecord| #[trigger] copy.requires((v,)),
-        forall|v:&ObjectRecord,r:ObjectRecord| #[trigger] copy.ensures((v,),r) ==> r.contents() == v.contents(),
     ensures match out {
         Ok(rows) => {
             let ids = row_ids(rows@).to_set();
@@ -128,8 +124,6 @@ pub(super) fn materialize<F:Fn(&ObjectRecord)->ObjectRecord>(
     let mut rows = Vec::with_capacity(seen.len());
     while rows.len() < seen.len()
         invariant
-            forall|v:&ObjectRecord| #[trigger] copy.requires((v,)),
-            forall|v:&ObjectRecord,r:ObjectRecord| #[trigger] copy.ensures((v,),r) ==> r.contents() == v.contents(),
             Preload(table).valid(),sequence.len() == seen.len(), rows.len() <= seen.len(),
             increasing_seq(sequence),sequence.unref().to_set() == seen@,it.remaining() == sequence.skip(rows.len() as int),
             row_ids(rows@) == sequence.unref().take(rows.len() as int),
@@ -142,8 +136,7 @@ pub(super) fn materialize<F:Fn(&ObjectRecord)->ObjectRecord>(
         let Some(id) = it.next() else {unreachable!("iterator length matches the closure size")};
         assert(sequence.unref()[i] == *id);
         assert(seen@.contains(*id));
-        let record = preloaded(*id,table,|v:&ObjectRecord| -> (r:ObjectRecord)
-            ensures r.contents() == v.contents(), {copy(v)}, |key:ObjectId| key);
+        let record = preloaded(*id,table);
         let Ok(record) = record else {unreachable!("visited object is present in the immutable preload")};
         rows.push((*id,record));
         assert(it.remaining() =~= sequence.skip(i+1));
@@ -153,6 +146,33 @@ pub(super) fn materialize<F:Fn(&ObjectRecord)->ObjectRecord>(
     assert(increasing_seq(sequence));
     assert(seen@.difference(Set::empty()) =~= seen@);
     Ok(rows)
+}
+
+pub(super) enum CommitError { Missing, WrongKind(ObjectKind) }
+
+/// The checked graph traversal has already admitted all owning edges. Check
+/// the remaining fresh-world rule on the exact record named by the journal.
+pub(super) fn commit_kind(rows:&[(ObjectId,&ObjectRecord)],root:ObjectId) -> (out:Result<(),CommitError>)
+    ensures match out {
+        Ok(()) => exists|i:int| 0 <= i < rows.len() && #[trigger] rows@[i].0 == root && rows@[i].1.contents().0 is Commit,
+        Err(CommitError::WrongKind(kind)) => !(kind is Commit) && exists|i:int| 0 <= i < rows.len() &&
+            #[trigger] rows@[i].0 == root && rows@[i].1.contents().0 == kind,
+        Err(CommitError::Missing) => forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].0 != root,
+    },
+{
+    let mut i = 0;
+    while i < rows.len()
+        invariant i <= rows.len(),forall|j:int| 0 <= j < i ==> #[trigger] rows@[j].0 != root,
+        decreases rows.len()-i,
+    {
+        let (id,record) = rows[i];
+        if id.same(&root) {
+            let kind = record.kind();
+            return match kind {ObjectKind::Commit => Ok(()),other => Err(CommitError::WrongKind(other))};
+        }
+        i = i.saturating_add(1);
+    }
+    Err(CommitError::Missing)
 }
 
 /// Incoming records shadow the committed WAL overlay. A media error for the

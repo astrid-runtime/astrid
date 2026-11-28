@@ -85,3 +85,71 @@ fn durable_admission_rechecks_a_foreign_seal_with_the_receiving_identity() {
         Some(root)
     );
 }
+
+#[test]
+fn preloaded_recovery_agrees_with_fresh_world_validation() {
+    use crate::storage_model::World;
+    let (root, txn) = transaction("alice", None, b"recovery");
+    let table: BTreeMap<_, _> = txn.records().iter().cloned().collect();
+    let leaf = txn.records()[0].0;
+    let mut incomplete = table.clone();
+    incomplete.remove(&leaf);
+    let mut cyclic = table.clone();
+    cyclic.insert(leaf, table[&root].clone());
+    let missing = ObjectId::new([0x73; 32]);
+    let wrong_kind_with_missing_child = BTreeMap::from([(
+        root,
+        ObjectRecord::new(
+            ObjectKind::Chunk,
+            ObjectFormatVersion::V1,
+            Vec::new(),
+            vec![ObjectReference::owns(label(b"missing"), missing)],
+            0,
+            ObjectClass::Data,
+        )
+        .unwrap(),
+    )]);
+    for (table, root) in [
+        (&table, root),
+        (&table, leaf),
+        (&table, missing),
+        (&incomplete, root),
+        (&cyclic, root),
+        (&wrong_kind_with_missing_child, root),
+    ] {
+        let mut source = World::<()>::new();
+        for (id, record) in table {
+            source.insert_object(*id, record.clone()).unwrap();
+        }
+        let expected = source.closure(root).and_then(|ids| {
+            let records = ids
+                .iter()
+                .map(|id| (*id, table[id].clone()))
+                .collect::<Vec<_>>();
+            let mut fresh = World::<()>::new();
+            fresh.import_closure(&records, root)?;
+            fresh.compare_and_swap_root((), None, root)?;
+            Ok(ids)
+        });
+
+        let history = BTreeMap::from([(
+            "alice",
+            (
+                RootState {
+                    commit: root,
+                    generation: RootGeneration::INITIAL,
+                },
+                913,
+            ),
+        )]);
+        let result = roots::validate_preloaded(&history, table).map_err(|error| match error {
+            DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset: 913,
+                source,
+            } => source,
+            other => panic!("unexpected recovery error: {other:?}"),
+        });
+        assert_eq!(result, expected);
+    }
+}

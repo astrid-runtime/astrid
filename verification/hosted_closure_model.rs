@@ -18,25 +18,46 @@ fn preload_equivalence<K:Ord+Copy,V,F:Fn(&V)->V>(table:&BTreeMap<K,V>,id:K,copy:
         |v:&V| -> (r:V) ensures r == *v, {copy(v)},
         |k:K,_:&u64| -> (r:Result<V,K>) ensures r == Err(k), {Err(k)},
         |k:K| -> (r:K) ensures r == k, {k});
-    let result = closure_load::preloaded(id,table,|v:&V| -> (r:V) ensures r == *v, {copy(v)},
-        |k:K| -> (r:K) ensures r == k, {k});
+    let result = match closure_load::preloaded(id,table) { Ok(v) => Ok(copy(v)),Err(e) => Err(e) };
     assert(result == layered);
     result
 }
 
+/// Classification is exact for arbitrary successful materializations, including
+/// a leaf root. A graph failure short-circuits before kind validation.
+fn recovered_commit(table:&BTreeMap<crate::ObjectId,crate::ObjectRecord>,root:crate::ObjectId)
+    requires crate::closure_load::Preload(table).valid(),
+{
+    use crate::closure_load::{self,row_ids};
+    if let Ok(rows) = closure_load::materialize(table,root) {
+        assert(row_ids(rows@).to_set().contains(root));
+        let ghost i = row_ids(rows@).index_of(root);
+        assert(rows@[i].0 == root);
+        match closure_load::commit_kind(&rows,root) {
+            Ok(()) => {
+                let ghost j = choose|j:int| 0 <= j < rows.len() && #[trigger] rows@[j].0 == root && rows@[j].1.contents().0 is Commit;
+                assert(table@[root].contents().0 is Commit);
+            },
+            Err(closure_load::CommitError::WrongKind(kind)) => {
+                let ghost j = choose|j:int| 0 <= j < rows.len() && #[trigger] rows@[j].0 == root && rows@[j].1.contents().0 == kind;
+                assert(!(table@[root].contents().0 is Commit) && table@[root].contents().0 == kind);
+            },
+            Err(closure_load::CommitError::Missing) => {assert(false);},
+        }
+    }
+}
+
 /// A root's owning child must be returned with its preloaded contents. An
 /// unrelated row outside any closed superset cannot appear in the result.
-fn recovered_child<F:Fn(&crate::ObjectRecord)->crate::ObjectRecord>(
+fn recovered_child(
     table:&BTreeMap<crate::ObjectId,crate::ObjectRecord>,root:crate::ObjectId,
-    child:crate::ObjectId,scope:Ghost<Set<crate::ObjectId>>,copy:F)
+    child:crate::ObjectId,scope:Ghost<Set<crate::ObjectId>>)
     requires crate::closure_load::Preload(table).valid(),
         table@.contains_key(root),walk::children(table@[root].contents().3).contains(child),
         walk::closed(root,Set::empty(),crate::closure_load::Preload(table).edges(),scope@),
-        forall|v:&crate::ObjectRecord| #[trigger] copy.requires((v,)),
-        forall|v:&crate::ObjectRecord,r:crate::ObjectRecord| #[trigger] copy.ensures((v,),r) ==> r.contents() == v.contents(),
 {
     use crate::closure_load::{self,Preload,row_ids};
-    match closure_load::materialize(table,root,copy) {
+    match closure_load::materialize(table,root) {
         Ok(rows) => {
             let ghost ids = row_ids(rows@).to_set();
             let ghost graph = Preload(table).edges();

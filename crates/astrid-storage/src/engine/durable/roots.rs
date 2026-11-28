@@ -2,15 +2,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::storage_model::{ModelError, ObjectId, RootState};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord, RootState};
 
+use super::closure_load::CommitError;
 use super::journal_history::{self, Rejection};
 use super::journal_snapshot::{self, SnapshotError};
 use super::root_wire::{self, TailError};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, preload_indexed_closures,
-    recovery_closure_error, scan_frames, validate_commit_closure,
+    recovery_closure_error, scan_frames,
 };
 
 use journal_snapshot::{HeaderError, JournalHeader};
@@ -95,16 +96,25 @@ where
         let root_offset = recovered.values().next().map_or(0, |(_, offset)| *offset);
         recovery_closure_error(error, root_offset)
     })?;
-    let validated = super::recovered_closure::check_all(
-        &recovered,
+    let validated = validate_preloaded(&recovered, &preload)?;
+    Ok((
+        recovered
+            .into_iter()
+            .map(|(principal, (root, _))| (principal, root))
+            .collect(),
+        validated,
+    ))
+}
+
+pub(super) fn validate_preloaded<P: Ord>(
+    recovered: &BTreeMap<P, (RootState, u64)>,
+    preload: &BTreeMap<ObjectId, ObjectRecord>,
+) -> Result<BTreeSet<ObjectId>, DurableError> {
+    super::recovered_closure::check_all(
+        recovered,
         |commit, at| {
             use super::closure_walk::Failure;
-            super::closure_load::materialize(
-                &preload,
-                commit,
-                crate::storage_model::ObjectRecord::clone,
-            )
-            .map_err(|failure| {
+            super::closure_load::materialize(preload, commit).map_err(|failure| {
                 let source = match failure {
                     Failure::Cycle(id) => ModelError::ObjectCycle(id),
                     Failure::Root(id) | Failure::Source(_, id) => ModelError::MissingObject(id),
@@ -113,20 +123,21 @@ where
             })
         },
         |records, commit, at| {
-            validate_commit_closure(records, commit).map_err(|source| DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset: at,
-                source,
+            super::closure_load::commit_kind(records, commit).map_err(|kind| {
+                DurableError::RecoveryModel {
+                    file: ROOT_FILE,
+                    offset: at,
+                    source: match kind {
+                        CommitError::WrongKind(actual) => ModelError::RootNotCommit {
+                            object: commit,
+                            actual,
+                        },
+                        CommitError::Missing => ModelError::MissingObject(commit),
+                    },
+                }
             })
         },
-    )?;
-    Ok((
-        recovered
-            .into_iter()
-            .map(|(principal, (root, _))| (principal, root))
-            .collect(),
-        validated,
-    ))
+    )
 }
 
 fn apply_root_journal_record<P, C>(

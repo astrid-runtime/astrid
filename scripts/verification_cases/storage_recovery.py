@@ -8,6 +8,9 @@ from .common import replace_once
 def consumer_defects():
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
+        ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),
+        ("reported kind", "rows@[i].1.contents().0 == kind,", "true,"),
+        ("root absence", "Err(CommitError::Missing) => forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].0 != root", "Err(CommitError::Missing) => true"),
         ("row order", "&&& in_id_order(row_ids(rows@))", "&&& true"),
         ("root membership", "&&& walk::closed(root,Set::empty(),graph,ids)", "&&& true"),
         ("minimality", "==> ids.subset_of(nodes)", "==> true"),
