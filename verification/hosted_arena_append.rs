@@ -6,7 +6,7 @@ use vstd::prelude::*;
 verus! {
 
 /// Check the physical frame domain, format, declared length and digest before replaying its payload.
-fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52],magic:[u8;8],version:u16,
+pub(super) fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52],magic:[u8;8],version:u16,
     body:&[u8],hash:H,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>) -> (accepted:bool)
     requires forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),
         forall|m:[u8;8],n:u64,b:&[u8],sum:[u8;32]| #[trigger] hash.ensures((m,n,b),sum) ==> sum == (digest@)(m,n,b@),

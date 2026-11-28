@@ -6,6 +6,19 @@ from .common import replace_once
 
 
 def consumer_defects():
+    transition = Path("crates/astrid-storage/src/engine/durable/journal_transition.rs")
+    for label, clause, weaker in [
+        ("owner bytes", "r.principal@==bytes@.subrange(at,at+length)", "true"),
+        ("replacement root", "history::represents(n,r.replacement) &&", "true &&"),
+        ("expected root", "(Some(a),Some(b))=>history::represents(a,b)", "(Some(_),Some(_))=>true"),
+        ("valid frame admission", "scheme,e,n) ==> out.is_ok()", "scheme,e,n) ==> true"),
+    ]:
+        yield (
+            f"root journal readback loses {label}", transition,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_acknowledged_root.rs"),
+        )
+
     fences = Path("crates/astrid-core/src/principal/retirement.rs")
     for label, clause, weaker in [
         ("error precedence", "out == match closed {Err(e)=>Err(e),Ok(_)=>match grants {Err(e)=>Err(e),Ok(_)=>Ok(())}}", "out.is_ok() == (closed.is_ok() && grants.is_ok())"),

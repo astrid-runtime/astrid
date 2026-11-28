@@ -7,8 +7,8 @@ use crate::storage_model::{ModelError, ObjectId, ObjectRecord, RootState};
 use super::closure_load::CommitError;
 use super::journal_history::{self, Rejection};
 use super::journal_snapshot::{self, SnapshotError};
-use super::journal_transition::{self, Record as DecodedRootRecord};
-use super::root_wire::{self, TailError};
+use super::journal_transition::{self, DecodeError, Record as DecodedRootRecord};
+use super::root_wire::TailError;
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, preload_indexed_closures,
@@ -306,21 +306,15 @@ fn decode_root_journal_record(
         },
     };
 
-    let principal_len =
-        usize::try_from(prefix).map_err(|_| "principal length is not process-addressable")?;
-    let principal = reader.take(principal_len)?.to_vec();
-    let (expected, replacement) = root_wire::read_tail(bytes, &mut reader.offset, scheme.into())
+    journal_transition::decode(bytes, &mut reader.offset, prefix, scheme.into())
+        .map(DecodedRootJournalRecord::Transition)
         .map_err(|error| match error {
-            TailError::Read(e) => read_error(e),
-            TailError::Root(e) => reader.root_error(e, scheme),
-            TailError::ExpectedTag => "invalid expected-root tag",
-            TailError::Trailing => "trailing root-journal bytes",
-        })?;
-    Ok(DecodedRootJournalRecord::Transition(DecodedRootRecord {
-        principal,
-        expected: expected.map(Into::into),
-        replacement: replacement.into(),
-    }))
+            DecodeError::Length => "principal length is not process-addressable",
+            DecodeError::Principal(e) | DecodeError::Tail(TailError::Read(e)) => read_error(e),
+            DecodeError::Tail(TailError::Root(e)) => reader.root_error(e, scheme),
+            DecodeError::Tail(TailError::ExpectedTag) => "invalid expected-root tag",
+            DecodeError::Tail(TailError::Trailing) => "trailing root-journal bytes",
+        })
 }
 
 fn read_error(error: super::root_wire::ReadError) -> &'static str {

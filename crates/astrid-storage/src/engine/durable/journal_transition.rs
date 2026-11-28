@@ -35,6 +35,36 @@ pub(super) fn encode(name:&[u8],scheme:root_wire::Scheme,expected:Option<RootSta
     root_wire::encode(name,scheme,prior,next)
 }
 
+pub(super) enum DecodeError { Length, Principal(root_wire::ReadError), Tail(root_wire::TailError) }
+
+/// Decode the transition body following a journal header. Keep the reader's
+/// cursor on failure so native diagnostics can inspect an invalid identity.
+pub(super) fn decode(bytes:&[u8],cursor:&mut usize,length:u64,scheme:root_wire::Scheme)
+    -> (out:Result<Record,DecodeError>)
+    ensures out matches Ok(r) ==> {
+        let at=*old(cursor) as int;
+        &&& *final(cursor)==bytes.len() && at+length<=bytes.len()
+        &&& r.principal@==bytes@.subrange(at,at+length)
+        &&& exists|e:Option<root_wire::Root>,n:root_wire::Root|
+            #[trigger] root_wire::tail(bytes@,at+length,scheme,e,n) && history::represents(n,r.replacement) &&
+            match (e,r.expected) {(None,None)=>true,(Some(a),Some(b))=>history::represents(a,b),_=>false}
+    },
+        forall|e:Option<root_wire::Root>,n:root_wire::Root| length<=usize::MAX &&
+            #[trigger] root_wire::tail(bytes@,*old(cursor) as int+length,scheme,e,n) ==> out.is_ok(),
+{
+    let Ok(len)=usize::try_from(length) else {return Err(DecodeError::Length);};
+    let name=match root_wire::take(bytes,cursor,len) {Ok(v)=>v,Err(e)=>return Err(DecodeError::Principal(e))};
+    let mut principal=Vec::new();
+    principal.extend_from_slice(name);
+    let ghost pos=*cursor as int;
+    let (expected,replacement)=match root_wire::read_tail(bytes,cursor,scheme) {
+        Ok(pair)=>pair,Err(e)=>return Err(DecodeError::Tail(e)),
+    };
+    assert(root_wire::tail(bytes@,pos,scheme,expected,replacement));
+    let prior=expected.map(|w:root_wire::Root| -> (r:RootState) ensures history::represents(w,r), {history::from_wire(w)});
+    Ok(Record{principal,expected:prior,replacement:history::from_wire(replacement)})
+}
+
 pub(super) enum Error { Length, Noncanonical, Principal, History(history::Rejection) }
 
 pub(super) open spec fn named<P,D:FnOnce(&[u8])->Option<P>,E:FnOnce(&P)->Vec<u8>>(
