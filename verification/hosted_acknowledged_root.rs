@@ -125,7 +125,7 @@ use crate::group_frontier::{JournalContainer,JournalFlush};
 enum Failure<E> { Journal(E), Frontier(E) }
 
 /// An arbitrary selected row occupies its own recorded interval in the completed batch.
-proof fn packed_row<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]>(
+pub(super) proof fn packed_row<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]>(
     input:&'a [T],select:F,hash:H,base:u64,magic:[u8;8],version:u16,initial:Seq<u8>,encoded:Seq<u8>,
     rows:Seq<arena_frame::ArenaLocation>,i:int)
     requires 0<=i<rows.len(), arena_frame::packed(input,select,hash,base,magic,version,initial,encoded,rows),

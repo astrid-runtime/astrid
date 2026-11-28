@@ -59,6 +59,90 @@ pub(super) fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52
     }
 }
 
+fn select_payload<'a>(v:&'a Vec<u8>) -> (out:&'a [u8]) ensures out@==v@ {v.as_slice()}
+
+pub(super) open spec fn appended_marker<I:FnOnce(&crate::ObjectRecord)->crate::ObjectId>(
+    prior:Seq<u8>,image:Seq<u8>,address:Seq<u8>,id:crate::ObjectId,loc:frame::ArenaLocation,identify:I) -> bool {
+    let at=loc.offset as int+frame::WIDTH;
+    &&& loc.offset>=prior.len()
+    &&& at+loc.payload_len<=image.len()
+    &&& image.take(prior.len() as int)==prior
+    &&& image.subrange(at+8,at+40)==id.digest()
+    &&& crate::hosted_delta_mutation::marker_bytes(
+        crate::hosted_journal_history::component_bytes(image,loc),address)
+    &&& exists|r:&crate::ObjectRecord| #[trigger] identify.ensures((r,),id) &&
+        r.contents().2==crate::hosted_journal_history::component_bytes(image,loc)
+}
+
+/// Follow a production marker record through canonical encoding and arena append.
+/// Neighbouring frames and the pre-existing file prefix have independent contents.
+#[verifier::rlimit(20)]
+pub(super) fn append_token_marker<S:frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+    I:FnOnce(&crate::ObjectRecord)->crate::ObjectId>(
+    file:&mut S,scheme:Scheme,key:Vec<u8>,previous:Option<crate::ObjectId>,
+    depth:u64,used:u64,totals:crate::checkpoint_totals::NodeTotals,
+    mut batch:Vec<Vec<u8>>,selected:usize,identify:I,hash:H,
+) -> (out:Result<(crate::ObjectId,frame::ArenaLocation),frame::BatchError<S::Error>>)
+    requires key.len()<=u32::MAX && key.len()+51<=isize::MAX && depth<u64::MAX &&
+        used+key.len()+1<=u64::MAX, old(file).image().len()<=u64::MAX, selected<batch.len(),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((frame::ARENA_MAGIC,n,b)),
+    ensures final(file).target()==old(file).target(),
+        out matches Ok((id,loc)) ==> appended_marker(old(file).image(),final(file).image(),key@,id,loc,identify),
+{
+    let (marker,_)=crate::hosted_delta_mutation::written_marker(key,previous,depth,used,totals);
+    let id=identify(&marker);
+    let payload=record::encode(scheme,id,&marker).unwrap();
+    let ghost payload_bytes=payload@;
+    batch.set(selected,payload);
+    let batch=batch.as_slice();
+    let select=select_payload;
+    let ghost prior=file.image();
+    let rows=frame::append_batch(file,batch,select,hash,frame::ARENA_MAGIC,frame::FRAME_VERSION,
+        (Vec::new(),Vec::new()))?;
+    let loc=rows[selected];
+    proof {
+        let base=prior.len() as u64;
+        let encoded=choose|bytes:Seq<u8>| file.image()==prior+bytes &&
+            #[trigger] frame::packed(batch,select,hash,base,frame::ARENA_MAGIC,frame::FRAME_VERSION,
+                Seq::empty(),bytes,rows@);
+        crate::hosted_acknowledged_root::packed_row(batch,select,hash,base,frame::ARENA_MAGIC,
+            frame::FRAME_VERSION,Seq::empty(),encoded,rows@,selected as int);
+        let start=loc.offset as int-base;
+        let body=choose|b:&[u8]| #[trigger] select.ensures((&batch@[selected as int],),b) &&
+            b.len()==loc.payload_len && hash.ensures((frame::ARENA_MAGIC,loc.payload_len,b),loc.checksum) &&
+            encoded.subrange(start,start+52+loc.payload_len)==frame::header_bytes(frame::ARENA_MAGIC,
+                frame::FRAME_VERSION,loc.payload_len,loc.checksum)+b@;
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(file.image().take(prior.len() as int) =~= prior);
+        let at=loc.offset as int+52;
+        let header=frame::header_bytes(frame::ARENA_MAGIC,frame::FRAME_VERSION,loc.payload_len,loc.checksum);
+        assert(header.len()==52);
+        assert(body@==payload_bytes);
+        assert(encoded.subrange(start+52,start+52+loc.payload_len) =~=
+            encoded.subrange(start,start+52+loc.payload_len).skip(52));
+        assert(file.image().subrange(at,at+loc.payload_len) =~= encoded.subrange(start+52,start+52+loc.payload_len));
+        assert(payload_bytes.subrange(8,40) =~= id.digest());
+        assert(file.image().subrange(at+8,at+40) =~= file.image().subrange(at,at+loc.payload_len).subrange(8,40));
+        assert(file.image().subrange(at+8,at+40) =~= id.digest());
+        let data=marker.contents().2;
+        assert(payload_bytes.subrange(53,61) =~= vstd::bytes::spec_u64_to_le_bytes(data.len() as u64));
+        assert(payload_bytes.subrange(69,69int+data.len()) =~= data);
+        assert(file.image().subrange(at,at+loc.payload_len)==payload_bytes);
+        assert(record::u64_field(payload_bytes,53)==data.len() as u64);
+        assert(data.len()<=payload_bytes.len());
+        assert(crate::hosted_journal_history::component_bytes(file.image(),loc)==data);
+        assert(identify.ensures((&marker,),id));
+        assert(exists|r:&crate::ObjectRecord| #[trigger] identify.ensures((r,),id) &&
+            r.contents().2==crate::hosted_journal_history::component_bytes(file.image(),loc));
+        assert(crate::hosted_delta_mutation::marker_bytes(data,key@));
+        assert(loc.offset>=prior.len());
+        assert(at+loc.payload_len<=file.image().len());
+        assert(appended_marker(prior,file.image(),key@,id,loc,identify));
+    }
+    Ok((id,loc))
+}
+
 /// Every accepted root contributes its own complete journal at the same index.
 fn legacy_group_journals<'a,P,R:Copy>(group:&'a [crate::root_transition::PreparedRoot<P,R>],index:usize)
     requires index < group.len(),

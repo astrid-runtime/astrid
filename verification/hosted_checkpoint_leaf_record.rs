@@ -83,7 +83,8 @@ fn isolated<'a>(owner:&'a u64,id:crate::ObjectId,other:crate::ObjectId,object:&c
     assert(hit.is_ok() && image(hit->Ok_0) == image(original) && hit->Ok_0.object == id);
 }
 
-#[verifier::rlimit(30)]
+#[verifier::spinoff_prover]
+#[verifier::rlimit(90)]
 fn written(claim:u64,id:crate::ObjectId,version:crate::ObjectFormatVersion,integrated:bool,warm:bool) -> (out:Result<record::DecodedLeaf,Error<()>>)
     requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
     ensures if claim != 4 { out == Err(Error::Summary(summary::Error::NonCanonical)) }

@@ -289,11 +289,13 @@ pub(crate) proof fn decoded_marker<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecor
     if let Head::Delta{previous,depth,delta_bytes,mutations,totals}=head {
         let saved=recovery::Recovered{previous,depth,delta_bytes,rows:mutations,totals};
         let (bs,rs,path)=choose|bs:&[u8],rs:&[ObjectReference],p:Seq<usize>| #[trigger] recovery::admitted(record,check,saved,bs,rs,p);
+        assert(bs@==record.contents().2 && 0<mutations.len()<=u32::MAX);
         let h=Header{depth,delta_bytes,entries:totals.entries,quota_bytes:totals.quota_bytes,count:mutations.len() as u32};
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         assert(h.wire().subrange(32,36) =~= storage_words::word32(h.count));
         assert(bs@.subrange(33,37) =~= h.wire().subrange(32,36));
         storage_words::unique_word32(h.count,1);
+        assert(mutations.len()==1);
         assert(delta::decoded(bs,37,path[1],rs,0,check,Ok(mutations@[0])));
         let n=address.len() as int;
         assert(bs@.subrange(37,41) =~= storage_words::word32(n as u32));
@@ -301,16 +303,18 @@ pub(crate) proof fn decoded_marker<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecor
         assert(bs@.subrange(41,41+n) =~= address);
         assert(bs@[41+n]==delta::INLINE && bs@.subrange(42+n,50+n) =~= vstd::bytes::spec_u64_to_le_bytes(1));
         assert(bs@.subrange(50+n,51+n) =~= seq![1u8]);
+        assert(mutations@[0].key@==address && (mutations@[0].value matches Some(ValueSlot::Inline(data)) && data@==seq![1u8]));
         reveal_with_fuel(crate::overlay_batch::after_rows,2);
-    }
+    } else {assert(false);}
 }
 
 // Reopen the physical record produced for a single presence marker, including
 // the prior component edge. Its address and one-byte value survive the round trip.
-#[verifier::rlimit(10)]
-pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u64,prior_bytes:u64,totals:crate::checkpoint_totals::NodeTotals) -> (out:crate::delta_chain::Head)
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40)]
+pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u64,prior_bytes:u64,totals:crate::checkpoint_totals::NodeTotals) -> (out:(crate::ObjectRecord,crate::delta_chain::Head))
     requires key.len()<=u32::MAX && key.len()+51<=isize::MAX && prior_depth<u64::MAX && prior_bytes+key.len()+1<=u64::MAX,
-    ensures out matches crate::delta_chain::Head::Delta{previous:p,depth,delta_bytes,mutations,totals:t} && p==previous && depth==prior_depth+1 && delta_bytes==prior_bytes+key.len()+1 && t==totals && mutations.len()==1 &&
+    ensures marker_bytes(out.0.contents().2,key@), out.1 matches crate::delta_chain::Head::Delta{previous:p,depth,delta_bytes,mutations,totals:t} && p==previous && depth==prior_depth+1 && delta_bytes==prior_bytes+key.len()+1 && t==totals && mutations.len()==1 &&
         mutations@[0].key@==key@ && (mutations@[0].value matches Some(ValueSlot::Inline(v)) && v@==seq![1u8]),
 {
     use crate::{delta_recovery as recovery,delta_batch as batch,projection_record as format,delta_chain::Head,delta_header::Header};
@@ -378,7 +382,7 @@ pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u
             assert(false);
         }
     }
-    match decoded {Ok(h)=>h,Err(_)=>{assert(false);unreached()}}
+    match decoded {Ok(h)=>(record,h),Err(_)=>{assert(false);unreached()}}
 }
 
 /// The same fixed header is used by the KV delta record writer and the replay reader.
