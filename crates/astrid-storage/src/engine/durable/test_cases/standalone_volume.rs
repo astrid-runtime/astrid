@@ -199,3 +199,38 @@ fn hosted_standalone_sync_failure_is_not_an_ack() {
     let copied = copy_volume_while_live(&path, &directory);
     assert_eq!(copied.object(id).unwrap(), None);
 }
+
+#[test]
+fn volume_tail_repair_flushes_the_container_and_propagates_failure() {
+    for fail_sync in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let volume = RecordingVolume::wrap(
+            HostedFileVolume::open(directory.path().join("repair.volume")).unwrap(),
+        );
+        let mut arena = super::File::volume(volume.clone(), ARENA_FILE, true).unwrap();
+        arena.write_all(&[0; 5]).unwrap();
+        volume.sync().unwrap();
+        let before = volume.sync_count();
+        if fail_sync {
+            volume.fail_next_syncs(1);
+        }
+        let recovered = super::format::recover_arena(&mut arena, &TestIdentity, limits(), 0);
+        if fail_sync {
+            assert!(matches!(
+                recovered,
+                Err(DurableError::Io {
+                    operation: "flush durable tail truncation",
+                    ..
+                })
+            ));
+        } else {
+            let (index, tail) = recovered.unwrap();
+            assert!(index.is_empty() && tail.is_none());
+        }
+        assert_eq!(volume.sync_count(), before + 1);
+        if !fail_sync {
+            super::format::recover_arena(&mut arena, &TestIdentity, limits(), 0).unwrap();
+            assert_eq!(volume.sync_count(), before + 1);
+        }
+    }
+}

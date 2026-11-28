@@ -52,6 +52,10 @@ impl DurableIo for ObservedFile {
         self.file.durable_sync_data()
     }
 
+    fn durable_sync_repaired_tail(&self) -> io::Result<()> {
+        self.file.durable_sync_repaired_tail()
+    }
+
     fn durable_read_at_preserves_cursor(&self) -> bool {
         self.file.durable_read_at_preserves_cursor()
     }

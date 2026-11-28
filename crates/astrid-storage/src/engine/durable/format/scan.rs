@@ -552,6 +552,6 @@ fn physical_frame_is_valid<F: DurableIo>(
 fn truncate_tail<F: DurableIo>(file: &mut F, valid_len: u64) -> Result<(), DurableError> {
     file.durable_set_len(valid_len)
         .map_err(|source| io_error("truncate incomplete durable tail", source))?;
-    file.durable_sync_data()
+    file.durable_sync_repaired_tail()
         .map_err(|source| io_error("flush durable tail truncation", source))
 }
