@@ -181,27 +181,33 @@ fn incomplete_declared_payload_preserves_later_frames() {
                 stream.rewind().unwrap();
                 stream.read_to_end(&mut original).unwrap();
                 stream.short_reads = short_reads;
-                let mut visits = 0;
-                let result = scan_frames(
-                    &mut stream,
-                    "test frames",
-                    ARENA_MAGIC,
-                    RecoveryLimits::process_addressable(),
-                    |at, body| {
-                        assert_eq!(at, 0);
-                        assert_eq!(body, b"retained prefix");
-                        visits = usize::strict_add(visits, 1);
-                        Ok(())
-                    },
-                );
-                assert_eq!(visits, 1);
-                let expected = if has_later_frame {
-                    assert!(
-                        matches!(result,Err(DurableError::Corrupt{offset,detail:"published frame payload is truncated",..}) if offset==prefix_len)
+                // Retry on the same handle before resetting its cursor.
+                for _ in 0..2 {
+                    let mut visits = 0;
+                    let result = scan_frames(
+                        &mut stream,
+                        "test frames",
+                        ARENA_MAGIC,
+                        RecoveryLimits::process_addressable(),
+                        |at, body| {
+                            assert_eq!(at, 0);
+                            assert_eq!(body, b"retained prefix");
+                            visits = usize::strict_add(visits, 1);
+                            Ok(())
+                        },
                     );
+                    assert_eq!(visits, 1);
+                    if has_later_frame {
+                        assert!(
+                            matches!(result,Err(DurableError::Corrupt{offset,detail:"published frame payload is truncated",..}) if offset==prefix_len)
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                }
+                let expected = if has_later_frame {
                     original.as_slice()
                 } else {
-                    result.unwrap();
                     &original[..usize::try_from(prefix_len).unwrap()]
                 };
                 stream.rewind().unwrap();
