@@ -87,6 +87,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/ownership/reservation_validation.rs"),
     Path("crates/astrid-storage/src/ownership/recovery.rs"),
     Path("verification/hosted_retirement_recovery.rs"),
+    Path("crates/astrid-kernel/src/authority_recovery/publication.rs"),
     Path("verification/hosted_runtime_residency.rs"),
     Path("crates/astrid-kernel/src/runtime_residency.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/net/reservation.rs"),

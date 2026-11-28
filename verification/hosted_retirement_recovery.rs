@@ -371,3 +371,103 @@ fn refuses_first_target(reservations: &BTreeMap<u64,Reservation>, directory: &Ha
     result
 }
 }
+
+verus! {
+// A failed allowance update may leave the private capability store fenced.
+// Ownership of both stores must stay inside recovery until replay succeeds.
+struct StartupStores {
+    inner:Stores,
+    // Model a store error for this alias after the capability fence has closed.
+    failed:Option<u64>,
+    calls:Ghost<Seq<(u64,Option<u64>)>>,
+}
+
+impl RetirementSink<u64> for StartupStores {
+    type Error = u64;
+    #[cfg(verus_keep_ghost)]
+    type Bucket = u64;
+
+    closed spec fn valid(&self) -> bool {
+        (forall|i:int| 0 <= i < self.calls@.len() && (#[trigger] self.calls@[i]).1.is_some() ==> self.calls@[i].1 == Some(self.calls@[i].0)) && self.inner.valid() && (self.failed.is_some() ==> self.failed == Some(7u64))
+    }
+    closed spec fn failure(&self) -> Option<u64> {self.failed}
+    closed spec fn history(&self) -> Seq<(u64,Option<u64>)> {self.calls@}
+    closed spec fn authority(&self,k:u64) -> (bool,bool,Option<u64>) {self.inner.authority(k)}
+
+    fn restore(&mut self,k:u64) -> (r:Result<(),u64>) {
+        let receipt = crate::principal_fences::restore_capability(&mut self.inner.capabilities,k);
+        if k == 7 {
+            self.failed = Some(k);
+            self.calls = Ghost(self.calls@.push((k,Some(k))));
+            return Err(k);
+        }
+        crate::principal_fences::restore_allowances(receipt,&mut self.inner.allowances,&mut self.inner.grants);
+        self.calls = Ghost(self.calls@.push((k,None)));
+        Ok(())
+    }
+}
+
+type PublishedAllowances = (HashSet<u64>,HashMap<u64,u64>);
+
+spec fn shared_authority(cap:HashSet<u64>,pair:PublishedAllowances,a:u64) -> (bool,bool,Option<u64>) {
+    (cap@.contains(a),pair.0@.contains(a),pair.1@.get(a))
+}
+
+spec fn restored_handles(cap:HashSet<u64>,pair:PublishedAllowances,rows:Map<u64,Reservation>,
+    directory:Map<u64,u64>,prior:StartupStores) -> bool {
+    forall|a:u64| #[trigger] shared_authority(cap,pair,a) ==
+        if crate::recovery::reserved(rows,directory,a) {(true,true,None)} else {prior.authority(a)}
+}
+
+fn publish_startup(read:Result<BTreeMap<u64,Reservation>,u64>,directory:&HashMap<u64,u64>,private:StartupStores)
+    requires private.valid(),private.failed.is_none(),hash_map_inv(directory),
+        read matches Ok(rows) ==> btree_map_wf(&rows),
+{
+    let restore = |rows:BTreeMap<u64,Reservation>,stores:StartupStores| ->
+        (out:Result<(HashSet<u64>,PublishedAllowances),u64>)
+        requires stores.valid(),stores.failed.is_none(),btree_map_wf(&rows),
+        ensures match out {
+            Ok((cap,pair)) => restored_handles(cap,pair,rows@,directory@,stores),
+            Err(e) => e == 7 && crate::recovery::reserved(rows@,directory@,e),
+        },
+    {
+        let mut active = stores;
+        let ghost n = active.calls@.len();
+        match crate::recovery::replay(&rows,directory,&mut active) {
+            Err(e)=>{
+                assert(active.failure()==Some(e) && active.valid());
+                assert(active.calls@.last().1==Some(e));
+                let ghost i = active.calls@.len() - 1;
+                assert(n <= i && active.calls@[i].1 == Some(e));
+                assert(active.calls@[i].0 == e);
+                assert(crate::recovery::reserved(rows@,directory@,active.history()[i].0));
+                Err(e)
+            },
+            Ok(())=>{
+                assert forall|a:u64| #[trigger] active.authority(a) ==
+                    if crate::recovery::reserved(rows@,directory@,a) {(true,true,None)} else {stores.authority(a)} by {};
+                let cap = active.inner.capabilities;
+                let pair = (active.inner.allowances,active.inner.grants);
+                assert forall|a:u64| #[trigger] shared_authority(cap,pair,a) ==
+                    if crate::recovery::reserved(rows@,directory@,a) {(true,true,None)} else {stores.authority(a)}
+                    by {assert(shared_authority(cap,pair,a)==active.authority(a));}
+                Ok((cap,pair))
+            },
+        }
+    };
+    let out = crate::retirement_publication::publish(read,private,restore);
+    let ghost original_read = read;
+    let ghost published = out;
+    proof { match original_read {
+        Err(e)=>{assert(out==Err(e));},
+        Ok(rows)=>match published {
+            Ok((cap,pair))=>{
+                assert(restored_handles(*cap,*pair,rows@,directory@,private));
+                assert forall|a:u64| #[trigger] shared_authority(*cap,*pair,a) ==
+                    if crate::recovery::reserved(rows@,directory@,a) {(true,true,None)} else {private.authority(a)} by {};
+            },
+            Err(e)=>{assert(e==7 && crate::recovery::reserved(rows@,directory@,e));},
+        }
+    } }
+}
+}

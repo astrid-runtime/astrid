@@ -1059,9 +1059,9 @@ impl Kernel {
         );
         let ownership = ownership_store.load().await.map_err(|error| {
             std::io::Error::other(format!("Failed to load ownership graph: {error}"))
-        })?;
+        });
         let (capabilities, allowance_store) = authority_recovery::restore_retirement_fences(
-            &ownership,
+            ownership,
             &principal_directory,
             capabilities,
             astrid_approval::AllowanceStore::new(),

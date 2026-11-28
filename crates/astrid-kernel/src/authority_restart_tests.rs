@@ -109,7 +109,7 @@ async fn hosted_token_revocation_and_consumption_survive_storage_reopen() {
         .unwrap();
     let ownership =
         astrid_storage::OwnershipStore::new(Arc::clone(&kv), directory.clone()).unwrap();
-    let snapshot = ownership.load().await.unwrap();
+    let snapshot = ownership.load().await.map_err(std::io::Error::other);
     let retiring_alias = PrincipalId::new("deletion-in-progress").unwrap();
     // The token payload survived, so denial must come from recovered authority.
     assert!(reopened.get(&retiring_id).await.unwrap().is_some());
@@ -130,7 +130,7 @@ async fn hosted_token_revocation_and_consumption_survive_storage_reopen() {
     };
     allowances.add_allowance(allowance.clone()).unwrap();
     let (reopened, allowances) = super::authority_recovery::restore_retirement_fences(
-        &snapshot, &directory, reopened, allowances,
+        snapshot, &directory, reopened, allowances,
     )
     .unwrap();
     assert_eq!(allowances.count_for(&retiring_alias), 0);
@@ -180,7 +180,7 @@ async fn restored_fences_cover_legacy_and_renamed_reservations_in_both_stores() 
             .await
             .unwrap(),
     );
-    let snapshot = ownership.load().await.unwrap();
+    let snapshot = ownership.load().await.map_err(std::io::Error::other);
 
     let recovered = PrincipalDirectory::default();
     recovered.register(renamed.clone(), renamed_uid).unwrap();
@@ -214,7 +214,7 @@ async fn restored_fences_cover_legacy_and_renamed_reservations_in_both_stores() 
         allowances.add_allowance(grant(alias)).unwrap();
     }
     let (capabilities, allowances) = super::authority_recovery::restore_retirement_fences(
-        &snapshot,
+        snapshot,
         &recovered,
         capabilities,
         allowances,

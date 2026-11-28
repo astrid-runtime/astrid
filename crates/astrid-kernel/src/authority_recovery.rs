@@ -7,6 +7,8 @@ use astrid_capabilities::CapabilityStore;
 use astrid_core::PrincipalId;
 use astrid_storage::{OwnershipSnapshot, PrincipalDirectory, RetirementSink};
 
+mod publication;
+
 struct RecoveringStores {
     capabilities: CapabilityStore,
     allowances: AllowanceStore,
@@ -25,17 +27,19 @@ impl RetirementSink<PrincipalId> for RecoveringStores {
 /// The durable ownership reservation remains the authority to resume or
 /// finish reclamation. Recovery only restores its admission consequences.
 pub(super) fn restore_retirement_fences(
-    ownership: &OwnershipSnapshot,
+    ownership: std::io::Result<OwnershipSnapshot>,
     principals: &PrincipalDirectory,
     capabilities: CapabilityStore,
     allowances: AllowanceStore,
 ) -> std::io::Result<(Arc<CapabilityStore>, Arc<AllowanceStore>)> {
-    let mut stores = RecoveringStores {
+    let stores = RecoveringStores {
         capabilities,
         allowances,
     };
-    principals
-        .replay_retirements(ownership, &mut stores)
-        .map_err(std::io::Error::other)?;
-    Ok((Arc::new(stores.capabilities), Arc::new(stores.allowances)))
+    publication::publish(ownership, stores, |graph, mut stores| {
+        principals
+            .replay_retirements(&graph, &mut stores)
+            .map_err(std::io::Error::other)?;
+        Ok((stores.capabilities, stores.allowances))
+    })
 }

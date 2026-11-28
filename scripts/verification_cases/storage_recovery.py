@@ -6,6 +6,20 @@ from .common import replace_once
 
 
 def consumer_defects():
+    publication = Path("crates/astrid-kernel/src/authority_recovery/publication.rs")
+    for label, clause, weaker in [
+        ("ownership read error", "Err(e) => out == Err(e)", "Err(e) => true"),
+        ("capability handle", "restore.ensures((graph,private),Ok((*capabilities,*allowances)))", "exists|c:C| #[trigger] restore.ensures((graph,private),Ok((c,*allowances)))"),
+        ("allowance handle", "restore.ensures((graph,private),Ok((*capabilities,*allowances)))", "exists|a:A| #[trigger] restore.ensures((graph,private),Ok((*capabilities,a)))"),
+        ("same ownership graph", "restore.ensures((graph,private),Ok((*capabilities,*allowances)))", "exists|g:G| #[trigger] restore.ensures((g,private),Ok((*capabilities,*allowances)))"),
+        ("same private stores", "restore.ensures((graph,private),Ok((*capabilities,*allowances)))", "exists|s:S| #[trigger] restore.ensures((graph,s),Ok((*capabilities,*allowances)))"),
+        ("retirement replay error", "Err(e) => restore.ensures((graph,private),Err(e))", "Err(e) => true"),
+    ]:
+        yield (
+            f"startup store publication loses {label}", publication,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_retirement_recovery.rs"),
+        )
     reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, source, clause, weaker in [
