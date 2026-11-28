@@ -215,7 +215,7 @@ where
             faults.as_ref(),
         )
         .and_then(super::recovery::checkpoint_recovered_wal)?;
-        Ok(Self::from_recovered(
+        Self::from_recovered(
             None,
             None,
             Some(volume),
@@ -226,7 +226,7 @@ where
             EngineOpenOptions { policy, faults },
             recovered,
             wal,
-        ))
+        )
     }
 
     /// Open or create a durable store with an explicit fault injector.
@@ -290,7 +290,7 @@ where
         )
         .and_then(super::recovery::checkpoint_recovered_wal)?;
 
-        Ok(Self::from_recovered(
+        Self::from_recovered(
             Some(path),
             Some(directory_capability),
             None,
@@ -301,7 +301,7 @@ where
             options,
             recovered,
             wal,
-        ))
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -316,8 +316,9 @@ where
         options: EngineOpenOptions<P>,
         recovered: super::RecoveredStore<P>,
         wal: Option<super::DurableWal<P, I, C>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DurableError> {
+        let published_roots = super::PublishedRoots::new(&recovered.roots_by_principal)?;
+        Ok(Self {
             directory,
             directory_capability,
             volume: RwLock::new(volume),
@@ -337,7 +338,7 @@ where
             commit_group: Mutex::new(CommitGroup::default()),
             transaction_wal: options.policy.transaction_wal,
             wal: Mutex::new(wal),
-            published_roots: super::PublishedRoots::new(&recovered.roots_by_principal),
+            published_roots,
             checkpoint_arbiter: std::sync::Arc::new(Mutex::new(
                 super::checkpoint_worker::CheckpointArbiterState::default(),
             )),
@@ -356,6 +357,6 @@ where
                 poisoned: false,
                 arena_generation: 0,
             }),
-        }
+        })
     }
 }

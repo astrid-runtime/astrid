@@ -143,6 +143,42 @@ fn close_fences_a_reader_already_inside_the_published_root_lookup() {
     assert!(released);
 }
 
+#[test]
+fn refused_slot_replacement_preserves_the_published_snapshot() {
+    use crate::engine::durable::{DurableError, PublishedRoots};
+    use crate::storage_model::{RootGeneration, RootState};
+    use std::collections::BTreeMap;
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Key(u8);
+
+    impl Clone for Key {
+        fn clone(&self) -> Self {
+            // Exercise an embedding that produces a different principal while building slots.
+            Self(if self.0 == 2 { 3 } else { self.0 })
+        }
+    }
+
+    let (commit, _) = transaction("alice", None, b"admitted");
+    let root = RootState {
+        generation: RootGeneration::INITIAL,
+        commit,
+    };
+    let published = PublishedRoots::new(&BTreeMap::from([(Key(1), root)])).unwrap();
+    let candidate = BTreeMap::from([(Key(2), root)]);
+    assert!(matches!(
+        PublishedRoots::new(&candidate),
+        Err(DurableError::InvalidRootProjection)
+    ));
+    assert!(matches!(
+        published.replace(&candidate),
+        Err(DurableError::InvalidRootProjection)
+    ));
+    assert_eq!(published.get(&Key(1)), Some(root));
+    assert_eq!(published.get(&Key(2)), None);
+    assert_eq!(published.get(&Key(3)), None);
+}
+
 struct FailAfterRoot(AtomicBool);
 impl FaultInjector for FailAfterRoot {
     fn should_fail(&self, point: FaultPoint) -> bool {

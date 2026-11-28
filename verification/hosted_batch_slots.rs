@@ -295,6 +295,29 @@ fn published_sample<P:Ord,S,F:Fn(&S)->crate::RootState>(slots:&std::collections:
         || -> (ok:bool) ensures ok == after, {after})
 }
 
+/// Follow an unpublished candidate through the installation callback and
+/// the first reader of that snapshot, before any in-place slot update.
+fn installed_sample<P:Ord,S,F:Fn(&S)->crate::RootState+Copy>(roots:&std::collections::BTreeMap<P,crate::RootState>,
+    slots:std::collections::BTreeMap<P,S>,owner:&P,read:F,value:Ghost<spec_fn(S)->crate::RootState>)
+    -> (out:Result<Option<crate::RootState>,()>)
+    requires vstd::std_specs::btree::btree_map_inv(roots),vstd::std_specs::btree::btree_map_inv(&slots),
+        vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
+        forall|s:&S| #[trigger] read.requires((s,)),
+        forall|s:&S,r:crate::RootState| #[trigger] read.ensures((s,),r) ==> r == (value@)(*s),
+    ensures match out {
+        Ok(sample) => slots@.dom() == roots@.dom() && sample == roots@.get(*owner) &&
+            forall|p:P| #[trigger] roots@.contains_key(p) ==> (value@)(slots@[p]) == roots@[p],
+        Err(()) => slots@.dom()!=roots@.dom() || exists|p:P| roots@.contains_key(p) && slots@.contains_key(p) &&
+            #[trigger] (value@)(slots@[p])!=roots@[p],
+    },
+{
+    let write = |candidate:std::collections::BTreeMap<P,S>| -> (selected:std::collections::BTreeMap<P,S>)
+        ensures selected == candidate, {candidate};
+    let Some(selected) = crate::journal_closure::install(roots,slots,read,write) else {return Err(());};
+    let sample = published_sample(&selected,owner,true,true,read).unwrap().get();
+    Ok(sample)
+}
+
 /// Recover no row from another root, even when a limit discards multiple FIFO entries.
 fn trim_point<F>(previous:Arc<crate::hot_snapshot::OwnerSnapshot>,wanted:Option<crate::RootState>,
     take:F,limit:usize,key:&Vec<u8>) -> (out:Option<Option<Vec<u8>>>)

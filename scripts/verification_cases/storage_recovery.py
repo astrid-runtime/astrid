@@ -158,6 +158,16 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b),
             Path("verification/hosted_batch_slots.rs"),
         )
+    for label, clause, weaker in [
+        ("installed map", "write.ensures((candidate,),value) &&", "true &&"),
+        ("principal domain", "write.ensures((candidate,),value) && candidate@.dom() == roots@.dom()", "write.ensures((candidate,),value)"),
+        ("root observation", "read.ensures((&candidate@[p],),roots@[p]),\n        None =>", "(exists|r:RootState| #[trigger] read.ensures((&candidate@[p],),r)),\n        None =>"),
+    ]:
+        yield (
+            f"restart slot installation loses {label}", Path("crates/astrid-storage/src/engine/durable/journal_closure.rs"),
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_batch_slots.rs"),
+        )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
         ("installed record", "final(loaded)@ == old(loaded)@.insert(id,record)", "final(loaded)@.dom() == old(loaded)@.dom().insert(id)"),

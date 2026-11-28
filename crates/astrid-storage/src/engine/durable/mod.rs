@@ -596,17 +596,22 @@ impl<P> PublishedRoots<P>
 where
     P: Clone + Ord,
 {
-    fn new(roots: &BTreeMap<P, RootState>) -> Self {
-        Self {
-            entries: ArcSwap::from_pointee(Self::entries(roots)),
-        }
+    fn new(roots: &BTreeMap<P, RootState>) -> Result<Self, DurableError> {
+        Self::install(roots, |slots| Self {
+            entries: ArcSwap::from_pointee(slots),
+        })
     }
 
-    fn entries(roots: &BTreeMap<P, RootState>) -> BTreeMap<P, Arc<PublishedRoot>> {
-        roots
+    fn install<T>(
+        roots: &BTreeMap<P, RootState>,
+        write: impl FnOnce(BTreeMap<P, Arc<PublishedRoot>>) -> T,
+    ) -> Result<T, DurableError> {
+        let slots = roots
             .iter()
             .map(|(principal, root)| (principal.clone(), Arc::new(PublishedRoot::new(*root))))
-            .collect()
+            .collect();
+        journal_closure::install(roots, slots, |slot| **slot.value.load(), write)
+            .ok_or(DurableError::InvalidRootProjection)
     }
 
     fn get(&self, principal: &P) -> Option<RootState> {
@@ -624,8 +629,8 @@ where
         self.entries.store(Arc::new(next));
     }
 
-    fn replace(&self, roots: &BTreeMap<P, RootState>) {
-        self.entries.store(Arc::new(Self::entries(roots)));
+    fn replace(&self, roots: &BTreeMap<P, RootState>) -> Result<(), DurableError> {
+        Self::install(roots, |slots| self.entries.store(Arc::new(slots)))
     }
 }
 

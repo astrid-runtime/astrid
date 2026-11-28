@@ -12,8 +12,8 @@ use vstd::{
     laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
     std_specs::{
         btree::{btree_map_inv, btree_set_inv},
-        iter::IteratorSpec,
         cmp::OrdSpec,
+        iter::IteratorSpec,
     },
 };
 
@@ -118,42 +118,45 @@ pub(super) fn commits<P:Ord>(history:&BTreeMap<P,(RootState,u64)>) -> (ids:BTree
     }
 }
 
-/// Certify the bulk-built root map against the journal in principal order.
-/// No property of the key copier or collection builder is needed on success.
-pub(super) fn project<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,roots:BTreeMap<P,RootState>) -> (out:Option<BTreeMap<P,RootState>>)
-    requires btree_map_inv(history),btree_map_inv(&roots),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
-    ensures match out {
-        Some(map) => map == roots && map@ == history@.map_values(|entry:(RootState,u64)| entry.0),
-        None => roots@ != history@.map_values(|entry:(RootState,u64)| entry.0),
+/// Compare every principal and its pair of values before exposing a built map.
+pub(super) fn matching<P:Ord,A,B,F:Fn(&A,&B)->bool>(history:&BTreeMap<P,A>,roots:&BTreeMap<P,B>,same:F) -> (ok:bool)
+    requires btree_map_inv(history),btree_map_inv(roots),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        forall|x:&A,y:&B| #[trigger] same.requires((x,y)),
+    ensures if ok {
+        roots@.dom() == history@.dom() && forall|p:P| #[trigger] history@.contains_key(p) ==> same.ensures((&history@[p],&roots@[p]),true)
+    } else {
+        roots@.dom() != history@.dom() || exists|p:P| history@.contains_key(p) && roots@.contains_key(p) &&
+            #[trigger] same.ensures((&history@[p],&roots@[p]),false)
     },
 {
-    if history.len() != roots.len() {return None;}
+    if history.len() != roots.len() {return false;}
     let mut input = history.iter();
     let mut output = roots.iter();
     let ghost src = input.remaining();
     let ghost dst = output.remaining();
-    let ghost a = src.map_values(|kv:(&P,&(RootState,u64))| *kv.0);
-    let ghost b = dst.map_values(|kv:(&P,&RootState)| *kv.0);
+    let ghost a = src.map_values(|kv:(&P,&A)| *kv.0);
+    let ghost b = dst.map_values(|kv:(&P,&B)| *kv.0);
     let ghost mut n:int = 0;
     loop
         invariant 0 <= n <= src.len(),src.len() == history.len(),src.len()==dst.len(),
             input.remaining()==src.skip(n), output.remaining()==dst.skip(n),
             src.unref().to_set()==history@.kv_pairs(),dst.unref().to_set()==roots@.kv_pairs(),
-            a == src.map_values(|kv:(&P,&(RootState,u64))| *kv.0),
-            b == dst.map_values(|kv:(&P,&RootState)| *kv.0),
+            a == src.map_values(|kv:(&P,&A)| *kv.0),
+            b == dst.map_values(|kv:(&P,&B)| *kv.0),
             vstd::std_specs::btree::increasing_seq(a),vstd::std_specs::btree::increasing_seq(b),
             obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
-            forall|j:int| 0 <= j < n ==> #[trigger] src[j].0 == dst[j].0 && src[j].1.0 == *dst[j].1,
+            forall|x:&A,y:&B| #[trigger] same.requires((x,y)),
+            forall|j:int| 0 <= j < n ==> #[trigger] src[j].0 == dst[j].0 && same.ensures((src[j].1,dst[j].1),true),
         decreases history.len()-n,
     {
         let Some((principal,entry)) = input.next() else {
             assert(n==src.len());
-            assert forall|p:P| #[trigger] history@.contains_key(p) implies roots@.contains_key(p) && roots@[p]==history@[p].0 by {
+            assert forall|p:P| #[trigger] history@.contains_key(p) implies roots@.contains_key(p) && same.ensures((&history@[p],&roots@[p]),true) by {
                 let pair = (p,history@[p]);
                 assert(src.unref().to_set().contains(pair));
                 let j = src.unref().index_of(pair);
-                assert(src.unref()[j]==pair && dst.unref()[j]==(p,pair.1.0));
-                assert(roots@.kv_pairs().contains((p,pair.1.0)));
+                assert(src.unref()[j]==pair && *dst[j].0==p);
+                assert(roots@.kv_pairs().contains(dst.unref()[j]));
             }
             assert forall|p:P| #[trigger] roots@.contains_key(p) implies history@.contains_key(p) by {
                 let pair = (p,roots@[p]);
@@ -162,17 +165,16 @@ pub(super) fn project<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,roots:BTreeMap
                 assert(dst.unref()[j]==pair && *src[j].0==p);
                 assert(history@.kv_pairs().contains(src.unref()[j]));
             }
-            assert(roots@ =~= history@.map_values(|entry:(RootState,u64)| entry.0));
-            return Some(roots);
+            assert(roots@.dom() =~= history@.dom());
+            return true;
         };
-        let (owner,root) = output.next()?;
+        let Some((owner,root)) = output.next() else {return false;};
         proof {
             reveal(vstd::laws_cmp::obeys_cmp_ord);
-            if roots@ == history@.map_values(|entry:(RootState,u64)| entry.0) {
-                assert(src.unref()[n]==(*principal,*entry) && dst.unref()[n]==(*owner,*root));
+            assert(src.unref()[n]==(*principal,*entry) && dst.unref()[n]==(*owner,*root));
+            assert(history@.kv_pairs().contains((*principal,*entry)) && roots@.kv_pairs().contains((*owner,*root)));
+            if roots@.dom() == history@.dom() {
                 assert(a[n]==*principal && b[n]==*owner);
-                assert(history@.kv_pairs().contains((*principal,*entry)));
-                assert(roots@.kv_pairs().contains((*owner,*root)));
                 if *principal != *owner {
                     let x = (*principal,roots@[*principal]);
                     let y = (*owner,history@[*owner]);
@@ -189,19 +191,64 @@ pub(super) fn project<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,roots:BTreeMap
                     }
                     assert(false);
                 }
-                assert(entry.0==*root);
+                assert(*principal == *owner);
             }
         }
-        match P::cmp(principal,owner) {std::cmp::Ordering::Equal => {}, _ => return None}
+        match P::cmp(principal,owner) {std::cmp::Ordering::Equal => {}, _ => return false}
         assert(principal.cmp_spec(owner) is Equal);
-        if !entry.0.same(*root) {return None;}
+        if !same(entry,root) {
+            assert(history@.contains_key(*principal) && roots@.contains_key(*principal));
+            assert(same.ensures((&history@[*principal],&roots@[*principal]),false));
+            return false;
+        }
         assert(*owner == *principal);
         assert(src[n] == (principal,entry) && dst[n] == (owner,root));
-        assert forall|j:int| 0 <= j < n+1 implies #[trigger] src[j].0 == dst[j].0 && src[j].1.0 == *dst[j].1 by {
-            if j < n { assert(src[j].0 == dst[j].0 && src[j].1.0 == *dst[j].1); }
-            else { assert(j==n && entry.0==*root); }
+        assert forall|j:int| 0 <= j < n+1 implies #[trigger] src[j].0 == dst[j].0 && same.ensures((src[j].1,dst[j].1),true) by {
+            if j < n { assert(src[j].0 == dst[j].0 && same.ensures((src[j].1,dst[j].1),true)); }
+            else { assert(j==n && same.ensures((entry,root),true)); }
         }
         proof { n=n+1; };
+    }
+}
+
+/// Check fresh live slots while the candidate still belongs exclusively to its builder.
+pub(super) fn install<P:Ord,S,T,F:Fn(&S)->RootState+Copy,W:FnOnce(BTreeMap<P,S>)->T>(roots:&BTreeMap<P,RootState>,candidate:BTreeMap<P,S>,read:F,write:W)
+    -> (out:Option<T>)
+    requires btree_map_inv(roots),btree_map_inv(&candidate),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        forall|s:&S| #[trigger] read.requires((s,)),
+        candidate@.dom() == roots@.dom() && (forall|p:P| #[trigger] roots@.contains_key(p) ==> read.ensures((&candidate@[p],),roots@[p])) ==> write.requires((candidate,)),
+    ensures match out {
+        Some(value) => write.ensures((candidate,),value) && candidate@.dom() == roots@.dom() &&
+            forall|p:P| #[trigger] roots@.contains_key(p) ==> read.ensures((&candidate@[p],),roots@[p]),
+        None => candidate@.dom() != roots@.dom() || exists|p:P,r:RootState| roots@.contains_key(p) && candidate@.contains_key(p) &&
+            #[trigger] read.ensures((&candidate@[p],),r) && r != roots@[p],
+    },
+{
+    let same = |root:&RootState,slot:&S| -> (ok:bool)
+        ensures if ok {read.ensures((slot,),*root)} else {exists|r:RootState| #[trigger] read.ensures((slot,),r) && r!=*root},
+    {
+        let observed = read(slot);
+        root.same(observed)
+    };
+    if matching(roots,&candidate,same) {Some(write(candidate))} else {None}
+}
+
+/// Certify the bulk-built root map against the journal in principal order.
+/// No property of the key copier or collection builder is needed on success.
+pub(super) fn project<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,roots:BTreeMap<P,RootState>) -> (out:Option<BTreeMap<P,RootState>>)
+    requires btree_map_inv(history),btree_map_inv(&roots),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+    ensures match out {
+        Some(map) => map == roots && map@ == history@.map_values(|entry:(RootState,u64)| entry.0),
+        None => roots@ != history@.map_values(|entry:(RootState,u64)| entry.0),
+    },
+{
+    let same = |entry:&(RootState,u64),root:&RootState| -> (ok:bool)
+        ensures ok == (entry.0 == *root), {entry.0.same(*root)};
+    if matching(history,&roots,same) {
+        assert(roots@ =~= history@.map_values(|entry:(RootState,u64)| entry.0));
+        Some(roots)
+    } else {
+        None
     }
 }
 

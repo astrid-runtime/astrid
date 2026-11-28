@@ -541,10 +541,14 @@ where
                     stable.finish(|wal| checkpoint_recovered_wal((recovered, wal)))
                 })
             };
+            let recovered = recovered.and_then(|(recovered, wal)| {
+                self.published_roots
+                    .replace(&recovered.roots_by_principal)?;
+                Ok((recovered, wal))
+            });
             match recovered {
                 Ok((recovered, wal)) => {
                     inner.roots_by_principal = recovered.roots_by_principal;
-                    self.published_roots.replace(&inner.roots_by_principal);
                     inner.index = recovered.index;
                     inner.pending_index_locations.clear();
                     inner.pending_direct_objects.clear();
