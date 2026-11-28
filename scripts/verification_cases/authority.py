@@ -280,6 +280,31 @@ def defects():
     ]
 
 
+def live_token_consumers():
+    for label, clause in [
+        ("marker namespace", 'address.0@ == "caps:revoked"@'),
+        ("marker identity", "*address.1 == *id"),
+        ("prior consumption", "final(authority)@[*id].used() == (old(authority)@.contains_key(*id) && old(authority)@[*id].used())"),
+        ("live refusal", "final(authority)@[*id].revoked()"),
+        ("peer isolation", "final(authority)@ == old(authority)@.insert(*id, final(authority)@[*id])"),
+    ]:
+        yield (
+            f"token revocation fence loses {label}", AUTHORITY,
+            lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
+        )
+    for label, clause in [
+        ("CAS address", "*out.1 == self.target()"),
+        ("admission", "admitted == (won && !revoked && !used)"),
+        ("live consumption", "final(authority)@[id].used()"),
+        ("prior revocation", "final(authority)@[id].revoked() == revoked"),
+        ("peer isolation", "final(authority)@ == old(authority)@.insert(id,final(authority)@[id])"),
+    ]:
+        yield (
+            f"single-use completion loses {label}", AUTHORITY,
+            lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
+        )
+
+
 def marker_batch_consumers():
     for label, clause, weaker in [
         ("complete enumeration", "Ok(()) => ids.len() == keys.len()", "Ok(()) => ids.len() <= keys.len()"),
