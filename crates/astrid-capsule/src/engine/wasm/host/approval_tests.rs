@@ -183,8 +183,8 @@ async fn hosted_approval_does_not_authorize_native_workspace() {
 }
 
 #[tokio::test]
-async fn once_and_session_are_not_saved_as_always() {
-    for decision in ["approve", "approve_session"] {
+async fn only_persistent_approval_can_change_the_saved_profile() {
+    for decision in ["approve", "approve_session", "deny", "unknown", ""] {
         let home = tempfile::tempdir().unwrap();
         answer_action_request(persistent_test_state(home.path()), decision)
             .await
@@ -598,7 +598,7 @@ fn approve_once_does_not_create_allowance() {
     ));
 }
 
-fn approval_response_event(
+pub(super) fn approval_response_event(
     request_id: &str,
     principal: Option<&str>,
     request_owner: Option<astrid_events::ipc::RequestOwnerId>,
@@ -883,7 +883,7 @@ pub(super) fn install_request_owner(state: &mut HostState) -> astrid_events::ipc
     owner
 }
 
-async fn await_approval_request(
+pub(super) async fn await_approval_request(
     rx: astrid_events::EventReceiver,
 ) -> (String, Option<String>, astrid_events::ipc::RequestOwnerId) {
     let (request_id, principal, owner, _) = await_approval_prompt(rx).await;
@@ -1340,4 +1340,77 @@ fn sanitize_guest_field_empty_string() {
     let mut s = String::new();
     sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
     assert!(s.is_empty());
+}
+
+#[tokio::test]
+async fn principal_retirement_during_approval_prevents_persistent_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = persistent_test_state(dir.path());
+    let owner = install_request_owner(&mut state);
+    let principal = state.effective_principal();
+    let tracker = std::sync::Arc::new(crate::engine::wasm::PrincipalInvocationTracker::default());
+    state.principal_invocations = Some(tracker.clone());
+    let bus = state.event_bus.clone();
+    let requests = bus.subscribe_topic(Topic::approval_request().as_str());
+    let task = tokio::task::spawn_blocking(move || {
+        approval::Host::request_approval(
+            &mut state,
+            approval_request("git push", "git push origin main"),
+        )
+    });
+    let (id, _, _) = await_approval_request(requests).await;
+    tracker.retire(&principal);
+    bus.publish(approval_response_event(
+        &id,
+        Some(principal.as_str()),
+        Some(owner),
+        "approve_always",
+    ));
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ErrorCode::StoreUnavailable)
+    ));
+    let fresh = persistent_test_state(dir.path());
+    assert!(!check_persisted_allowance(&fresh, &principal, "git push origin main").unwrap());
+}
+
+#[tokio::test]
+async fn transformed_display_text_requires_a_new_approval() {
+    let home = tempfile::tempdir().unwrap();
+    for durable in [false, true] {
+        let mut state = persistent_test_state(home.path());
+        let principal = state.effective_principal();
+        if durable {
+            state
+                .profile_cache
+                .as_ref()
+                .unwrap()
+                .persist_command_always(&principal, "list", state.hosted_workspace_root.to_str())
+                .unwrap();
+        } else {
+            let store = AllowanceStore::new();
+            create_allowance_from_decision(
+                &store,
+                &principal,
+                "list",
+                "approve_session",
+                Some(state.workspace_root.clone()),
+                "test",
+            );
+            state.allowance_store = Some(std::sync::Arc::new(store));
+        }
+        for resource in [
+            "list items ".to_owned(),
+            format!("list {}", "a".repeat(MAX_RESOURCE_LEN)),
+        ] {
+            let response =
+                approval::Host::request_approval(&mut state, approval_request("list", &resource))
+                    .unwrap();
+            assert_eq!(response.decision, ApprovalDecision::Denied);
+        }
+        let exact =
+            approval::Host::request_approval(&mut state, approval_request("list", "list items"))
+                .unwrap();
+        assert_eq!(exact.decision, ApprovalDecision::Allowance);
+    }
 }

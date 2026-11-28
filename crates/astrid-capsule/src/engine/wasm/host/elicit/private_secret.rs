@@ -26,14 +26,25 @@ pub(super) fn collect(
             "private secret input has no bound responder device".into(),
         ));
     };
-    let device_key_id = device.as_str().to_owned();
+    let profile = state
+        .profile_cache
+        .as_ref()
+        .and_then(|cache| cache.resolve(&principal).ok())
+        .ok_or_else(|| ErrorCode::Unknown("private responder profile unavailable".into()))?;
+    let responder = profile
+        .active_device(device)
+        .ok_or_else(|| ErrorCode::Unknown("private responder device is inactive".into()))?;
     let identity = SecretElicitIdentity::new(
         principal.clone(),
         state.capsule_id.clone(),
         SecretElicitKey::new(request.key.clone()).map_err(|_| ErrorCode::InvalidInput)?,
     );
+    let responder_stamp = astrid_events::ipc::DeviceStamp {
+        fingerprint: Some(device.as_str()),
+        registration: responder.registration_id.map(Into::into),
+    };
     let waiter = registry
-        .register_kind(identity, expected_kind(&field))
+        .register_for_device(identity, expected_kind(&field), responder_stamp)
         .map_err(|_| ErrorCode::Unknown("secret input request capacity unavailable".into()))?;
     let event = super::elicit_request_event(
         astrid_events::ipc::Topic::private_elicit_request(),
@@ -41,7 +52,7 @@ pub(super) fn collect(
         state.capsule_id.to_string(),
         field.clone(),
         principal.to_string(),
-        Some(device_key_id),
+        responder_stamp,
     );
     let bus = state.event_bus.clone();
     let cancellation = state.effective_cancel_token();
@@ -65,6 +76,17 @@ pub(super) fn collect(
         None if cancellation.is_cancelled() => return Err(ErrorCode::Cancelled),
         None | Some(Err(_)) => return Err(ErrorCode::Timeout),
     };
+    if matches!(reply, SecretElicitReply::Cancelled) {
+        return Err(ErrorCode::Cancelled);
+    }
+    // Waiting for a human holds no device session. Re-enter both authority
+    // domains before disclosing an answer or persisting a secret.
+    let _caller = state
+        .begin_device_operation()
+        .map_err(|()| ErrorCode::Cancelled)?;
+    let _responder = state
+        .bind_device_operation(&principal, device.clone(), responder_stamp.registration)
+        .map_err(|()| ErrorCode::Cancelled)?;
     into_guest_response(state, request, &field, reply)
 }
 

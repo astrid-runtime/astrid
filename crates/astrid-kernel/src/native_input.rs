@@ -28,7 +28,29 @@ pub fn native_input_device_is_live(
     profile.active_device(&key_id).is_some()
 }
 
+/// Revalidate the registration captured by a signed native handshake.
+#[must_use]
+pub fn native_input_registration_is_live(
+    cache: &PrincipalProfileCache,
+    principal: &PrincipalId,
+    device_key_id: &str,
+    registration: Option<uuid::Uuid>,
+) -> bool {
+    let Ok(key) = DeviceKeyId::new(device_key_id) else {
+        return false;
+    };
+    cache
+        .resolve(principal)
+        .is_ok_and(|profile| profile.active_registration(&key, registration).is_some())
+}
+
 impl crate::Kernel {
+    /// Registry shared with the daemon's local device authenticator.
+    #[must_use]
+    pub fn device_sessions(&self) -> astrid_core::profile::device_sessions::DeviceSessions {
+        self.device_sessions.clone()
+    }
+
     /// Bind private secret routing before loading boot capsules. This shares
     /// waiter ownership with the native responder; it does not register keys.
     ///
@@ -42,6 +64,22 @@ impl crate::Kernel {
         self.native_secret_inputs
             .set(registry)
             .map_err(|_| std::io::Error::other("native secret input routing is already bound"))
+    }
+
+    /// Resolve the current keypair policy and exact registration for a native answer.
+    #[must_use]
+    pub fn native_input_registration_is_live(
+        &self,
+        principal: &PrincipalId,
+        device_key_id: &str,
+        registration: Option<uuid::Uuid>,
+    ) -> bool {
+        native_input_registration_is_live(
+            &self.profile_cache,
+            principal,
+            device_key_id,
+            registration,
+        )
     }
 
     /// Live profile revalidation for private secret replies.

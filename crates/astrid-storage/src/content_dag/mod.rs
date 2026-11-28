@@ -14,8 +14,10 @@
 
 extern crate alloc;
 
-use crate::storage_model::ObjectRecord;
+#[cfg(verus_keep_ghost)]
+use crate::storage_model::ReferenceKind;
 use crate::storage_model::{ModelError, ObjectId};
+use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
@@ -24,6 +26,9 @@ mod append;
 pub(crate) use append::append_verified_content;
 mod boundary;
 mod build;
+mod child_range;
+mod chunk_range;
+pub(crate) mod file_wire;
 mod read;
 mod stream;
 #[cfg(test)]
@@ -362,77 +367,46 @@ impl From<ModelError> for ContentError {
     }
 }
 
-pub(crate) const CONTENT_LABEL: &[u8] = b"content";
+pub(crate) const CONTENT_LABEL: &[u8] = file_wire::CONTENT;
 pub(crate) const FORMAT_VERSION: crate::storage_model::ObjectFormatVersion =
     crate::storage_model::ObjectFormatVersion::V1;
-pub(crate) const FILE_HEADER_BYTES: usize = 40;
+#[cfg(test)]
+pub(crate) const FILE_HEADER_BYTES: usize = file_wire::LENGTH;
 
 pub(crate) fn encode_file_header(
     profile: ChunkingProfile,
     logical_bytes: u64,
     chunk_count: u64,
 ) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(FILE_HEADER_BYTES);
-    bytes.push(1);
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.push(1);
-    bytes.extend_from_slice(&profile.minimum_bytes.to_le_bytes());
-    bytes.extend_from_slice(&profile.average_bytes.to_le_bytes());
-    bytes.extend_from_slice(&profile.maximum_bytes.to_le_bytes());
-    bytes.extend_from_slice(&profile.gear_seed.to_le_bytes());
-    bytes.extend_from_slice(&logical_bytes.to_le_bytes());
-    bytes.extend_from_slice(&chunk_count.to_le_bytes());
-    bytes
+    file_wire::Header {
+        minimum: profile.minimum_bytes,
+        average: profile.average_bytes,
+        maximum: profile.maximum_bytes,
+        seed: profile.gear_seed,
+        logical: logical_bytes,
+        chunks: chunk_count,
+    }
+    .encode()
 }
 
+#[cfg(test)]
 pub(crate) fn decode_file_header(
     object: ObjectId,
     bytes: &[u8],
 ) -> Result<(ChunkingProfile, u64, u64), ContentError> {
-    if bytes.len() != FILE_HEADER_BYTES
-        || bytes[0] != 1
-        || bytes[1..3] != 1_u16.to_le_bytes()
-        || bytes[3] != 1
-    {
-        return Err(ContentError::InvalidObject {
-            object,
-            detail: "unsupported file chunking profile",
-        });
-    }
-    let minimum = u32::from_le_bytes(
-        bytes[4..8]
-            .try_into()
-            .map_err(|_| ContentError::LengthOverflow)?,
-    );
-    let average = u32::from_le_bytes(
-        bytes[8..12]
-            .try_into()
-            .map_err(|_| ContentError::LengthOverflow)?,
-    );
-    let maximum = u32::from_le_bytes(
-        bytes[12..16]
-            .try_into()
-            .map_err(|_| ContentError::LengthOverflow)?,
-    );
-    let seed = u64::from_le_bytes(
-        bytes[16..24]
-            .try_into()
-            .map_err(|_| ContentError::LengthOverflow)?,
-    );
-    let logical_bytes = u64::from_le_bytes(
-        bytes[24..32]
-            .try_into()
-            .map_err(|_| ContentError::LengthOverflow)?,
-    );
-    let chunk_count = u64::from_le_bytes(
-        bytes[32..40]
-            .try_into()
-            .map_err(|_| ContentError::LengthOverflow)?,
-    );
+    let header = file_wire::decode(bytes).ok_or(ContentError::InvalidObject {
+        object,
+        detail: "unsupported file chunking profile",
+    })?;
     Ok((
-        ChunkingProfile::fastcdc_v2020(minimum, average, maximum, seed)?,
-        logical_bytes,
-        chunk_count,
+        ChunkingProfile::fastcdc_v2020(
+            header.minimum,
+            header.average,
+            header.maximum,
+            header.seed,
+        )?,
+        header.logical,
+        header.chunks,
     ))
 }
 
@@ -441,13 +415,15 @@ pub(crate) fn insert_record<I: crate::storage_model::ObjectIdentity>(
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
     record: ObjectRecord,
 ) -> Result<ObjectId, ContentError> {
-    let id = identity.identify(&record);
-    match records.get(&id) {
-        Some(existing) if existing == &record => {},
-        Some(_) => return Err(ContentError::Model(ModelError::ObjectCollision(id))),
-        None => {
-            records.insert(id, record);
-        },
+    crate::engine::transaction_records::stage(records, record, |r| identity.identify(r))
+        .map_err(|id| ContentError::Model(ModelError::ObjectCollision(id)))
+}
+
+impl file_wire::Error<ContentError> {
+    pub(crate) fn at(self, object: ObjectId) -> ContentError {
+        match self {
+            Self::Invalid(detail) => ContentError::InvalidObject { object, detail },
+            Self::Profile(error) => error,
+        }
     }
-    Ok(id)
 }

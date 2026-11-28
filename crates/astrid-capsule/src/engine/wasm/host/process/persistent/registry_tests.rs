@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use astrid_core::principal::PrincipalId;
 
-use super::{PersistentProcessRegistry, SpawnParams};
+use super::{ErrorCode, PersistentProcessRegistry, SpawnParams};
 
 /// Spawn a real child running `sh -c <script>`, in its own process group
 /// (mirroring the production sandboxed path), with stdout/stderr piped.
@@ -172,9 +172,90 @@ async fn spawn_wait_read_and_owner_isolation() {
     assert!(!logs.running);
 
     // Exited but retained → still resolvable; release reaps it.
+    assert!(matches!(
+        reg.release(&id, &alice, "cap-b"),
+        Err(ErrorCode::NoSuchProcess)
+    ));
     assert!(reg.status(&id, &alice, "cap-a").is_ok());
+    assert!(matches!(
+        reg.release(&id, &bob, "cap-a"),
+        Err(ErrorCode::NoSuchProcess)
+    ));
+    assert!(
+        reg.status_many(std::slice::from_ref(&id), &alice, "cap-b")
+            .is_empty()
+    );
+    assert_eq!(
+        reg.status_many(std::slice::from_ref(&id), &alice, "cap-a")[0].id,
+        id
+    );
     reg.release(&id, &alice, "cap-a").expect("release");
+    reg.release(&id, &alice, "cap-a").expect("already removed");
     assert!(reg.status(&id, &alice, "cap-a").is_err());
+}
+
+#[tokio::test]
+async fn retirement_removes_all_owned_capsules_and_preserves_foreign_entries() {
+    let registry = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
+    let alice = PrincipalId::new("alice").unwrap();
+    let bob = PrincipalId::new("bob").unwrap();
+    let register = |owner: &PrincipalId, capsule: &str| {
+        let (child, stdout, stderr, pid) = spawn_raw("exit 0");
+        registry
+            .spawn(params(owner, capsule, child, stdout, stderr, pid, 3))
+            .expect("register child")
+    };
+    let first = register(&alice, "shared");
+    let other = register(&bob, "shared");
+    let second = register(&alice, "another");
+
+    registry.shutdown_for(&alice);
+    registry.shutdown_for(&alice);
+    for (token, capsule) in [(first, "shared"), (second, "another")] {
+        assert!(matches!(
+            registry.status(&token, &alice, capsule),
+            Err(ErrorCode::NoSuchProcess)
+        ));
+    }
+    let exit = registry
+        .wait(&other, &bob, "shared", Duration::from_secs(5))
+        .await
+        .expect("foreign child remains registered");
+    assert_eq!(exit.exit_code, Some(0));
+    registry.release(&other, &bob, "shared").unwrap();
+}
+
+#[tokio::test]
+async fn graceful_shutdown_detaches_every_token_and_finishes_its_monitor() {
+    let registry = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
+    let mut children = Vec::new();
+    for name in ["alice", "bob"] {
+        let owner = PrincipalId::new(name).unwrap();
+        let (child, stdout, stderr, pid) = spawn_raw("exec sleep 30");
+        let token = registry
+            .spawn(params(&owner, "shared", child, stdout, stderr, pid, 1))
+            .expect("register child");
+        let monitor = registry.lock()[&registry.key_of(&token)]
+            .monitor
+            .abort_handle();
+        assert!(!monitor.is_finished());
+        children.push((owner, token, monitor));
+    }
+    registry.shutdown();
+    registry.shutdown();
+    for (owner, token, monitor) in children {
+        assert!(matches!(
+            registry.status(&token, &owner, "shared"),
+            Err(ErrorCode::NoSuchProcess)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !monitor.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shutdown finishes the selected child's monitor");
+    }
 }
 
 #[tokio::test]
@@ -194,6 +275,11 @@ async fn concurrent_cap_enforced_and_stop_reaps() {
     let id1 = reg
         .spawn(params(&p, "cap", c1, o1, e1, pid1, 1))
         .expect("first spawn");
+
+    assert!(matches!(
+        reg.release(&id1, &p, "cap"),
+        Err(ErrorCode::InvalidInput)
+    ));
 
     // Second spawn must be rejected with `quota`.
     let (c2, o2, e2, pid2) = spawn_raw("sleep 30");
@@ -385,4 +471,88 @@ async fn write_stdin_delivers_survives_reset_and_close_eofs() {
     ));
 
     reg.release(&id, &alice, "cap").expect("release");
+}
+
+#[cfg(unix)]
+#[test]
+fn group_signal_fallback_uses_the_same_positive_pid_and_signal() {
+    use super::signal_target::{DeliveryError, deliver};
+    use std::cell::RefCell;
+
+    for (pid, group_ok) in [(0, false), (u32::MAX, false), (73, true), (73, false)] {
+        let calls = RefCell::new(Vec::new());
+        let result = deliver(
+            pid,
+            15u8,
+            |p, s| {
+                calls.borrow_mut().push(("group", p, s));
+                group_ok
+            },
+            |p, s| {
+                calls.borrow_mut().push(("process", p, s));
+                Err(7u8)
+            },
+        );
+        let observed = calls.into_inner();
+        match pid {
+            0 => {
+                assert!(matches!(result, Err(DeliveryError::Closed)));
+                assert!(observed.is_empty());
+            },
+            u32::MAX => {
+                assert!(matches!(result, Err(DeliveryError::InvalidPid)));
+                assert!(observed.is_empty());
+            },
+            _ if group_ok => {
+                assert!(result.is_ok());
+                assert_eq!(observed, [("group", 73, 15)]);
+            },
+            _ => {
+                assert!(matches!(result, Err(DeliveryError::Send(7))));
+                assert_eq!(observed, [("group", 73, 15), ("process", 73, 15)]);
+            },
+        }
+    }
+    let fallback = deliver(
+        73,
+        15u8,
+        |_, _| false,
+        |pid, signal| {
+            assert_eq!((pid, signal), (73, 15));
+            Ok::<(), u8>(())
+        },
+    );
+    assert!(fallback.is_ok());
+}
+
+#[test]
+fn token_collision_never_replaces_another_child() {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    for fresh_at_end in [false, true] {
+        let mut entries = HashMap::from([(7u8, (42u8, "existing"))]);
+        let draws = Cell::new(0u8);
+        let result = super::publication::publish(
+            &mut entries,
+            "pending",
+            |attempt| {
+                assert_eq!(attempt, draws.get());
+                draws.set(attempt + 1);
+                attempt
+            },
+            |attempt| if fresh_at_end && *attempt == 8 { 9 } else { 7 },
+            |token, child| (*token, child),
+        );
+        assert_eq!(draws.get(), 9);
+        assert_eq!(entries[&7], (42, "existing"));
+        if fresh_at_end {
+            assert_eq!(result, Ok(8));
+            assert_eq!(entries[&9], (8, "pending"));
+            assert_eq!(entries.len(), 2);
+        } else {
+            assert_eq!(result, Err("pending"));
+            assert_eq!(entries.len(), 1);
+        }
+    }
 }

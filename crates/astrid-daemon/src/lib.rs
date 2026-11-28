@@ -353,8 +353,11 @@ async fn run_with_args(
         event_bus: std::sync::Arc::clone(&kernel.event_bus),
         shutdown: kernel.shutdown_tx.subscribe(),
     };
-    let native_uplink_task = native_uplink
-        .spawn_with_capsule_readiness(kernel.capsule_ingress_readiness(), private_inputs);
+    let native_uplink_task = native_uplink.spawn_with_device_sessions(
+        kernel.capsule_ingress_readiness(),
+        private_inputs,
+        kernel.device_sessions(),
+    );
 
     // Load the boot-critical default view. Non-default profile principals warm
     // after readiness so a large tenant set cannot make daemon restart health

@@ -34,68 +34,31 @@ impl std::fmt::Display for WasmHash {
     }
 }
 
-/// Authority scope of one executable runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RuntimeScope {
-    /// Mutable runtime state belongs exclusively to this durable principal.
-    Principal(PrincipalUid),
-    /// Explicit kernel service runtime with neutral host state.
-    SystemResident,
-}
+#[path = "runtime_scope.rs"]
+mod runtime_scope;
+pub use runtime_scope::RuntimeScope;
 
-/// Logical runtime slot. Artifact identity and authority identity are distinct.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RuntimeKey {
-    capsule_id: CapsuleId,
-    artifact: WasmHash,
-    scope: RuntimeScope,
-}
-
-impl RuntimeKey {
+impl RuntimeScope {
+    /// Compare a pinned viewer to the instance owner. System residency has
+    /// separate operator admission and an explicit principal view.
     #[must_use]
-    pub fn new(capsule_id: CapsuleId, artifact: WasmHash, scope: RuntimeScope) -> Self {
-        Self {
-            capsule_id,
-            artifact,
-            scope,
-        }
-    }
-
-    #[must_use]
-    pub fn capsule_id(&self) -> &CapsuleId {
-        &self.capsule_id
-    }
-
-    #[must_use]
-    pub fn artifact(&self) -> &WasmHash {
-        &self.artifact
-    }
-
-    #[must_use]
-    pub const fn scope(&self) -> RuntimeScope {
-        self.scope
+    pub fn matches_view_owner(&self, viewer: PrincipalUid) -> bool {
+        let owner = match self {
+            Self::Principal(uid) => Some(uid.as_bytes()),
+            Self::SystemResident => None,
+        };
+        super::view_owner::matches(owner, viewer.as_bytes())
     }
 }
+
+/// Logical runtime slot identified by the capsule, artifact and authority scope.
+pub type RuntimeKey = super::generation::RuntimeKey<CapsuleId, WasmHash, RuntimeScope>;
 
 /// One incarnation of a logical runtime slot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RuntimeId {
-    pub(super) key: RuntimeKey,
-    pub(super) generation: u64,
-}
+pub type RuntimeId = super::generation::RuntimeId<CapsuleId, WasmHash, RuntimeScope>;
 
+#[cfg(test)]
 impl RuntimeId {
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    #[must_use]
-    pub const fn key(&self) -> &RuntimeKey {
-        &self.key
-    }
-
-    #[cfg(test)]
     pub(crate) fn for_test(capsule_id: CapsuleId, generation: u64) -> Self {
         Self::for_test_scope(
             capsule_id,
@@ -104,19 +67,21 @@ impl RuntimeId {
         )
     }
 
-    #[cfg(test)]
     pub(crate) fn for_test_scope(
         capsule_id: CapsuleId,
         generation: u64,
         scope: RuntimeScope,
     ) -> Self {
-        Self {
-            key: RuntimeKey::new(
-                capsule_id,
-                WasmHash::from_raw(format!("test-artifact-{generation}")),
-                scope,
-            ),
-            generation,
-        }
+        super::generation::issue(
+            &mut { generation },
+            capsule_id,
+            WasmHash::from_raw(format!("test-artifact-{generation}")),
+            scope,
+        )
+        .expect("test runtime generation must be reservable")
     }
 }
+
+#[cfg(test)]
+#[path = "issuance_tests.rs"]
+mod issuance_tests;

@@ -25,6 +25,7 @@ fn alice() -> astrid_core::PrincipalId {
 }
 
 struct BlockingSetStore {
+    block_first_set: std::sync::atomic::AtomicBool,
     inner: astrid_storage::MemoryKvStore,
     entered: Arc<tokio::sync::Barrier>,
     release: Arc<tokio::sync::Barrier>,
@@ -45,8 +46,13 @@ impl astrid_storage::KvStore for BlockingSetStore {
         key: &str,
         value: Vec<u8>,
     ) -> astrid_storage::StorageResult<()> {
-        self.entered.wait().await;
-        self.release.wait().await;
+        if self
+            .block_first_set
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.entered.wait().await;
+            self.release.wait().await;
+        }
         self.inner.set(namespace, key, value).await
     }
     async fn delete(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
@@ -309,6 +315,21 @@ async fn retirement_fence_rejects_late_admission_and_drains_existing_call() {
     assert!(tracker.begin(&principal).is_some());
 }
 
+#[tokio::test]
+async fn stale_runtime_owner_cannot_install_replacement_kv_overlay() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let alias = alice();
+    let uid = state.principal_directory.uid_for(&alias).unwrap();
+    state.runtime_owner_uid = Some(uid);
+    assert!(install_principal_overlays_sync(&mut state, Some(&alias)));
+    let stale_uid = astrid_core::PrincipalUid::from_bytes([0x97; 32]);
+    assert_ne!(uid, stale_uid);
+    state.runtime_owner_uid = Some(stale_uid);
+    assert!(!install_principal_overlays_sync(&mut state, Some(&alias)));
+    assert!(state.invocation_kv.is_none());
+    assert!(state.invocation_secret_store.is_none());
+}
+
 #[test]
 fn retired_principal_loses_kv_fs_and_secret_host_authority_without_harming_peer() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -324,6 +345,30 @@ fn retired_principal_loses_kv_fs_and_secret_host_authority_without_harming_peer(
 
     assert!(matches!(
         KvHost::kv_set(&mut state, "after".into(), b"denied".to_vec()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_get(&mut state, "before".into()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_delete(&mut state, "before".into()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_list_keys(&mut state, String::new()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_list_keys_page(&mut state, String::new(), None, 1),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_clear_prefix(&mut state, String::new()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_cas(&mut state, "after".into(), None, vec![1]),
         Err(KvError::Unknown(_))
     ));
     assert!(matches!(
@@ -353,6 +398,7 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Barrier::new(2));
     let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(BlockingSetStore {
+        block_first_set: true.into(),
         inner: astrid_storage::MemoryKvStore::new(),
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
@@ -365,6 +411,7 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     // Restore the barrier backend after overlay installation selected the
     // production principal store.
     let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(BlockingSetStore {
+        block_first_set: true.into(),
         inner: astrid_storage::MemoryKvStore::new(),
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
@@ -372,11 +419,7 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     state.invocation_kv = Some(astrid_storage::ScopedKvStore::new(backend, "alice:test").unwrap());
 
     let mut operation = tokio::spawn(async move {
-        let _operation = state
-            .begin_host_operation()
-            .expect("principal storage operation should be admitted");
-        let kv = state.effective_kv().clone();
-        let result = kv.set("effect", b"committed".to_vec()).await;
+        let result = KvHost::kv_set(&mut state, "effect".into(), b"committed".to_vec());
         (state, result)
     });
     if tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
@@ -484,4 +527,361 @@ async fn quiescence_wait_registers_before_sampling_active_operations() {
         .await
         .expect("registered notification must wake quiescence")
         .expect("quiescence task should join");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn device_retirement_drains_kv_and_all_seven_imports_reject_the_old_registration() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope, PrincipalProfile};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let principal = alice();
+    let device = || DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let first = device();
+    let replacement = device();
+    let key = DeviceKeyId::new(first.key_id.clone()).unwrap();
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(first.clone());
+    profile.save(&home, &principal).unwrap();
+    let cache = Arc::new(crate::profile_cache::PrincipalProfileCache::with_home(
+        home.clone(),
+    ));
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let backend = Arc::new(BlockingSetStore {
+        block_first_set: true.into(),
+        inner: astrid_storage::MemoryKvStore::new(),
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(cache.clone());
+    state.invocation_kv = Some(astrid_storage::ScopedKvStore::new(backend, "alice:test").unwrap());
+    let mut caller = msg_from(&principal).with_device_key_id(first.key_id);
+    caller.device_registration_id = first.registration_id.map(Into::into);
+    state.caller_context = Some(caller);
+    let sessions = state.device_sessions.clone();
+
+    let operation = tokio::spawn(async move {
+        let result = KvHost::kv_set(&mut state, "sentinel".into(), vec![7]);
+        (state, result)
+    });
+    let timeout = std::time::Duration::from_secs(5);
+    tokio::time::timeout(timeout, entered.wait())
+        .await
+        .expect("backend entered");
+    profile.auth.public_keys.clear();
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    let mut retirement = std::pin::pin!(sessions.retire(&principal, &key));
+    tokio::select! {
+        biased;
+        result = &mut retirement => panic!("acknowledged pending backend write: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    release.wait().await;
+    let (mut state, result) = tokio::time::timeout(timeout, operation)
+        .await
+        .unwrap()
+        .unwrap();
+    result.unwrap();
+    tokio::time::timeout(timeout, retirement)
+        .await
+        .unwrap()
+        .unwrap();
+
+    profile.add_device(replacement.clone());
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    assert!(KvHost::kv_get(&mut state, "sentinel".into()).is_err());
+    assert!(KvHost::kv_set(&mut state, "sentinel".into(), vec![8]).is_err());
+    assert!(KvHost::kv_delete(&mut state, "sentinel".into()).is_err());
+    assert!(KvHost::kv_list_keys(&mut state, String::new()).is_err());
+    assert!(KvHost::kv_list_keys_page(&mut state, String::new(), None, 32).is_err());
+    assert!(KvHost::kv_clear_prefix(&mut state, "sent".into()).is_err());
+    assert!(KvHost::kv_cas(&mut state, "sentinel".into(), Some(vec![7]), vec![9]).is_err());
+    state
+        .caller_context
+        .as_mut()
+        .unwrap()
+        .device_registration_id = replacement.registration_id.map(Into::into);
+    assert_eq!(
+        KvHost::kv_get(&mut state, "sentinel".into()).unwrap(),
+        Some(vec![7])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_kv_requires_the_publishing_device_to_still_be_active() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(tmp.path());
+    let principal = alice();
+    let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.auth.public_keys.push(device.clone());
+    profile.save(&home, &principal).unwrap();
+    let cache = Arc::new(crate::profile_cache::PrincipalProfileCache::with_home(
+        home.clone(),
+    ));
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(cache.clone());
+    state.invocation_kv = Some(state.kv.clone());
+    let mut caller = msg_from(&principal).with_device_key_id(device.key_id);
+    caller.device_registration_id = device.registration_id.map(Into::into);
+    state.caller_context = Some(caller);
+    KvHost::kv_set(&mut state, "saved".into(), vec![1]).unwrap();
+    profile.auth.public_keys.clear();
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    assert!(KvHost::kv_get(&mut state, "saved".into()).is_err());
+    assert!(KvHost::kv_set(&mut state, "saved".into(), vec![2]).is_err());
+    assert!(KvHost::kv_delete(&mut state, "saved".into()).is_err());
+    assert!(KvHost::kv_list_keys(&mut state, String::new()).is_err());
+    assert!(KvHost::kv_list_keys_page(&mut state, String::new(), None, 10).is_err());
+    assert!(KvHost::kv_clear_prefix(&mut state, String::new()).is_err());
+    assert!(KvHost::kv_cas(&mut state, "saved".into(), Some(vec![1]), vec![2]).is_err());
+    state.caller_context = Some(msg_from(&principal));
+    assert_eq!(
+        KvHost::kv_get(&mut state, "saved".into()).unwrap(),
+        Some(vec![1])
+    );
+}
+
+#[derive(Default)]
+struct FilesystemAudit {
+    admitted: tokio::sync::Notify,
+    events: std::sync::Mutex<Vec<(&'static str, String)>>,
+}
+
+impl crate::audit_sink::HostAuditSink for FilesystemAudit {
+    fn record(
+        &self,
+        _: &astrid_core::PrincipalId,
+        event: crate::audit_sink::HostAuditEvent<'_>,
+        outcome: crate::audit_sink::HostAuditOutcome<'_>,
+    ) {
+        use crate::audit_sink::HostAuditOutcome;
+        let label = match outcome {
+            HostAuditOutcome::Denied(_) => "denied",
+            HostAuditOutcome::Allowed => "allowed",
+            HostAuditOutcome::Failed(_) => "failed",
+        };
+        self.events
+            .lock()
+            .unwrap()
+            .push((label, format!("{event:?}")));
+    }
+
+    fn admit(
+        &self,
+        _: &astrid_core::PrincipalId,
+        event: crate::audit_sink::HostAuditEvent<'_>,
+    ) -> Result<(), crate::audit_sink::HostAuditRefusal> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(("admit", format!("{event:?}")));
+        self.admitted.notify_one();
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filesystem_rechecks_device_after_wait_and_rejects_revoked_path_operations() {
+    use crate::engine::wasm::host_state::{PrincipalMount, PrincipalMountLocation};
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("marker"), b"original").unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(directory.path());
+    let principal = alice();
+    let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.auth.public_keys.push(device.clone());
+    profile.save(&home, &principal).unwrap();
+    let cache = Arc::new(crate::profile_cache::PrincipalProfileCache::with_home(
+        home.clone(),
+    ));
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(cache.clone());
+    let mut caller = msg_from(&principal).with_device_key_id(device.key_id.clone());
+    caller.device_registration_id = device.registration_id.map(Into::into);
+    state.caller_context = Some(caller);
+    let handle = astrid_capabilities::DirHandle::new();
+    state.workspace = Some(PrincipalMount {
+        location: PrincipalMountLocation::Native(root.clone()),
+        vfs: Arc::new(astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &root).unwrap()),
+        handle,
+    });
+    state.workspace_root = root.clone();
+    assert_eq!(state.read_file("marker".into()).unwrap(), b"original");
+
+    let admitted = Arc::new(FilesystemAudit::default());
+    state.audit_sink = Some(admitted.clone());
+    state.blocking_semaphore = Arc::new(Semaphore::new(1));
+    let permit = state
+        .blocking_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let writer = tokio::spawn(async move {
+        let result = state.write_file("marker".into(), b"updated".to_vec());
+        (result, state)
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        admitted.admitted.notified(),
+    )
+    .await
+    .unwrap();
+    profile.auth.public_keys.clear();
+    let replacement = DeviceKey::new(device.pubkey.clone(), DeviceScope::Full, None, 0);
+    assert_ne!(replacement.registration_id, device.registration_id);
+    profile.add_device(replacement);
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    drop(permit);
+    let (result, mut state) = writer.await.unwrap();
+    assert!(matches!(result, Err(FsError::CapabilityDenied)));
+    assert!(matches!(
+        state.fs_exists("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_mkdir("dir".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_mkdir_all("nested/dir".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_readdir(".".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_stat("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_unlink("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.read_file("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    {
+        let events = admitted.events.lock().unwrap();
+        assert_eq!(events.len(), 9);
+        assert_eq!(events[0].0, "admit");
+        assert_eq!(events[0].1, events[1].1);
+        assert!(events[1..].iter().all(|(outcome, _)| *outcome == "denied"));
+    }
+    state.caller_context = Some(msg_from(&principal));
+    assert_eq!(state.read_file("marker".into()).unwrap(), b"original");
+    assert!(!root.join("dir").exists());
+    assert!(!root.join("nested").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_creation_holds_principal_admission_through_storage() {
+    use crate::engine::wasm::bindings::astrid::identity::host::{
+        ErrorCode, Host, IdentityCreateUserRequest, IdentityLinkRequest, IdentityResolveRequest,
+        IdentityUnlinkRequest,
+    };
+    use astrid_storage::{IdentityStore, KvIdentityStore, MemoryKvStore, ScopedKvStore};
+    use std::time::Duration;
+
+    let tracker = Arc::new(PrincipalInvocationTracker::default());
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let backend = Arc::new(BlockingSetStore {
+        block_first_set: std::sync::atomic::AtomicBool::new(true),
+        inner: MemoryKvStore::new(),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let identities = Arc::new(KvIdentityStore::new(
+        ScopedKvStore::new(backend, "system:identity").unwrap(),
+    ));
+    let principal = alice();
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.caller_context = Some(msg_from(&principal));
+    state.identity_store = Some(identities.clone());
+    state.security = Some(Arc::new(crate::security::AllowAllGate));
+    state.principal_invocations = Some(Arc::clone(&tracker));
+    assert!(install_principal_overlays_sync(
+        &mut state,
+        Some(&principal)
+    ));
+
+    let request = || IdentityCreateUserRequest { display_name: None };
+    let operation = tokio::spawn(async move {
+        let result = state.identity_create_user(request());
+        (state, result)
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .unwrap();
+    tracker.retire(&principal);
+    let drain = tracker.wait_for_quiescence(&principal);
+    tokio::pin!(drain);
+    let was_pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx).is_pending()))
+            .await;
+    release.wait().await;
+    let (mut state, created) = operation.await.unwrap();
+    if was_pending {
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap();
+    }
+    assert!(
+        was_pending,
+        "retirement must include the blocked identity write"
+    );
+    let user = uuid::Uuid::parse_str(&created.unwrap().user_id).unwrap();
+    assert!(identities.get_user(user).await.unwrap().is_some());
+    assert!(matches!(
+        state.identity_create_user(request()),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    let platform = "test-platform";
+    let user_key = "test-user";
+    assert!(matches!(
+        state.identity_resolve(IdentityResolveRequest {
+            platform: platform.into(),
+            platform_user_id: user_key.into(),
+        }),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.identity_link(IdentityLinkRequest {
+            platform: platform.into(),
+            platform_user_id: user_key.into(),
+            astrid_user_id: user.to_string(),
+            method: "test".into(),
+        }),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.identity_unlink(IdentityUnlinkRequest {
+            platform: platform.into(),
+            platform_user_id: user_key.into(),
+        }),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.identity_list_links(user.to_string()),
+        Err(ErrorCode::CapabilityDenied)
+    ));
 }

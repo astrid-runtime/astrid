@@ -46,30 +46,21 @@ pub(crate) struct InstallLifecycle<'a> {
     pub(crate) manifest: &'a CapsuleManifest,
     pub(crate) home: &'a AstridHome,
     pub(crate) target_principal: &'a PrincipalId,
-    pub(crate) storage: Option<&'a RuntimePrincipalStore>,
+    pub(crate) storage: Option<(&'a RuntimePrincipalStore, astrid_core::PrincipalUid)>,
     pub(crate) phase: LifecyclePhase,
     pub(crate) previous_version: Option<&'a str>,
     pub(crate) services: LifecycleServices,
 }
 
 pub(crate) fn run_install_lifecycle(request: InstallLifecycle<'_>) -> anyhow::Result<()> {
-    let uid = request
-        .storage
-        .map(|storage| {
-            storage
-                .principal_directory()
-                .uid_for(request.target_principal)
-        })
-        .transpose()
-        .map_err(|error| anyhow::anyhow!("resolve durable principal UID: {error}"))?;
     run_lifecycle_in_scope(
         request.target_dir,
         request.wasm_bytes,
         request.manifest,
         Some(request.home),
         request.target_principal,
-        uid,
-        request.storage.cloned(),
+        request.storage.map(|(_, uid)| uid),
+        request.storage.map(|(store, _)| store.clone()),
         request.phase,
         request.previous_version,
         request.services,
@@ -315,8 +306,8 @@ fn run_lifecycle_in_scope(
             .with_secret_env(secret_env)
             .with_execution_throttle(cpu);
     let principal_context = if let Some(storage) = principal_storage {
-        let directory = storage.principal_directory();
-        principal_context.with_principal_storage(storage, directory)
+        let uid = principal_uid.context("missing admitted lifecycle principal UID")?;
+        principal_context.with_admitted_principal_storage(storage, uid)
     } else {
         principal_context
     };

@@ -116,21 +116,16 @@ pub(super) fn validate_key(key: &str) -> StorageResult<()> {
     Ok(())
 }
 
+mod encoding;
+
 /// Build the composite key `"{namespace}\0{key}"` as bytes.
 pub(super) fn composite_key(namespace: &str, key: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(namespace.len().saturating_add(1).saturating_add(key.len()));
-    buf.extend_from_slice(namespace.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(key.as_bytes());
-    buf
+    encoding::composite(namespace.as_bytes(), key.as_bytes())
 }
 
 /// Build the start of the namespace range (inclusive): `"{namespace}\0"`.
 pub(super) fn namespace_range_start(namespace: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(namespace.len().saturating_add(1));
-    buf.extend_from_slice(namespace.as_bytes());
-    buf.push(0);
-    buf
+    encoding::composite(namespace.as_bytes(), &[])
 }
 
 /// Build the end of the namespace range (exclusive): `"{namespace}\x01"`.
@@ -140,37 +135,16 @@ pub(super) fn namespace_range_start(namespace: &str) -> Vec<u8> {
 /// so the range `["{namespace}\0", "{namespace}\x01")` captures exactly
 /// all keys in the namespace.
 pub(super) fn namespace_range_end(namespace: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(namespace.len().saturating_add(1));
-    buf.extend_from_slice(namespace.as_bytes());
-    buf.push(1);
-    buf
+    encoding::prefix_end(namespace.as_bytes(), &[])
 }
 
 /// Build the exclusive upper bound for a prefix range scan within a namespace.
 ///
 /// For prefix "foo" in namespace "ns", this returns the key just after all
 /// keys starting with "ns\0foo". Works by incrementing the last byte of
-/// the prefix. If the prefix is empty, falls back to the full namespace
-/// range end.
+/// the prefix. An empty prefix increments the namespace separator instead.
 pub(super) fn prefix_range_end(namespace: &str, prefix: &str) -> Vec<u8> {
-    if prefix.is_empty() {
-        return namespace_range_end(namespace);
-    }
-    let mut buf = composite_key(namespace, prefix);
-    // Increment the last byte to form the exclusive upper bound.
-    // If the last byte is 0xFF, pop and try the next one up.
-    while let Some(&last) = buf.last() {
-        if let Some(next) = last.checked_add(1) {
-            // Safety: we just confirmed `buf.last()` is `Some`.
-            if let Some(slot) = buf.last_mut() {
-                *slot = next;
-            }
-            return buf;
-        }
-        buf.pop();
-    }
-    // All bytes were 0xFF - fall back to namespace end.
-    namespace_range_end(namespace)
+    encoding::prefix_end(namespace.as_bytes(), prefix.as_bytes())
 }
 
 // ---------------------------------------------------------------------------

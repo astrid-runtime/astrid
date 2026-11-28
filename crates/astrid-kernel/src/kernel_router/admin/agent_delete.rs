@@ -78,6 +78,8 @@ pub(super) async fn agent_delete(
             .capabilities
             .begin_principal_retirement(principal.clone())
             .await;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        crate::storage_mount::retire_requester(kernel, &principal, pending.principal_uid).await;
         if let Err(error) = kernel
             .allowance_store
             .begin_principal_retirement(&principal)

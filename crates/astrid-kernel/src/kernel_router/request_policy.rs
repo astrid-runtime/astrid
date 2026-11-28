@@ -7,66 +7,58 @@ use KernelRequest::{
     PutCapsuleInstallResumeReceipt as P,
 };
 
-/// The authority surface a management request operates over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthorityScope {
-    /// Request operates on the caller's own principal.
-    Self_,
-    /// Request operates on global or another principal's state.
-    Global,
+pub use super::principal_scope::AuthorityScope;
+
+/// Select the scope and any explicit principal used by the handler. A new
+/// wire variant must declare how its target affects management authority.
+pub(super) fn request_principal<'a>(
+    request: &'a KernelRequest,
+    caller: &PrincipalId,
+) -> (AuthorityScope, Option<&'a PrincipalId>) {
+    let explicit = match request {
+        KernelRequest::ReloadCapsules => return (AuthorityScope::Global, None),
+        KernelRequest::InstallCapsule {
+            target_principal, ..
+        }
+        | KernelRequest::BeginCapsuleInstallBatch {
+            target_principal, ..
+        }
+        | KernelRequest::FinishCapsuleInstallBatch {
+            target_principal, ..
+        } => target_principal.as_ref(),
+        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal } => {
+            Some(target_principal)
+        },
+        KernelRequest::ReloadCapsule { .. }
+        | KernelRequest::UnloadCapsule { .. }
+        | KernelRequest::RemoveCapsule { .. }
+        | KernelRequest::PromoteWorkspace { .. }
+        | KernelRequest::RollbackWorkspace { .. }
+        | I { .. }
+        | G { .. }
+        | P { .. }
+        | KernelRequest::ApproveCapability { .. }
+        | KernelRequest::ListCapsules
+        | KernelRequest::GetCommands
+        | KernelRequest::GetCapsuleMetadata
+        | KernelRequest::GetAgentReadiness
+        | KernelRequest::Shutdown { .. }
+        | KernelRequest::GetStatus => None,
+    };
+    let scope = explicit.map_or(AuthorityScope::Self_, |target| {
+        AuthorityScope::for_target(
+            caller.as_str().as_bytes(),
+            target.as_str().as_bytes(),
+            false,
+        )
+    });
+    (scope, explicit)
 }
 
 /// Return the authority scope the caller is exercising for `request`.
 #[must_use]
 pub fn resolve_scope(request: &KernelRequest, caller: &PrincipalId) -> AuthorityScope {
-    match request {
-        KernelRequest::ReloadCapsules => AuthorityScope::Global,
-        KernelRequest::InstallCapsule {
-            target_principal: Some(target),
-            ..
-        }
-        | KernelRequest::BeginCapsuleInstallBatch {
-            target_principal: Some(target),
-            ..
-        }
-        | KernelRequest::FinishCapsuleInstallBatch {
-            target_principal: Some(target),
-            ..
-        } if target != caller => AuthorityScope::Global,
-        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
-            if target_principal != caller =>
-        {
-            AuthorityScope::Global
-        },
-        _ => AuthorityScope::Self_,
-    }
-}
-
-/// Return an explicit cross-principal target for audit records.
-pub(super) fn request_target_principal(
-    request: &KernelRequest,
-    caller: &PrincipalId,
-) -> Option<PrincipalId> {
-    match request {
-        KernelRequest::InstallCapsule {
-            target_principal: Some(target),
-            ..
-        }
-        | KernelRequest::BeginCapsuleInstallBatch {
-            target_principal: Some(target),
-            ..
-        }
-        | KernelRequest::FinishCapsuleInstallBatch {
-            target_principal: Some(target),
-            ..
-        } if target != caller => Some(target.clone()),
-        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
-            if target_principal != caller =>
-        {
-            Some(target_principal.clone())
-        },
-        _ => None,
-    }
+    request_principal(request, caller).0
 }
 
 /// Return the static capability required to satisfy `request` under `scope`.

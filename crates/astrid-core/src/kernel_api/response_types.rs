@@ -361,6 +361,10 @@ pub struct PairTokenRedeemed {
     /// device's bearer scoped to THIS `key_id` so the device authenticates
     /// with — and is attenuated to — its own registered key.
     pub key_id: String,
+    /// Registration committed by this redeem. Earlier profiles and older responders
+    /// can omit it. Re-pairing a removed key creates a new registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<crate::profile::DeviceRegistrationId>,
 }
 
 /// Summary of an outstanding invite returned by

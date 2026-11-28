@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use dashmap::DashMap;
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(super) mod cache_address;
+
 use super::{BoundMaterialization, Kernel, authenticated_ancestor_directories};
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -105,31 +108,47 @@ impl MaterializationRepairLocks {
 }
 
 impl Kernel {
-    /// Verify every projected byte against one immutable package snapshot.
+    /// Read the authenticated package before inspecting or modifying its projection.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) fn verify_published_materialization(
+    fn verified_publication(
         &self,
-        dir: &Path,
-        principal: &astrid_core::principal::PrincipalId,
-        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        uid: astrid_core::PrincipalUid,
+        id: &str,
         snapshot: &astrid_storage::CapsulePackageSnapshot,
-    ) -> anyhow::Result<()> {
-        self.validate_published_cache_path(dir, principal, manifest, snapshot)?;
-        let uid = self
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
+    ) -> anyhow::Result<astrid_capsule_install::VerifiedDurableCapsulePackage> {
         let verified = astrid_capsule_install::read_verified_durable_package_for_owner(
             self.principal_store
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("durable capsule registry is unavailable"))?,
             &astrid_storage::StateOwner::Principal(uid),
-            manifest.package.name.as_str(),
+            id,
         )?
         .ok_or_else(|| anyhow::anyhow!("materialized capsule is absent from durable registry"))?;
         if verified.snapshot() != snapshot {
             anyhow::bail!("materialized capsule snapshot differs from the caller's publication");
         }
+        Ok(verified)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) fn verify_published_materialization(
+        &self,
+        dir: &Path,
+        uid: astrid_core::PrincipalUid,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<()> {
+        self.validate_published_cache_path(dir, uid, manifest, snapshot)?;
+        let verified = self.verified_publication(uid, &manifest.package.name, snapshot)?;
+        Self::verify_projection_files(dir, manifest, &verified)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn verify_projection_files(
+        dir: &Path,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        verified: &astrid_capsule_install::VerifiedDurableCapsulePackage,
+    ) -> anyhow::Result<()> {
         if verified.manifest().package.name != manifest.package.name
             || verified.manifest().package.version != manifest.package.version
         {
@@ -218,68 +237,47 @@ impl Kernel {
         principal: &astrid_core::principal::PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
         operation: &str,
+        expected_uid: Option<astrid_core::PrincipalUid>,
     ) -> anyhow::Result<Option<BoundMaterialization>> {
-        let snapshot = self.published_capsule_snapshot(principal, manifest)?;
-        if let Some(snapshot) = snapshot {
-            let runtime_dir = self.published_cache_target(principal, manifest, &snapshot)?;
-            let bound_manifest = self.repair_published_materialization(
-                &runtime_dir,
-                principal,
-                manifest,
-                &snapshot,
-            )?;
+        let snapshot = self.published_capsule_snapshot(principal, manifest, expected_uid)?;
+        if let Some((uid, snapshot)) = snapshot {
+            let runtime_dir = self.published_cache_target(uid, manifest, &snapshot)?;
+            let bound_manifest =
+                self.ensure_published_materialization(&runtime_dir, uid, manifest, &snapshot)?;
             return Ok(Some(BoundMaterialization {
+                uid,
                 snapshot,
                 runtime_dir,
                 manifest: bound_manifest,
             }));
         }
-        if !self.verify_registry_materialization(dir, principal, manifest)? {
-            if self.principal_store.is_some()
-                && !dir.starts_with(self.workspace_selection.state_dir())
-            {
-                anyhow::bail!(
-                    "capsule {operation} '{}' is outside the explicit workspace portal and \
-                     has no durable registry authority",
-                    manifest.package.name
-                );
-            }
-            self.verify_installed_authority_for_runtime(dir, manifest).map_err(|error| {
-                anyhow::anyhow!(
-                    "capsule {operation} '{}' exceeds or cannot prove its installed authority: {error:#}",
-                    manifest.package.name
-                )
-            })?;
+        if self.principal_store.is_some() && !dir.starts_with(self.workspace_selection.state_dir())
+        {
+            anyhow::bail!(
+                "capsule {operation} '{}' is outside the explicit workspace portal and \
+                 has no durable registry authority",
+                manifest.package.name
+            );
         }
+        self.verify_installed_authority_for_runtime(dir, manifest).map_err(|error| {
+            anyhow::anyhow!(
+                "capsule {operation} '{}' exceeds or cannot prove its installed authority: {error:#}",
+                manifest.package.name
+            )
+        })?;
         Ok(None)
     }
 
-    /// Repair a stale or missing cache generation from one exact snapshot.
+    /// Repair a projection only from the immutable owner's current publication.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn ensure_published_materialization(
         &self,
         target: &Path,
-        principal: &astrid_core::principal::PrincipalId,
-        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
-        snapshot: &astrid_storage::CapsulePackageSnapshot,
-    ) -> anyhow::Result<astrid_capsule_types::manifest::CapsuleManifest> {
-        self.repair_published_materialization(target, principal, manifest, snapshot)
-    }
-
-    /// Replace a canonical stale projection without trusting the old manifest.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) fn repair_published_materialization(
-        &self,
-        target: &Path,
-        principal: &astrid_core::principal::PrincipalId,
+        uid: astrid_core::PrincipalUid,
         discovery_manifest: &astrid_capsule_types::manifest::CapsuleManifest,
         snapshot: &astrid_storage::CapsulePackageSnapshot,
     ) -> anyhow::Result<astrid_capsule_types::manifest::CapsuleManifest> {
-        self.validate_published_cache_path(target, principal, discovery_manifest, snapshot)?;
-        let uid = self
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
+        self.validate_published_cache_path(target, uid, discovery_manifest, snapshot)?;
         let digest = blake3::hash(&snapshot.package().archive)
             .to_hex()
             .to_string();
@@ -289,6 +287,8 @@ impl Kernel {
             &digest,
         );
         let _repair_guard = repair.lock();
+        let verified =
+            self.verified_publication(uid, &discovery_manifest.package.name, snapshot)?;
         let target_metadata = match std::fs::symlink_metadata(target) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -300,9 +300,7 @@ impl Kernel {
             }
             if let Ok(bound_manifest) =
                 astrid_capsule::discovery::load_manifest(&target.join("Capsule.toml"))
-                && self
-                    .verify_published_materialization(target, principal, &bound_manifest, snapshot)
-                    .is_ok()
+                && Self::verify_projection_files(target, &bound_manifest, &verified).is_ok()
             {
                 return Ok(bound_manifest);
             }
@@ -317,7 +315,7 @@ impl Kernel {
             .map_err(|error| anyhow::anyhow!("materialize durable capsule package: {error:#}"))?;
         let bound_manifest = astrid_capsule::discovery::load_manifest(&target.join("Capsule.toml"))
             .map_err(|error| anyhow::anyhow!(error))?;
-        self.verify_published_materialization(target, principal, &bound_manifest, snapshot)?;
+        self.verify_published_materialization(target, uid, &bound_manifest, snapshot)?;
         Ok(bound_manifest)
     }
 
@@ -366,13 +364,8 @@ impl Kernel {
             )
             .map_err(|error| format!("read capsule '{capsule}' package: {error}"))?
             .ok_or_else(|| format!("durable capsule '{capsule}' package is malformed"))?;
-            self.ensure_published_materialization(
-                &target,
-                principal,
-                package.manifest(),
-                &snapshot,
-            )
-            .map_err(|error| format!("project added capsule '{capsule}': {error:#}"))?;
+            self.ensure_published_materialization(&target, uid, package.manifest(), &snapshot)
+                .map_err(|error| format!("project added capsule '{capsule}': {error:#}"))?;
         }
         Ok(())
     }
@@ -384,16 +377,11 @@ impl Kernel {
         dir: &Path,
         principal: &astrid_core::principal::PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
-        snapshot: &astrid_storage::CapsulePackageSnapshot,
+        bound: &BoundMaterialization,
     ) -> anyhow::Result<()> {
-        let current = self.published_capsule_snapshot(principal, manifest)?;
-        if current.as_ref() != Some(snapshot) {
-            anyhow::bail!(
-                "capsule '{}' changed while activation was in progress",
-                manifest.package.name
-            );
-        }
-        self.verify_published_materialization(dir, principal, manifest, snapshot)
+        self.principal_directory
+            .bound_uid(principal, Some(bound.uid))?;
+        self.verify_published_materialization(dir, bound.uid, manifest, &bound.snapshot)
     }
 }
 

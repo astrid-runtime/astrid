@@ -520,6 +520,64 @@ async fn valid_explicit_allow_and_deny_survive_issue_and_redeem() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pairing_preserves_a_live_registration_and_rotates_after_revocation() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("device_registration");
+    seed(&kernel, &caller, &["self:*"], vec![]);
+    let mut legacy = load(&kernel, &caller);
+    legacy.profile_version = 1;
+    legacy
+        .save(&kernel.astrid_home, &caller)
+        .expect("save v1 profile");
+    let public_key = "d".repeat(64);
+    let key_id = device_key_id_fingerprint(&public_key);
+    let redeem = async || {
+        let response = handlers::dispatch(&kernel, &caller, issue(PairScopeArg::Full)).await;
+        let AdminResponseBody::PairToken(token) = response else {
+            panic!("pair token issue failed: {response:?}");
+        };
+        let response = handlers::dispatch(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::PairDeviceRedeem {
+                token: token.token,
+                public_key: public_key.clone(),
+            },
+        )
+        .await;
+        let AdminResponseBody::PairTokenRedeemed(paired) = response else {
+            panic!("pair token redeem failed: {response:?}");
+        };
+        assert_eq!(paired.principal, caller);
+        assert_eq!(paired.key_id, key_id);
+        let saved = load(&kernel, &caller)
+            .auth
+            .device_by_key_id(&key_id)
+            .expect("device on disk")
+            .registration_id
+            .expect("fresh registration");
+        assert_eq!(paired.registration_id, Some(saved));
+        saved
+    };
+    let original = redeem().await;
+    assert_eq!(redeem().await, original);
+    let response = handlers::dispatch(
+        &kernel,
+        &caller,
+        AdminRequestKind::PairDeviceRevoke {
+            principal: caller.clone(),
+            key_id: key_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        AdminResponseBody::PairDeviceRevoked { .. }
+    ));
+    assert_ne!(redeem().await, original);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_pair_provisioning_does_not_burn_the_token() {
     let (_dir, kernel) = fixture().await;
     let caller = pid("retryable-pair");
@@ -608,12 +666,13 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
             .expect("authorize pair issuance");
     // An updated policy relaxes one restriction and introduces another.
     // Neither snapshot alone describes the scope that may be minted.
-    seed(
-        &kernel,
-        &caller,
-        &["self:*"],
-        vec![scoped_device('a', &["self:*"], &["self:capsule:remove"])],
-    );
+    let mut updated = load(&kernel, &caller);
+    updated.auth.public_keys[0].scope = DeviceScope::Scoped {
+        allow: vec!["self:*".into()],
+        deny: vec!["self:capsule:remove".into()],
+    };
+    updated.save(&kernel.astrid_home, &caller).unwrap();
+    kernel.profile_cache.invalidate(&caller);
     // The issuer requests a broad child: allow self:*. The stored child scope
     // must inherit the issuer's deny (self:capsule:install) so the child can
     // never exceed the parent on that cap.
@@ -682,6 +741,21 @@ async fn queued_pair_issue_cannot_mint_after_scope_narrows() {
             profile.auth.public_keys[0].scope = scoped_device('a', &["self:auth:pair"], &[]).scope;
         },
         "requested device scope exceeds",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn queued_pair_issue_cannot_mint_after_the_same_key_is_repaired() {
+    queued_pair_denial(
+        |profile| {
+            let replacement = scoped_device('a', &["self:*"], &[]);
+            let previous = &mut profile.auth.public_keys[0];
+            assert_eq!(previous.key_id, replacement.key_id);
+            assert_ne!(previous.registration_id, replacement.registration_id);
+            *previous = replacement;
+        },
+        "outside the authenticating device",
     )
     .await;
 }
@@ -769,6 +843,58 @@ async fn use_only_device_denied_pair_issue_but_holds_use_cap() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn post_rename_sync_error_withholds_ack_and_invalidates_the_live_profile() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("device_owner");
+    let key = full_device('a');
+    let registration = key.registration_id;
+    let id = key.key_id.clone();
+    seed(&kernel, &caller, &["self:*"], vec![key]);
+    assert!(
+        kernel
+            .profile_cache
+            .resolve(&caller)
+            .unwrap()
+            .auth
+            .device_by_key_id(&id)
+            .is_some()
+    );
+    let mut session = kernel
+        .device_sessions()
+        .challenge(caller.clone())
+        .unwrap()
+        .bind(
+            astrid_core::profile::DeviceKeyId::new(id.clone()).unwrap(),
+            registration,
+        )
+        .unwrap();
+    let mut revoke = std::pin::pin!(
+        super::pair_device_handlers::revoke_with_failed_directory_sync(&kernel, &caller, &id)
+    );
+    tokio::select! {
+        biased;
+        _ = &mut revoke => panic!("retirement returned before the live socket drained"),
+        () = session.retired() => {}
+    }
+    drop(session);
+    let response = revoke.await;
+    assert!(load(&kernel, &caller).auth.device_by_key_id(&id).is_none());
+    assert!(
+        matches!(response, AdminResponseBody::Error(message) if message.contains("persistence is unconfirmed"))
+    );
+    assert!(
+        kernel
+            .profile_cache
+            .resolve(&caller)
+            .unwrap()
+            .auth
+            .device_by_key_id(&id)
+            .is_none()
+    );
+}
+
 // ── Criterion 4: list + revoke; revoked device fails closed at the gate ─
 
 #[tokio::test(flavor = "multi_thread")]
@@ -778,6 +904,7 @@ async fn list_and_revoke_round_trip_and_fail_closed() {
     let full = full_device('a');
     let scoped = scoped_device('b', &["self:*"], &["self:auth:pair"]);
     let full_id = full.key_id.clone();
+    let registration = scoped.registration_id;
     let scoped_id = scoped.key_id.clone();
     seed(&kernel, &caller, &["self:*"], vec![full, scoped]);
 
@@ -802,16 +929,31 @@ async fn list_and_revoke_round_trip_and_fail_closed() {
             .any(|d| d.key_id == scoped_id && matches!(d.scope, DeviceScope::Scoped { .. })),
     );
 
-    // Revoke the scoped device.
-    let resp = handlers::dispatch(
+    // Acknowledgement must follow release of the signed connection.
+    let mut live = kernel
+        .device_sessions()
+        .challenge(caller.clone())
+        .unwrap()
+        .bind(
+            astrid_core::profile::DeviceKeyId::new(scoped_id.clone()).unwrap(),
+            registration,
+        )
+        .unwrap();
+    let mut revoke = std::pin::pin!(handlers::dispatch(
         &kernel,
         &caller,
         AdminRequestKind::PairDeviceRevoke {
             principal: caller.clone(),
             key_id: scoped_id.clone(),
         },
-    )
-    .await;
+    ));
+    tokio::select! {
+        biased;
+        _ = &mut revoke => panic!("revocation acknowledged a live device session"),
+        () = live.retired() => {}
+    }
+    drop(live);
+    let resp = revoke.await;
     match resp {
         AdminResponseBody::PairDeviceRevoked { key_id } => assert_eq!(key_id, scoped_id),
         other => panic!("revoke must return PairDeviceRevoked: {other:?}"),
@@ -961,3 +1103,6 @@ fn legacy_bare_public_keys_load_as_full_devices() {
         );
     }
 }
+
+#[cfg(unix)]
+mod restart;

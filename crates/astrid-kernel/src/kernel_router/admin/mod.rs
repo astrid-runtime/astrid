@@ -41,6 +41,7 @@ mod invite_handlers;
 mod pair_device_handlers;
 #[cfg(test)]
 mod pair_device_tests;
+mod pair_issue_result;
 #[cfg(test)]
 mod principal_ownership;
 mod quota;
@@ -91,8 +92,7 @@ use tracing::warn;
 
 use super::caller::{CallerResolutionError, MANAGEMENT_CALLER_REQUIRED};
 use super::{
-    AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
-    resolve_caller, resolve_device_key_id,
+    AdminAuditEntry, AuthorityScope, publish_response, record_admin_audit, resolve_caller,
 };
 use request_authorization::{
     AdminAuthorizationContext, authorize_admin_request, record_admin_request_failure,
@@ -155,12 +155,13 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::
                             );
                             let kernel = Arc::clone(&kernel);
                             let response_topic = admin_response_topic(&message.topic);
-                            let device_key_id = resolve_device_key_id(message);
+                            let device =
+                                astrid_events::ipc::OwnedDeviceStamp::from(message.device_stamp());
                             astrid_runtime::spawn(async move {
                                 reject_admin_request_without_caller(
                                     &kernel,
                                     response_topic,
-                                    device_key_id,
+                                    device.as_stamp(),
                                     req,
                                     error,
                                 )
@@ -171,9 +172,11 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::
                     };
                     let kernel = Arc::clone(&kernel);
                     let topic = message.topic.clone();
-                    let device_key_id = resolve_device_key_id(message);
+
+                    let device = astrid_events::ipc::OwnedDeviceStamp::from(message.device_stamp());
                     astrid_runtime::spawn(async move {
-                        handle_admin_request(&kernel, topic, caller, device_key_id, req).await;
+                        let device = device.as_stamp();
+                        handle_admin_request(&kernel, topic, caller, device, req).await;
                     });
                 },
                 Err(e) => {
@@ -194,7 +197,7 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::
 async fn reject_admin_request_without_caller(
     kernel: &Arc<crate::Kernel>,
     response_topic: Topic,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     req: AdminKernelRequest,
     error: CallerResolutionError,
 ) {
@@ -204,7 +207,7 @@ async fn reject_admin_request_without_caller(
             kernel,
             response_topic,
             caller.as_str(),
-            device_key_id.as_deref(),
+            device,
             AdminKernelResponse::for_request(
                 req.request_id,
                 AdminResponseBody::Error("runtime is shutting down".into()),
@@ -222,7 +225,7 @@ async fn reject_admin_request_without_caller(
             caller: &caller,
             method,
             required_cap,
-            device_key_id: device_key_id.as_deref(),
+            device_key_id: device.fingerprint,
             target_principal: admin_target_principal(&req.kind).cloned(),
             params: sanitize_admin_audit_params(&req.kind),
             authorization: AuthorizationProof::Denied {
@@ -236,7 +239,7 @@ async fn reject_admin_request_without_caller(
         kernel,
         response_topic,
         caller.as_str(),
-        device_key_id.as_deref(),
+        device,
         AdminKernelResponse::for_request(
             req.request_id,
             AdminResponseBody::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
@@ -277,11 +280,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
             scope,
             ..
         } => {
-            if *scope == EnvStorageScope::Shared || principal != caller {
-                AuthorityScope::Global
-            } else {
-                AuthorityScope::Self_
-            }
+            AuthorityScope::for_target(caller.as_str().as_bytes(), principal.as_str().as_bytes(), *scope == EnvStorageScope::Shared)
         }
         AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
@@ -299,11 +298,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
             view: astrid_core::storage_provider::StorageProviderViewV1::Principal(principal),
             ..
         } => {
-            if principal == caller {
-                AuthorityScope::Self_
-            } else {
-                AuthorityScope::Global
-            }
+            AuthorityScope::for_target(caller.as_str().as_bytes(), principal.as_str().as_bytes(), false)
         },
         // `GroupList` is read-only over system config and carries no
         // target principal; every agent legitimately needs to read it
@@ -808,7 +803,7 @@ async fn handle_redeem_admin_request(
     response_topic: Topic,
     request_id: Option<String>,
     caller: PrincipalId,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     kind: AdminRequestKind,
 ) {
     let method = admin_request_method(&kind);
@@ -823,7 +818,7 @@ async fn handle_redeem_admin_request(
             caller: &caller,
             method,
             required_cap,
-            device_key_id: device_key_id.as_deref(),
+            device_key_id: device.fingerprint,
             target_principal: None,
             params: audit_params,
             authorization,
@@ -835,7 +830,7 @@ async fn handle_redeem_admin_request(
         kernel,
         response_topic,
         caller.as_str(),
-        device_key_id.as_deref(),
+        device,
         AdminKernelResponse::for_request(request_id, body),
     );
 }
@@ -844,7 +839,7 @@ async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: Topic,
     caller: PrincipalId,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     req: AdminKernelRequest,
 ) {
     let response_topic = admin_response_topic(&topic);
@@ -854,7 +849,7 @@ async fn handle_admin_request(
             kernel,
             response_topic,
             caller.as_str(),
-            device_key_id.as_deref(),
+            device,
             AdminKernelResponse::for_request(
                 request_id,
                 AdminResponseBody::Error("runtime is shutting down".to_owned()),
@@ -866,15 +861,8 @@ async fn handle_admin_request(
         req.kind,
         AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
     ) {
-        handle_redeem_admin_request(
-            kernel,
-            response_topic,
-            request_id,
-            caller,
-            device_key_id,
-            req.kind,
-        )
-        .await;
+        handle_redeem_admin_request(kernel, response_topic, request_id, caller, device, req.kind)
+            .await;
         return;
     }
 
@@ -892,7 +880,7 @@ async fn handle_admin_request(
     let audit_params = sanitize_admin_audit_params(&req.kind);
     let context = AdminAuthorizationContext {
         caller: &caller,
-        device_key_id: device_key_id.as_deref(),
+        device,
         method,
         required_cap,
         target_principal: target.as_ref(),
@@ -905,7 +893,7 @@ async fn handle_admin_request(
                 kernel,
                 response_topic,
                 caller.as_str(),
-                device_key_id.as_deref(),
+                device,
                 AdminKernelResponse::for_request(request_id, AdminResponseBody::Error(error)),
             );
             return;
@@ -921,7 +909,7 @@ async fn handle_admin_request(
         kernel,
         response_topic,
         caller.as_str(),
-        device_key_id.as_deref(),
+        device,
         AdminKernelResponse::for_request(request_id, body),
     );
 }

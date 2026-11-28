@@ -10,6 +10,17 @@ use uuid::Uuid;
 
 use super::*;
 
+fn device_caller() -> CallerContext {
+    CallerContext {
+        principal: astrid_core::PrincipalId::new("agent-alice").unwrap(),
+        issued_at_epoch: 1,
+        expires_at_epoch: 60,
+        registration_id: None,
+        device_key_id: Some("0123456789abcdef".to_owned()),
+        request_owner: RequestOwnerId::generate(),
+    }
+}
+
 /// The fail-fast `error` payload must name exactly which piece of the
 /// loop is missing, so the client gets an actionable signal instead of a
 /// 5-minute silent wait.
@@ -137,9 +148,10 @@ async fn elicit_response_publishes_stamped_reply_on_topic() {
     let topic = Topic::elicit_response(request_id);
     let mut rx = bus.subscribe_topic(topic.as_str());
 
+    let caller = device_caller();
     publish_elicit_response(
         &bus,
-        "agent-alice",
+        &caller,
         ElicitResponseRequest {
             request_id,
             value: Some("hello".to_string()),
@@ -158,6 +170,12 @@ async fn elicit_response_publishes_stamped_reply_on_topic() {
         message.principal.as_deref(),
         Some("agent-alice"),
         "reply must carry the caller's verified principal"
+    );
+    assert_eq!(message.device_key_id, caller.device_key_id);
+    assert_eq!(message.request_owner, Some(caller.request_owner));
+    assert_eq!(
+        message.origin,
+        astrid_events::ipc::MessageOrigin::RemoteGateway
     );
     match &message.payload {
         BusIpcPayload::ElicitResponse {
@@ -181,9 +199,10 @@ async fn elicit_response_cancellation_round_trips() {
     let request_id = Uuid::new_v4();
     let mut rx = bus.subscribe_topic(Topic::elicit_response(request_id).as_str());
 
+    let caller = device_caller();
     publish_elicit_response(
         &bus,
-        "agent-alice",
+        &caller,
         ElicitResponseRequest {
             request_id,
             value: None,
@@ -257,18 +276,17 @@ fn elicit_response_rejects_both_value_and_values() {
 async fn approval_response_publishes_stamped_reply_on_topic() {
     let bus = astrid_events::EventBus::with_capacity(64);
     let request_id = Uuid::new_v4().to_string();
-    let request_owner = RequestOwnerId::generate();
+    let caller = device_caller();
     let mut rx = bus.subscribe_topic(Topic::approval_response(&request_id).as_str());
 
     publish_approval_response(
         &bus,
-        "agent-alice",
+        &caller,
         ApprovalResponseRequest {
             request_id: request_id.clone(),
             decision: "approve_session".to_string(),
             reason: Some("ok for this run".to_string()),
         },
-        request_owner,
     );
 
     let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -279,7 +297,12 @@ async fn approval_response_publishes_stamped_reply_on_topic() {
         panic!("expected IPC event");
     };
     assert_eq!(message.principal.as_deref(), Some("agent-alice"));
-    assert_eq!(message.request_owner, Some(request_owner));
+    assert_eq!(message.request_owner, Some(caller.request_owner));
+    assert_eq!(message.device_key_id, caller.device_key_id);
+    assert_eq!(
+        message.origin,
+        astrid_events::ipc::MessageOrigin::RemoteGateway
+    );
     match &message.payload {
         BusIpcPayload::ApprovalResponse {
             request_id: got_id,

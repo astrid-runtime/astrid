@@ -99,7 +99,7 @@ async fn reclaim_derived_principal(
     views: Vec<crate::CapsuleViewGuard>,
     initialization: Option<&astrid_storage::ownership::PrincipalInitialization>,
 ) -> Result<(), String> {
-    fence_failed_initialization(kernel, principal, views).await?;
+    fence_failed_initialization(kernel, principal, pending.principal_uid(), views).await?;
     kernel
         .identity_store
         .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
@@ -234,6 +234,11 @@ fn reclaim_initializing_installs(
 pub(super) async fn fence_failed_initialization(
     kernel: &crate::Kernel,
     principal: &PrincipalId,
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        expect(unused_variables, reason = "native storage leases are host-only")
+    )]
+    principal_uid: Option<astrid_core::PrincipalUid>,
     views: Vec<crate::CapsuleViewGuard>,
 ) -> Result<(), String> {
     {
@@ -244,6 +249,8 @@ pub(super) async fn fence_failed_initialization(
             .capabilities
             .begin_principal_retirement(principal.clone())
             .await;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        crate::storage_mount::retire_requester(kernel, principal, principal_uid).await;
         kernel
             .allowance_store
             .begin_principal_retirement(principal)

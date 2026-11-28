@@ -153,10 +153,11 @@ async fn elicitation_reply_retains_completed_turn_owner() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
     let connection_owner = astrid_types::ipc::RequestOwnerId::generate();
-    let receiver = registry.subscribe("alice".to_owned(), None, connection_owner);
+    let receiver = registry.subscribe_principal("alice".to_owned(), connection_owner);
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: connection_owner,
     };
     assert!(receiver.begin_turn("old-chat"));
@@ -214,15 +215,15 @@ async fn management_approval_reply_preserves_request_owner_during_chat() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
     let connection_owner = astrid_types::ipc::RequestOwnerId::generate();
-    let receiver = registry.subscribe("alice".to_owned(), None, connection_owner);
-    let foreign = registry.subscribe(
+    let receiver = registry.subscribe_principal("alice".to_owned(), connection_owner);
+    let foreign = registry.subscribe_principal(
         "alice".to_owned(),
-        None,
         astrid_types::ipc::RequestOwnerId::generate(),
     );
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: connection_owner,
     };
     assert!(receiver.begin_turn("chat"));
@@ -294,9 +295,10 @@ async fn legacy_kernel_elicitation_gets_connection_reply_ownership_outside_chat(
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: astrid_types::ipc::RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let id = Uuid::new_v4();
     // Exact shape emitted by the legacy Wasm host: nil source, principal,
     // typed field, no request owner, and no active chat.
@@ -358,12 +360,12 @@ async fn selection_reply_keeps_picker_owner_and_standalone_selection_stays_conne
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: astrid_types::ipc::RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
-    let foreign = registry.subscribe(
+    let receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
+    let foreign = registry.subscribe_principal(
         "alice".into(),
-        None,
         astrid_types::ipc::RequestOwnerId::generate(),
     );
     assert!(receiver.begin_turn("chat"));
@@ -381,6 +383,16 @@ async fn selection_reply_keeps_picker_owner_and_standalone_selection_stays_conne
     };
     assert!(receiver.human_reply_owner(&response("wrong")).is_err());
     assert!(foreign.human_reply_owner(&response("picker")).is_err());
+    let cancelled = receiver
+        .claim_human_reply(&response("picker"))
+        .unwrap()
+        .unwrap();
+    assert!(receiver.claim_human_reply(&response("picker")).is_err());
+    assert_eq!(
+        receiver.human_reply_owner(&response("second")).unwrap(),
+        Some(identity.request_owner)
+    );
+    drop(cancelled);
     let mut replies = bus.subscribe_topic(topic.as_str());
     process_inbound(&bus, &identity, "alice", &receiver, response("picker"))
         .await
@@ -444,11 +456,12 @@ async fn cancel_turn_is_forwarded_only_by_the_active_connection() {
     let registry = egress::Registry::install(&bus);
     let owner_id = astrid_types::ipc::RequestOwnerId::generate();
     let other_owner_id = astrid_types::ipc::RequestOwnerId::generate();
-    let owner = registry.subscribe("alice".to_owned(), None, owner_id);
-    let other = registry.subscribe("alice".to_owned(), None, other_owner_id);
+    let owner = registry.subscribe_principal("alice".to_owned(), owner_id);
+    let other = registry.subscribe_principal("alice".to_owned(), other_owner_id);
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("valid principal"),
         device_key_id: None,
+        registration: None,
         request_owner: owner_id,
     };
     let mut inbound = bus.subscribe_topic(routing::CHAT_REQUEST_TOPIC);
@@ -500,14 +513,12 @@ async fn cancel_turn_is_forwarded_only_by_the_active_connection() {
 async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let mut alice_rx = registry.subscribe(
+    let mut alice_rx = registry.subscribe_principal(
         "alice".to_owned(),
-        None,
         astrid_types::ipc::RequestOwnerId::generate(),
     );
-    let mut bob_rx = registry.subscribe(
+    let mut bob_rx = registry.subscribe_principal(
         "bob".to_owned(),
-        None,
         astrid_types::ipc::RequestOwnerId::generate(),
     );
 
@@ -548,9 +559,8 @@ async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
 async fn unrelated_bus_burst_cannot_lag_client_egress() {
     let bus = Arc::new(EventBus::with_capacity(1));
     let registry = egress::Registry::install(&bus);
-    let mut egress_rx = registry.subscribe(
+    let mut egress_rx = registry.subscribe_principal(
         "alice".to_owned(),
-        None,
         astrid_types::ipc::RequestOwnerId::generate(),
     );
 
@@ -575,9 +585,8 @@ async fn unrelated_bus_burst_cannot_lag_client_egress() {
 async fn one_principal_burst_cannot_lag_another_principal() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let mut bob_rx = registry.subscribe(
+    let mut bob_rx = registry.subscribe_principal(
         "bob".to_owned(),
-        None,
         astrid_types::ipc::RequestOwnerId::generate(),
     );
 

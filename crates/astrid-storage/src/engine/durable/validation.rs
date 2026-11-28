@@ -2,6 +2,7 @@
 
 use crate::storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, PrincipalUsage, World};
 
+use super::closure_walk::{self, Failure, Source, Work};
 use super::format::{read_indexed_object, visit_indexed_objects};
 use super::wal::PendingWalOverlay;
 use super::{
@@ -24,16 +25,46 @@ pub(super) struct ClosureObjects<'a, I, P: Ord> {
 
 impl<I: PersistentObjectIdentity, P: Ord> ClosureObjects<'_, I, P> {
     fn load(&mut self, id: ObjectId) -> Result<ObjectRecord, DurableError> {
-        if let Some(record) = self.incoming.get(&id) {
-            return Ok(record.clone());
+        super::closure_load::load(
+            id,
+            &super::closure_load::Layers {
+                incoming: self.incoming,
+                pending: self.pending.map(PendingWalOverlay::object_index),
+                index: self.index,
+            },
+            ObjectRecord::clone,
+            |pending| pending.record().clone(),
+            |requested, location| {
+                read_indexed_object(self.arena, requested, *location, self.identity, self.limits)
+            },
+            |missing| ModelError::MissingObject(missing).into(),
+        )
+    }
+}
+
+impl<I: PersistentObjectIdentity, P: Ord> Source<ObjectId> for ClosureObjects<'_, I, P> {
+    type Error = DurableError;
+
+    fn check_root(&mut self, root: ObjectId) -> Result<(), DurableError> {
+        let root_record = self.load(root)?;
+        if root_record.kind() != ObjectKind::Commit {
+            return Err(ModelError::RootNotCommit {
+                object: root,
+                actual: root_record.kind(),
+            }
+            .into());
         }
-        if let Some(record) = self.pending.and_then(|pending| pending.get_object(&id)) {
-            return Ok(record.record().clone());
-        }
-        if let Some(location) = self.index.get(&id).copied() {
-            return read_indexed_object(self.arena, id, location, self.identity, self.limits);
-        }
-        Err(ModelError::MissingObject(id).into())
+        Ok(())
+    }
+
+    fn expand(
+        &mut self,
+        id: ObjectId,
+        stack: &mut Vec<Work<ObjectId>>,
+    ) -> Result<(), DurableError> {
+        let record = self.load(id)?;
+        closure_walk::schedule(record.references(), stack);
+        Ok(())
     }
 }
 
@@ -76,57 +107,30 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
 pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
     arena: &File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
-    roots: impl IntoIterator<Item = ObjectId>,
+    roots: BTreeSet<ObjectId>,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
-    let mut loaded = BTreeMap::new();
-    let mut frontier = roots.into_iter().collect::<BTreeSet<_>>();
-    while !frontier.is_empty() {
-        let mut requested = Vec::new();
-        for id in frontier {
-            if loaded.contains_key(&id) {
-                continue;
-            }
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
-            requested.push((id, location));
-        }
-        if requested.is_empty() {
-            break;
-        }
+    use super::journal_preload::{Error, accept, preload};
+    preload(index, roots, |mut loaded, requested| {
         let mut next = BTreeSet::new();
         visit_indexed_objects(
             arena,
-            &requested,
+            requested,
             RECOVERY_CLOSURE_READ_TARGET_BYTES,
             identity,
             limits,
             |id, _location, record, _payload| {
-                for child in record.owning_references() {
-                    if !loaded.contains_key(&child) {
-                        next.insert(child);
-                    }
-                }
-                loaded.insert(id, record);
+                accept(&mut loaded, &mut next, id, record);
                 Ok(())
             },
         )?;
-        frontier = next;
-    }
-    Ok(loaded)
-}
-
-pub(super) fn validate_commit_closure(
-    records: &[(ObjectId, ObjectRecord)],
-    commit: ObjectId,
-) -> Result<(), ModelError> {
-    let mut world = World::<()>::new();
-    world.import_closure(records, commit)?;
-    world.compare_and_swap_root((), None, commit)?;
-    Ok(())
+        Ok((loaded, next))
+    })
+    .map_err(|error| match error {
+        Error::Missing(id) => ModelError::MissingObject(id).into(),
+        Error::Read(error) => error,
+    })
 }
 
 pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(
@@ -134,41 +138,10 @@ pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(
     validated: &BTreeSet<ObjectId>,
     root: ObjectId,
 ) -> Result<BTreeSet<ObjectId>, DurableError> {
-    let root_record = source.load(root)?;
-    if root_record.kind() != ObjectKind::Commit {
-        return Err(ModelError::RootNotCommit {
-            object: root,
-            actual: root_record.kind(),
-        }
-        .into());
-    }
-    let mut reachable = BTreeSet::new();
-    let mut marks = BTreeMap::<ObjectId, u8>::new();
-    let mut stack = vec![(root, false)];
-
-    while let Some((id, expanded)) = stack.pop() {
-        if validated.contains(&id) {
-            reachable.insert(id);
-            continue;
-        }
-        if expanded {
-            marks.insert(id, 2);
-            continue;
-        }
-        match marks.get(&id).copied() {
-            Some(2) => continue,
-            Some(1) => return Err(ModelError::ObjectCycle(id).into()),
-            Some(_) | None => {},
-        }
-        let record = source.load(id)?;
-        reachable.insert(id);
-        marks.insert(id, 1);
-        stack.push((id, true));
-        for child in record.owning_references().rev() {
-            stack.push((child, false));
-        }
-    }
-    Ok(reachable)
+    closure_walk::walk(source, validated, root).map_err(|error| match error {
+        Failure::Cycle(id) => ModelError::ObjectCycle(id).into(),
+        Failure::Root(e) | Failure::Source(_, e) => e,
+    })
 }
 
 pub(super) fn usage_from_closure(

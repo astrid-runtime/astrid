@@ -5,15 +5,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::ProjectionPhase;
-use crate::storage_model::{ModelError, ObjectId, ObjectIdentity};
+use crate::storage_model::{ModelError, ObjectId};
 
+use super::super::group_publication::{self, Action, Entry};
 use super::super::wal::durable_error as wal_durable_error;
 use super::super::{
     ARENA_FILE, DurableEngine, DurableError, DurableInner, FaultPoint, Persisted,
-    PersistentObjectIdentity, Prepared, PrincipalCodec, WAL_FILE, decode_object_frame,
-    encode_object_frame, io_error, live_files_mut, read_indexed_object,
+    PersistentObjectIdentity, Prepared, PrincipalCodec, decode_object_frame, encode_object_frame,
+    io_error, live_files_mut, read_indexed_object,
 };
 use super::{AcceptedCommit, record_group};
+
+type WalEntry<'a, P> = Entry<'a, AcceptedCommit<P>, BTreeMap<ObjectId, Arc<[u8]>>>;
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -45,19 +48,20 @@ where
             .last()
             .map(|(_, location)| *location);
         let files = live_files_mut(&mut inner.files)?;
-        if arena_len < files.arena_len {
+        let Some((length, tail)) = super::super::frontier::wal_position(
+            files.arena_len,
+            files.arena_tail,
+            arena_len,
+            arena_tail,
+        ) else {
             return Err(DurableError::Corrupt {
                 file: ARENA_FILE,
                 offset: arena_len,
                 detail: "object arena moved behind the cached WAL frontier",
             });
-        }
-        if arena_len > files.arena_len {
-            files.arena_len = arena_len;
-            if arena_tail.is_some() {
-                files.arena_tail = arena_tail;
-            }
-        }
+        };
+        files.arena_len = length;
+        files.arena_tail = tail;
         Ok(())
     }
 
@@ -86,19 +90,25 @@ where
     ) -> Result<Persisted, DurableError> {
         let durable_frontier = live_files_mut(&mut inner.files)?.arena_len;
         let staged = self.collect_unsynced_staged(inner, durable_frontier)?;
-        let prepared = accepted
-            .iter()
-            .map(|accepted| Self::collect_prepared_wal_objects(&accepted.prepared))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.append_wal_transactions(accepted, &staged, &prepared)?;
-        self.fail_if(FaultPoint::AfterWalPublication)?;
-        self.install_wal_overlay(inner, accepted, &staged, &prepared)?;
+        let prepared = group_publication::prepare(accepted, |entry| {
+            Self::collect_prepared_wal_objects(&entry.prepared)
+        })?;
+        group_publication::install_after_flush(
+            &prepared,
+            &staged,
+            |group, staged| self.append_wal_transactions(accepted, staged, group),
+            |group, staged, _published_count| {
+                self.fail_if(FaultPoint::AfterWalPublication)?;
+                self.install_wal_overlay(inner, staged, group)
+            },
+        )?;
         let arena_len = live_files_mut(&mut inner.files)?
             .arena
             .metadata()
             .map_err(|source| io_error("read WAL staged arena metadata", source))?
             .len();
         Ok(Persisted {
+            frontier: super::super::CommitFrontier::Wal,
             locations: Vec::new(),
             arena_len,
         })
@@ -107,12 +117,16 @@ where
     fn install_wal_overlay(
         &self,
         inner: &mut DurableInner<P>,
-        accepted: &[AcceptedCommit<P>],
         staged: &BTreeMap<ObjectId, crate::storage_model::ObjectRecord>,
-        prepared: &[BTreeMap<ObjectId, Arc<[u8]>>],
+        prepared: &[WalEntry<'_, P>],
     ) -> Result<(), DurableError> {
         for (id, record) in staged {
-            let location = inner.index.get(id).copied().ok_or(DurableError::Corrupt {
+            let (location, direct) = super::super::arena_index::placement(
+                *id,
+                &inner.index,
+                &inner.pending_direct_objects,
+            )
+            .ok_or(DurableError::Corrupt {
                 file: ARENA_FILE,
                 offset: 0,
                 detail: "WAL staged object is missing its arena location",
@@ -124,36 +138,20 @@ where
                 payload,
                 Arc::new(record.clone()),
                 location,
-                inner.pending_direct_objects.get(id).cloned(),
+                direct.cloned(),
             )?;
         }
-        for objects in prepared {
-            for (id, payload) in objects {
-                let (decoded_id, record) = decode_object_frame(payload, self.identity.scheme())
-                    .map_err(|detail| DurableError::Corrupt {
-                        file: WAL_FILE,
-                        offset: 0,
-                        detail,
-                    })?;
-                if decoded_id != *id || self.identity.identify(&record) != *id {
-                    return Err(DurableError::Corrupt {
-                        file: WAL_FILE,
-                        offset: 0,
-                        detail: "WAL overlay object identity mismatch",
-                    });
-                }
-                inner
-                    .pending_wal
-                    .insert_prepared(*id, Arc::clone(payload), Arc::new(record))?;
+        for entry in prepared {
+            for (id, payload) in &entry.frames {
+                let (name, retained, record) =
+                    super::super::format::pending_object_frame(payload, *id, &self.identity)?;
+                inner.pending_wal.insert_prepared(name, retained, record)?;
             }
         }
-        for accepted in accepted {
-            inner.pending_wal.push_root(
-                accepted.prepared.principal.clone(),
-                accepted.prepared.expected,
-                accepted.prepared.root,
-                accepted.prepared.journal.clone(),
-            );
+        for entry in prepared {
+            inner
+                .pending_wal
+                .retain_root(&entry.transaction.prepared.root);
         }
         Ok(())
     }
@@ -162,85 +160,80 @@ where
         &self,
         accepted: &[AcceptedCommit<P>],
         staged: &BTreeMap<ObjectId, crate::storage_model::ObjectRecord>,
-        prepared: &[BTreeMap<ObjectId, Arc<[u8]>>],
-    ) -> Result<(), DurableError> {
+        prepared: &[WalEntry<'_, P>],
+    ) -> Result<u64, DurableError> {
         let mut wal = self.wal.lock();
         let writer = wal.as_mut().ok_or(DurableError::Closed)?;
-        for (position, accepted) in accepted.iter().enumerate() {
-            let sequence = writer.next_sequence().map_err(wal_durable_error)?;
-            writer.begin(sequence, None).map_err(wal_durable_error)?;
-            if position == 0 {
-                let mut staged = staged.iter().peekable();
-                let mut prepared = prepared[position].iter().peekable();
-                loop {
-                    match (staged.peek(), prepared.peek()) {
-                        (Some((staged_id, staged_record)), Some((prepared_id, frame))) => {
-                            match staged_id.cmp(prepared_id) {
-                                std::cmp::Ordering::Less => {
-                                    writer
-                                        .append_object(**staged_id, staged_record)
-                                        .map_err(wal_durable_error)?;
-                                    staged.next();
-                                },
-                                std::cmp::Ordering::Greater => {
-                                    writer
-                                        .append_prepared_object(**prepared_id, frame)
-                                        .map_err(wal_durable_error)?;
-                                    prepared.next();
-                                },
-                                std::cmp::Ordering::Equal => {
-                                    let (_, decoded) =
-                                        decode_object_frame(frame, self.identity.scheme())
-                                            .map_err(|detail| DurableError::Corrupt {
-                                                file: ARENA_FILE,
-                                                offset: 0,
-                                                detail,
-                                            })?;
-                                    if decoded != **staged_record {
-                                        return Err(ModelError::ObjectCollision(**staged_id).into());
-                                    }
-                                    writer
-                                        .append_prepared_object(**prepared_id, frame)
-                                        .map_err(wal_durable_error)?;
-                                    staged.next();
-                                    prepared.next();
-                                },
-                            }
-                        },
-                        (Some((id, record)), None) => {
-                            writer
-                                .append_object(**id, record)
-                                .map_err(wal_durable_error)?;
-                            staged.next();
-                        },
-                        (None, Some((id, frame))) => {
-                            writer
-                                .append_prepared_object(**id, frame)
-                                .map_err(wal_durable_error)?;
-                            prepared.next();
-                        },
-                        (None, None) => break,
-                    }
+        let empty = BTreeMap::new();
+        group_publication::publish(
+            prepared,
+            writer,
+            |writer, action| -> Result<_, DurableError> {
+                match action {
+                    Action::Begin => {
+                        let sequence = writer.next_sequence().map_err(wal_durable_error)?;
+                        writer.begin(sequence, None).map_err(wal_durable_error)?;
+                    },
+                    Action::Objects { first, frames } => {
+                        let staged_rows = if first { staged } else { &empty };
+                        self.append_wal_rows(writer, staged_rows, frames)?;
+                    },
+                    Action::Root(entry) => {
+                        entry
+                            .prepared
+                            .root
+                            .write_wal(|owner, expected, replacement, journal| {
+                                writer.append_prepared_root(owner, expected, replacement, journal)
+                            })
+                            .map_err(wal_durable_error)?;
+                    },
+                    Action::Commit => {
+                        writer.finish_commit().map_err(wal_durable_error)?;
+                    },
                 }
-            } else {
-                for (id, frame) in &prepared[position] {
-                    writer
-                        .append_prepared_object(*id, frame)
-                        .map_err(wal_durable_error)?;
+                Ok(writer)
+            },
+            |writer| {
+                let started = Instant::now();
+                let published = writer.publish().map_err(wal_durable_error)?;
+                record_group(accepted, ProjectionPhase::Flush, started);
+                Ok(published)
+            },
+        )
+    }
+
+    fn append_wal_rows(
+        &self,
+        writer: &mut super::super::DurableWal<P, I, C>,
+        staged_rows: &BTreeMap<ObjectId, crate::storage_model::ObjectRecord>,
+        frames: &BTreeMap<ObjectId, Arc<[u8]>>,
+    ) -> Result<(), DurableError> {
+        super::super::merge_rows::merge(
+            staged_rows,
+            frames,
+            &mut *writer,
+            |writer, row| -> Result<_, DurableError> {
+                use super::super::merge_rows::Input;
+                let input = row.resolve(
+                    |frame| {
+                        decode_object_frame(frame, self.identity.scheme())
+                            .map(|(_, record)| record)
+                            .map_err(|detail| DurableError::Corrupt {
+                                file: ARENA_FILE,
+                                offset: 0,
+                                detail,
+                            })
+                    },
+                    |id| DurableError::from(ModelError::ObjectCollision(id)),
+                )?;
+                match input {
+                    Input::Staged(id, record) => writer.append_object(id, record),
+                    Input::Prepared(id, frame) => writer.append_prepared_object(id, frame),
                 }
-            }
-            writer
-                .append_root(
-                    &accepted.prepared.principal,
-                    accepted.prepared.expected,
-                    accepted.prepared.root,
-                )
                 .map_err(wal_durable_error)?;
-            writer.finish_commit().map_err(wal_durable_error)?;
-        }
-        let flush_started = Instant::now();
-        writer.publish().map_err(wal_durable_error)?;
-        record_group(accepted, ProjectionPhase::Flush, flush_started);
+                Ok(writer)
+            },
+        )?;
         Ok(())
     }
 

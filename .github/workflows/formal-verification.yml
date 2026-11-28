@@ -1,0 +1,70 @@
+name: Formal verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.run_attempt == '1' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-attempt-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
+
+jobs:
+  defects:
+    name: Verify hosted authority mutations (shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    runs-on: ubuntu-latest
+    # Hosted runs take roughly 80 seconds per mutation. Allow headroom for solver variance.
+    timeout-minutes: 240
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned verifier
+        working-directory: ${{ runner.temp }}
+        run: |
+          version=0.2026.11.22.1ce6a59
+          archive="verus-${version}-x86-linux.zip"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/verus-lang/verus/releases/download/release/${version}/${archive}" \
+            --output "$archive"
+          echo "c955d5958877f4f907cce80aa996d4239a481984829d82e325938c7bf242b0db  $archive" | sha256sum --check
+          unzip -q "$archive"
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
+
+      - name: Check contracts against production source
+        run: verus --edition=2024 --crate-type=lib --no-cheating verification/hosted_authority.rs
+
+      - name: Test the edit helpers of the defect script
+        run: python3 -m unittest scripts/test_verification_defect_checks.py
+
+      - name: Check that deliberate defects fail the verifier
+        env:
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_COUNT: ${{ strategy.job-total }}
+        run: python3 -u scripts/verification_defect_checks.py --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT"
+
+  fuel-ledger:
+    name: Verify hosted authority transitions
+    needs: defects
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all verifier shards to pass
+        env:
+          SHARDS_RESULT: ${{ needs.defects.result }}
+        run: test "$SHARDS_RESULT" = success

@@ -7,9 +7,10 @@ async fn repeated_cancel_does_not_acknowledge_an_unretired_turn_twice() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let prompt = |cancel: bool| {
         IpcMessage::new(
             Topic::user_prompt(),

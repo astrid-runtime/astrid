@@ -67,6 +67,7 @@ pub struct BusAdminClient {
     /// device's scope as an attenuation floor on `caller`'s authority. `None`
     /// for a legacy full-authority bearer or a bootstrap (`default`) caller.
     device_key_id: Option<String>,
+    registration: Option<Uuid>,
     timeout: Duration,
 }
 
@@ -84,6 +85,7 @@ impl BusAdminClient {
             caller,
             expected_source_id,
             device_key_id: None,
+            registration: None,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -93,7 +95,14 @@ impl BusAdminClient {
     /// leaves the request unattenuated (full principal authority).
     #[must_use]
     pub fn with_device_key_id(mut self, device_key_id: Option<String>) -> Self {
+        self.registration = None;
         self.device_key_id = device_key_id;
+        self
+    }
+
+    pub(crate) fn with_caller_device(mut self, caller: &crate::auth::CallerContext) -> Self {
+        self.device_key_id.clone_from(&caller.device_key_id);
+        self.registration = caller.registration_id.map(Into::into);
         self
     }
 
@@ -134,6 +143,7 @@ impl BusAdminClient {
         if let Some(key_id) = &self.device_key_id {
             msg = msg.with_device_key_id(key_id.clone());
         }
+        msg.device_registration_id = self.registration;
         self.bus.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("astrid-gateway::bus_admin"),
             message: msg,

@@ -3,6 +3,9 @@
 #[cfg(test)]
 mod tests;
 
+#[path = "index/rebuild.rs"]
+mod rebuild;
+
 use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
     ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner, DurableWal,
@@ -72,22 +75,16 @@ where
     let cached = index_cache
         .as_mut()
         .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
-    let (index, arena_tail) = if let Some(state) = cached {
-        (state.objects, state.arena_tail)
-    } else {
-        let (index, arena_tail) = recover_arena(&mut arena, identity, limits, protected_arena_len)?;
-        let state = IndexState {
-            arena_len: arena
-                .metadata()
-                .map_err(|source| io_error("read recovered arena metadata", source))?
-                .len(),
-            arena_tail,
-            objects: index,
-        };
-        drop(index_cache.take());
-        index_cache = Some(replace_index(store_root, &state, scheme, faults)?);
-        (state.objects, state.arena_tail)
-    };
+    let state = rebuild::select(
+        cached,
+        || scan_index_state(&mut arena, identity, limits, protected_arena_len),
+        |state| {
+            drop(index_cache.take());
+            index_cache = Some(replace_index(store_root, state, scheme, faults)?);
+            Ok(())
+        },
+    )?;
+    let (index, arena_tail) = (state.objects, state.arena_tail);
     generation_zero.validate(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
@@ -259,33 +256,46 @@ where
         .metadata()
         .map_err(|source| io_error("read object-arena metadata", source))?
         .len();
-    if let Some(state) = index_cache
+    let cached = index_cache
         .as_mut()
-        .and_then(|file| recover_index(file, arena, scheme, limits, arena_len))
-    {
-        return Ok((state.objects, state.arena_tail));
+        .and_then(|file| recover_index(file, arena, scheme, limits, arena_len));
+    if cached.is_none() {
+        drop(index_cache.take());
     }
+    let state = rebuild::select(
+        cached,
+        || scan_index_state(arena, identity, limits, protected_arena_len),
+        |state| {
+            *index_cache = Some(replace_volume_index(
+                Arc::clone(volume),
+                state,
+                scheme,
+                faults,
+            )?);
+            volume
+                .sync()
+                .map_err(|source| io_error("flush rebuilt volume index", source))
+        },
+    )?;
+    Ok((state.objects, state.arena_tail))
+}
 
-    drop(index_cache.take());
-    let (index, arena_tail) = recover_arena(arena, identity, limits, protected_arena_len)?;
-    let state = IndexState {
-        arena_len: arena
-            .metadata()
-            .map_err(|source| io_error("read recovered arena metadata", source))?
-            .len(),
+fn scan_index_state<I: PersistentObjectIdentity>(
+    arena: &mut super::File,
+    identity: &SharedIdentity<I>,
+    limits: RecoveryLimits,
+    protected_arena_len: u64,
+) -> Result<IndexState, DurableError> {
+    let (objects, arena_tail) = recover_arena(arena, identity, limits, protected_arena_len)?;
+    let arena_len = arena
+        .metadata()
+        .map_err(|source| io_error("read recovered arena metadata", source))?
+        .len();
+    Ok(IndexState {
+        arena_len,
         arena_tail,
-        objects: &index,
-    };
-    *index_cache = Some(replace_volume_index(
-        Arc::clone(volume),
-        &state,
-        scheme,
-        faults,
-    )?);
-    volume
-        .sync()
-        .map_err(|source| io_error("flush rebuilt volume index", source))?;
-    Ok((index, arena_tail))
+        objects,
+    })
 }
 
 fn open_optional_native_wal(
@@ -336,54 +346,105 @@ where
     C: PrincipalCodec<P>,
 {
     let mut wal_validated = BTreeSet::new();
-    let mut root_history =
-        recover_root_history::<P, _, _>(roots, codec, identity.scheme(), limits)?;
-    let mut wal_writer = recover_wal(
+    let root_history = recover_root_history::<P, _, _>(roots, codec, identity.scheme(), limits)?;
+    recover_wal(
         wal_file,
         arena,
         roots,
         index,
         &mut wal_validated,
-        &mut root_history,
+        root_history,
         representations,
         identity.clone(),
         codec.clone(),
         limits,
-    )?;
-    wal_writer.checkpoint().map_err(wal_durable_error)?;
-    Ok(wal_writer)
+    )
 }
 
-fn stabilize_recovered_store<P: Ord>(
-    recovered: &mut RecoveredStore<P>,
-    faults: &dyn FaultInjector,
-) -> Result<(), DurableError> {
-    if faults.should_fail(FaultPoint::BeforeInProcessRecoveryArenaFlush) {
-        return Err(io_error(
-            "flush recovered object arena",
-            io::Error::other("injected recovery arena-flush I/O failure"),
-        ));
+pub(super) fn checkpoint_recovered_wal<P, I, C>(
+    (recovered, mut wal): RecoveredWal<P, I, C>,
+) -> Result<RecoveredWal<P, I, C>, DurableError>
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    if let Some(writer) = &mut wal {
+        writer.checkpoint().map_err(wal_durable_error)?;
     }
-    recovered
-        .files
-        .arena
-        .sync_data()
-        .map_err(|source| io_error("flush recovered object arena", source))?;
-    if faults.should_fail(FaultPoint::BeforeInProcessRecoveryRootFlush) {
-        return Err(io_error(
-            "flush recovered root journal",
-            io::Error::other("injected recovery root-flush I/O failure"),
-        ));
+    Ok((recovered, wal))
+}
+
+struct CanonicalFiles<'a> {
+    arena: &'a mut super::File,
+    roots: &'a mut super::File,
+    representations: Option<&'a mut super::representations::RepresentationStore>,
+    faults: Option<&'a dyn FaultInjector>,
+}
+
+impl super::recovery_barrier::Files for CanonicalFiles<'_> {
+    type Error = DurableError;
+
+    fn representations_present(&self) -> bool {
+        self.representations.is_some()
     }
-    recovered
-        .files
-        .roots
-        .sync_data()
-        .map_err(|source| io_error("flush recovered root journal", source))?;
-    if let Some(representations) = &mut recovered.representations {
-        representations.flush()?;
+
+    fn sync(&mut self, target: super::recovery_barrier::Target) -> Result<(), DurableError> {
+        use super::recovery_barrier::Target;
+        let (file, replay_label, recovery_label, point, injected) = match target {
+            Target::Arena => (
+                &mut self.arena,
+                "flush WAL-replayed object arena",
+                "flush recovered object arena",
+                FaultPoint::BeforeInProcessRecoveryArenaFlush,
+                "injected recovery arena-flush I/O failure",
+            ),
+            Target::Roots => (
+                &mut self.roots,
+                "flush WAL-replayed root journal",
+                "flush recovered root journal",
+                FaultPoint::BeforeInProcessRecoveryRootFlush,
+                "injected recovery root-flush I/O failure",
+            ),
+            Target::Representations => {
+                if let Some(representations) = self.representations.as_deref_mut() {
+                    representations.flush()?;
+                }
+                return Ok(());
+            },
+        };
+        let label = if let Some(faults) = self.faults {
+            if faults.should_fail(point) {
+                return Err(io_error(recovery_label, io::Error::other(injected)));
+            }
+            recovery_label
+        } else {
+            replay_label
+        };
+        file.sync_data().map_err(|source| io_error(label, source))
     }
-    Ok(())
+}
+
+pub(super) fn prepare_recovered_files<W>(
+    arena: &mut super::File,
+    roots: &mut super::File,
+    representations: Option<&mut super::representations::RepresentationStore>,
+    faults: Option<&dyn FaultInjector>,
+    wal: W,
+) -> Result<super::recovery_barrier::Prepared<W>, DurableError> {
+    use super::recovery_barrier::{Error, stabilize};
+    stabilize(
+        &mut CanonicalFiles {
+            arena,
+            roots,
+            representations,
+            faults,
+        },
+        wal,
+    )
+    .map_err(|error| match error {
+        Error::Arena(e) | Error::Roots(e) | Error::Representations(e) => e,
+    })
 }
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -469,14 +530,24 @@ where
                 ))
             } else {
                 self.recover_media().and_then(|(mut recovered, wal)| {
-                    stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
-                    Ok((recovered, wal))
+                    let prepared = prepare_recovered_files(
+                        &mut recovered.files.arena,
+                        &mut recovered.files.roots,
+                        recovered.representations.as_mut(),
+                        Some(self.faults.as_ref()),
+                        wal,
+                    )?;
+                    prepared.finish(|wal| checkpoint_recovered_wal((recovered, wal)))
                 })
             };
+            let recovered = recovered.and_then(|(recovered, wal)| {
+                self.published_roots
+                    .replace(&recovered.roots_by_principal)?;
+                Ok((recovered, wal))
+            });
             match recovered {
                 Ok((recovered, wal)) => {
                     inner.roots_by_principal = recovered.roots_by_principal;
-                    self.published_roots.replace(&inner.roots_by_principal);
                     inner.index = recovered.index;
                     inner.pending_index_locations.clear();
                     inner.pending_direct_objects.clear();

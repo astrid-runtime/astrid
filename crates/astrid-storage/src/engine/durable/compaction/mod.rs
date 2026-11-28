@@ -12,11 +12,11 @@ use crate::storage_model::{
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableFiles,
     DurableInner, FaultPoint, File, INDEX_FILE, IndexState, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame,
-    create_private_file_capability, decode_object_frame, encode_object_frame, encode_root_snapshot,
-    ensure_payload_limit, io_error, live_files_mut, materialize_closure, open_directory_capability,
-    open_rw_capability, read_indexed_object, recover_arena, recover_roots, replace_index,
-    replace_volume_index, scan_frames, sync_store_directory_capability,
+    PrincipalCodec, ROOT_FILE, RecoveryLimits, append_frame, create_private_file_capability,
+    decode_object_frame, encode_object_frame, ensure_payload_limit, io_error, live_files_mut,
+    materialize_closure, open_directory_capability, open_rw_capability, read_indexed_object,
+    recover_arena, recover_roots, replace_index, replace_volume_index, scan_frames,
+    sync_store_directory_capability,
 };
 use crate::engine::refinery::{EngineCompactionPass, NativeArenaCompactionPass};
 
@@ -812,10 +812,30 @@ where
         journal: &mut impl super::DurableIo,
         roots: &BTreeMap<P, RootState>,
     ) -> Result<(), DurableError> {
+        use super::journal_payload::WriteError;
+
         let roots = encoded_roots(roots, &self.principal_codec)?;
-        let payload = encode_root_snapshot(self.identity.scheme(), &roots)?;
-        ensure_payload_limit(ROOT_FILE, 0, payload.len(), self.limits)?;
-        append_frame(journal, ROOT_MAGIC, &payload)?;
+        super::journal_payload::append_snapshot(
+            journal,
+            &roots,
+            self.identity.scheme().into(),
+            self.limits.max_frame_bytes,
+            super::format::frame_checksum,
+        )
+        .map_err(|error| match error {
+            WriteError::Order => super::corrupt(
+                ROOT_FILE,
+                0,
+                "root snapshot principals are not strictly ordered",
+            ),
+            WriteError::Size(declared) => DurableError::FrameTooLarge {
+                file: ROOT_FILE,
+                offset: 0,
+                declared,
+                limit: self.limits.max_frame_bytes,
+            },
+            WriteError::Frame(error) => super::format::single_frame_error(error),
+        })?;
         journal
             .durable_sync_data()
             .map_err(|source| io_error("flush compacted root snapshot", source))

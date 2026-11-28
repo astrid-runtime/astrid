@@ -361,6 +361,33 @@ fn malformed_content_cannot_mint_a_verification_token() {
 }
 
 #[test]
+fn a_chunk_slice_preserves_existing_output_and_count_overflow_is_atomic() {
+    use super::chunk_range::{Chunk, Error, RangeOutput, emit};
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        FORMAT_VERSION,
+        vec![9, 8, 7, 6],
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let chunk = Chunk::from_record(&record, FORMAT_VERSION, 4, 1, 0).unwrap();
+    let mut bytes = vec![42];
+    assert!(matches!(
+        emit(&chunk, 20, 21, 99, &mut RangeOutput::Buffer(&mut bytes)),
+        Ok(3)
+    ));
+    assert_eq!(bytes, [42, 8, 7, 6]);
+    let mut count = RangeOutput::Count(usize::MAX - 2);
+    assert!(matches!(
+        emit(&chunk, 20, 21, 99, &mut count),
+        Err(Error::Overflow)
+    ));
+    assert!(matches!(count, RangeOutput::Count(n) if n == usize::MAX - 2));
+}
+
+#[test]
 fn exact_ranges_cross_chunk_and_tree_boundaries() {
     let bytes = deterministic_bytes(5 * 1024 * 1024);
     let built = build_content(&TestIdentity, ChunkingProfile::ASTRID_V1, &bytes).unwrap();
@@ -723,6 +750,31 @@ fn format_one_content_constants_are_stable() {
     assert_eq!(profile.gear_seed(), 0);
     assert_eq!(CHUNK_TREE_FANOUT, 128);
     assert_eq!(FILE_HEADER_BYTES, 40);
+}
+
+#[test]
+fn version_one_file_descriptor_matches_the_persisted_byte_layout() {
+    let seed = 0x1716_1514_1312_1110;
+    let logical = 0x2726_2524_2322_2120;
+    let count = 0x3736_3534_3332_3130;
+    let profile = ChunkingProfile::fastcdc_v2020(257, 1024, 65_538, seed).unwrap();
+    let wire = [
+        1, 1, 0, 1, 1, 1, 0, 0, 0, 4, 0, 0, 2, 0, 1, 0, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+        0x17, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+        0x36, 0x37,
+    ];
+    assert_eq!(encode_file_header(profile, logical, count), wire);
+    let file = ObjectId::new([3; 32]);
+    assert_eq!(
+        super::decode_file_header(file, &wire).unwrap(),
+        (profile, logical, count)
+    );
+    for index in 0..4 {
+        let mut invalid = wire;
+        invalid[index] ^= 1;
+        assert!(matches!(super::decode_file_header(file, &invalid),
+            Err(ContentError::InvalidObject { object, .. }) if object == file));
+    }
 }
 
 #[test]

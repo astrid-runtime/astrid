@@ -120,7 +120,7 @@ where
             _direct_objects: std::mem::take(&mut inner.pending_direct_objects),
             _locations: std::mem::take(&mut inner.pending_index_locations),
             _wal: inner.pending_wal.take(),
-            _published_roots: self.published_roots.entries.swap(Arc::new(BTreeMap::new())),
+            _published_roots: self.published_roots.entries.swap(None),
         }
     }
 
@@ -306,8 +306,8 @@ where
         let mut poison =
             super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
         let result = (|| {
-            self.fold_pending_wal(inner, representations.as_deref_mut())?;
-            let mut wal = self.wal.lock();
+            let folded = self.fold_pending_wal(inner, representations.as_deref_mut(), &self.wal)?;
+            let mut wal = folded.finish(|wal| wal.lock());
             if let Some(writer) = wal.as_mut() {
                 writer.checkpoint().map_err(wal_durable_error)?;
             }
@@ -322,11 +322,12 @@ where
         result
     }
 
-    fn fold_pending_wal(
+    fn fold_pending_wal<W>(
         &self,
         inner: &mut DurableInner<P>,
         mut representations: Option<&mut super::representations::RepresentationStore>,
-    ) -> Result<(), DurableError> {
+        wal: W,
+    ) -> Result<super::recovery_barrier::Prepared<W>, DurableError> {
         let pending = inner.pending_wal.take();
         let mut new_ids = Vec::new();
         let mut new_payloads = Vec::new();
@@ -354,23 +355,20 @@ where
             }
             if !new_payloads.is_empty() {
                 let appended = append_frames(&mut files.arena, ARENA_MAGIC, &new_payloads)?;
-                if appended.len() != new_ids.len() {
+                if !super::arena_index::publish_batch(
+                    &mut inner.index,
+                    &mut inner.pending_index_locations,
+                    &new_ids,
+                    &appended,
+                ) {
                     return Err(DurableError::Corrupt {
                         file: super::ARENA_FILE,
                         offset: 0,
                         detail: "WAL overlay fold returned the wrong object count",
                     });
                 }
-                for (id, location) in new_ids.iter().copied().zip(appended) {
-                    inner.index.insert(id, location);
-                    inner.pending_index_locations.push((id, location));
-                }
             }
-            let journals = pending
-                .roots()
-                .iter()
-                .map(super::wal::PendingWalRoot::journal)
-                .collect::<Vec<_>>();
+            let journals = pending.journals();
             if !journals.is_empty() {
                 append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
             }
@@ -386,22 +384,36 @@ where
             &staged_direct,
         )?;
         let files = live_files_mut(&mut inner.files)?;
-        files
-            .arena
-            .sync_data()
-            .map_err(|source| io_error("flush WAL checkpoint object arena", source))?;
-        if let Some(store) = representations.as_mut() {
-            if let Some(update) = representation_update {
-                store.publish_direct_update(update)?;
-            }
-            store.flush()?;
-        }
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
-        self.sync_volume()?;
-        Ok(())
+        super::recovery_barrier::stabilize_fold(
+            wal,
+            |wal| {
+                files
+                    .arena
+                    .sync_data()
+                    .map_err(|source| io_error("flush WAL checkpoint object arena", source))?;
+                Ok(wal)
+            },
+            |wal| {
+                if let Some(store) = representations {
+                    if let Some(update) = representation_update {
+                        store.publish_direct_update(update)?;
+                    }
+                    store.flush()?;
+                }
+                Ok(wal)
+            },
+            |wal| {
+                files
+                    .roots
+                    .sync_data()
+                    .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
+                Ok(wal)
+            },
+            |wal| {
+                self.sync_volume()?;
+                Ok(wal)
+            },
+        )
     }
 
     fn checkpoint_index(
@@ -547,7 +559,7 @@ struct RetiredMetadata<P: Ord> {
     _direct_objects: BTreeMap<ObjectId, super::representations::DirectArenaObject>,
     _locations: Vec<(ObjectId, super::ArenaLocation)>,
     _wal: super::wal::PendingWalOverlay<P>,
-    _published_roots: Arc<BTreeMap<P, Arc<super::PublishedRoot>>>,
+    _published_roots: Option<Arc<BTreeMap<P, Arc<super::PublishedRoot>>>>,
 }
 
 #[cfg(test)]

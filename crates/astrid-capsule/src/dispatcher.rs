@@ -27,6 +27,7 @@
 //! - Single-segment wildcard: `tool.execute.*.result` matches
 //!   `tool.execute.search.result` but not `tool.execute.result`
 
+use astrid_events::ipc::DeviceStamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -224,6 +225,12 @@ impl EventDispatcher {
         // is N independent FIFO consumers, not a single class-keyed
         // queue collapsing the load (#813 Layer 3).
         let capsule_queues = Arc::clone(&self.queues);
+        if let Some(resolver) = self.access_resolver.take() {
+            capsule_queues
+                .resolver
+                .set(resolver)
+                .expect("dispatcher starts once");
+        }
         assert!(
             self.admitter
                 .active
@@ -232,7 +239,6 @@ impl EventDispatcher {
                     event_bus: Arc::downgrade(&self.event_bus),
                     queues: Arc::clone(&capsule_queues),
                     chain_locks: Arc::clone(&self.chain_locks),
-                    access_resolver: self.access_resolver.clone(),
                     waits: wait_graph::WaitGraph::default(),
                 })
                 .is_ok(),
@@ -312,17 +318,18 @@ impl EventDispatcher {
             // granted capsules — never a caller-supplied claim.
             let caller_principal: Option<&str> =
                 ipc_message.as_deref().and_then(|m| m.principal.as_deref());
-            let caller_device_key_id: Option<&str> = ipc_message
+            let caller_device = ipc_message
                 .as_deref()
-                .and_then(|m| m.device_key_id.as_deref());
+                .map(astrid_events::ipc::IpcMessage::device_stamp)
+                .unwrap_or_default();
             let caller_request_owner = ipc_message.as_deref().and_then(|m| m.request_owner);
             let matches = find_matching_interceptors(
                 &self.registry,
                 &topic,
                 caller_principal,
-                caller_device_key_id,
+                caller_device,
                 caller_request_owner,
-                self.access_resolver.as_ref(),
+                capsule_queues.resolver.get(),
                 &self.event_bus,
             )
             .await;
@@ -436,6 +443,7 @@ fn dispatch_to_capsule_queues(
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
+    let execution_queues = Arc::clone(queues);
     let terminal_failure = failure::TerminalFailure::capture(event_bus, ipc_message.as_deref());
     astrid_runtime::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
@@ -461,8 +469,8 @@ fn dispatch_to_capsule_queues(
             let _chain_guard = acquire_chain_lock(&chain_locks_clone, chain_key).await;
 
             let caller = ipc_clone.as_deref();
-            match capsule
-                .invoke_interceptor(action, &current_payload, caller)
+            match execution_queues
+                .invoke(capsule.as_ref(), action, &current_payload, caller)
                 .await
             {
                 Ok(crate::capsule::InterceptResult::Continue(modified_payload)) => {
@@ -707,7 +715,7 @@ async fn find_matching_interceptors(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
     caller_principal: Option<&str>,
-    caller_device_key_id: Option<&str>,
+    caller_device: DeviceStamp<'_>,
     caller_request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
@@ -716,7 +724,7 @@ async fn find_matching_interceptors(
         registry,
         topic,
         caller_principal,
-        caller_device_key_id,
+        caller_device,
         access_resolver,
     )
     .await;
@@ -743,7 +751,7 @@ async fn collect_matching_interceptors(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
     caller_principal: Option<&str>,
-    caller_device_key_id: Option<&str>,
+    caller_device: DeviceStamp<'_>,
     access_resolver: Option<&CapsuleAccessResolver>,
 ) -> (InterceptorMatches, Vec<String>) {
     // Receipts belong to publisher resource subscriptions, never broad handlers.
@@ -757,10 +765,15 @@ async fn collect_matching_interceptors(
     let describe_surface =
         topic == "tool.v1.request.describe" || topic == "llm.v1.request.describe";
     let view_scoped_surface = access_resolver.is_some() && (gate_surface || describe_surface);
-    let identity_stamped = caller_principal.is_some() || caller_device_key_id.is_some();
+    let device_stamped =
+        caller_device.fingerprint.is_some() || caller_device.registration.is_some();
+    if device_stamped && access_resolver.is_none() {
+        return (Vec::new(), Vec::new());
+    }
+    let identity_stamped = caller_principal.is_some() || device_stamped;
     let resolved_access = if access_resolver.is_some() && identity_stamped {
         access_resolver
-            .and_then(|resolver| resolver.resolve_access(caller_principal, caller_device_key_id))
+            .and_then(|resolver| resolver.resolve_access(caller_principal, caller_device))
     } else {
         None
     };

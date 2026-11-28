@@ -4,14 +4,24 @@
 //! checkpoint folds them into the canonical object arena and root journal.
 
 mod codec;
+mod commit_wire;
+mod interior;
+mod measured_record;
+mod measurement;
+mod object_storage;
 mod overlay;
+mod physical_wire;
+mod read_buffer;
+mod record_wire;
 mod replay;
+mod root_history;
 mod scan;
+mod transaction;
 mod types;
 mod writer;
 
 #[allow(unused_imports)]
-pub(super) use overlay::{PendingWalOverlay, PendingWalRoot};
+pub(super) use overlay::{PendingWalOverlay, read_snapshot};
 pub(super) use replay::recover_wal;
 #[allow(unused_imports)]
 pub(super) use scan::{ScannedWal, WalScanner};
@@ -25,7 +35,12 @@ pub(super) use types::{
 #[allow(unused_imports)]
 pub(super) use writer::{WalSink, WalWriter};
 
-use super::{DurableError, WAL_FILE, io_error};
+#[cfg(verus_keep_ghost)]
+use super::ObjectId;
+use super::{
+    DurableError, RootState, WAL_FILE, io_error, journal_history, journal_transition,
+    root_transition, root_wire,
+};
 
 /// Convert the private WAL grammar error into the durable engine's stable
 /// public error surface without discarding underlying I/O failures.

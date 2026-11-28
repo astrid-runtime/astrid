@@ -14,6 +14,7 @@ mod install_generation;
 mod install_generation_cas_tests;
 mod installed_identity;
 mod inventory;
+mod principal_scope;
 mod projection_names;
 mod rate_limit;
 mod request_policy;
@@ -28,7 +29,7 @@ pub(crate) use rate_limit::rate_limit_for_request;
 pub use request_policy::{
     AuthorityScope, kernel_request_method, required_capability, resolve_scope,
 };
-use request_policy::{omit_success_admin_audit, request_target_principal};
+use request_policy::{omit_success_admin_audit, request_principal};
 pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
 use std::sync::Arc;
@@ -126,20 +127,19 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
                                 &kernel,
                                 response_topic_for(&message.topic),
                                 message.principal.as_deref().unwrap_or("anonymous"),
-                                message.device_key_id.as_deref(),
+                                message.device_stamp(),
                                 KernelResponse::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
                             );
                             continue;
                         },
                     };
-                    let device_key_id = resolve_device_key_id(message);
                     handle_request(
                         &kernel,
                         &mut rate_limiter,
                         &mut install_batches,
                         message.topic.clone(),
                         caller,
-                        device_key_id,
+                        message.device_stamp(),
                         req,
                     )
                     .await;
@@ -182,19 +182,28 @@ async fn handle_request(
     install_batches: &mut install_batch::InstallBatchRegistry,
     topic: Topic,
     caller: PrincipalId,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     req: KernelRequest,
 ) {
+    let device_key_id = device.fingerprint;
     let response_topic = response_topic_for(&topic);
     let Some(_work) = kernel.runtime_work.admit() else {
         publish_response(
             kernel,
             response_topic,
             caller.as_str(),
-            device_key_id.as_deref(),
+            device,
             KernelResponse::Error("runtime is shutting down".to_owned()),
         );
         return;
+    };
+
+    // Receipt storage resolves the caller's durable UID. Keep the profile
+    // decision, namespace access and response publication in the same owner
+    // lifetime as principal creation and deletion.
+    let _receipt_owner_guard = match &req {
+        G { .. } | P { .. } => Some(kernel.admin_write_lock.lock().await),
+        _ => None,
     };
 
     // Capability enforcement preamble (issue #670). Resolve the caller's
@@ -202,11 +211,14 @@ async fn handle_request(
     // reject with an audited `Denied` entry on failure. No match arm
     // below is reached without `authorize_request` returning Ok.
     let method = kernel_request_method(&req);
-    let scope = resolve_scope(&req, &caller);
-    let requested_target = request_target_principal(&req, &caller);
+    let (scope, explicit) = request_principal(&req, &caller);
+    let explicit = explicit.cloned();
+    let requested_target = explicit
+        .as_ref()
+        .filter(|_| scope == AuthorityScope::Global);
     let required_cap = required_capability(&req, scope);
     let install_authorization =
-        authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap);
+        admit_management_request(kernel, &caller, device, required_cap).await;
     // Install secrets are staged in the host-wide Shared namespace, not the
     // target principal's namespace. Install permission must never substitute
     // for the same global env authority required by an explicit Shared write.
@@ -215,7 +227,12 @@ async fn handle_request(
             if matches!(&req, KernelRequest::InstallCapsule { env, .. }
                 if env.iter().any(|value| value.kind == astrid_core::kernel_api::EnvValueKind::Secret)) =>
         {
-            ("env:write", authorization.require_shared_env_write())
+            (
+                "env:write",
+                authorization
+                    .require_shared_env_write()
+                    .map_err(ManagementAdmissionError::Policy),
+            )
         },
         result => (required_cap, result),
     };
@@ -235,8 +252,8 @@ async fn handle_request(
                     caller: &caller,
                     method,
                     required_cap,
-                    device_key_id: device_key_id.as_deref(),
-                    target_principal: requested_target.clone(),
+                    device_key_id,
+                    target_principal: requested_target.cloned(),
                     params: None,
                     authorization: AuthorizationProof::Denied {
                         reason: e.to_string(),
@@ -249,7 +266,7 @@ async fn handle_request(
                 kernel,
                 response_topic,
                 caller.as_str(),
-                device_key_id.as_deref(),
+                device,
                 KernelResponse::Error(e.to_string()),
             );
             return;
@@ -262,12 +279,11 @@ async fn handle_request(
     let batch_reservation = match &req {
         KernelRequest::InstallCapsule {
             source,
-            target_principal,
             provenance,
             batch: Some(context),
             ..
         } => {
-            let target = target_principal.as_ref().unwrap_or(&caller);
+            let target = explicit.as_ref().unwrap_or(&caller);
             match install_batches.reserve(&caller, target, context, source, provenance.as_ref()) {
                 Ok(member) => Some(member),
                 Err(reason) => {
@@ -277,8 +293,8 @@ async fn handle_request(
                             caller: &caller,
                             method,
                             required_cap,
-                            device_key_id: device_key_id.as_deref(),
-                            target_principal: requested_target.clone(),
+                            device_key_id,
+                            target_principal: requested_target.cloned(),
                             params: None,
                             authorization: authorization_proof.clone(),
                             outcome: AuditOutcome::failure(reason.clone()),
@@ -289,7 +305,7 @@ async fn handle_request(
                         kernel,
                         response_topic,
                         caller.as_str(),
-                        device_key_id.as_deref(),
+                        device,
                         KernelResponse::Error(reason),
                     );
                     return;
@@ -319,8 +335,8 @@ async fn handle_request(
                 caller: &caller,
                 method,
                 required_cap,
-                device_key_id: device_key_id.as_deref(),
-                target_principal: requested_target.clone(),
+                device_key_id,
+                target_principal: requested_target.cloned(),
                 params: None,
                 authorization: authorization_proof,
                 outcome: AuditOutcome::failure(reason.clone()),
@@ -331,7 +347,7 @@ async fn handle_request(
             kernel,
             response_topic,
             caller.as_str(),
-            device_key_id.as_deref(),
+            device,
             KernelResponse::Error(reason),
         );
         return;
@@ -346,8 +362,8 @@ async fn handle_request(
                 caller: &caller,
                 method,
                 required_cap,
-                device_key_id: device_key_id.as_deref(),
-                target_principal: requested_target,
+                device_key_id,
+                target_principal: requested_target.cloned(),
                 params: None,
                 authorization: authorization_proof,
                 outcome: AuditOutcome::success(),
@@ -365,18 +381,10 @@ async fn handle_request(
     // across every request — no per-endpoint config. Dropped before each
     // terminal publish below so the terminal frame is never preceded by a late
     // redundant ping.
-    let pinger = KeepalivePinger::spawn(
-        kernel,
-        response_topic.clone(),
-        &caller,
-        device_key_id.as_deref(),
-    );
+    let pinger = KeepalivePinger::spawn(kernel, response_topic.clone(), &caller, device);
     let res = match req {
-        KernelRequest::BeginCapsuleInstallBatch {
-            target_principal,
-            members,
-        } => {
-            let target = target_principal.as_ref().unwrap_or(&caller);
+        KernelRequest::BeginCapsuleInstallBatch { members, .. } => {
+            let target = explicit.as_ref().unwrap_or(&caller);
             match kernel.principal_directory.uid_for(target) {
                 Err(error) => KernelResponse::Error(format!(
                     "resolve capsule install batch target {target}: {error}"
@@ -393,7 +401,7 @@ async fn handle_request(
         KernelRequest::InstallCapsule {
             source,
             workspace,
-            target_principal,
+            target_principal: _,
             provenance,
             authority,
             env,
@@ -403,10 +411,10 @@ async fn handle_request(
             info!(
                 source = %source,
                 workspace,
-                target = ?target_principal,
+                target = ?explicit,
                 "Kernel received install request"
             );
-            let target = target_principal.as_ref().unwrap_or(&caller);
+            let target = explicit.as_ref().unwrap_or(&caller);
             if let Some(install_batch::InstallBatchReservation::Completed(member)) =
                 batch_reservation.as_ref()
             {
@@ -423,7 +431,7 @@ async fn handle_request(
                     kernel,
                     install::InstallCapsuleRequest {
                         caller: &caller,
-                        requested_target: target_principal.as_ref(),
+                        requested_target: explicit.as_ref(),
                         source: &source,
                         workspace,
                         provenance: provenance.as_ref(),
@@ -446,11 +454,8 @@ async fn handle_request(
                 }
             }
         },
-        KernelRequest::FinishCapsuleInstallBatch {
-            batch_id,
-            target_principal,
-        } => {
-            let target = target_principal.as_ref().unwrap_or(&caller);
+        KernelRequest::FinishCapsuleInstallBatch { batch_id, .. } => {
+            let target = explicit.as_ref().unwrap_or(&caller);
             match install_batches.finish(&caller, target, batch_id, |target, member| {
                 install_batch::installed_member_matches(kernel, target, member)
             }) {
@@ -590,7 +595,7 @@ async fn handle_request(
                 kernel,
                 response_topic.clone(),
                 caller.as_str(),
-                device_key_id.as_deref(),
+                device,
                 KernelResponse::Success(serde_json::json!({"status": "shutting_down"})),
             );
             // Signal the daemon's main loop to exit gracefully.
@@ -627,11 +632,9 @@ async fn handle_request(
             };
             KernelResponse::Status(status)
         },
-        KernelRequest::GetCapsuleMetadata => {
-            capsule_metadata::response(kernel, &authorization, None).await
-        },
-        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal } => {
-            capsule_metadata::response(kernel, &authorization, Some(&target_principal)).await
+        KernelRequest::GetCapsuleMetadata
+        | KernelRequest::GetCapsuleMetadataForPrincipal { .. } => {
+            capsule_metadata::response(kernel, &authorization, explicit.as_ref()).await
         },
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(&authorization);
@@ -644,13 +647,7 @@ async fn handle_request(
     // Stop the keepalive before the terminal frame so it isn't preceded by a
     // late redundant `Working`.
     drop(pinger);
-    publish_response(
-        kernel,
-        response_topic,
-        caller.as_str(),
-        device_key_id.as_deref(),
-        res,
-    );
+    publish_response(kernel, response_topic, caller.as_str(), device, res);
 }
 
 fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
@@ -699,17 +696,6 @@ async fn unregister_failed_capsules(kernel: &crate::Kernel) {
     }
 }
 
-/// Resolve the authenticating device `key_id` from an incoming [`IpcMessage`].
-///
-/// Host-derived metadata stamped by the socket per-connection registry or the
-/// gateway-signed bearer (never a client-controlled field). `Some(key_id)`
-/// means the request authenticated with a specific registered device, whose
-/// scope the cap-gate applies as an attenuation floor; `None` means an
-/// unattenuated full-principal request (every legacy / unpaired connection).
-fn resolve_device_key_id(message: &IpcMessage) -> Option<String> {
-    message.device_key_id.clone()
-}
-
 /// Authorization inputs pinned at the request's policy decision point.
 #[derive(Debug)]
 struct AuthorizedRequest {
@@ -718,6 +704,7 @@ struct AuthorizedRequest {
     groups: Arc<GroupConfig>,
     device_scope: Option<DeviceScope>,
     device_key_id: Option<astrid_core::profile::DeviceKeyId>,
+    device_registration: Option<astrid_core::profile::DeviceRegistrationId>,
     authenticated_public_key: Option<[u8; 32]>,
 }
 
@@ -742,6 +729,44 @@ impl AuthorizedRequest {
     }
 }
 
+#[derive(Debug)]
+enum ManagementAdmissionError {
+    Policy(PermissionError),
+    Retiring(PrincipalId),
+}
+
+impl std::fmt::Display for ManagementAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Policy(error) => error.fmt(formatter),
+            Self::Retiring(principal) => {
+                write!(
+                    formatter,
+                    "permission denied for principal {principal}: agent is retiring"
+                )
+            },
+        }
+    }
+}
+
+/// Admit through the same retirement fence restored before daemon startup.
+/// A successful decision is bound to the caller and checked policy snapshot.
+async fn admit_management_request(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    device: astrid_events::ipc::DeviceStamp<'_>,
+    required_cap: &str,
+) -> Result<AuthorizedRequest, ManagementAdmissionError> {
+    let authorization = authorize_with(kernel, caller, required_cap, |profile| {
+        device_scope::resolve_stamp(profile, caller, device, required_cap)
+    })
+    .map_err(ManagementAdmissionError::Policy)?;
+    if kernel.capabilities.is_principal_retiring(caller).await {
+        return Err(ManagementAdmissionError::Retiring(caller.clone()));
+    }
+    Ok(authorization)
+}
+
 /// Evaluate the capability check for `caller` against the kernel's resolved
 /// group config and the caller's profile.
 ///
@@ -754,6 +779,19 @@ fn authorize_request(
     caller: &PrincipalId,
     device_key_id: Option<&str>,
     required_cap: &str,
+) -> Result<AuthorizedRequest, PermissionError> {
+    authorize_with(kernel, caller, required_cap, |profile| {
+        resolve_device(profile, caller, device_key_id, required_cap)
+    })
+}
+
+fn authorize_with(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    required_cap: &str,
+    device_for: impl FnOnce(
+        &PrincipalProfile,
+    ) -> Result<Option<&astrid_core::profile::DeviceKey>, PermissionError>,
 ) -> Result<AuthorizedRequest, PermissionError> {
     let profile = match kernel.profile_cache.resolve(caller) {
         Ok(p) => p,
@@ -789,7 +827,7 @@ fn authorize_request(
     }
     let groups = kernel.groups.load_full();
 
-    let device = resolve_device(profile.as_ref(), caller, device_key_id, required_cap)?;
+    let device = device_for(&profile)?;
     let device_scope = device.map(|device| device.scope.clone());
     let authenticated_device_id = device
         .map(|device| astrid_core::profile::DeviceKeyId::new(device.key_id.clone()))
@@ -814,12 +852,14 @@ fn authorize_request(
         check = check.with_device_scope(scope);
     }
     check.require(required_cap)?;
+    let device_registration = device.and_then(|record| record.registration_id);
     Ok(AuthorizedRequest {
         principal: caller.clone(),
         profile,
         groups,
         device_scope,
         device_key_id: authenticated_device_id,
+        device_registration,
         authenticated_public_key,
     })
 }

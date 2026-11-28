@@ -10,7 +10,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, KvProjectionError};
-use crate::storage_model::{ModelError, RootState};
+use crate::storage_model::{
+    ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
+    ObjectReference, ReferenceLabel, RootState,
+};
 use parking_lot::Mutex;
 
 use self::context::{Replacement, TreeContext};
@@ -26,41 +29,89 @@ use super::tree_error::map_engine;
 use crate::error::{StorageError, StorageResult};
 use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 
+use super::encoding;
+
 mod adapter;
+#[cfg(verus_keep_ghost)]
+use crate::storage_model::ReferenceKind;
+mod checkpoint_branch;
+mod checkpoint_cache;
+mod checkpoint_child;
+mod checkpoint_descent;
+mod checkpoint_entries;
+mod checkpoint_header;
+mod checkpoint_key_field;
+mod checkpoint_leaf;
+mod checkpoint_leaf_record;
+mod checkpoint_leaf_summary;
+mod checkpoint_page;
+mod checkpoint_point;
+mod checkpoint_progress;
+mod checkpoint_range;
+mod checkpoint_record;
+mod checkpoint_reference;
+mod checkpoint_summary;
+mod checkpoint_totals;
+mod checkpoint_value;
+mod checkpoint_walk;
 mod context;
 mod delta;
+use crate::storage_model::reference_lookup;
+mod checkpoint_replay;
+mod delta_batch;
+mod delta_chain;
+mod delta_header;
+mod delta_mutation;
+mod delta_recovery;
+mod delta_replay;
+mod delta_totals;
+mod delta_writer;
 mod handoff;
 mod header;
 mod hot_cache;
 #[cfg(test)]
 mod hot_cache_integration_tests;
+mod hot_lookup;
+mod hot_snapshot;
+mod key_projection;
 mod legacy_avl;
 mod maintenance;
 mod memo;
+mod memo_admission;
+mod memo_projection;
+mod mutation_ack;
+mod mutation_replay;
 mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
+mod projection_record;
+mod projection_recovery;
+#[cfg(verus_keep_ghost)]
+use overlay::batch as overlay_batch;
 mod publication;
+mod record_source;
+mod replay_values;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod retirement_tests;
+mod spill_record;
 mod validation;
 
 pub(crate) use self::handoff::seed_owner_memo_if_live;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
-pub(crate) use self::memo::MemoEpoch;
+pub(crate) use self::memo_admission::MemoEpoch;
 pub(crate) use self::publication::{KvCheckpointPublication, RetiredKvProjection};
 pub(crate) use self::validation::CertifiedValueMembership;
 pub(super) use self::validation::TreeValidation;
 
 pub(super) const FORMAT_VERSION: crate::storage_model::ObjectFormatVersion =
     PRINCIPAL_GRAPH_VERSION;
-pub(super) const KV_LABEL: &[u8] = b"kv";
-const PARENT_LABEL: &[u8] = b"parent";
-pub(super) const ROOT_LABEL: &[u8] = b"root";
-pub(super) const STATE_LABEL: &[u8] = b"state";
+pub(super) const KV_LABEL: &[u8] = crate::storage_model::header_graph::KV;
+const PARENT_LABEL: &[u8] = crate::storage_model::header_writer::PARENT;
+pub(super) const ROOT_LABEL: &[u8] = projection_record::ROOT_LABEL;
+pub(super) const STATE_LABEL: &[u8] = crate::storage_model::header_graph::STATE;
 // Soft maintenance batch target. This is neither a quota nor a format limit.
 const CHECKPOINT_MIN_DELTA_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -104,15 +155,9 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         // Order every cache publisher and check currency inside that guard.
         // Never hold it across graph validation or an authoritative commit.
         let mut projections = self.projections.lock();
-        if !self.epoch_is_current(epoch) {
-            return;
-        }
-        let Ok(Some(current)) = engine.current_kv_root(&owner) else {
-            // An optional cache query must not false-fail an already successful
-            // commit or historical snapshot read.
-            return;
-        };
-        if current != expected {
+        if !epoch.admits_root(self.memo_epoch(), &owner, Some(expected), |principal| {
+            engine.current_kv_root(principal)
+        }) {
             return;
         }
         // Nested cache order is projections -> trees. The engine root method
@@ -220,6 +265,20 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
         }
     }
 
+    /// A view over the same engine, quotas, caches and checkpoint state.
+    pub(crate) fn with_resolver<S>(&self, resolver: S) -> TreeKvStore<P, I, S, E> {
+        TreeKvStore {
+            engine: Arc::clone(&self.engine),
+            resolver,
+            quota: self.quota.clone(),
+            validation: Arc::clone(&self.validation),
+            validated_content: Arc::clone(&self.validated_content),
+            checkpointing: Arc::clone(&self.checkpointing),
+            hot_cache: self.hot_cache.clone(),
+            marker: PhantomData,
+        }
+    }
+
     /// Shared owner validation memos used by KV and content projections.
     pub(crate) fn validation_cache(&self) -> &Arc<KvValidationCache<P>> {
         &self.validation
@@ -280,7 +339,8 @@ where
         // capture. A concurrent checkpoint may replace the shared cache while
         // this reader loads its captured commit/state. Head matching below
         // preserves that snapshot without retaining an extra owner history.
-        let captured_projection = self.validation.projections.lock().get(&owner).cloned();
+        let captured_projection =
+            memo_projection::capture(&self.validation.projections.lock(), &owner);
         let Some(root) = self
             .engine
             .current_kv_root(&owner)
@@ -334,61 +394,63 @@ where
             let header = self.header_at_epoch(owner.clone(), epoch)?;
             let mut context = TreeContext::new(self.engine.as_ref(), owner);
             let (result, mutations, changed) = mutation(&mut context, &header)?;
-            if !changed {
+            let attempt = mutation_ack::finish(result, mutations, changed, |mutations| {
+                let projection = context.apply_mutations(&header, mutations)?;
+                let logical_bytes = projection.totals.logical_bytes;
+                let projection_used = projection.totals.quota_bytes;
+                let used = projection_used
+                    .checked_add(header.other_quota_bytes)
+                    .ok_or_else(|| {
+                        StorageError::Internal("principal quota total overflow".to_owned())
+                    })?;
+                let previous_used = header
+                    .quota_bytes
+                    .checked_add(header.other_quota_bytes)
+                    .ok_or_else(|| {
+                        StorageError::Internal("principal quota total overflow".to_owned())
+                    })?;
+                self.validate_mutation_quota(owner, quota, used, previous_used)?;
+                let tree = projection.tree;
+                let validated_projection = projection.clone();
+                let transaction = context.finish_projection(header, &projection)?;
+                match self.engine.commit_kv_root(transaction) {
+                    Ok(outcome) => {
+                        // A delta projection keeps the checkpoint tree unchanged;
+                        // its totals include the overlay and therefore must never
+                        // be cached as validation for that checkpoint tree.
+                        let checkpoint = if projection.depth == 0
+                            && let Some(certificate) = projection
+                                .boundary
+                                .filter(|certificate| certificate.matches_tree(tree))
+                        {
+                            Some(TreeValidation::from_certificate(
+                                certificate,
+                                projection.totals.entries,
+                                logical_bytes,
+                                projection_used,
+                            ))
+                        } else {
+                            None
+                        };
+                        self.validation.publish_if_current(
+                            self.engine.as_ref(),
+                            owner.clone(),
+                            outcome.root(),
+                            validated_projection,
+                            checkpoint,
+                            epoch,
+                        );
+                        if should_checkpoint(&projection) {
+                            self.schedule_checkpoint(owner.clone());
+                        }
+                        Ok(true)
+                    },
+                    Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),
+                    Err(error) => Err(map_engine(&error)),
+                }
+            })?;
+            if let Some(result) = attempt {
                 return Ok(result);
-            }
-            let projection = context.apply_mutations(&header, mutations)?;
-            let logical_bytes = projection.totals.logical_bytes;
-            let projection_used = projection.totals.quota_bytes;
-            let used = projection_used
-                .checked_add(header.other_quota_bytes)
-                .ok_or_else(|| {
-                    StorageError::Internal("principal quota total overflow".to_owned())
-                })?;
-            let previous_used = header
-                .quota_bytes
-                .checked_add(header.other_quota_bytes)
-                .ok_or_else(|| {
-                    StorageError::Internal("principal quota total overflow".to_owned())
-                })?;
-            self.validate_mutation_quota(owner, quota, used, previous_used)?;
-            let tree = projection.tree;
-            let validated_projection = projection.clone();
-            let transaction = context.finish_projection(header, &projection)?;
-            match self.engine.commit_kv_root(transaction) {
-                Ok(outcome) => {
-                    // A delta projection keeps the checkpoint tree unchanged;
-                    // its totals include the overlay and therefore must never
-                    // be cached as validation for that checkpoint tree.
-                    let checkpoint = if projection.depth == 0
-                        && let Some(certificate) = projection
-                            .boundary
-                            .filter(|certificate| certificate.matches_tree(tree))
-                    {
-                        Some(TreeValidation::from_certificate(
-                            certificate,
-                            projection.totals.entries,
-                            logical_bytes,
-                            projection_used,
-                        ))
-                    } else {
-                        None
-                    };
-                    self.validation.publish_if_current(
-                        self.engine.as_ref(),
-                        owner.clone(),
-                        outcome.root(),
-                        validated_projection,
-                        checkpoint,
-                        epoch,
-                    );
-                    if should_checkpoint(&projection) {
-                        self.schedule_checkpoint(owner.clone());
-                    }
-                    return Ok(result);
-                },
-                Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(map_engine(&error)),
             }
         }
     }
@@ -452,7 +514,7 @@ where
         let (tree, validation) = context.build_validated_checkpoint(&base)?;
         let checkpoint_totals = base_projection.totals;
         interleave()?;
-        let current = self.header_at_epoch(owner.clone(), epoch)?;
+        let current = self.header_at_epoch(owner, epoch)?;
         let current_projection = projection_from_header(&current);
         if !force && !should_checkpoint(&current_projection) {
             return Ok(false);
@@ -467,8 +529,7 @@ where
         else {
             return Ok(false);
         };
-        let commit = transaction.commit();
-        let transaction = transaction.with_kv_checkpoint_publication(|| {
+        let transaction = transaction.with_kv_checkpoint_publication(|owner, commit| {
             KvCheckpointPublication::new(
                 Arc::clone(&self.validation),
                 owner.clone(),
@@ -478,16 +539,19 @@ where
                 epoch,
             )
         });
+        let target = transaction.checkpoint_target();
         match self.engine.commit_kv_root(transaction) {
             Ok(outcome) => {
-                self.validation.publish_if_current(
-                    self.engine.as_ref(),
-                    owner,
-                    outcome.root(),
-                    rebased,
-                    Some(validation),
-                    epoch,
-                );
+                target.publish(outcome.root(), |owner, root| {
+                    self.validation.publish_if_current(
+                        self.engine.as_ref(),
+                        owner,
+                        root,
+                        rebased,
+                        Some(validation),
+                        epoch,
+                    );
+                });
                 Ok(true)
             },
             Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),

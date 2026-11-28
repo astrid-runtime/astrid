@@ -543,6 +543,7 @@ async fn assemble_runtime_store(
     );
     let staging = Arc::new(OnceLock::new());
     let store = RuntimePrincipalStore {
+        principal_scratch_root: home.runtime_principal_scratch_root().into(),
         quota,
         volume_binding: Arc::downgrade(&volume),
         engine,

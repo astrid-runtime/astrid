@@ -7,7 +7,7 @@ use astrid_core::PrincipalUid;
 use crate::content::{ContentName, PrincipalContentError};
 use crate::content_dag::ContentReadError;
 use crate::engine::PrincipalProjectionError;
-use crate::storage_model::{ObjectId, ObjectRecord, ReferenceLabel};
+use crate::storage_model::{ObjectId, ObjectRecord};
 
 use super::{
     BRANCH_RECEIPT_PREFIX_BYTES, CatalogRoot, CatalogValue, WorkspaceBranchError, WorkspaceUid,
@@ -21,10 +21,6 @@ pub(super) struct BranchState {
     pub(super) target_prefix: Option<ContentName>,
     pub(super) base: Option<CatalogRoot>,
     pub(super) working: Option<CatalogRoot>,
-}
-
-fn branch_label(id: WorkspaceUid) -> String {
-    id.to_string()
 }
 
 pub(super) fn is_workspace_receipt_label(label: &[u8]) -> bool {
@@ -54,21 +50,12 @@ pub(super) fn validate_target_prefix(
     Ok(Some(prefix))
 }
 
-pub(super) fn workspace_ref_label(id: WorkspaceUid) -> ReferenceLabel<Vec<u8>> {
-    ReferenceLabel::new(branch_label(id).into_bytes())
-}
-
-pub(super) fn workspace_receipt_label(id: WorkspaceUid) -> ReferenceLabel<Vec<u8>> {
-    ReferenceLabel::new(format!("workspace-promoted/{id}").into_bytes())
-}
-
 pub(super) fn parse_workspace_uid(label: &[u8]) -> Option<WorkspaceUid> {
-    std::str::from_utf8(label).ok()?.parse().ok()
+    super::reference_transition::branch(label).map(WorkspaceUid::from_bytes)
 }
 
 pub(super) fn parse_workspace_receipt_uid(label: &[u8]) -> Option<WorkspaceUid> {
-    let suffix = label.strip_prefix(BRANCH_RECEIPT_PREFIX_BYTES)?;
-    std::str::from_utf8(suffix).ok()?.parse().ok()
+    super::reference_transition::receipt(label).map(WorkspaceUid::from_bytes)
 }
 
 pub(super) fn hydrate_root(

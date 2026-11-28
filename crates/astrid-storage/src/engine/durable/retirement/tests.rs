@@ -114,13 +114,13 @@ fn handoff_preserves_history_and_closes_retained_engine() {
         commits.push(commit);
     }
     let count = engine.object_count().unwrap();
-    let publications = engine.published_roots.entries.load_full();
+    let publications = engine.published_roots.entries.load_full().unwrap();
     let transferred = engine.handoff_for_retirement().unwrap();
     assert!(Arc::ptr_eq(
         &publications,
-        &transferred.published_roots.entries.load_full()
+        &transferred.published_roots.entries.load_full().unwrap()
     ));
-    assert!(engine.published_roots.entries.load().is_empty());
+    assert!(engine.published_roots.entries.load().is_none());
     assert_eq!(transferred.root(&principal).unwrap(), root);
     assert_eq!(transferred.object_count().unwrap(), count);
     for commit in &commits {

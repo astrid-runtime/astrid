@@ -25,14 +25,19 @@
 //! table is the canonical storage for `ManagedProcess`.
 
 mod audit;
+mod command;
 mod compat;
 mod context;
 mod handle;
 mod inject;
 mod managed;
 mod persistent;
+mod process_batch;
+use crate::registry_keys;
+mod spawn_admission;
 mod synchronous;
 mod tracker;
+mod tracker_registry;
 
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -102,10 +107,22 @@ fn authenticated_principal(state: &HostState) -> Option<astrid_core::principal::
         .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
 }
 
+#[cfg(test)]
+mod storage_mount_tests;
+
 fn prepare_process_storage_mount(
     state: &HostState,
     op: &str,
     command: &str,
+) -> Result<Option<ProcessStorageMount>, ErrorCode> {
+    prepare_process_storage_mount_for(state, op, command, || state.effective_principal())
+}
+
+fn prepare_process_storage_mount_for(
+    state: &HostState,
+    op: &str,
+    command: &str,
+    owner: impl FnOnce() -> astrid_core::principal::PrincipalId,
 ) -> Result<Option<ProcessStorageMount>, ErrorCode> {
     let pathless = state.effective_workspace().is_some_and(|mount| {
         matches!(
@@ -126,11 +143,23 @@ fn prepare_process_storage_mount(
         record_process_denied(state, op, command, reason);
         return Err(ErrorCode::CapabilityDenied);
     };
-    let principal = state.effective_principal();
+    let uid = state
+        .invocation_storage_uid
+        .or(state.runtime_owner_uid)
+        .ok_or_else(|| {
+            record_process_denied(
+                state,
+                op,
+                command,
+                "process storage requires an admitted owner UID",
+            );
+            ErrorCode::CapabilityDenied
+        })?;
+    let principal = owner();
     util::bounded_block_on(
         &state.runtime_handle,
         &state.io_semaphore,
-        broker.mount(&principal),
+        broker.mount_for(&principal, uid),
     )
     .map(Some)
     .map_err(|error| {
@@ -666,88 +695,8 @@ impl process::Host for HostState {
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
 
-        if !self.principal_process_allows(&request.cmd) {
-            record_process_denied(
-                self,
-                "astrid:process/host.spawn-persistent",
-                &cmd_for_audit,
-                "restricted principal process policy denied executable",
-            );
-            return Err(ErrorCode::CapabilityDenied);
-        }
-
-        // Capability gate FIRST — a capsule lacking `host_process` gets
-        // `capability-denied` (consistent with `spawn` / `spawn-background`
-        // and the WIT "Security-gated" header), BEFORE any persistence-
-        // feasibility checks. Otherwise an ungranted capsule with no caller in
-        // scope would observe `persist-unsupported` instead of the capability
-        // error.
-        let Some(sec) = self.security.clone() else {
-            record_process_denied(
-                self,
-                "astrid:process/host.spawn-persistent",
-                &cmd_for_audit,
-                "no security gate configured",
-            );
-            return Err(ErrorCode::CapabilityDenied);
-        };
-        {
-            let cmd = request.cmd.to_string();
-            let cid = self.capsule_id.as_str().to_owned();
-            let check = util::bounded_block_on(&handle, &semaphore, async move {
-                sec.check_host_process(&cid, &cmd).await
-            });
-            if let Err(reason) = check {
-                record_process_denied(
-                    self,
-                    "astrid:process/host.spawn-persistent",
-                    &cmd_for_audit,
-                    &reason,
-                );
-                return Err(ErrorCode::CapabilityDenied);
-            }
-        }
-
-        // Persistent exec is an operator sub-grant ON TOP of `host_process`:
-        // the capsule must also declare `allow_persistent` to spawn a child
-        // that OUTLIVES the instance. `host_process` alone keeps only the
-        // ephemeral `spawn` / `spawn-background`. Manifest-derived, so it's the
-        // same capability set `enumerate-capabilities` reports.
-        if !self
-            .capability_names
-            .iter()
-            .any(|c| c == "allow_persistent")
-        {
-            record_process_denied(
-                self,
-                "astrid:process/host.spawn-persistent",
-                &cmd_for_audit,
-                "persistent exec requires the allow_persistent capability",
-            );
-            return Err(ErrorCode::CapabilityDenied);
-        }
-
-        // Persistence feasibility: refuse the owner-fallback principal — a
-        // persistent id must be scoped to an authenticated principal, else
-        // unauthenticated paths would share a `default` namespace that
-        // `list-processes` enumerates.
-        let Some(principal) = authenticated_principal(self) else {
-            return Err(ErrorCode::PersistUnsupported);
-        };
-        // `some(0)` idle timeout is rejected per the WIT.
-        if request.idle_timeout_ms == Some(0) {
-            return Err(ErrorCode::InvalidInput);
-        }
-        if self.effective_cancel_token().is_cancelled() {
-            return Err(ErrorCode::Cancelled);
-        }
-
-        admit_spawn(self, &cmd_for_audit)?;
-        let process_mount = prepare_process_storage_mount(
-            self,
-            "astrid:process/host.spawn-persistent",
-            request.cmd.as_str(),
-        )?;
+        let (principal, process_mount) =
+            persistent::admit_and_prepare(self, &request.cmd, request.idle_timeout_ms)?;
         let workspace_root = process_mount.as_ref().map_or_else(
             || self.workspace_root.clone(),
             |mount| mount.workspace_root.clone(),

@@ -16,9 +16,15 @@
 //! hashes. Audit redaction lives in `admin::mod::sanitize_admin_audit_params`
 //! so neither the raw token nor the ed25519 key ever reaches the audit log.
 
+mod deny_patterns;
+
+pub(super) use super::pair_issue_result::PairIssueError;
+use super::pair_issue_result::{self, Inserted};
+
 use std::sync::Arc;
 
 use astrid_capabilities::{CapabilityCheck, device_scope_within};
+use astrid_capsule::profile_cache::DeviceRemoval;
 use astrid_core::PrincipalId;
 use astrid_core::groups::GroupConfig;
 use astrid_core::kernel_api::{
@@ -49,14 +55,14 @@ fn pair_token_store(kernel: &Arc<crate::Kernel>) -> Result<DurablePairTokenStore
 fn current_pair_issuer_authority(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    admitted: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
-    admitted: bool,
 ) -> Result<PairIssuerAuthority, PairIssueError> {
     let profile =
         PrincipalProfile::load_required(&kernel.astrid_home, caller).map_err(|error| {
             if matches!(&error, ProfileError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) {
                 let message = format!("caller principal {caller} does not exist (no profile.toml)");
-                if admitted {
+                if admitted.is_some() {
                     PairIssueError::Unauthorized(message)
                 } else {
                     PairIssueError::BadInput(message)
@@ -70,12 +76,29 @@ fn current_pair_issuer_authority(
             "caller principal {caller} is disabled"
         )));
     }
-    let issuer_scope = crate::kernel_router::resolve_device_scope(
-        &profile,
-        caller,
-        issuer_device_key_id,
-        "self:auth:pair",
-    )
+    let issuer_scope = if let Some(auth) = admitted {
+        let device = astrid_events::ipc::DeviceStamp {
+            fingerprint: auth
+                .device_key_id
+                .as_ref()
+                .map(astrid_core::profile::DeviceKeyId::as_str),
+            registration: auth.device_registration.map(Into::into),
+        };
+        crate::kernel_router::device_scope::resolve_stamp(
+            &profile,
+            caller,
+            device,
+            "self:auth:pair",
+        )
+        .map(|record| record.map(|record| record.scope.clone()))
+    } else {
+        crate::kernel_router::resolve_device_scope(
+            &profile,
+            caller,
+            issuer_device_key_id,
+            "self:auth:pair",
+        )
+    }
     .map_err(|error| PairIssueError::Unauthorized(error.to_string()))?;
     Ok((profile, kernel.groups.load_full(), issuer_scope))
 }
@@ -106,12 +129,8 @@ pub(super) async fn pair_device_issue(
     };
 
     let _guard = kernel.admin_write_lock.lock().await;
-    let (profile, groups, issuer_scope) = current_pair_issuer_authority(
-        kernel,
-        caller,
-        issuer_device_key_id,
-        authorization.is_some(),
-    )?;
+    let (profile, groups, issuer_scope) =
+        current_pair_issuer_authority(kernel, caller, authorization, issuer_device_key_id)?;
     let stored_scope = validate_pair_issue_authority(
         caller,
         &profile,
@@ -154,19 +173,19 @@ pub(super) async fn pair_device_issue(
         label: label.clone(),
         scope: stored_scope.clone(),
     };
-    match store.issue(&record).await {
-        Ok(true) => {},
-        Ok(false) => {
+    let token = match pair_issue_result::finish(&store.issue(&record).await, token) {
+        Inserted::Issued(value) => value,
+        Inserted::Collision => {
             return Err(PairIssueError::Internal(
                 "pair-token identifier collision".into(),
             ));
         },
-        Err(_) => {
+        Inserted::Unavailable => {
             return Err(PairIssueError::Internal(
                 "pair-token durable storage write failed".into(),
             ));
         },
-    }
+    };
 
     info!(
         token_fingerprint = %token_hash,
@@ -213,14 +232,6 @@ pub(super) fn pair_scope_requires_admin(scope: &PairScopeArg) -> bool {
         },
         PairScopeArg::Explicit { allow, .. } => allow.iter().any(|pattern| pattern == "*"),
     }
-}
-
-/// Pair-issuance failure class used to keep audit authorization and operation
-/// outcomes distinct without changing the public error wire shape.
-pub(super) enum PairIssueError {
-    BadInput(String),
-    Unauthorized(String),
-    Internal(String),
 }
 
 impl PairIssueError {
@@ -323,11 +334,7 @@ fn inherit_issuer_denies(child: DeviceScope, issuer_scope: Option<&DeviceScope>)
         return child;
     };
     let mut merged_deny = deny.clone();
-    for pattern in issuer_deny {
-        if !merged_deny.contains(pattern) {
-            merged_deny.push(pattern.clone());
-        }
-    }
+    deny_patterns::inherit(&mut merged_deny, issuer_deny);
     DeviceScope::Scoped {
         allow: allow.clone(),
         deny: merged_deny,
@@ -418,18 +425,20 @@ async fn pair_device_redeem_reserved(
     // + validated at issue time, with the issuer's denies already folded in),
     // so the paired device is attenuated to exactly that scope on every
     // transport — not hard-coded to Full.
-    if profile
-        .auth
-        .device_by_typed_pubkey(&normalised_key)
-        .is_none()
-    {
-        profile.auth.public_keys.push(DeviceKey::new(
-            normalised_key.as_str().to_string(),
-            chosen.scope.clone(),
-            chosen.label.clone(),
-            i64::try_from(now).unwrap_or(0),
-        ));
-    }
+    let registration_id =
+        if let Some(registered) = profile.auth.device_by_typed_pubkey(&normalised_key) {
+            registered.registration_id
+        } else {
+            let device = DeviceKey::new(
+                normalised_key.as_str().to_string(),
+                chosen.scope.clone(),
+                chosen.label.clone(),
+                i64::try_from(now).unwrap_or(0),
+            );
+            let registration_id = device.registration_id;
+            profile.add_device(device);
+            registration_id
+        };
     if !profile.auth.methods.contains(&AuthMethod::Keypair) {
         profile.auth.methods.push(AuthMethod::Keypair);
     }
@@ -497,6 +506,7 @@ async fn pair_device_redeem_reserved(
     Ok(AdminResponseBody::PairTokenRedeemed(PairTokenRedeemed {
         principal,
         public_key_fingerprint: fingerprint,
+        registration_id,
         key_id: key_id.into_inner(),
     }))
 }
@@ -553,57 +563,92 @@ pub(crate) async fn pair_device_revoke(
     principal: &PrincipalId,
     key_id: &str,
 ) -> AdminResponseBody {
+    #[cfg(unix)]
+    let confirm = confirm_profile_publication;
+    #[cfg(not(unix))]
+    let confirm = |_: &std::path::Path| Ok(());
+    revoke_with_publication_barrier(kernel, principal, key_id, confirm).await
+}
+
+// The replacement file has already been synced. Unix filesystems also
+// require the containing directory to be synced to commit the rename.
+#[cfg(unix)]
+fn confirm_profile_publication(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("profile has no parent"))?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(all(test, unix))]
+pub(super) async fn revoke_with_failed_directory_sync(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    key_id: &str,
+) -> AdminResponseBody {
+    revoke_with_publication_barrier(kernel, principal, key_id, |path| {
+        assert_eq!(path, kernel.astrid_home.profile_path(principal));
+        Err(std::io::Error::other("test directory sync failure"))
+    })
+    .await
+}
+
+async fn revoke_with_publication_barrier(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    key_id: &str,
+    confirm: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> AdminResponseBody {
     let key_id = match DeviceKeyId::new(key_id) {
         Ok(key_id) => key_id,
         Err(e) => return err_bad_input(e),
     };
     let _guard = kernel.admin_write_lock.lock().await;
     let profile_path = kernel.astrid_home.profile_path(principal);
-    if !profile_path.exists() {
-        return err_bad_input(format!(
-            "principal {principal} does not exist (no profile.toml)"
-        ));
-    }
-    let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
-        Ok(p) => p,
-        Err(e) => return err_internal(format!("profile load failed: {e}")),
+    let removed_key = match kernel
+        .profile_cache
+        .remove_paired_device(principal, &key_id)
+    {
+        Ok(DeviceRemoval::Removed(removed)) => removed,
+        Ok(DeviceRemoval::DeviceMissing) => {
+            return err_bad_input(format!(
+                "no paired device with key_id {key_id} on principal {principal}"
+            ));
+        },
+        Ok(DeviceRemoval::PrincipalMissing) => {
+            return err_bad_input(format!(
+                "principal {principal} does not exist (no profile.toml)"
+            ));
+        },
+        Err(error) => return err_internal(format!("profile update failed: {error}")),
     };
-
-    let before = profile.auth.public_keys.len();
-    profile
-        .auth
-        .public_keys
-        .retain(|k| k.key_id != key_id.as_str());
-    if profile.auth.public_keys.len() == before {
-        return err_bad_input(format!(
-            "no paired device with key_id {key_id} on principal {principal}"
+    let receipt = match kernel
+        .device_sessions
+        .retire_with_receipt(principal, &removed_key)
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return err_internal(format!(
+                "device removed but session retirement failed: {error}"
+            ));
+        },
+    };
+    if let Err(error) = confirm(&profile_path) {
+        return err_internal(format!(
+            "device removed from live profile but persistence is unconfirmed: {error}"
         ));
     }
-
-    // If that was the last keypair, drop the Keypair auth method so the
-    // profile's declared auth surface matches its registered keys (mirrors the
-    // add-side logic in redeem).
-    if profile.auth.public_keys.is_empty() {
-        profile.auth.methods.retain(|m| *m != AuthMethod::Keypair);
-    }
-
-    if let Err(e) = profile.validate() {
-        return err_internal(format!("profile rejected after device removal: {e}"));
-    }
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        return err_internal(format!("profile save failed: {e}"));
-    }
-    kernel.profile_cache.invalidate(principal);
 
     info!(
-        principal = %principal,
-        key_id = %key_id,
+        principal = receipt.principal(),
+        key_id = receipt.key_id(),
         security_event = true,
         "Layer 6 auth.pair.revoke"
     );
 
     AdminResponseBody::PairDeviceRevoked {
-        key_id: key_id.to_string(),
+        key_id: receipt.key_id().to_owned(),
     }
 }
 

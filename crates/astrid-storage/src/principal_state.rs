@@ -51,7 +51,9 @@ mod format_amendment_tests;
 mod format_identity_tests;
 #[cfg(test)]
 mod format_migration_tests;
+mod guest_authority;
 mod lifecycle;
+mod owner_codec;
 pub use lifecycle::{PendingRuntimeFinalization, RuntimeFinalization, RuntimeLifecycleGuard};
 #[cfg(test)]
 mod hosted_volume_tests;
@@ -257,35 +259,21 @@ pub struct StateOwnerCodecV2;
 impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
     fn encode(&self, owner: &StateOwner) -> Vec<u8> {
         match owner {
-            StateOwner::System => vec![0],
-            StateOwner::Principal(principal) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(1);
-                bytes.extend_from_slice(principal.as_bytes());
-                bytes
-            },
-            StateOwner::Fleet(fleet) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(2);
-                bytes.extend_from_slice(fleet.as_bytes());
-                bytes
-            },
+            StateOwner::System => owner_codec::Owner::System,
+            StateOwner::Principal(uid) => owner_codec::Owner::Principal(*uid.as_bytes()),
+            StateOwner::Fleet(uid) => owner_codec::Owner::Fleet(*uid.as_bytes()),
         }
+        .encode()
     }
 
     fn decode(&self, bytes: &[u8]) -> Option<StateOwner> {
-        match bytes.split_first()? {
-            (0, []) => Some(StateOwner::System),
-            (1, principal) if principal.len() == 32 => {
-                let uid = PrincipalUid::from_bytes(<[u8; 32]>::try_from(principal).ok()?);
-                Some(StateOwner::Principal(uid))
+        Some(match owner_codec::decode(bytes)? {
+            owner_codec::Owner::System => StateOwner::System,
+            owner_codec::Owner::Principal(uid) => {
+                StateOwner::Principal(PrincipalUid::from_bytes(uid))
             },
-            (2, fleet) if fleet.len() == 32 => {
-                let uid = FleetUid::from_bytes(<[u8; 32]>::try_from(fleet).ok()?);
-                Some(StateOwner::Fleet(uid))
-            },
-            _ => None,
-        }
+            owner_codec::Owner::Fleet(uid) => StateOwner::Fleet(FleetUid::from_bytes(uid)),
+        })
     }
 }
 
@@ -470,6 +458,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    principal_scratch_root: Arc<std::path::Path>,
     quota: Arc<dyn crate::KvQuotaResolver<StateOwner>>,
     volume_binding: std::sync::Weak<crate::volume::HostedFileVolume>,
     engine: Arc<RuntimeEngine>,
@@ -482,6 +471,14 @@ pub struct RuntimePrincipalStore {
 }
 
 impl RuntimePrincipalStore {
+    /// Native scratch directory for a durable principal in this opened runtime.
+    #[must_use]
+    pub fn principal_tmp_dir(&self, uid: PrincipalUid) -> std::path::PathBuf {
+        self.principal_scratch_root
+            .join(uid.to_string())
+            .join("tmp")
+    }
+
     /// Write the current live container bytes for a quiescent replay fixture.
     ///
     /// Uses the lock-owning handle without flushing, closing, or releasing
@@ -574,6 +571,44 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn kv(&self) -> Arc<dyn KvStore> {
         Arc::clone(&self.kv)
+    }
+
+    /// Open the existing guest namespace with its admitted owner pinned.
+    /// Reads and writes retain the original durable key encoding. The tree
+    /// adapter resolves each operation directly to this UID or rejects it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the alias no longer belongs to the admitted UID
+    /// or the capsule name cannot form an ordinary guest namespace.
+    pub fn principal_capsule_kv(
+        &self,
+        alias: &PrincipalId,
+        uid: PrincipalUid,
+        capsule: &str,
+    ) -> StorageResult<ScopedKvStore> {
+        if capsule.is_empty() || capsule.contains(':') {
+            return Err(StorageError::InvalidKey(
+                "invalid guest capsule namespace".into(),
+            ));
+        }
+        let namespace = format!("{alias}:capsule:{capsule}");
+        let expected_namespace = namespace.clone();
+        let principals = self.principals.clone();
+        let alias = alias.clone();
+        let resolve = move |requested: &str| {
+            let observed = principals.uid_for(&alias)?;
+            guest_authority::select(
+                expected_namespace.as_bytes(),
+                requested.as_bytes(),
+                *uid.as_bytes(),
+                *observed.as_bytes(),
+            )
+            .map(|owner| StateOwner::Principal(PrincipalUid::from_bytes(owner)))
+            .ok_or_else(|| StorageError::InvalidKey("guest KV owner or namespace changed".into()))
+        };
+        resolve(&namespace)?;
+        ScopedKvStore::new(Arc::new(self.runtime_kv.with_resolver(resolve)), namespace)
     }
 
     /// Return a host-only system-control projection over the authoritative

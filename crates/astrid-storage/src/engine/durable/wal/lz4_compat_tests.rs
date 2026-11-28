@@ -21,7 +21,7 @@ const LZ4_FLEX_0_12_STORED_BODY: [u8; 66] = [
 fn lz4_flex_zero_twelve_wal_bytes_decode_with_zero_fourteen() {
     let canonical = encode_object_frame(scheme(), object_id(1), &record(1, 4096)).unwrap();
     let limits = RecoveryLimits::process_addressable();
-    let decoded = decode_object_storage_body(
+    let (_, decoded) = decode_object_storage_body(
         &LZ4_FLEX_0_12_STORED_BODY,
         OBJECT_FLAG_LZ4,
         limits,
@@ -31,9 +31,14 @@ fn lz4_flex_zero_twelve_wal_bytes_decode_with_zero_fourteen() {
     assert_eq!(decoded.as_ref(), canonical.as_slice());
 
     let (flags, current) = encode_object_storage_body(&canonical).unwrap();
-    assert_eq!(flags, OBJECT_FLAG_LZ4);
-    let current_decoded =
-        decode_object_storage_body(current.as_ref(), flags, limits, WalOffset::new(0)).unwrap();
+    assert_eq!(flags.wire_flag(), OBJECT_FLAG_LZ4);
+    let (_, current_decoded) = decode_object_storage_body(
+        current.as_ref(),
+        flags.wire_flag(),
+        limits,
+        WalOffset::new(0),
+    )
+    .unwrap();
     assert_eq!(current_decoded.as_ref(), canonical.as_slice());
 
     let events = scan_events(compressed_transaction()).unwrap();
@@ -61,8 +66,7 @@ fn compressed_transaction() -> Vec<u8> {
         sequence,
         WalOrdinal::new(0),
         &begin_body,
-    )
-    .unwrap();
+    );
     let mut bytes = encode_physical_record(
         WalRecordKind::Begin,
         sequence,
@@ -78,8 +82,7 @@ fn compressed_transaction() -> Vec<u8> {
         sequence,
         WalOrdinal::new(1),
         stored,
-    )
-    .unwrap();
+    );
     logical_bytes = logical_bytes
         .checked_add(logical_record_length(stored).unwrap())
         .unwrap();
@@ -100,8 +103,7 @@ fn compressed_transaction() -> Vec<u8> {
         sequence,
         WalOrdinal::new(2),
         &root_body,
-    )
-    .unwrap();
+    );
     logical_bytes = logical_bytes
         .checked_add(logical_record_length(&root_body).unwrap())
         .unwrap();

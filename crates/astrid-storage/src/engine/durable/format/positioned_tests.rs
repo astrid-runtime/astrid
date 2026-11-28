@@ -314,6 +314,161 @@ fn malformed_frames_and_limits_fail_closed() {
 }
 
 #[test]
+fn coalesced_read_checks_overflow_only_after_confirming_adjacency() {
+    use crate::engine::durable::tests::TestIdentity;
+    let source = ObservedSource::new();
+    let id = ObjectId::new([0x51; 32]);
+    let first = ArenaLocation {
+        offset: 0,
+        payload_len: 0,
+        checksum: [0; 32],
+    };
+    let read = |offset| {
+        let later = ArenaLocation {
+            offset,
+            payload_len: u64::MAX,
+            ..first
+        };
+        visit_indexed_objects(
+            &source,
+            &[(id, later), (id, first)],
+            FRAME_HEADER_LEN,
+            &TestIdentity,
+            RecoveryLimits::process_addressable(),
+            |_, _, _, _| panic!("empty arena cannot deliver a record"),
+        )
+    };
+    assert!(matches!(
+        read(FRAME_HEADER_LEN),
+        Err(DurableError::EncodingOverflow)
+    ));
+    assert!(source.reads.borrow().is_empty());
+    assert!(read(FRAME_HEADER_LEN + 1).is_err());
+    assert_eq!(*source.reads.borrow(), vec![(0, FRAME_HEADER_LEN_USIZE)]);
+}
+
+#[test]
+fn coalesced_delivery_preserves_order_and_stops_at_the_first_failure() {
+    use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
+    use crate::storage_model::ObjectIdentity;
+
+    let mut source = ObservedSource::new();
+    let mut frames = Vec::new();
+    for byte in 0..3 {
+        let record = ObjectRecord::new(
+            ObjectKind::Chunk,
+            ObjectFormatVersion::V1,
+            vec![byte],
+            Vec::new(),
+            1,
+            ObjectClass::Data,
+        )
+        .unwrap();
+        let id = TestIdentity.identify(&record);
+        let payload = encode_object_frame(TEST_IDENTITY_SCHEME, id, &record).unwrap();
+        let location = append_frame(&mut source, ARENA_MAGIC, &payload).unwrap();
+        frames.push((id, location, record, payload));
+    }
+    let requests: Vec<_> = frames
+        .iter()
+        .rev()
+        .map(|(id, loc, _, _)| (*id, *loc))
+        .collect();
+    let visit = |rows: &[(ObjectId, ArenaLocation)], reject_at: Option<usize>, target| {
+        let mut seen = Vec::new();
+        let outcome = visit_indexed_objects(
+            &source,
+            rows,
+            target,
+            &TestIdentity,
+            RecoveryLimits::process_addressable(),
+            |id, loc, record, payload| {
+                seen.push((id, loc, record, payload.to_vec()));
+                if reject_at == Some(seen.len()) {
+                    return Err(DurableError::EncodingOverflow);
+                }
+                Ok(())
+            },
+        );
+        (outcome, seen)
+    };
+    let (outcome, seen) = visit(&requests, None, u64::MAX);
+    outcome.unwrap();
+    assert_eq!(seen, frames);
+    let duplicates = [requests[0], requests[2], requests[0], requests[1]];
+    source.reads.borrow_mut().clear();
+    let (outcome, seen) = visit(&duplicates, None, u64::MAX);
+    outcome.unwrap();
+    let mut expected = frames.clone();
+    expected.push(frames[2].clone());
+    assert_eq!(seen, expected);
+    let last = &frames[2];
+    let frame_len = FRAME_HEADER_LEN_USIZE.saturating_add(last.3.len());
+    let batch_len = frames
+        .iter()
+        .map(|(_, _, _, payload)| FRAME_HEADER_LEN_USIZE.saturating_add(payload.len()))
+        .sum();
+    assert_eq!(
+        *source.reads.borrow(),
+        vec![(frames[0].1.offset, batch_len), (last.1.offset, frame_len)]
+    );
+
+    let (outcome, seen) = visit(&requests, Some(2), u64::MAX);
+    assert!(matches!(outcome, Err(DurableError::EncodingOverflow)));
+    assert_eq!(seen, frames[..2]);
+    source.reads.borrow_mut().clear();
+    let (outcome, seen) = visit(&requests, Some(2), 0);
+    assert!(matches!(outcome, Err(DurableError::EncodingOverflow)));
+    assert_eq!(seen, frames[..2]);
+    let reads: Vec<_> = frames[..2]
+        .iter()
+        .map(|(_, loc, _, payload)| {
+            (
+                loc.offset,
+                FRAME_HEADER_LEN_USIZE.saturating_add(payload.len()),
+            )
+        })
+        .collect();
+    assert_eq!(*source.reads.borrow(), reads);
+    let mut wrong_identity = requests;
+    wrong_identity[1].0 = frames[0].0;
+    let (outcome, seen) = visit(&wrong_identity, None, u64::MAX);
+    assert!(outcome.is_err());
+    assert_eq!(seen, frames[..1]);
+}
+
+#[test]
+fn partial_coalesced_read_propagates_io_error_before_delivery() {
+    use crate::engine::durable::tests::TestIdentity;
+    let mut source = ObservedSource::new();
+    source.write_all(&[0; 7]).unwrap();
+    let row = (
+        ObjectId::new([0x51; 32]),
+        ArenaLocation {
+            offset: 0,
+            payload_len: 4,
+            checksum: [0; 32],
+        },
+    );
+    source.short_limit = 7;
+    source.unreadable = Some(7..8);
+    source.error_kind = io::ErrorKind::PermissionDenied;
+    let failure = visit_indexed_objects(
+        &source,
+        &[row],
+        u64::MAX,
+        &TestIdentity,
+        RecoveryLimits::process_addressable(),
+        |_, _, _, _| panic!("a partially filled span cannot deliver its first object"),
+    );
+    assert!(
+        matches!(failure, Err(DurableError::Io { source, .. }) if source.kind() == io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(source.reads.borrow().len(), 2);
+    assert_eq!(source.reads.borrow()[1].0, 7);
+}
+
+#[test]
 fn indexed_object_hashes_frame_once_and_still_checks_index_and_object_identity() {
     use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
     use crate::storage_model::ObjectIdentity;
@@ -434,5 +589,33 @@ fn indexed_tail_preserves_header_checksum_and_index_length_guards() {
     source.write_all(&[location.checksum[0] ^ 1]).unwrap();
     assert!(
         verify_indexed_tail(&mut source, location, RecoveryLimits::process_addressable()).is_err()
+    );
+}
+
+#[test]
+fn indexed_identity_read_stays_inside_the_declared_frame() {
+    use crate::engine::durable::tests::TEST_IDENTITY_SCHEME;
+
+    let id = ObjectId::new([7; 32]);
+    let mut identity = Vec::new();
+    encode_identity(&mut identity, TEST_IDENTITY_SCHEME, id);
+    let limits = RecoveryLimits::process_addressable();
+    let mut arena = ObservedSource::new();
+    let short = append_frame(&mut arena, ARENA_MAGIC, &identity[..identity.len() - 1]).unwrap();
+    let exact = append_frame(&mut arena, ARENA_MAGIC, &identity).unwrap();
+
+    assert!(matches!(
+        verify_indexed_location(&mut arena, id, short, TEST_IDENTITY_SCHEME, limits),
+        Err(DurableError::Corrupt { file: ARENA_FILE, offset, .. }) if offset == short.offset
+    ));
+    assert_eq!(
+        arena.stream_position().unwrap(),
+        short.offset + FRAME_HEADER_LEN
+    );
+
+    verify_indexed_location(&mut arena, id, exact, TEST_IDENTITY_SCHEME, limits).unwrap();
+    assert_eq!(
+        arena.stream_position().unwrap(),
+        exact.offset + FRAME_HEADER_LEN + exact.payload_len
     );
 }

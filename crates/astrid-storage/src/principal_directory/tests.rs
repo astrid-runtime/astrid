@@ -10,6 +10,36 @@ fn uid(byte: u8) -> PrincipalUid {
 }
 
 #[test]
+fn owned_publication_runs_under_the_binding_or_returns_its_candidate() {
+    let directory = PrincipalDirectory::default();
+    let original = alias("original");
+    let renamed = alias("renamed");
+    let owner = uid(1);
+    directory.register(original.clone(), owner).unwrap();
+    let candidate = Box::new(37);
+    let candidate = directory
+        .with_bound_input(&original, owner, candidate, |candidate| {
+            assert!(directory.inner.try_write().is_none());
+            candidate
+        })
+        .unwrap();
+    directory.rename(owner, &original, renamed.clone()).unwrap();
+    directory.register(original.clone(), uid(2)).unwrap();
+    let candidate = directory
+        .with_bound_input(&original, owner, candidate, |_| {
+            panic!("cannot publish an old owner's candidate into a reused alias")
+        })
+        .unwrap_err();
+    directory.inner.write().principals.remove(&owner);
+    let candidate = directory
+        .with_bound_input(&renamed, owner, candidate, |_| {
+            panic!("cannot publish through a one-way binding")
+        })
+        .unwrap_err();
+    assert_eq!(*candidate, 37);
+}
+
+#[test]
 fn live_binding_holds_read_authority_through_the_callback() {
     let directory = PrincipalDirectory::default();
     let owner = alias("alice");
@@ -177,4 +207,66 @@ fn batch_membership_yields_to_pending_writers_before_completing() {
     assert_eq!(reader.join().unwrap(), None);
     writer.join().unwrap();
     progressed.expect("a pending writer must progress before the batch finishes");
+}
+
+#[test]
+fn recovery_observes_one_directory_across_reservations() {
+    struct Observer<'a> {
+        directory: &'a PrincipalDirectory,
+        targets: Vec<PrincipalId>,
+        fail_on: Option<PrincipalId>,
+    }
+    impl crate::RetirementSink<PrincipalId> for Observer<'_> {
+        type Error = &'static str;
+
+        fn restore(&mut self, alias: PrincipalId) -> Result<(), Self::Error> {
+            assert!(self.directory.inner.try_write().is_none());
+            self.targets.push(alias);
+            if self.targets.last() == self.fail_on.as_ref() {
+                Err("recovery stopped")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let directory = PrincipalDirectory::default();
+    let first = uid(1);
+    let second = uid(2);
+    directory.register(alias("first"), first).unwrap();
+    directory.register(alias("second"), second).unwrap();
+    let mut stored = serde_json::to_value(crate::OwnershipSnapshot::default()).unwrap();
+    stored["principal_deletions"] =
+        serde_json::json!({ first.to_string(): { "alias": "retained" }, second.to_string(): {} });
+    let ownership = serde_json::from_value(stored).unwrap();
+
+    let mut observer = Observer {
+        directory: &directory,
+        targets: Vec::new(),
+        fail_on: Some(alias("retained")),
+    };
+    assert_eq!(
+        directory.replay_retirements(&ownership, &mut observer),
+        Err("recovery stopped")
+    );
+    assert_eq!(observer.targets, [alias("retained")]);
+    assert!(directory.inner.try_write().is_some());
+    observer.fail_on = Some(alias("first"));
+    observer.targets.clear();
+    assert_eq!(
+        directory.replay_retirements(&ownership, &mut observer),
+        Err("recovery stopped")
+    );
+    assert_eq!(observer.targets, [alias("retained"), alias("first")]);
+    assert!(directory.inner.try_write().is_some());
+    observer.fail_on = None;
+    observer.targets.clear();
+    directory
+        .replay_retirements(&ownership, &mut observer)
+        .unwrap();
+    assert_eq!(
+        observer.targets,
+        [alias("retained"), alias("first"), alias("second")]
+    );
+    assert!(directory.inner.try_write().is_some());
 }

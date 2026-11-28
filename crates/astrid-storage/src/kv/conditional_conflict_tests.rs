@@ -50,6 +50,15 @@ impl KvProjectionEngine<String> for PausingEngine {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_conflict_rechecks_delete_predicate_after_replacement() {
+    check_conflicting_update(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_conflict_rechecks_swap_predicate_after_replacement() {
+    check_conflicting_update(true).await;
+}
+
+async fn check_conflicting_update(swap: bool) {
     let engine = Arc::new(PausingEngine {
         inner: InMemoryEngine::new(TestIdentity),
         pause: std::sync::Mutex::new(None),
@@ -62,12 +71,18 @@ async fn root_conflict_rechecks_delete_predicate_after_replacement() {
     store.set(namespace, "key", b"old".to_vec()).await.unwrap();
     let (sender, receiver) = mpsc::channel();
     *engine.pause.lock().unwrap() = Some(sender);
-    let deleting_store = store.clone();
-    let deletion = tokio::spawn(async move {
-        deleting_store
-            .compare_and_delete(namespace, "key", b"old".to_vec())
-            .await
-            .unwrap()
+    let contender = store.clone();
+    let pending = tokio::spawn(async move {
+        if swap {
+            contender
+                .compare_and_swap(namespace, "key", Some(b"old"), b"candidate".to_vec())
+                .await
+        } else {
+            contender
+                .compare_and_delete(namespace, "key", b"old".to_vec())
+                .await
+        }
+        .unwrap()
     });
     tokio::task::spawn_blocking(move || {
         receiver
@@ -81,7 +96,7 @@ async fn root_conflict_rechecks_delete_predicate_after_replacement() {
     let replacement = writer.set(namespace, "key", b"replacement".to_vec()).await;
     engine.resume.wait();
     replacement.unwrap();
-    assert!(!deletion.await.unwrap());
+    assert!(!pending.await.unwrap());
     assert_eq!(
         store.get(namespace, "key").await.unwrap(),
         Some(b"replacement".to_vec())

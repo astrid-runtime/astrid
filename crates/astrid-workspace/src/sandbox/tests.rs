@@ -4,44 +4,22 @@
 use super::*;
 use std::path::PathBuf;
 
-/// Validates that a path is safe for interpolation into an SBPL profile string.
-fn validate_sandbox_path(path: &Path) -> io::Result<()> {
-    let s = path.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("sandbox path is not valid UTF-8: {}", path.display()),
-        )
-    })?;
-    if s.contains(['"', '\\', '\0']) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "sandbox path contains forbidden characters (double-quote, backslash, or null): {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-// --- validate_sandbox_path tests ---
-
 #[test]
 fn validate_sandbox_path_accepts_normal_path() {
     let path = PathBuf::from("/Users/agent/workspace/project");
-    assert!(validate_sandbox_path(&path).is_ok());
+    assert!(validate_sandbox_str(&path, "path").is_ok());
 }
 
 #[test]
 fn validate_sandbox_path_accepts_path_with_spaces() {
     let path = PathBuf::from("/Users/agent/my project/src");
-    assert!(validate_sandbox_path(&path).is_ok());
+    assert!(validate_sandbox_str(&path, "path").is_ok());
 }
 
 #[test]
 fn validate_sandbox_path_rejects_double_quote() {
     let path = PathBuf::from("/Users/agent/work\"inject");
-    let err = validate_sandbox_path(&path).unwrap_err();
+    let err = validate_sandbox_str(&path, "path").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(
         err.to_string().contains("forbidden characters"),
@@ -53,7 +31,7 @@ fn validate_sandbox_path_rejects_double_quote() {
 fn validate_sandbox_path_rejects_sbpl_injection_payload() {
     // Simulates an actual SBPL escape attempt.
     let path = PathBuf::from(r#"/tmp/evil") (allow file-write* (subpath "/"))"#);
-    let err = validate_sandbox_path(&path).unwrap_err();
+    let err = validate_sandbox_str(&path, "path").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(
         err.to_string().contains("forbidden characters"),
@@ -64,7 +42,7 @@ fn validate_sandbox_path_rejects_sbpl_injection_payload() {
 #[test]
 fn validate_sandbox_path_rejects_backslash() {
     let path = PathBuf::from("/tmp/work\\nspace");
-    let err = validate_sandbox_path(&path).unwrap_err();
+    let err = validate_sandbox_str(&path, "path").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(
         err.to_string().contains("forbidden characters"),
@@ -75,7 +53,7 @@ fn validate_sandbox_path_rejects_backslash() {
 #[test]
 fn validate_sandbox_path_rejects_null_byte() {
     let path = PathBuf::from("/tmp/work\0space");
-    let err = validate_sandbox_path(&path).unwrap_err();
+    let err = validate_sandbox_str(&path, "path").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(
         err.to_string().contains("forbidden characters"),
@@ -503,6 +481,15 @@ fn config_default_policy_is_required_when_env_unset() {
         "fresh config with unset env must default to Required — \
              silent unsandboxed launches are the bug from #655"
     );
+}
+
+#[test]
+fn invalid_paths_are_rejected_before_either_policy_can_construct_a_command() {
+    for policy in [SandboxPolicy::Required, SandboxPolicy::Off] {
+        let config = ProcessSandboxConfig::new("relative-path").with_policy(policy);
+        let error = config.sandbox_prefix().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 }
 
 #[test]

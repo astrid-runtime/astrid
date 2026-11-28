@@ -260,6 +260,19 @@ pub(super) fn scheme() -> IdentityScheme {
     IdentityScheme::new(1, 1).unwrap()
 }
 
+impl<S: WalSink> WalWriter<S, TestIdentity, TestCodec, String> {
+    fn append_root(
+        &mut self,
+        principal: &String,
+        expected: Option<RootState>,
+        replacement: RootState,
+    ) -> Result<(), WalError> {
+        let journal =
+            encode_root_record(scheme(), principal.as_bytes(), expected, replacement).unwrap();
+        self.append_prepared_root(principal, expected, replacement, &journal)
+    }
+}
+
 fn new_writer<S: WalSink>(
     sink: S,
     limits: RecoveryLimits,
@@ -340,8 +353,7 @@ fn raw_transaction(
         sequence,
         WalOrdinal::new(0),
         &begin_body,
-    )
-    .unwrap();
+    );
     let mut bytes = super::codec::encode_physical_record(
         WalRecordKind::Begin,
         sequence,
@@ -359,8 +371,7 @@ fn raw_transaction(
             sequence,
             ordinal,
             &object_body,
-        )
-        .unwrap();
+        );
         logical_count = logical_count.checked_inc().unwrap();
         logical_bytes = logical_bytes
             .checked_add(super::codec::logical_record_length(&object_body).unwrap())
@@ -385,8 +396,7 @@ fn raw_transaction(
             sequence,
             ordinal,
             &root_body,
-        )
-        .unwrap();
+        );
         logical_count = logical_count.checked_inc().unwrap();
         logical_bytes = logical_bytes
             .checked_add(super::codec::logical_record_length(&root_body).unwrap())
@@ -602,8 +612,7 @@ fn compressed_object_flag_changes_transaction_digest() {
         sequence(1),
         WalOrdinal::new(1),
         body,
-    )
-    .unwrap();
+    );
     let mut compressed = super::codec::new_digest();
     super::codec::digest_record_with_flags(
         &mut compressed,
@@ -612,8 +621,7 @@ fn compressed_object_flag_changes_transaction_digest() {
         sequence(1),
         WalOrdinal::new(1),
         body,
-    )
-    .unwrap();
+    );
     assert_ne!(
         super::codec::finish_digest(&legacy),
         super::codec::finish_digest(&compressed),
@@ -625,7 +633,7 @@ fn compressed_object_flag_changes_transaction_digest() {
 fn incompressible_object_falls_back_to_flags_zero() {
     let canonical = *blake3::hash(b"bounded incompressible WAL body").as_bytes();
     let (flags, stored) = super::codec::encode_object_storage_body(&canonical).unwrap();
-    assert_eq!(flags, 0);
+    assert_eq!(flags.wire_flag(), 0);
     assert_eq!(stored.as_ref(), canonical);
 }
 
@@ -633,14 +641,14 @@ fn incompressible_object_falls_back_to_flags_zero() {
 fn compressed_object_rejects_corruption_and_oversized_declaration() {
     let canonical = encode_object_frame(scheme(), object_id(1), &record(1, 4096)).unwrap();
     let (flags, stored) = super::codec::encode_object_storage_body(&canonical).unwrap();
-    assert_eq!(flags, super::codec::OBJECT_FLAG_LZ4);
+    assert_eq!(flags.wire_flag(), super::codec::OBJECT_FLAG_LZ4);
 
     let mut corrupt = stored.into_owned();
     corrupt[..8].copy_from_slice(&(u64::try_from(canonical.len()).unwrap() - 1).to_le_bytes());
     assert!(matches!(
         super::codec::decode_object_storage_body(
             &corrupt,
-            flags,
+            flags.wire_flag(),
             RecoveryLimits::process_addressable(),
             WalOffset::new(0),
         ),
@@ -651,7 +659,12 @@ fn compressed_object_rejects_corruption_and_oversized_declaration() {
     let mut oversized = vec![0_u8; 9];
     oversized[..8].copy_from_slice(&129_u64.to_le_bytes());
     assert!(matches!(
-        super::codec::decode_object_storage_body(&oversized, flags, limits, WalOffset::new(0),),
+        super::codec::decode_object_storage_body(
+            &oversized,
+            flags.wire_flag(),
+            limits,
+            WalOffset::new(0),
+        ),
         Err(WalError::FrameTooLarge { .. })
     ));
 }
@@ -901,22 +914,6 @@ fn tx1_complete_tx2_torn_preserves_tx1_commit_descriptor() {
             .iter()
             .any(|event| matches!(event, WalEvent::Tail(_)))
     );
-}
-
-#[test]
-fn semantic_commit_count_and_digest_mismatch_is_fatal() {
-    let mut bytes = raw_transaction(1, Some(object_id(1)), b"alice", true);
-    mutate_record(&mut bytes, 3, |payload| payload[RECORD_HEADER_LEN + 8] ^= 1);
-    assert!(matches!(
-        scan_events(bytes),
-        Err(WalError::CommitCountMismatch { .. })
-    ));
-
-    let mut bytes = raw_transaction(1, Some(object_id(1)), b"alice", true);
-    mutate_record(&mut bytes, 3, |payload| {
-        payload[RECORD_HEADER_LEN + 40] ^= 1;
-    });
-    assert!(matches!(scan_events(bytes), Err(WalError::DigestMismatch)));
 }
 
 #[test]
@@ -1190,10 +1187,36 @@ fn writer_is_poisoned_after_partial_write_or_sync_failure() {
         .unwrap();
     writer.finish_commit().unwrap();
     assert!(matches!(writer.publish(), Err(WalError::Io { .. })));
+    assert_eq!(writer.pending_publications(), 1);
     assert!(matches!(
         writer.publish(),
         Err(WalError::InvalidTransaction(_))
     ));
+}
+
+#[test]
+fn checkpoint_sync_failure_prevents_writer_reuse() {
+    let sink = CountingSink {
+        fail_sync: true,
+        ..CountingSink::default()
+    };
+    let mut writer = new_writer(sink, RecoveryLimits::process_addressable());
+    assert!(matches!(
+        writer.checkpoint(),
+        Err(WalError::Io {
+            operation: "sync ASTWAL2 checkpoint",
+            ..
+        })
+    ));
+    assert!(matches!(
+        writer.begin(sequence(1), None),
+        Err(WalError::InvalidTransaction(_))
+    ));
+    assert!(matches!(
+        writer.checkpoint(),
+        Err(WalError::InvalidTransaction(_))
+    ));
+    assert_eq!(writer.into_inner().syncs, 1);
 }
 
 #[test]
@@ -1249,3 +1272,5 @@ fn checked_newtypes_reject_zero_and_overflow() {
         u64::try_from(usize::MAX).unwrap()
     );
 }
+
+mod root_recovery;

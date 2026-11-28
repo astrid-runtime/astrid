@@ -6,6 +6,8 @@
 //! canonical [`PrincipalGenesis`] record and never changes when an alias or
 //! active authentication key changes.
 
+mod text;
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -42,10 +44,8 @@ impl PrincipalUid {
 
 impl fmt::Display for PrincipalUid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        let bytes = text::encode(&self.0);
+        formatter.write_str(std::str::from_utf8(&bytes).map_err(|_| fmt::Error)?)
     }
 }
 
@@ -62,17 +62,9 @@ impl FromStr for PrincipalUid {
     type Err = PrincipalIdentityError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            return Err(PrincipalIdentityError::InvalidUidText);
-        }
-        let decoded = hex::decode(value).map_err(|_| PrincipalIdentityError::InvalidUidText)?;
-        let bytes =
-            <[u8; 32]>::try_from(decoded).map_err(|_| PrincipalIdentityError::InvalidUidText)?;
-        Ok(Self(bytes))
+        text::decode(value.as_bytes())
+            .map(Self)
+            .ok_or(PrincipalIdentityError::InvalidUidText)
     }
 }
 

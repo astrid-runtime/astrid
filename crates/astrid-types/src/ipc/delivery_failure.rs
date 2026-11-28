@@ -46,6 +46,7 @@ pub struct DeliveryFailureBinding {
     principal: String,
     owner: Option<RequestOwnerId>,
     device_key_id: Option<String>,
+    registration: Option<Uuid>,
     delivery_id: DeliveryId,
 }
 
@@ -63,6 +64,7 @@ impl DeliveryFailureBinding {
             principal: request.principal.clone()?,
             owner: request.request_owner,
             device_key_id: request.device_key_id.clone(),
+            registration: request.device_registration_id,
             delivery_id: request.delivery_id?,
         })
     }
@@ -82,6 +84,7 @@ impl DeliveryFailureBinding {
         reply.principal = Some(self.principal.clone());
         reply.request_owner = self.owner;
         reply.device_key_id.clone_from(&self.device_key_id);
+        reply.device_registration_id = self.registration;
         reply
     }
 }

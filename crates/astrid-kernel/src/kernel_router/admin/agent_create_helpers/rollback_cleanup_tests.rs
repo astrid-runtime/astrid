@@ -126,45 +126,10 @@ async fn assignment_error_rolls_back_identity_when_uid_is_unowned() {
 async fn changed_assignment_cannot_retire_the_new_owner() {
     let (_dir, kernel, creator, _) = kernel_with_identity("rollback-creator").await;
     let child = PrincipalId::new("transferred-initialization").unwrap();
-    let child_user = kernel
-        .identity_store
-        .create_principal(child.clone(), [0x12; 32])
-        .await
-        .unwrap();
-    kernel
-        .identity_store
-        .link(
-            AGENT_IDENTITY_PLATFORM,
-            child.as_str(),
-            child_user.id,
-            "system",
-        )
-        .await
-        .unwrap();
-    let profile = PrincipalProfile::path_for(&kernel.astrid_home, &child);
-    PrincipalProfile::default().save_to_path(&profile).unwrap();
     let (human, fleets) = rollback_fleets(&kernel.ownership_store).await;
-    let creator_uid = kernel.principal_directory.uid_for(&creator).unwrap();
+    let receipt = initialize_rollback_child(&kernel, &creator, &child, &human, &fleets[0]).await;
     let child_uid = kernel.principal_directory.uid_for(&child).unwrap();
-    kernel
-        .ownership_store
-        .assign_principal(PrincipalOwnership {
-            principal_uid: creator_uid,
-            fleet_uid: fleets[0].uid,
-            assigned_by: human.uid,
-        })
-        .await
-        .unwrap();
-    let captured = kernel
-        .ownership_store
-        .capture_derived_ownership(creator_uid)
-        .await
-        .unwrap();
-    let receipt = kernel
-        .ownership_store
-        .assign_derived_principal_for_initialization(child_uid, &captured)
-        .await
-        .unwrap();
+    let profile = PrincipalProfile::path_for(&kernel.astrid_home, &child);
     kernel
         .ownership_store
         .transfer_principal(child_uid, fleets[0].uid, fleets[1].uid, human.uid)
@@ -207,6 +172,53 @@ async fn changed_assignment_cannot_retire_the_new_owner() {
     );
 }
 
+async fn initialize_rollback_child(
+    kernel: &crate::Kernel,
+    creator: &PrincipalId,
+    child: &PrincipalId,
+    human: &UserIdentity,
+    fleet: &FleetIdentity,
+) -> astrid_storage::ownership::PrincipalInitialization {
+    let child_user = kernel
+        .identity_store
+        .create_principal(child.clone(), [0x12; 32])
+        .await
+        .unwrap();
+    kernel
+        .identity_store
+        .link(
+            AGENT_IDENTITY_PLATFORM,
+            child.as_str(),
+            child_user.id,
+            "system",
+        )
+        .await
+        .unwrap();
+    let profile = PrincipalProfile::path_for(&kernel.astrid_home, child);
+    PrincipalProfile::default().save_to_path(&profile).unwrap();
+    let creator_uid = kernel.principal_directory.uid_for(creator).unwrap();
+    let child_uid = kernel.principal_directory.uid_for(child).unwrap();
+    kernel
+        .ownership_store
+        .assign_principal(PrincipalOwnership {
+            principal_uid: creator_uid,
+            fleet_uid: fleet.uid,
+            assigned_by: human.uid,
+        })
+        .await
+        .unwrap();
+    let captured = kernel
+        .ownership_store
+        .capture_derived_ownership(creator_uid)
+        .await
+        .unwrap();
+    kernel
+        .ownership_store
+        .assign_derived_principal_for_initialization(child_uid, &captured)
+        .await
+        .unwrap()
+}
+
 async fn rollback_fleets(
     store: &astrid_storage::ownership::OwnershipStore,
 ) -> (UserIdentity, Vec<FleetIdentity>) {
@@ -241,6 +253,7 @@ async fn rollback_fence_waits_for_an_admitted_capsule_constructor() {
     let mut fence = Box::pin(super::rollback::fence_failed_initialization(
         &kernel,
         &principal,
+        kernel.principal_directory.uid_for(&principal).ok(),
         Vec::new(),
     ));
     let mut context = Context::from_waker(Waker::noop());
@@ -250,4 +263,70 @@ async fn rollback_fence_waits_for_an_admitted_capsule_constructor() {
     drop(constructor);
     fence.await.unwrap();
     assert!(kernel.capabilities.is_principal_retiring(&principal).await);
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_closes_only_mounts_from_the_captured_generation() {
+    use super::super::test_support::mounts::{PreparedIssue, issue};
+
+    let (dir, kernel, creator, _) = kernel_with_identity("mount-rollback-creator").await;
+    let alias = PrincipalId::new("mount-rollback-child").unwrap();
+    let (human, fleets) = rollback_fleets(&kernel.ownership_store).await;
+    let initialization =
+        initialize_rollback_child(&kernel, &creator, &alias, &human, &fleets[0]).await;
+    let captured = kernel.principal_directory.uid_for(&alias).unwrap();
+    let mountpoint = dir.path().join("mount");
+    let old = issue(&kernel, &alias, &mountpoint).await.unwrap();
+    let late = PreparedIssue::begin(&kernel, &alias, &mountpoint).await;
+    let constructor = kernel.capsule_load_lock.lock().await;
+    let rollback = {
+        let kernel = std::sync::Arc::clone(&kernel);
+        let alias = alias.clone();
+        tokio::spawn(async move {
+            super::rollback::rollback_failed_initialization(
+                &kernel,
+                &alias,
+                &initialization,
+                super::super::handlers::err_internal("injected initialization failure".into()),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !kernel
+            .ownership_store
+            .load()
+            .await
+            .unwrap()
+            .principal_is_retiring(captured)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rollback must reserve the captured generation before waiting on constructors");
+    kernel
+        .principal_directory
+        .rename(captured, &alias, PrincipalId::new("previous").unwrap())
+        .unwrap();
+    let replacement = astrid_core::PrincipalUid::from_bytes([0x91; 32]);
+    kernel
+        .principal_directory
+        .register(alias.clone(), replacement)
+        .unwrap();
+    let current = issue(&kernel, &alias, &mountpoint).await.unwrap();
+
+    drop(constructor);
+    let response = rollback.await.unwrap();
+    assert!(
+        matches!(&response, astrid_events::kernel_api::AdminResponseBody::Error(message) if message == "injected initialization failure"),
+        "{response:?}"
+    );
+    late.assert_retired().await;
+    assert!(!kernel.storage_mounts.contains_key(&old.mount_id));
+    assert!(kernel.storage_mounts.contains_key(&current.mount_id));
+    crate::storage_mount::revoke_lease(&kernel, &alias, true, current.mount_id)
+        .await
+        .unwrap();
 }

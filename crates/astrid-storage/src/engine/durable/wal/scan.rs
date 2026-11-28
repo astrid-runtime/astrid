@@ -5,15 +5,16 @@ use super::super::{PersistentObjectIdentity, PrincipalCodec};
 
 use super::codec::{
     PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, decode_begin_body,
-    decode_commit_body, decode_object_body, decode_object_storage_body, decode_physical_header,
-    decode_record_header, decode_root_body, digest_record, digest_record_with_flags,
-    logical_record_length, new_digest, record_body, validate_logical_body, validate_record_version,
+    decode_object_body, decode_object_storage_body, decode_physical_header, decode_record,
+    decode_root_body, new_digest, update_digest, validate_logical_body, validate_record_version,
     wal_physical_limit,
 };
+use super::measured_record::{DataKind, Measured};
+use super::physical_wire::{Extent, extent};
 use super::types::{
-    WalBeginDescriptor, WalCommitDescriptor, WalCount, WalError, WalEvent, WalLength, WalLimits,
-    WalObjectDescriptor, WalOffset, WalOrdinal, WalRecordKind, WalResumeState, WalRootDescriptor,
-    WalScanTail, WalSequence, WalTailKind, WalTransactionDescriptor,
+    WalBeginDescriptor, WalError, WalEvent, WalLength, WalLimits, WalObjectDescriptor, WalOffset,
+    WalOrdinal, WalRecordKind, WalResumeState, WalRootDescriptor, WalScanTail, WalSequence,
+    WalTailKind, WalTransactionDescriptor,
 };
 
 /// A scanner-finished stream paired with the exact validated append state.
@@ -67,15 +68,10 @@ struct ActiveScan {
     begin_offset: WalOffset,
     sequence: WalSequence,
     scheme: super::super::IdentityScheme,
-    next_ordinal: WalOrdinal,
-    object_count: WalCount,
-    root_count: WalCount,
-    logical_count: WalCount,
-    logical_bytes: WalLength,
+    counts: super::commit_wire::Counts,
     digest: blake3::Hasher,
     previous_object: Option<crate::storage_model::ObjectId>,
     previous_principal: Option<Vec<u8>>,
-    saw_root: bool,
 }
 
 impl<R, I, C, P> WalScanner<R, I, C, P>
@@ -137,7 +133,11 @@ where
         }
         let record_offset = WalOffset::new(self.offset);
         let mut header = [0_u8; PHYSICAL_HEADER_LEN];
-        let header_bytes = read_prefix(&mut self.reader, &mut header)?;
+        let mut input = FrameInput {
+            reader: &mut self.reader,
+            purpose: ReadPurpose::Header,
+        };
+        let header_bytes = super::read_buffer::fill(&mut input, &mut header)?;
         if header_bytes == 0 {
             return Ok(self.tail_or_end(record_offset, WalTailKind::Incomplete, false));
         }
@@ -147,63 +147,75 @@ where
         let Ok(physical) = decode_physical_header(&header, record_offset) else {
             return self.bad_physical(record_offset);
         };
-        let payload_len = physical.payload_len;
+        let payload_len = physical.payload_len();
         let limit = wal_physical_limit(self.limits).length();
-        let payload_start = self
-            .offset
-            .checked_add(
-                u64::try_from(PHYSICAL_HEADER_LEN)
-                    .map_err(|_| WalError::Encoding("WAL physical header length overflow"))?,
-            )
+        let payload_start = super::physical_wire::payload_start(record_offset.get())
             .ok_or(WalError::LengthOverflow { value: payload_len })?;
-        let file_len = stream_len_at(&mut self.reader, payload_start)?;
-        let payload_end = payload_start
-            .checked_add(payload_len.get())
-            .ok_or(WalError::LengthOverflow { value: payload_len })?;
-        if payload_end > file_len {
-            if has_valid_physical_after(
-                &mut self.reader,
-                record_offset.get().saturating_add(1),
-                self.limits,
-            )? {
-                return Err(WalError::InteriorCorruption {
+        let file_len = stream_len_at(&mut input, payload_start)?;
+        let payload_end = match extent(
+            payload_start,
+            physical.payload_len().get(),
+            file_len,
+            limit.get(),
+        ) {
+            Extent::Complete(end) => end,
+            Extent::Overflow => return Err(WalError::LengthOverflow { value: payload_len }),
+            Extent::Incomplete => {
+                if has_valid_physical_after(
+                    &mut self.reader,
+                    record_offset.get().saturating_add(1),
+                    self.limits,
+                )? {
+                    return Err(WalError::InteriorCorruption {
+                        offset: record_offset,
+                        detail: "incomplete WAL record before a later record",
+                    });
+                }
+                return Ok(self.tail_or_end(record_offset, WalTailKind::Incomplete, true));
+            },
+            Extent::Oversized => {
+                if has_valid_physical_after(
+                    &mut self.reader,
+                    record_offset.get().saturating_add(1),
+                    self.limits,
+                )? {
+                    return Err(WalError::InteriorCorruption {
+                        offset: record_offset,
+                        detail: "oversized WAL record before a later record",
+                    });
+                }
+                return Err(WalError::FrameTooLarge {
                     offset: record_offset,
-                    detail: "incomplete WAL record before a later record",
+                    declared: payload_len,
+                    limit,
                 });
-            }
-            return Ok(self.tail_or_end(record_offset, WalTailKind::Incomplete, true));
-        }
-        if payload_len > limit {
-            if has_valid_physical_after(
-                &mut self.reader,
-                record_offset.get().saturating_add(1),
-                self.limits,
-            )? {
-                return Err(WalError::InteriorCorruption {
-                    offset: record_offset,
-                    detail: "oversized WAL record before a later record",
-                });
-            }
-            return Err(WalError::FrameTooLarge {
-                offset: record_offset,
-                declared: payload_len,
-                limit,
-            });
-        }
+            },
+        };
         let payload_size = payload_len.as_usize()?;
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(payload_size)
             .map_err(|_| WalError::Encoding("WAL record allocation failed"))?;
         payload.resize(payload_size, 0);
-        read_exact_payload(&mut self.reader, &mut payload, record_offset)?;
+        input.purpose = ReadPurpose::Payload;
+        let integrity = super::read_buffer::read_payload(
+            &mut input,
+            &mut payload,
+            physical,
+            super::super::format::frame_checksum,
+        )?;
+        if matches!(integrity, super::read_buffer::Payload::Short) {
+            return Err(WalError::Corrupt {
+                offset: record_offset,
+                detail: "WAL payload ended unexpectedly",
+            });
+        }
         self.offset = payload_end;
-        if !checksum_valid(physical, &payload) {
+        if matches!(integrity, super::read_buffer::Payload::BadChecksum) {
             return self.bad_physical(record_offset);
         }
-        let record = decode_record_header(&payload, record_offset)?;
+        let (record, body) = decode_record(&payload, record_offset)?;
         validate_record_version(physical, record, record_offset)?;
-        let body = record_body(&payload, record_offset)?;
         validate_logical_body(body, self.limits, record_offset)?;
         self.consume_record(record_offset, payload_end, record, body)
     }
@@ -245,18 +257,23 @@ where
         let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
             "WAL active transaction disappeared",
         ))?;
-        if record.sequence != active.sequence {
-            return Err(WalError::SequenceMismatch {
+        let body = super::record_wire::body_at_position(
+            body,
+            record.sequence.get(),
+            record.ordinal.get(),
+            active.sequence.get(),
+            active.counts.logical,
+        )
+        .map_err(|error| match error {
+            super::record_wire::PositionError::Sequence => WalError::SequenceMismatch {
                 expected: active.sequence,
                 found: record.sequence,
-            });
-        }
-        if record.ordinal != active.next_ordinal {
-            return Err(WalError::OrdinalMismatch {
-                expected: active.next_ordinal,
+            },
+            super::record_wire::PositionError::Ordinal => WalError::OrdinalMismatch {
+                expected: WalOrdinal::new(active.counts.logical),
                 found: record.ordinal,
-            });
-        }
+            },
+        })?;
         match record.kind {
             WalRecordKind::Begin => Err(WalError::Corrupt {
                 offset,
@@ -300,28 +317,20 @@ where
         if self.identity.scheme() != scheme {
             return Err(WalError::IdentitySchemeMismatch);
         }
-        let logical_bytes = logical_record_length(body)?;
+        let measured =
+            Measured::begin(record.sequence.get(), body).map_err(|_| WalError::CountOverflow {
+                field: "logical bytes",
+            })?;
         let mut digest = new_digest();
-        digest_record(
-            &mut digest,
-            WalRecordKind::Begin,
-            record.sequence,
-            record.ordinal,
-            body,
-        )?;
+        let (counts, ()) = measured.observe(update_digest(&mut digest));
         self.active = Some(ActiveScan {
             begin_offset: offset,
             sequence: record.sequence,
             scheme,
-            next_ordinal: WalOrdinal::new(1),
-            object_count: WalCount::new(0),
-            root_count: WalCount::new(0),
-            logical_count: WalCount::new(1),
-            logical_bytes,
+            counts,
             digest,
             previous_object: None,
             previous_principal: None,
-            saw_root: false,
         });
         Ok(Some(WalEvent::Begin(WalBeginDescriptor {
             offset,
@@ -338,61 +347,28 @@ where
         flags: u8,
         body: &[u8],
     ) -> Result<Option<WalEvent>, WalError> {
-        let (scheme, previous, count, logical, saw_root) = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL object has no active transaction",
-            ))?;
-            (
-                active.scheme,
-                active.previous_object,
-                active.object_count,
-                active.logical_bytes,
-                active.saw_root,
-            )
-        };
-        if saw_root {
-            return Err(WalError::OrderingViolation);
-        }
-        let canonical = decode_object_storage_body(body, flags, self.limits, offset)?;
-        let (id, body_length) = decode_object_body(&canonical, scheme, &self.identity, offset)?;
-        if previous.is_some_and(|previous| previous >= id) {
-            return Err(WalError::OrderingViolation);
-        }
-        let next_count = count
-            .checked_inc()
-            .ok_or(WalError::CountOverflow { field: "objects" })?;
-        let logical_record = logical_record_length(body)?;
-        let next_logical = logical
-            .checked_add(logical_record)
-            .ok_or(WalError::CountOverflow {
-                field: "logical bytes",
-            })?;
         let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
-            "WAL object transaction disappeared",
+            "WAL object has no active transaction",
         ))?;
-        let ordinal = active.next_ordinal;
-        let next_ordinal = ordinal
-            .checked_next()
-            .ok_or(WalError::CountOverflow { field: "ordinals" })?;
-        active.object_count = next_count;
-        active.logical_bytes = next_logical;
-        active.next_ordinal = next_ordinal;
+        let scheme = active.scheme;
+        let previous = active.previous_object;
+        if active.counts.roots != 0 {
+            return Err(WalError::OrderingViolation);
+        }
+        let (encoding, canonical) = decode_object_storage_body(body, flags, self.limits, offset)?;
+        let (id, body_length) = decode_object_body(&canonical, scheme, &self.identity, offset)?;
+        if !id.follows(previous) {
+            return Err(WalError::OrderingViolation);
+        }
+        let measured =
+            Measured::append(active.counts, DataKind::Object(encoding), body).map_err(|error| {
+                WalError::CountOverflow {
+                    field: error.field("ordinals"),
+                }
+            })?;
+        let (counts, ()) = measured.observe(update_digest(&mut active.digest));
+        active.counts = counts;
         active.previous_object = Some(id);
-        digest_record_with_flags(
-            &mut active.digest,
-            WalRecordKind::Object,
-            flags,
-            active.sequence,
-            ordinal,
-            body,
-        )?;
-        active.logical_count =
-            active
-                .logical_count
-                .checked_inc()
-                .ok_or(WalError::CountOverflow {
-                    field: "logical records",
-                })?;
         Ok(Some(WalEvent::Object(WalObjectDescriptor {
             offset,
             length: physical_length,
@@ -407,59 +383,23 @@ where
         physical_length: WalLength,
         body: &[u8],
     ) -> Result<Option<WalEvent>, WalError> {
-        let (scheme, previous, count, logical) = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL root has no active transaction",
-            ))?;
-            (
-                active.scheme,
-                active.previous_principal.clone(),
-                active.root_count,
-                active.logical_bytes,
-            )
-        };
+        let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
+            "WAL root has no active transaction",
+        ))?;
+        let scheme = active.scheme;
+        let previous = active.previous_principal.as_deref();
         let (transition, _body_length) = decode_root_body(body, scheme, &self.codec, offset)?;
-        if previous
-            .as_deref()
-            .is_some_and(|previous| previous >= transition.principal())
-        {
+        if !super::root_history::follows(previous, transition.principal()) {
             return Err(WalError::OrderingViolation);
         }
-        let next_count = count
-            .checked_inc()
-            .ok_or(WalError::CountOverflow { field: "roots" })?;
-        let logical_record = logical_record_length(body)?;
-        let next_logical = logical
-            .checked_add(logical_record)
-            .ok_or(WalError::CountOverflow {
-                field: "logical bytes",
-            })?;
-        let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
-            "WAL root transaction disappeared",
-        ))?;
-        let ordinal = active.next_ordinal;
-        let next_ordinal = ordinal
-            .checked_next()
-            .ok_or(WalError::CountOverflow { field: "ordinals" })?;
-        active.root_count = next_count;
-        active.logical_bytes = next_logical;
-        active.next_ordinal = next_ordinal;
+        let measured = Measured::append(active.counts, DataKind::Root, body).map_err(|error| {
+            WalError::CountOverflow {
+                field: error.field("ordinals"),
+            }
+        })?;
+        let (counts, ()) = measured.observe(update_digest(&mut active.digest));
+        active.counts = counts;
         active.previous_principal = Some(transition.principal().to_vec());
-        active.saw_root = true;
-        digest_record(
-            &mut active.digest,
-            WalRecordKind::Root,
-            active.sequence,
-            ordinal,
-            body,
-        )?;
-        active.logical_count =
-            active
-                .logical_count
-                .checked_inc()
-                .ok_or(WalError::CountOverflow {
-                    field: "logical records",
-                })?;
         Ok(Some(WalEvent::Root(WalRootDescriptor {
             offset,
             length: physical_length,
@@ -476,50 +416,45 @@ where
         let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
             "WAL Commit has no active transaction",
         ))?;
-        if !active.saw_root {
+        if active.counts.roots == 0 {
             return Err(WalError::ZeroRoots);
         }
-        let (sequence, logical_count, object_count, root_count, logical_bytes, digest) =
-            decode_commit_body(body, offset)?;
-        if sequence != active.sequence {
-            return Err(WalError::CommitSequenceMismatch {
-                expected: active.sequence,
-                found: sequence,
-            });
-        }
-        if logical_count != active.logical_count {
-            return Err(WalError::CommitCountMismatch {
-                field: "logical records",
-            });
-        }
-        if object_count != active.object_count {
-            return Err(WalError::CommitCountMismatch { field: "objects" });
-        }
-        if root_count != active.root_count {
-            return Err(WalError::CommitCountMismatch { field: "roots" });
-        }
-        if logical_bytes != active.logical_bytes {
-            return Err(WalError::CommitCountMismatch {
-                field: "logical bytes",
-            });
-        }
-        let expected_digest = super::codec::finish_digest(&active.digest);
-        if digest != expected_digest {
-            return Err(WalError::DigestMismatch);
-        }
-        let descriptor = WalCommitDescriptor {
+        let marker = super::commit_wire::decode(body).ok_or(WalError::Corrupt {
             offset,
-            length: physical_length,
-            sequence,
-            logical_count,
-            object_count,
-            root_count,
-            logical_bytes,
-            digest,
-        };
+            detail: "WAL Commit body length is invalid",
+        })?;
+        let sequence = WalSequence::new(marker.counts.sequence).ok_or(WalError::Corrupt {
+            offset,
+            detail: "WAL Commit sequence is zero",
+        })?;
+        let checked = marker
+            .confirm(&active.counts, || {
+                *super::codec::finish_digest(&active.digest).as_bytes()
+            })
+            .map_err(|mismatch| match mismatch {
+                super::commit_wire::Mismatch::Digest => WalError::DigestMismatch,
+                super::commit_wire::Mismatch::Sequence => WalError::CommitSequenceMismatch {
+                    expected: active.sequence,
+                    found: sequence,
+                },
+                super::commit_wire::Mismatch::Logical => WalError::CommitCountMismatch {
+                    field: "logical records",
+                },
+                super::commit_wire::Mismatch::Objects => {
+                    WalError::CommitCountMismatch { field: "objects" }
+                },
+                super::commit_wire::Mismatch::Roots => {
+                    WalError::CommitCountMismatch { field: "roots" }
+                },
+                super::commit_wire::Mismatch::Bytes => WalError::CommitCountMismatch {
+                    field: "logical bytes",
+                },
+            })?;
         let transaction = WalTransactionDescriptor {
             begin_offset: active.begin_offset,
-            commit: descriptor,
+            offset,
+            length: physical_length,
+            marker: checked,
         };
         self.last_sequence = Some(sequence);
         self.active = None;
@@ -546,92 +481,89 @@ where
         kind: WalTailKind,
         force_tail: bool,
     ) -> Option<WalEvent> {
-        if self.active.is_some() || force_tail {
-            let tail_offset = self
-                .active
-                .as_ref()
-                .map_or(offset, |active| active.begin_offset);
-            self.resume_offset = Some(tail_offset);
-            self.active = None;
-            self.finished = true;
-            return Some(WalEvent::Tail(WalScanTail {
-                offset: tail_offset,
-                kind,
-            }));
-        }
-        self.resume_offset = Some(offset);
+        use super::interior::{Boundary, boundary};
+        let active_begin = self.active.as_ref().map(|active| active.begin_offset.get());
         self.finished = true;
-        None
-    }
-}
-
-fn read_prefix<R: Read>(reader: &mut R, destination: &mut [u8]) -> Result<usize, WalError> {
-    let mut read = 0_usize;
-    while read < destination.len() {
-        let amount = reader
-            .read(&mut destination[read..])
-            .map_err(|source| WalError::Io {
-                operation: "read ASTWAL2 header",
-                source,
-            })?;
-        if amount == 0 {
-            break;
+        match boundary(active_begin, offset.get(), force_tail) {
+            Boundary::Tail(begin) => {
+                let offset = WalOffset::new(begin);
+                self.resume_offset = Some(offset);
+                self.active = None;
+                Some(WalEvent::Tail(WalScanTail { offset, kind }))
+            },
+            Boundary::End(end) => {
+                self.resume_offset = Some(WalOffset::new(end));
+                None
+            },
         }
-        read = read.checked_add(amount).ok_or(WalError::CountOverflow {
-            field: "header bytes",
-        })?;
     }
-    Ok(read)
 }
 
-fn read_exact_payload<R: Read>(
-    reader: &mut R,
-    payload: &mut [u8],
-    offset: WalOffset,
-) -> Result<(), WalError> {
-    let mut read = 0_usize;
-    while read < payload.len() {
-        let amount = reader
-            .read(&mut payload[read..])
-            .map_err(|source| WalError::Io {
-                operation: "read ASTWAL2 payload",
-                source,
-            })?;
-        if amount == 0 {
-            return Err(WalError::Corrupt {
-                offset,
-                detail: "WAL payload ended unexpectedly",
-            });
+#[derive(Clone, Copy)]
+enum ReadPurpose {
+    Header,
+    Payload,
+    Interior(&'static str),
+}
+
+struct FrameInput<'a, R> {
+    reader: &'a mut R,
+    purpose: ReadPurpose,
+}
+
+impl<R: Read> super::read_buffer::Source for FrameInput<'_, R> {
+    type Error = WalError;
+
+    fn read_part(&mut self, destination: &mut [u8]) -> Result<usize, WalError> {
+        let (operation, field) = match self.purpose {
+            ReadPurpose::Header => ("read ASTWAL2 header", "header bytes"),
+            ReadPurpose::Payload => ("read ASTWAL2 payload", "payload bytes"),
+            ReadPurpose::Interior(operation) => (operation, "interior probe bytes"),
+        };
+        loop {
+            match self.reader.read(destination) {
+                Ok(n) if n <= destination.len() => return Ok(n),
+                Ok(_) => return Err(WalError::CountOverflow { field }),
+                Err(source)
+                    if matches!(self.purpose, ReadPurpose::Interior(_))
+                        && source.kind() == std::io::ErrorKind::Interrupted => {},
+                Err(source) => return Err(WalError::Io { operation, source }),
+            }
         }
-        read = read.checked_add(amount).ok_or(WalError::CountOverflow {
-            field: "payload bytes",
-        })?;
     }
-    Ok(())
 }
 
-fn stream_len_at<R: Seek>(reader: &mut R, restore: u64) -> Result<u64, WalError> {
-    let length = reader
-        .seek(SeekFrom::End(0))
-        .map_err(|source| WalError::Io {
+impl<R: Read + Seek> super::read_buffer::Positioned for FrameInput<'_, R> {
+    type SeekError = std::io::Error;
+
+    fn seek_end(&mut self) -> Result<u64, Self::SeekError> {
+        self.reader.seek(SeekFrom::End(0))
+    }
+
+    fn seek_start(&mut self, offset: u64) -> Result<(), Self::SeekError> {
+        self.reader.seek(SeekFrom::Start(offset)).map(|_| ())
+    }
+}
+
+fn stream_len_at<R: Read + Seek>(
+    input: &mut FrameInput<'_, R>,
+    restore: u64,
+) -> Result<u64, WalError> {
+    use super::read_buffer::LengthError;
+    super::read_buffer::length_at(input, restore).map_err(|error| match error {
+        LengthError::End(source) => WalError::Io {
             operation: "read ASTWAL2 length",
             source,
-        })?;
-    reader
-        .seek(SeekFrom::Start(restore))
-        .map_err(|source| WalError::Io {
+        },
+        LengthError::Restore(source) => WalError::Io {
             operation: "restore ASTWAL2 cursor",
             source,
-        })?;
-    Ok(length)
+        },
+    })
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "interior physical recovery must keep its bounded byte-stream state together"
-)]
 fn has_valid_physical_after<R: Read + Seek>(
-    mut reader: &mut R,
+    reader: &mut R,
     start: u64,
     limits: WalLimits,
 ) -> Result<bool, WalError> {
@@ -645,103 +577,73 @@ fn has_valid_physical_after<R: Read + Seek>(
             operation: "read ASTWAL2 length",
             source,
         })?;
-    let mut candidate = start;
-    while candidate < file_len {
-        reader
-            .seek(SeekFrom::Start(candidate))
-            .map_err(|source| WalError::Io {
-                operation: "seek ASTWAL2 interior candidate",
-                source,
-            })?;
-        let mut first = [0_u8; 1];
-        if !read_probe(&mut reader, &mut first, "read ASTWAL2 interior candidate")? {
-            break;
-        }
-        if first[0] != WAL_MAGIC[0] {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        }
-        let mut header = [0_u8; PHYSICAL_HEADER_LEN];
-        header[0] = first[0];
-        if !read_probe(
-            &mut reader,
-            &mut header[1..],
-            "read ASTWAL2 interior header",
-        )? {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        }
-        let offset = WalOffset::new(candidate);
-        let Ok(physical) = super::codec::decode_physical_header(&header, offset) else {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        };
-        let end = candidate
-            .checked_add(
-                u64::try_from(PHYSICAL_HEADER_LEN)
-                    .map_err(|_| WalError::Encoding("WAL physical header length overflow"))?,
-            )
-            .and_then(|value| value.checked_add(physical.payload_len.get()));
-        let Some(end) = end else {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        };
-        if end <= file_len && physical.payload_len > wal_physical_limit(limits).length() {
-            reader
-                .seek(SeekFrom::Start(saved))
-                .map_err(|source| WalError::Io {
-                    operation: "restore ASTWAL2 cursor",
-                    source,
-                })?;
-            return Ok(true);
-        }
-        if end > file_len {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        }
-        let Ok(payload_len) = physical.payload_len.as_usize() else {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        };
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_len)
-            .map_err(|_| WalError::Encoding("WAL interior allocation failed"))?;
-        payload.resize(payload_len, 0);
-        if read_probe(&mut reader, &mut payload, "read ASTWAL2 interior payload")?
-            && checksum_valid(physical, &payload)
-        {
-            reader
-                .seek(SeekFrom::Start(saved))
-                .map_err(|source| WalError::Io {
-                    operation: "restore ASTWAL2 cursor",
-                    source,
-                })?;
-            return Ok(true);
-        }
-        candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-            field: "candidate offsets",
-        })?;
-    }
+    let (reader, result) = super::interior::search(reader, start, file_len, |reader, offset| {
+        let probe = probe_candidate(reader, offset, file_len, limits);
+        (reader, probe)
+    });
+    let found = result.map_err(|(_, error)| error)?;
     reader
         .seek(SeekFrom::Start(saved))
         .map_err(|source| WalError::Io {
             operation: "restore ASTWAL2 cursor",
             source,
         })?;
-    Ok(false)
+    Ok(found.is_some())
+}
+
+fn probe_candidate<R: Read + Seek>(
+    reader: &mut R,
+    candidate: u64,
+    file_len: u64,
+    limits: WalLimits,
+) -> Result<super::interior::Probe, WalError> {
+    use super::interior::Probe;
+    reader
+        .seek(SeekFrom::Start(candidate))
+        .map_err(|source| WalError::Io {
+            operation: "seek ASTWAL2 interior candidate",
+            source,
+        })?;
+    let mut header = [0u8; PHYSICAL_HEADER_LEN];
+    if !read_probe(reader, &mut header[..1], "read ASTWAL2 interior candidate")? {
+        return Ok(Probe::End);
+    }
+    if header[0] != WAL_MAGIC[0]
+        || !read_probe(reader, &mut header[1..], "read ASTWAL2 interior header")?
+    {
+        return Ok(Probe::Miss);
+    }
+    let Ok(physical) = decode_physical_header(&header, WalOffset::new(candidate)) else {
+        return Ok(Probe::Miss);
+    };
+    let Some(start) = super::physical_wire::payload_start(candidate) else {
+        return Ok(Probe::Miss);
+    };
+    match extent(
+        start,
+        physical.payload_len().get(),
+        file_len,
+        wal_physical_limit(limits).length().get(),
+    ) {
+        Extent::Oversized => return Ok(Probe::Found),
+        Extent::Overflow | Extent::Incomplete => return Ok(Probe::Miss),
+        Extent::Complete(_) => {},
+    }
+    let Ok(size) = physical.payload_len().as_usize() else {
+        return Ok(Probe::Miss);
+    };
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(size)
+        .map_err(|_| WalError::Encoding("WAL interior allocation failed"))?;
+    payload.resize(size, 0);
+    if read_probe(reader, &mut payload, "read ASTWAL2 interior payload")?
+        && checksum_valid(physical, &payload)
+    {
+        Ok(Probe::Found)
+    } else {
+        Ok(Probe::Miss)
+    }
 }
 
 fn read_probe<R: Read>(
@@ -749,19 +651,15 @@ fn read_probe<R: Read>(
     destination: &mut [u8],
     operation: &'static str,
 ) -> Result<bool, WalError> {
-    let mut read = 0_usize;
-    while read < destination.len() {
-        match reader.read(&mut destination[read..]) {
-            Ok(0) => return Ok(false),
-            Ok(amount) => {
-                read = read.checked_add(amount).ok_or(WalError::CountOverflow {
-                    field: "interior probe bytes",
-                })?;
-            },
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {},
-            Err(source) if source.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(source) => return Err(WalError::Io { operation, source }),
-        }
+    let mut input = FrameInput {
+        reader,
+        purpose: ReadPurpose::Interior(operation),
+    };
+    match super::read_buffer::fill(&mut input, destination) {
+        Ok(filled) => Ok(filled == destination.len()),
+        Err(WalError::Io { source, .. }) if source.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Ok(false)
+        },
+        Err(error) => Err(error),
     }
-    Ok(true)
 }

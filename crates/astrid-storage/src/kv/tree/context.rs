@@ -1,23 +1,20 @@
 //! Path-copy operations over canonical KV pages.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use crate::engine::{KvIdentitySession, KvProjectionEngine, RootTransaction};
-use crate::storage_model::{
-    ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
-};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord};
 
+use super::FORMAT_VERSION;
 use super::delta::{
-    Head, Mutation, Projection, checkpoint_record, decode_head, delta_record,
-    mutation_payload_bytes,
+    Head, Projection, checkpoint_record, decode_head, delta_record, mutation_payload_bytes,
 };
 use super::header::TreeHeader;
 use super::node::{
     ChildPointer, INLINE_VALUE_MAX, LeafEntry, NODE_MAX_ENTRIES, NODE_MAX_RETAINED_BYTES, Node,
-    NodeHandle, NodeTotals, ValueSlot, branch_record, decode_node, leaf_record,
+    NodeHandle, NodeTotals, ValueSlot, branch_record, leaf_record,
 };
-use super::{FORMAT_VERSION, KV_LABEL, PARENT_LABEL, STATE_LABEL};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
 
@@ -25,57 +22,14 @@ mod checkpoint;
 mod range;
 pub(super) mod value;
 
-// A comparison and its mutation share one immutable header per CAS attempt.
-// Carry only its length and equality result through accounting, releasing
-// each old payload immediately; key-only operations keep deferred reads.
-pub(super) struct Replacement {
-    key: Vec<u8>,
-    previous: PreviousValue,
-    value: Option<Vec<u8>>,
-}
-
-enum PreviousValue {
-    Unread,
-    Loaded {
-        previous_len: Option<usize>,
-        unchanged: bool,
-    },
-}
-
-impl Replacement {
-    #[cfg(any(test, all(feature = "legacy-surrealkv", not(target_family = "wasm"))))]
-    pub(super) fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
-        Self {
-            key,
-            previous: PreviousValue::Unread,
-            value,
-        }
-    }
-
-    pub(super) fn observed(
-        key: Vec<u8>,
-        previous: Option<Vec<u8>>,
-        value: Option<Vec<u8>>,
-    ) -> Self {
-        let previous_len = previous.as_ref().map(Vec::len);
-        let unchanged = previous == value;
-        drop(previous);
-        Self {
-            key,
-            previous: PreviousValue::Loaded {
-                previous_len,
-                unchanged,
-            },
-            value,
-        }
-    }
-}
+mod replacement;
+use replacement::PreviousValue;
+pub(super) use replacement::Replacement;
 
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,
-    principal: &'a P,
     records: BTreeMap<ObjectId, ObjectRecord>,
-    nodes: BTreeMap<ObjectId, NodeHandle>,
+    nodes: super::checkpoint_cache::Cache<'a, P>,
     identity_session: Option<KvIdentitySession<'a>>,
     marker: PhantomData<fn() -> P>,
 }
@@ -88,9 +42,8 @@ where
     pub(super) fn new(engine: &'a E, principal: &'a P) -> Self {
         Self {
             engine,
-            principal,
             records: BTreeMap::new(),
-            nodes: BTreeMap::new(),
+            nodes: super::checkpoint_cache::Cache::new(principal),
             identity_session: engine.kv_identity_session(),
             marker: PhantomData,
         }
@@ -118,28 +71,23 @@ where
     /// Authoritative leaf lookup used by ordinary and certified point-reads.
     pub(super) fn get_slot(
         &mut self,
-        mut root: Option<ObjectId>,
+        root: Option<ObjectId>,
         key: &[u8],
     ) -> StorageResult<Option<ValueSlot>> {
-        while let Some(object) = root {
-            let handle = self.node(object)?;
-            match handle.node {
-                Node::Leaf(mut leaf) => {
-                    return Ok(leaf
-                        .entries
-                        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
-                        .ok()
-                        .map(|index| leaf.entries.swap_remove(index).value));
-                },
-                Node::Branch(branch) => {
-                    let index = child_index(&branch.children, key);
-                    let child = &branch.children[index];
-                    self.validate_pointer(child)?;
-                    root = Some(child.object);
-                },
-            }
-        }
-        Ok(None)
+        use super::checkpoint_descent;
+        checkpoint_descent::lookup(self, root, key, |context, object| {
+            let handle = context.node(object)?;
+            Ok((context, handle))
+        })
+        .map_err(|error| match error {
+            checkpoint_descent::Error::Source(error) => error,
+            checkpoint_descent::Error::Mismatch(object) => {
+                invalid(object, "persistent KV child summary disagrees")
+            },
+            checkpoint_descent::Error::Branch(object) => {
+                invalid(object, "invalid persistent KV branch descent")
+            },
+        })
     }
 
     pub(super) fn projected_get(
@@ -160,8 +108,8 @@ where
     }
 
     /// Live principal bound to this context.
-    pub(super) const fn principal(&self) -> &P {
-        self.principal
+    pub(super) fn principal(&self) -> &P {
+        self.nodes.principal()
     }
 
     pub(super) fn build_sorted(
@@ -304,7 +252,7 @@ where
         let totals = tree.map_or(Ok(NodeTotals::default()), |tree| {
             Ok(self.node(tree)?.node.totals())
         })?;
-        let head = self.insert(checkpoint_record(tree, totals)?)?;
+        let head = self.insert(checkpoint_record(tree, totals))?;
         self.finish_head(header, head)
     }
 
@@ -330,12 +278,8 @@ where
         };
         let mut current = header.overlay.clone();
         let mut mutations = Vec::with_capacity(replacements.len());
-        for Replacement {
-            key,
-            previous,
-            value: replacement,
-        } in replacements
-        {
+        for row in replacements {
+            let (key, previous, replacement) = row.into_parts();
             let (previous_len, unchanged) = if let Some(value) = current.get(&key) {
                 (value.as_ref().map(Vec::len), value == &replacement)
             } else {
@@ -350,22 +294,24 @@ where
                     },
                 }
             };
-            if unchanged {
-                return Err(StorageError::Serialization(
-                    "KV mutation batch contains a no-op".to_owned(),
-                ));
-            }
-            update_totals(&mut totals, &key, previous_len, replacement.as_deref())?;
-            let value = replacement
-                .as_ref()
-                .map(|value| self.make_value(value.as_slice()))
-                .transpose()?;
-            // Chunk construction borrows these bytes; retain them for the
-            // overlay instead of reconstructing the just-staged value.
-            // Admission retains all structural and publication checks; locally
-            // bound identities do not need a second computation.
-            current.insert(key.clone(), replacement);
-            mutations.push(Mutation { key, value });
+            totals = super::delta_totals::admit(
+                totals,
+                key.len(),
+                previous_len,
+                replacement.as_ref().map(Vec::len),
+                unchanged,
+            )
+            .map_err(|error| match error {
+                super::delta_totals::ReplayError::Unchanged => {
+                    StorageError::Serialization("KV mutation batch contains a no-op".to_owned())
+                },
+                super::delta_totals::ReplayError::Accounting(_) => arithmetic_overflow(),
+            })?;
+            mutations.push(current.stage(key, replacement, |data| {
+                super::delta_mutation::encode(data, |bytes, length| {
+                    self.spill_value(bytes.into(), length)
+                })
+            })?);
         }
         let record = delta_record(
             header.head,
@@ -435,7 +381,7 @@ where
         }
         tail.reverse();
 
-        let mut head = self.insert(checkpoint_record(tree, checkpoint_totals)?)?;
+        let mut head = self.insert(checkpoint_record(tree, checkpoint_totals))?;
         let mut overlay = super::overlay::OverlayMap::default();
         let mut depth = 0_u64;
         let mut delta_bytes = 0_u64;
@@ -475,46 +421,32 @@ where
         header: TreeHeader<P>,
         head: ObjectId,
     ) -> StorageResult<RootTransaction<P>> {
-        let mut state_references = header.preserved_state;
-        state_references.push(ObjectReference::owns(KV_LABEL.to_vec().into(), head));
-        state_references.sort();
-        let state = ObjectRecord::new(
-            ObjectKind::PrincipalState,
+        use crate::storage_model::header_writer::{StageError, stage_headers};
+        let (_, commit) = stage_headers(
+            &mut self,
+            header.preserved_state,
+            header.preserved_commit,
+            head,
+            header.root,
             FORMAT_VERSION,
-            Vec::new(),
-            state_references,
-            0,
-            ObjectClass::Metadata,
+            |context, record| {
+                let id = context.insert(record)?;
+                Ok((context, id))
+            },
         )
-        .map_err(|error| model_error(&error))?;
-        let state = self.insert(state)?;
-
-        let mut commit_references = header.preserved_commit;
-        if let Some(previous) = header.root {
-            commit_references.push(ObjectReference::new(
-                PARENT_LABEL.to_vec().into(),
-                previous.commit,
-                ReferenceKind::Lineage,
-            ));
-        }
-        commit_references.push(ObjectReference::owns(STATE_LABEL.to_vec().into(), state));
-        commit_references.sort();
-        let commit = ObjectRecord::new(
-            ObjectKind::Commit,
-            FORMAT_VERSION,
-            Vec::new(),
-            commit_references,
-            0,
-            ObjectClass::Metadata,
-        )
-        .map_err(|error| model_error(&error))?;
-        let commit = self.insert(commit)?;
-        self.retain_reachable(commit);
-        let records = self.records.into_iter().collect();
-        Ok(match self.identity_session {
-            Some(session) => session.seal_transaction(header.owner, header.root, commit, records),
-            None => RootTransaction::new(header.owner, header.root, commit, records),
-        })
+        .map_err(|error| match error {
+            StageError::State | StageError::Commit => {
+                model_error(&ModelError::NonCanonicalReferences)
+            },
+            StageError::Insert(error) => error,
+        })?;
+        Ok(RootTransaction::from_staged(
+            header.owner,
+            header.root,
+            commit,
+            self.records,
+            self.identity_session,
+        ))
     }
 
     fn pack_branches(&mut self, children: &[ChildPointer]) -> StorageResult<Vec<NodeHandle>> {
@@ -559,34 +491,67 @@ where
     }
 
     pub(super) fn node(&mut self, object: ObjectId) -> StorageResult<NodeHandle> {
-        if let Some(handle) = self.nodes.get(&object) {
-            return Ok(handle.clone());
-        }
-        let record = self.record(object)?;
-        let handle = decode_node(object, &record)?;
-        self.nodes.insert(object, handle.clone());
-        Ok(handle)
+        use super::checkpoint_cache::Error;
+        let records = &self.records;
+        let engine = self.engine;
+        self.nodes
+            .lookup(
+                object,
+                FORMAT_VERSION,
+                |principal, id| {
+                    Self::load_record(
+                        records,
+                        principal,
+                        id,
+                        ObjectRecord::owned_record,
+                        |owner, address| engine.load_kv_object_for(owner, address),
+                    )
+                },
+                |key| super::validation::validate_composite_key(object, key),
+            )
+            .map_err(|e| match e {
+                Error::Load(e) => e,
+                Error::Decode(e) => super::node::decode_error(object, e),
+            })
     }
 
     pub(super) fn record(&self, object: ObjectId) -> StorageResult<ObjectRecord> {
-        if let Some(record) = self.records.get(&object) {
-            return Ok(record.clone());
-        }
-        self.engine
-            .load_kv_object_for(self.principal, object)
-            .map_err(|error| map_engine(&error))?
-            .ok_or_else(|| map_engine(&ModelError::MissingObject(object).into()))
+        Self::load_record(
+            &self.records,
+            self.principal(),
+            object,
+            ObjectRecord::owned_record,
+            |principal, id| self.engine.load_kv_object_for(principal, id),
+        )
+    }
+
+    fn load_record<T>(
+        records: &BTreeMap<ObjectId, ObjectRecord>,
+        principal: &P,
+        object: ObjectId,
+        copy: impl FnOnce(&ObjectRecord) -> T,
+        engine: impl FnOnce(&P, ObjectId) -> Result<Option<T>, crate::engine::KvProjectionError>,
+    ) -> StorageResult<T> {
+        use super::record_source::{self, Error};
+        record_source::load(records, principal, object, copy, engine).map_err(|error| match error {
+            Error::Source(error) => map_engine(&error),
+            Error::Missing(id) => map_engine(&ModelError::MissingObject(id).into()),
+        })
     }
 
     fn insert_node(&mut self, record: &ObjectRecord) -> StorageResult<NodeHandle> {
         let object = self.insert(record.clone())?;
-        let handle = decode_node(object, record)?;
-        self.nodes.insert(object, handle.clone());
-        Ok(handle)
+        self.nodes
+            .admit(object, record, FORMAT_VERSION, |key| {
+                super::validation::validate_composite_key(object, key)
+            })
+            .map_err(|e| super::node::decode_error(object, e))
     }
 
     pub(super) fn insert(&mut self, record: ObjectRecord) -> StorageResult<ObjectId> {
-        self.stage_identified_record(self.identify_record(&record), record)
+        let (id, record) =
+            crate::engine::transaction_records::identify(record, |r| self.identify_record(r));
+        self.stage_identified_record(id, record)
     }
 
     pub(super) fn identify_record(&self, record: &ObjectRecord) -> ObjectId {
@@ -604,72 +569,9 @@ where
         object: ObjectId,
         record: ObjectRecord,
     ) -> StorageResult<ObjectId> {
-        match self.records.get(&object) {
-            Some(existing) if existing == &record => {},
-            Some(_) => return Err(map_engine(&ModelError::ObjectCollision(object).into())),
-            None => {
-                self.records.insert(object, record);
-            },
-        }
-        Ok(object)
+        crate::engine::transaction_records::insert(&mut self.records, object, record)
+            .map_err(|id| map_engine(&ModelError::ObjectCollision(id).into()))
     }
-
-    fn retain_reachable(&mut self, root: ObjectId) {
-        let mut reachable = BTreeSet::new();
-        let mut stack = vec![root];
-        while let Some(object) = stack.pop() {
-            if !reachable.insert(object) {
-                continue;
-            }
-            if let Some(record) = self.records.get(&object) {
-                stack.extend(record.owning_references());
-            }
-        }
-        self.records.retain(|object, _| reachable.contains(object));
-    }
-}
-
-fn update_totals(
-    totals: &mut NodeTotals,
-    key: &[u8],
-    previous: Option<usize>,
-    replacement: Option<&[u8]>,
-) -> StorageResult<()> {
-    let key_bytes = u64::try_from(key.len()).map_err(|_| arithmetic_overflow())?;
-    let previous_bytes = previous.map_or(0, |length| length as u64);
-    let replacement_bytes = replacement.map_or(0, |value| value.len() as u64);
-    totals.entries = match (previous, replacement) {
-        (None, Some(_)) => totals.entries.checked_add(1),
-        (Some(_), None) => totals.entries.checked_sub(1),
-        _ => Some(totals.entries),
-    }
-    .ok_or_else(arithmetic_overflow)?;
-    totals.logical_bytes = totals
-        .logical_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(arithmetic_overflow)?;
-    totals.quota_bytes = totals
-        .quota_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| {
-            if previous.is_none() {
-                total.checked_add(key_bytes)
-            } else if replacement.is_none() {
-                total.checked_sub(key_bytes)
-            } else {
-                Some(total)
-            }
-        })
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(arithmetic_overflow)?;
-    Ok(())
-}
-
-pub(super) fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {
-    children
-        .partition_point(|child| child.lower_bound.as_slice() <= key)
-        .saturating_sub(1)
 }
 
 fn page_retained(record: &ObjectRecord) -> StorageResult<u64> {

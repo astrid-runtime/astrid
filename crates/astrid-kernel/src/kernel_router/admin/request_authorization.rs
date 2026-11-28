@@ -10,12 +10,12 @@ use tracing::warn;
 
 use super::audit_handlers;
 use crate::kernel_router::{
-    AdminAuditEntry, AuthorizedRequest, authorize_request, record_admin_audit,
+    AdminAuditEntry, AuthorizedRequest, admit_management_request, record_admin_audit,
 };
 
 pub(super) struct AdminAuthorizationContext<'a> {
     pub(super) caller: &'a PrincipalId,
-    pub(super) device_key_id: Option<&'a str>,
+    pub(super) device: astrid_events::ipc::DeviceStamp<'a>,
     pub(super) method: &'static str,
     pub(super) required_cap: &'static str,
     pub(super) target_principal: Option<&'a PrincipalId>,
@@ -50,7 +50,7 @@ async fn record_admin_authorization_failure(
             caller: context.caller,
             method: context.method,
             required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
+            device_key_id: context.device.fingerprint,
             target_principal: context.target_principal.cloned(),
             params: context.audit_params.cloned(),
             authorization: AuthorizationProof::Denied {
@@ -74,7 +74,7 @@ pub(super) async fn record_admin_request_failure(
             caller: context.caller,
             method: context.method,
             required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
+            device_key_id: context.device.fingerprint,
             target_principal: context.target_principal.cloned(),
             params: context.audit_params.cloned(),
             authorization: allowed_admin_authorization(context),
@@ -89,12 +89,14 @@ pub(super) async fn authorize_admin_request(
     context: &AdminAuthorizationContext<'_>,
     kind: &AdminRequestKind,
 ) -> Result<AuthorizedRequest, String> {
-    let authorization = match authorize_request(
+    let authorization = match admit_management_request(
         kernel,
         context.caller,
-        context.device_key_id,
+        context.device,
         context.required_cap,
-    ) {
+    )
+    .await
+    {
         Ok(authorization) => authorization,
         Err(error) => {
             let error = error.to_string();
@@ -132,7 +134,7 @@ async fn record_admin_success(
             caller: context.caller,
             method: context.method,
             required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
+            device_key_id: context.device.fingerprint,
             target_principal: context.target_principal.cloned(),
             params: context.audit_params.cloned(),
             authorization: allowed_admin_authorization(context),
@@ -146,18 +148,18 @@ async fn record_admin_success(
 pub(super) async fn record_pair_issue_outcome(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
-    key: Option<&str>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     request: &AdminRequestKind,
     result: &Result<
         astrid_core::kernel_api::PairTokenIssued,
         super::pair_device_handlers::PairIssueError,
     >,
 ) {
-    use super::pair_device_handlers::PairIssueError;
+    use super::pair_issue_result::{self, Audit};
     let params = super::sanitize_admin_audit_params(request);
     let context = AdminAuthorizationContext {
         caller,
-        device_key_id: key,
+        device,
         method: super::admin_request_method(request),
         required_cap: super::required_capability_for_admin_request(
             request,
@@ -166,12 +168,12 @@ pub(super) async fn record_pair_issue_outcome(
         target_principal: super::admin_target_principal(request),
         audit_params: params.as_ref(),
     };
-    match result {
-        Ok(_) => record_admin_success(kernel, &context).await,
-        Err(PairIssueError::Unauthorized(error)) => {
+    match pair_issue_result::audit(result) {
+        Audit::Success => record_admin_success(kernel, &context).await,
+        Audit::Denied(error) => {
             record_admin_authorization_failure(kernel, &context, error).await;
         },
-        Err(PairIssueError::BadInput(error) | PairIssueError::Internal(error)) => {
+        Audit::Failure(error) => {
             record_admin_request_failure(kernel, &context, error).await;
         },
     }

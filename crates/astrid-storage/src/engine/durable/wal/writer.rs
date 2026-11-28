@@ -1,3 +1,4 @@
+use super::super::frontier::{CheckpointError, PublicationError, checkpoint_io, sync_pending};
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -7,15 +8,14 @@ use super::super::{IdentityScheme, PersistentObjectIdentity, PrincipalCodec};
 use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 
 use super::codec::{
-    digest_record, digest_record_with_flags, encode_begin_body, encode_commit_body,
-    encode_object_body, encode_object_storage_body, encode_physical_record,
-    encode_physical_record_with_flags, encode_root_body, finish_digest, logical_record_length,
-    new_digest,
+    encode_begin_body, encode_object_body, encode_object_storage_body, finish_digest, new_digest,
+    write_marker, write_measured,
 };
+use super::measured_record::{DataKind, Measured};
 use super::scan::ScannedWal;
 use super::types::{
     WalBeginHints, WalCommitDescriptor, WalCount, WalError, WalLength, WalLimits,
-    WalObjectDescriptor, WalOffset, WalOrdinal, WalRecordKind, WalResumeState, WalSequence,
+    WalObjectDescriptor, WalOffset, WalResumeState, WalSequence,
 };
 
 /// A stream capable of one explicit durability publication.
@@ -59,15 +59,42 @@ impl WalSink for super::super::File {
     }
 }
 
+impl<S: WalSink> super::super::frontier::WalOutput for S {
+    type Error = io::Error;
+
+    fn append_record(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes)
+    }
+}
+
+impl super::super::frontier::BufferedWal for BufWriter<super::super::File> {
+    fn drain(&mut self) -> io::Result<super::super::frontier::WalDrain> {
+        use super::super::frontier::WalDrain;
+        self.flush()?;
+        Ok(match self.get_ref() {
+            super::super::File::Native(_) => WalDrain::File,
+            super::super::File::Volume(_) => WalDrain::Container,
+        })
+    }
+
+    fn sync_file(&mut self) -> io::Result<()> {
+        self.get_ref().sync_data()
+    }
+}
+
+impl super::super::frontier::ResizeWal for BufWriter<super::super::File> {
+    fn resize_region(&mut self, length: u64) -> io::Result<()> {
+        self.get_mut().set_len(length)
+    }
+}
+
 impl WalSink for BufWriter<super::super::File> {
     fn sync_data(&mut self) -> io::Result<()> {
-        self.flush()?;
-        self.get_ref().sync_data()
+        super::super::frontier::publish_buffer(self)
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
-        self.flush()?;
-        self.get_mut().set_len(len)
+        super::super::frontier::resize_buffered(self, len)
     }
 }
 
@@ -87,17 +114,11 @@ pub(crate) struct WalWriter<S, I, C, P> {
 }
 
 struct ActiveWrite {
-    sequence: WalSequence,
     scheme: IdentityScheme,
-    next_ordinal: WalOrdinal,
-    object_count: WalCount,
-    root_count: WalCount,
-    logical_count: WalCount,
-    logical_bytes: WalLength,
+    counts: super::commit_wire::Counts,
     digest: blake3::Hasher,
     previous_object: Option<ObjectId>,
     previous_principal: Option<Vec<u8>>,
-    saw_root: bool,
 }
 
 impl<S, I, C, P> WalWriter<S, I, C, P>
@@ -224,35 +245,19 @@ where
         }
         let scheme = self.identity.scheme();
         let body = encode_begin_body(scheme, hints)?;
-        let logical_bytes = logical_record_length(&body)?;
+        let measured =
+            Measured::begin(sequence.get(), &body).map_err(|_| WalError::CountOverflow {
+                field: "logical bytes",
+            })?;
         let mut digest = new_digest();
-        digest_record(
-            &mut digest,
-            WalRecordKind::Begin,
-            sequence,
-            WalOrdinal::new(0),
-            &body,
-        )?;
-        let encoded = encode_physical_record(
-            WalRecordKind::Begin,
-            sequence,
-            WalOrdinal::new(0),
-            &body,
-            self.limits,
-        )?;
+        let (encoded, counts) = write_measured(measured, self.limits, &mut digest)?;
         self.append_encoded(&encoded)?;
         self.active = Some(ActiveWrite {
-            sequence,
             scheme,
-            next_ordinal: WalOrdinal::new(1),
-            object_count: WalCount::new(0),
-            root_count: WalCount::new(0),
-            logical_count: WalCount::new(1),
-            logical_bytes,
+            counts,
             digest,
             previous_object: None,
             previous_principal: None,
-            saw_root: false,
         });
         Ok(())
     }
@@ -304,85 +309,32 @@ where
         body: &[u8],
     ) -> Result<WalObjectDescriptor, WalError> {
         super::codec::validate_logical_body(body, self.limits, WalOffset::new(0))?;
-        let (sequence, ordinal, previous, saw_root, count, logical) = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL object requires an active transaction",
-            ))?;
-            (
-                active.sequence,
-                active.next_ordinal,
-                active.previous_object,
-                active.saw_root,
-                active.object_count,
-                active.logical_bytes,
-            )
-        };
-        if saw_root || previous.is_some_and(|previous| previous >= id) {
+        let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
+            "WAL object requires an active transaction",
+        ))?;
+        let previous = active.previous_object;
+        if active.counts.roots != 0 || !id.follows(previous) {
             return Err(WalError::OrderingViolation);
         }
         let body_length = WalLength::new(
             u64::try_from(body.len())
                 .map_err(|_| WalError::Encoding("WAL object length overflow"))?,
         );
-        let (flags, stored_body) = encode_object_storage_body(body)?;
-        let next_count = count
-            .checked_inc()
-            .ok_or(WalError::CountOverflow { field: "objects" })?;
-        let logical_record = logical_record_length(&stored_body)?;
-        let next_logical = logical
-            .checked_add(logical_record)
-            .ok_or(WalError::CountOverflow {
-                field: "logical bytes",
+        let (encoding, stored_body) = encode_object_storage_body(body)?;
+        let measured = Measured::append(active.counts, DataKind::Object(encoding), &stored_body)
+            .map_err(|error| WalError::CountOverflow {
+                field: error.field("logical records"),
             })?;
-        let next_logical_count = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL object transaction disappeared",
-            ))?;
-            active
-                .logical_count
-                .checked_inc()
-                .ok_or(WalError::CountOverflow {
-                    field: "logical records",
-                })?
-        };
-        let next_ordinal = ordinal
-            .checked_next()
-            .ok_or(WalError::CountOverflow { field: "ordinals" })?;
-        let encoded = encode_physical_record_with_flags(
-            WalRecordKind::Object,
-            flags,
-            sequence,
-            ordinal,
-            &stored_body,
-            self.limits,
-        )?;
+        let mut next_digest = active.digest.clone();
+        let (encoded, counts) = write_measured(measured, self.limits, &mut next_digest)?;
         let encoded_length = encoded_length(&encoded)?;
-        let mut next_digest = self
-            .active
-            .as_ref()
-            .ok_or(WalError::InvalidTransaction(
-                "WAL object transaction disappeared",
-            ))?
-            .digest
-            .clone();
-        digest_record_with_flags(
-            &mut next_digest,
-            WalRecordKind::Object,
-            flags,
-            sequence,
-            ordinal,
-            &stored_body,
-        )?;
         let offset = self.append_encoded(&encoded)?;
         let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
             "WAL transaction disappeared while appending object",
         ))?;
-        active.object_count = next_count;
-        active.logical_bytes = next_logical;
-        active.next_ordinal = next_ordinal;
+        active.counts = counts;
         active.previous_object = Some(id);
         active.digest = next_digest;
-        active.logical_count = next_logical_count;
         Ok(WalObjectDescriptor {
             offset,
             length: encoded_length,
@@ -391,86 +343,46 @@ where
         })
     }
 
-    /// Append one codec-validated canonical root transition without syncing.
-    pub(in crate::engine::durable) fn append_root(
+    /// Frame and digest the very same payload that preparation supplied.
+    pub(in crate::engine::durable) fn append_prepared_root(
         &mut self,
         principal: &P,
         expected: Option<RootState>,
         replacement: RootState,
+        journal: &[u8],
     ) -> Result<(), WalError> {
         self.ensure_usable()?;
-        let (sequence, ordinal, scheme, previous, count, logical) = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL root requires an active transaction",
-            ))?;
-            (
-                active.sequence,
-                active.next_ordinal,
-                active.scheme,
-                active.previous_principal.clone(),
-                active.root_count,
-                active.logical_bytes,
-            )
-        };
-        let (principal_bytes, body) =
-            encode_root_body(scheme, principal, expected, replacement, &self.codec)?;
-        if previous
-            .as_deref()
-            .is_some_and(|previous| previous >= principal_bytes.as_slice())
-        {
+        let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
+            "WAL root requires an active transaction",
+        ))?;
+        let scheme = active.scheme;
+        let previous = active.previous_principal.as_deref();
+        let principal_bytes = super::codec::prepared_owner(
+            journal,
+            principal,
+            expected,
+            replacement,
+            scheme,
+            &self.codec,
+        )?;
+        if !super::root_history::follows(previous, principal_bytes.as_slice()) {
             return Err(WalError::OrderingViolation);
         }
-        let next_count = count
-            .checked_inc()
-            .ok_or(WalError::CountOverflow { field: "roots" })?;
-        let logical_record = logical_record_length(&body)?;
-        let next_logical = logical
-            .checked_add(logical_record)
-            .ok_or(WalError::CountOverflow {
-                field: "logical bytes",
+        let measured =
+            Measured::append(active.counts, DataKind::Root, journal).map_err(|error| {
+                WalError::CountOverflow {
+                    field: error.field("logical records"),
+                }
             })?;
-        let next_logical_count = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL root transaction disappeared",
-            ))?;
-            active
-                .logical_count
-                .checked_inc()
-                .ok_or(WalError::CountOverflow {
-                    field: "logical records",
-                })?
-        };
-        let next_ordinal = ordinal
-            .checked_next()
-            .ok_or(WalError::CountOverflow { field: "ordinals" })?;
-        let encoded =
-            encode_physical_record(WalRecordKind::Root, sequence, ordinal, &body, self.limits)?;
-        let mut next_digest = self
-            .active
-            .as_ref()
-            .ok_or(WalError::InvalidTransaction(
-                "WAL root transaction disappeared",
-            ))?
-            .digest
-            .clone();
-        digest_record(
-            &mut next_digest,
-            WalRecordKind::Root,
-            sequence,
-            ordinal,
-            &body,
-        )?;
+        let mut next_digest = active.digest.clone();
+        let (encoded, counts) = write_measured(measured, self.limits, &mut next_digest)?;
         self.append_encoded(&encoded)?;
         let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
             "WAL transaction disappeared while appending root",
         ))?;
-        active.root_count = next_count;
-        active.logical_bytes = next_logical;
-        active.next_ordinal = next_ordinal;
+        active.counts = counts;
         active.previous_principal = Some(principal_bytes);
-        active.saw_root = true;
         active.digest = next_digest;
-        active.logical_count = next_logical_count;
         Ok(())
     }
 
@@ -479,48 +391,30 @@ where
         &mut self,
     ) -> Result<WalCommitDescriptor, WalError> {
         self.ensure_usable()?;
-        let (
-            sequence,
-            logical_count,
-            object_count,
-            root_count,
-            logical_bytes,
-            digest_state,
-            ordinal,
-        ) = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL Commit requires an active transaction",
-            ))?;
-            if !active.saw_root {
-                return Err(WalError::ZeroRoots);
-            }
-            (
-                active.sequence,
-                active.logical_count,
-                active.object_count,
-                active.root_count,
-                active.logical_bytes,
-                active.digest.clone(),
-                active.next_ordinal,
-            )
-        };
+        let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
+            "WAL Commit requires an active transaction",
+        ))?;
+        if active.counts.roots == 0 {
+            return Err(WalError::ZeroRoots);
+        }
+        let sequence = WalSequence::new(active.counts.sequence)
+            .ok_or(WalError::InvalidTransaction("active WAL sequence is zero"))?;
+        let logical_count = WalCount::new(active.counts.logical);
+        let object_count = WalCount::new(active.counts.objects);
+        let root_count = WalCount::new(active.counts.roots);
+        let logical_bytes = WalLength::new(active.counts.bytes);
         let next_pending =
             self.pending_publications
                 .checked_add(1)
                 .ok_or(WalError::CountOverflow {
                     field: "pending publications",
                 })?;
-        let digest = finish_digest(&digest_state);
-        let body = encode_commit_body(
-            sequence,
-            logical_count,
-            object_count,
-            root_count,
-            logical_bytes,
-            digest,
-        );
-        let encoded =
-            encode_physical_record(WalRecordKind::Commit, sequence, ordinal, &body, self.limits)?;
+        let digest = finish_digest(&active.digest);
+        let marker = super::commit_wire::Marker {
+            counts: active.counts,
+            digest: *digest.as_bytes(),
+        };
+        let encoded = write_marker(&marker, self.limits)?;
         let encoded_length = encoded_length(&encoded)?;
         let offset = self.append_encoded(&encoded)?;
         let descriptor = WalCommitDescriptor {
@@ -542,26 +436,25 @@ where
     /// Sync all complete transactions appended since the previous publication.
     pub(in crate::engine::durable) fn publish(&mut self) -> Result<u64, WalError> {
         self.ensure_usable()?;
-        if self.active.is_some() {
-            return Err(WalError::InvalidTransaction(
-                "cannot publish an active transaction",
-            ));
-        }
-        if self.pending_publications == 0 {
-            return Err(WalError::InvalidTransaction(
-                "no complete transaction is pending publication",
-            ));
-        }
-        if let Err(source) = self.sink.sync_data() {
-            self.poisoned = true;
-            return Err(WalError::Io {
+        sync_pending(
+            self.active.is_some(),
+            &mut self.pending_publications,
+            &mut self.poisoned,
+            || self.sink.sync_data(),
+        )
+        .map(|(count, ())| count)
+        .map_err(|error| match error {
+            PublicationError::Active => {
+                WalError::InvalidTransaction("cannot publish an active transaction")
+            },
+            PublicationError::Empty => {
+                WalError::InvalidTransaction("no complete transaction is pending publication")
+            },
+            PublicationError::Sync(source) => WalError::Io {
                 operation: "sync ASTWAL2 publication",
                 source,
-            });
-        }
-        let published = self.pending_publications;
-        self.pending_publications = 0;
-        Ok(published)
+            },
+        })
     }
 
     /// Retire every committed WAL record after the canonical arena, root
@@ -573,27 +466,30 @@ where
                 "cannot checkpoint an active or unpublished WAL transaction",
             ));
         }
-        if let Err(source) = self.sink.set_len(0) {
+        checkpoint_io(
+            &mut self.sink,
+            |sink| {
+                sink.set_len(0)?;
+                Ok(sink)
+            },
+            |sink| {
+                sink.seek(SeekFrom::Start(0))?;
+                Ok(sink)
+            },
+            |sink| {
+                sink.sync_data()?;
+                Ok(sink)
+            },
+        )
+        .map_err(|error| {
             self.poisoned = true;
-            return Err(WalError::Io {
-                operation: "truncate ASTWAL2 checkpoint",
-                source,
-            });
-        }
-        if let Err(source) = self.sink.seek(SeekFrom::Start(0)) {
-            self.poisoned = true;
-            return Err(WalError::Io {
-                operation: "seek ASTWAL2 checkpoint",
-                source,
-            });
-        }
-        if let Err(source) = self.sink.sync_data() {
-            self.poisoned = true;
-            return Err(WalError::Io {
-                operation: "sync ASTWAL2 checkpoint",
-                source,
-            });
-        }
+            let (operation, source) = match error {
+                CheckpointError::Truncate(e) => ("truncate ASTWAL2 checkpoint", e),
+                CheckpointError::Rewind(e) => ("seek ASTWAL2 checkpoint", e),
+                CheckpointError::Sync(e) => ("sync ASTWAL2 checkpoint", e),
+            };
+            WalError::Io { operation, source }
+        })?;
         self.last_sequence = None;
         self.append_offset = WalOffset::new(0);
         Ok(())
@@ -619,7 +515,9 @@ where
             .ok_or(WalError::CountOverflow {
                 field: "WAL append offset",
             })?;
-        if let Err(source) = self.sink.write_all(encoded) {
+        if let Err(source) =
+            super::super::frontier::WalOutput::append_record(&mut self.sink, encoded)
+        {
             self.poisoned = true;
             return Err(WalError::Io {
                 operation: "append ASTWAL2 record",

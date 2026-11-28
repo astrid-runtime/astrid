@@ -15,54 +15,8 @@ pub(crate) use manifest_gate::{ManifestSecurityGate, net_connect_pattern_matches
 #[cfg(test)]
 pub(crate) use test_gates::{AllowAllGate, DenyAllGate};
 
-/// Identity operations that can be gated by the security gate.
-///
-/// Typed enum prevents string-matching bugs. Each variant maps to a
-/// required capability level in the manifest's `identity` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityOperation {
-    /// Resolve a platform user to an AstridUserId (requires "resolve").
-    Resolve,
-    /// Create a platform link (requires "link").
-    Link,
-    /// Remove a platform link (requires "link").
-    Unlink,
-    /// List links for a user (requires "link").
-    ListLinks,
-    /// Create a new user (requires "admin").
-    CreateUser,
-}
-
-impl IdentityOperation {
-    /// Return the minimum capability level required for this operation.
-    ///
-    /// The hierarchy is: `admin > link > resolve`.
-    #[must_use]
-    pub fn required_capability(self) -> &'static str {
-        match self {
-            Self::Resolve => "resolve",
-            Self::Link | Self::Unlink | Self::ListLinks => "link",
-            Self::CreateUser => "admin",
-        }
-    }
-}
-
-/// Check whether a set of declared capability strings satisfies a required level.
-///
-/// The hierarchy is `admin > link > resolve`. Having `"admin"` implies
-/// `"link"` and `"resolve"`.
-pub(super) fn identity_capability_satisfies(declared: &[String], required: &str) -> bool {
-    // Direct match.
-    if declared.iter().any(|d| d == required) {
-        return true;
-    }
-    // Hierarchy: admin implies everything, link implies resolve.
-    match required {
-        "resolve" => declared.iter().any(|d| d == "link" || d == "admin"),
-        "link" => declared.iter().any(|d| d == "admin"),
-        _ => false,
-    }
-}
+mod identity;
+pub use identity::IdentityOperation;
 
 /// Security gate for capsule host function calls.
 ///
@@ -71,7 +25,8 @@ pub(super) fn identity_capability_satisfies(declared: &[String], required: &str)
 /// to permit or deny the operation.
 #[async_trait]
 pub trait CapsuleSecurityGate: Send + Sync {
-    /// Check whether the capsule is allowed to make an HTTP request.
+    /// Check whether the capsule is allowed to make an HTTP request. The hosted
+    /// HTTP backend supplies the serialized, parsed URL of the current hop.
     async fn check_http_request(
         &self,
         capsule_id: &str,

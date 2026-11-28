@@ -8,17 +8,20 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::super::node::{decode_value, spilled_opaque_payload, value_record};
+use super::super::node::{spilled_opaque_payload, value_record};
 use super::{
-    INLINE_VALUE_MAX, KvProjectionEngine, ObjectClass, ObjectId, ObjectKind, ObjectRecord,
-    ObjectReference, ReferenceKind, StorageError, StorageResult, TreeContext, ValueSlot,
-    arithmetic_overflow, invalid, map_engine,
+    INLINE_VALUE_MAX, KvProjectionEngine, ObjectId, ObjectRecord, StorageError, StorageResult,
+    TreeContext, ValueSlot, arithmetic_overflow, invalid,
 };
 use crate::content_dag::{
     ChunkingProfile, ContentSource, OpenedContent, build_content, open_content,
     read_opened_content, validate_opened_content,
 };
-use crate::storage_model::{ModelError, ObjectFormatVersion, ObjectIdentity, ReferenceLabel};
+#[cfg(test)]
+use crate::storage_model::{
+    ObjectClass, ObjectKind, ObjectReference, ReferenceKind, ReferenceLabel,
+};
+use crate::storage_model::{ObjectFormatVersion, ObjectIdentity};
 
 // These are immutable encoding rules, not operator memory limits. They pin
 // identities and the canonical representation chosen for the same KV bytes.
@@ -27,11 +30,8 @@ const CHUNKED_VALUE_VERSION: ObjectFormatVersion = match ObjectFormatVersion::ne
     None => unreachable!(),
 };
 
-#[must_use]
-pub(in crate::kv::tree) const fn chunked_value_version() -> ObjectFormatVersion {
-    CHUNKED_VALUE_VERSION
-}
-const CONTENT_LABEL: &[u8] = b"content";
+#[cfg(test)]
+const CONTENT_LABEL: &[u8] = &super::super::spill_record::CONTENT;
 const PROFILE: ChunkingProfile = ChunkingProfile::ASTRID_V1;
 
 impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
@@ -44,12 +44,20 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             return Ok(ValueSlot::Inline(bytes.into_owned()));
         }
         let length = u64::try_from(bytes.len()).map_err(|_| arithmetic_overflow())?;
-        let object = if length > u64::from(PROFILE.maximum_bytes()) {
-            self.make_chunked_value(&bytes, length)?
-        } else {
-            self.insert(value_record(bytes.into_owned())?)?
-        };
+        let object = self.spill_value(bytes, length)?;
         Ok(ValueSlot::Spilled { object, length })
+    }
+
+    pub(super) fn spill_value(
+        &mut self,
+        bytes: Cow<'_, [u8]>,
+        length: u64,
+    ) -> StorageResult<ObjectId> {
+        if length > u64::from(PROFILE.maximum_bytes()) {
+            self.make_chunked_value(&bytes, length)
+        } else {
+            self.insert(value_record(bytes.into_owned()))
+        }
     }
 
     fn make_chunked_value(&mut self, bytes: &[u8], length: u64) -> StorageResult<ObjectId> {
@@ -63,33 +71,33 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         for (object, record) in built.into_records() {
             self.stage_identified_record(object, record)?;
         }
-        let wrapper = ObjectRecord::new(
-            ObjectKind::KvLeaf,
-            CHUNKED_VALUE_VERSION,
-            length.to_le_bytes().to_vec(),
-            vec![ObjectReference::owns(
-                ReferenceLabel::new(CONTENT_LABEL.to_vec()),
-                file,
-            )],
-            0,
-            ObjectClass::Data,
-        )
-        .map_err(|error| map_engine(&error.into()))?;
+        let wrapper = super::super::spill_record::wrapper(CHUNKED_VALUE_VERSION, file, length);
         self.insert(wrapper)
     }
 
     pub(in crate::kv::tree) fn value_bytes(&self, value: &ValueSlot) -> StorageResult<Vec<u8>> {
-        match value {
-            ValueSlot::Inline(bytes) => Ok(bytes.clone()),
-            ValueSlot::Spilled { object, length } => {
-                let record = self.record(*object)?;
-                if record.format_version() == CHUNKED_VALUE_VERSION {
-                    self.read_chunked_value(*object, *length, &record)
-                } else {
-                    decode_value(*object, *length, &record)
-                }
-            },
-        }
+        self.resolve_slot(value, |id, length, record| {
+            self.read_chunked_value(id, length, record)
+        })
+    }
+
+    pub(in crate::kv::tree) fn resolve_slot(
+        &self,
+        value: &ValueSlot,
+        chunk: impl FnOnce(ObjectId, u64, &ObjectRecord) -> StorageResult<Vec<u8>>,
+    ) -> StorageResult<Vec<u8>> {
+        use super::super::spill_record::{self, ResolveError};
+        spill_record::resolve(
+            value,
+            super::super::FORMAT_VERSION,
+            CHUNKED_VALUE_VERSION,
+            |id| self.record(id),
+            chunk,
+        )
+        .map_err(|error| match error {
+            ResolveError::Source(e) => e,
+            ResolveError::Invalid(id) => invalid(id, "invalid spilled KV value"),
+        })
     }
 
     pub(in crate::kv::tree) fn validate_value(&self, value: &ValueSlot) -> StorageResult<()> {
@@ -129,21 +137,14 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         length: u64,
         record: &ObjectRecord,
     ) -> StorageResult<OpenedContent> {
-        if record.kind() != ObjectKind::KvLeaf
-            || record.class() != ObjectClass::Data
-            || record.logical_bytes() != 0
-            || record.canonical_bytes() != length.to_le_bytes()
-            || record.references().len() != 1
-            || length <= u64::from(PROFILE.maximum_bytes())
-        {
-            return Err(invalid(id, "invalid chunked KV value wrapper"));
-        }
-        let reference = &record.references()[0];
-        if reference.kind() != ReferenceKind::Owns || reference.label().as_bytes() != CONTENT_LABEL
-        {
-            return Err(invalid(id, "invalid chunked KV content reference"));
-        }
-        let opened = open_content(self, reference.target()).map_err(|error| {
+        use super::super::spill_record::{self, Error};
+        let file = spill_record::file(record, length, PROFILE.maximum_bytes()).map_err(
+            |error| match error {
+                Error::Wrapper => invalid(id, "invalid chunked KV value wrapper"),
+                Error::Reference => invalid(id, "invalid chunked KV content reference"),
+            },
+        )?;
+        let opened = open_content(self, file).map_err(|error| {
             StorageError::Serialization(format!("open chunked KV value {id:?}: {error}"))
         })?;
         // Validate the declared size before content reconstruction allocates.
@@ -169,14 +170,14 @@ impl<P: Ord, E: KvProjectionEngine<P>> ContentSource for TreeContext<'_, P, E> {
     }
 
     fn load_shared_content_object(&self, id: ObjectId) -> StorageResult<Option<Arc<ObjectRecord>>> {
-        if let Some(record) = self.records.get(&id) {
-            return Ok(Some(Arc::new(record.clone())));
-        }
-        self.engine
-            .load_shared_kv_object_for(self.principal, id)
-            .map_err(|error| map_engine(&error))?
-            .map(Some)
-            .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))
+        Self::load_record(
+            &self.records,
+            self.principal(),
+            id,
+            super::super::record_source::shared,
+            |principal, object| self.engine.load_shared_kv_object_for(principal, object),
+        )
+        .map(Some)
     }
 
     fn load_shared_content_objects(

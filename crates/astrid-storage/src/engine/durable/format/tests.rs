@@ -116,3 +116,85 @@ fn reference_decoder_keeps_bounds_tags_and_canonical_order_checks() {
         Err("trailing object-frame bytes")
     );
 }
+
+#[test]
+fn canonical_labels_follow_byte_order_across_long_shared_prefixes() {
+    let mut labels = vec![vec![], vec![0], vec![255]];
+    for len in [1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 127] {
+        for last in [0, 1, 127, 255] {
+            let mut value = vec![0x61; len];
+            value.push(last);
+            labels.push(value);
+        }
+    }
+    for left in &labels {
+        for right in &labels {
+            let target = ObjectId::new([3; 32]);
+            let refs = vec![
+                ObjectReference::owns(ReferenceLabel::new(left.clone()), target),
+                ObjectReference::owns(ReferenceLabel::new(right.clone()), target),
+            ];
+            let record = ObjectRecord::new(
+                ObjectKind::Directory,
+                ObjectFormatVersion::V1,
+                vec![],
+                refs,
+                0,
+                ObjectClass::Metadata,
+            );
+            assert_eq!(record.is_ok(), left < right);
+        }
+    }
+}
+
+#[test]
+fn pending_wal_keeps_the_confirmed_frame_and_record_together() {
+    use crate::engine::durable::tests::TestIdentity;
+    use crate::storage_model::ObjectIdentity;
+    use std::sync::Arc;
+
+    let record = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        vec![7, 5],
+        references(3),
+        312,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let id = TestIdentity.identify(&record);
+    let bytes: Arc<[u8]> = encode_object_frame(TEST_IDENTITY_SCHEME, id, &record)
+        .unwrap()
+        .into();
+    let (name, retained, decoded) = pending_object_frame(&bytes, id, &TestIdentity).unwrap();
+    assert!(Arc::ptr_eq(&bytes, &retained));
+    assert_eq!(name, id);
+    assert_eq!(*decoded, record);
+    let wrong = ObjectId::new([3; 32]);
+    assert!(matches!(
+        pending_object_frame(&bytes, wrong, &TestIdentity),
+        Err(DurableError::Corrupt {
+            detail: "WAL overlay object identity mismatch",
+            ..
+        })
+    ));
+    let wrong_frame = encode_object_frame(TEST_IDENTITY_SCHEME, wrong, &record)
+        .unwrap()
+        .into();
+    assert!(matches!(
+        pending_object_frame(&wrong_frame, wrong, &TestIdentity),
+        Err(DurableError::Corrupt {
+            detail: "WAL overlay object identity mismatch",
+            ..
+        })
+    ));
+    let mut trailing = bytes.to_vec();
+    trailing.push(1);
+    assert!(matches!(
+        pending_object_frame(&trailing.into(), id, &TestIdentity),
+        Err(DurableError::Corrupt {
+            detail: "trailing object-frame bytes",
+            ..
+        })
+    ));
+}

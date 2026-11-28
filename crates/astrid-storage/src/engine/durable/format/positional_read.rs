@@ -1,0 +1,188 @@
+//! Fill a positional buffer across short reads from a stable media image.
+use vstd::prelude::*;
+
+verus! {
+
+pub(super) trait Media {
+    type Error;
+    spec fn target(&self) -> (int,Seq<u8>);
+    spec fn image(&self) -> Seq<u8>;
+    spec fn io_error(&self, offset:u64, error:Self::Error) -> bool;
+
+    fn read_at(&self, offset:u64, buffer:&mut [u8]) -> (out: Result<usize,Self::Error>)
+        ensures final(buffer).len() == old(buffer).len(),
+            out matches Err(e) ==> self.io_error(offset,e),
+            out matches Ok(n) ==> {
+                &&& n <= old(buffer).len()
+                &&& n == 0 || offset as int + n <= self.image().len()
+                &&& (n == 0) == (old(buffer).len() == 0 || offset >= self.image().len())
+                &&& n > 0 ==> final(buffer)@.take(n as int) == self.image().subrange(offset as int,offset as int+n)
+            };
+}
+
+pub(super) enum Error<E> { Offset, Length, Short, Io(E) }
+
+pub(super) open spec fn failed_within<M:Media>(media:&M, offset:u64, len:nat, error:M::Error) -> bool {
+    exists|at:u64| offset <= at < offset as int + len && #[trigger] media.io_error(at,error)
+}
+
+/// The buffer from a successful read is exactly the requested interval.
+/// The next provider call begins after the bytes actually supplied.
+pub(super) fn exact<M:Media>(media:&M, offset:u64, buffer:&mut [u8]) -> (out:Result<(),Error<M::Error>>)
+    ensures final(buffer).len() == old(buffer).len(),
+        out.is_ok() && final(buffer).len() > 0 ==> offset as int + final(buffer).len() <= media.image().len() &&
+            final(buffer)@ == media.image().subrange(offset as int,offset as int + final(buffer).len()),
+        out matches Err(Error::Short) ==> offset as int + final(buffer).len() > media.image().len(),
+        out matches Err(Error::Offset) ==> offset as int + final(buffer).len() > u64::MAX,
+        !(out matches Err(Error::Length)),
+        out matches Err(Error::Io(e)) ==> failed_within(media,offset,old(buffer)@.len(),e),
+{
+    let mut filled = 0usize;
+    while filled != buffer.len()
+        invariant buffer.len() == old(buffer).len(), filled <= buffer.len(),
+            filled > 0 ==> offset as int + filled <= media.image().len() &&
+                buffer@.take(filled as int) == media.image().subrange(offset as int,offset as int+filled),
+        decreases buffer.len()-filled,
+    {
+        let Some(position) = offset.checked_add(filled as u64) else {return Err(Error::Offset);};
+        let ghost before = buffer@;
+        let part = &mut buffer[filled..];
+        let n = match media.read_at(position,part) {
+            Ok(n) => n,
+            Err(error) => {
+                assert(media.io_error(position,error));
+                assert(offset <= position < offset as int + old(buffer).len());
+                assert(failed_within(media,offset,old(buffer)@.len(),error));
+                return Err(Error::Io(error));
+            },
+
+        };
+        if n == 0 {return Err(Error::Short);}
+        let ghost received = part@;
+        proof {
+            assert(buffer@.skip(filled as int) =~= received);
+            assert(buffer@.take(filled as int) =~= before.take(filled as int));
+            assert(buffer@.subrange(filled as int,filled as int+n) =~= received.take(n as int));
+            assert(buffer@.take(filled as int+n) =~= media.image().subrange(offset as int,offset as int+filled+n));
+        }
+        let Some(next) = filled.checked_add(n) else {return Err(Error::Length);};
+        filled = next;
+    }
+    assert(buffer@ =~= buffer@.take(filled as int));
+    Ok(())
+}
+
+pub(super) enum SpanError<I,E> { Capacity, Read(Error<I>), Consumer(E) }
+
+pub(super) open spec fn interval<M:Media>(media:&M,offset:u64,size:u64,data:&[u8]) -> bool {
+    data.len() == size && (size > 0 ==> offset as int + size <= media.image().len() &&
+        data@ == media.image().subrange(offset as int,offset as int + size))
+}
+
+pub(super) open spec fn span_result<M:Media,T,E,F:FnOnce(&[u8],u64)->Result<T,E>>(
+    media:&M,offset:u64,size:u64,consume:F,result:Result<T,E>) -> bool {
+    exists|data:&[u8],base:u64| interval(media,offset,size,data) && base == offset &&
+        #[trigger] consume.ensures((data,base),result)
+}
+
+/// Call the consumer with the completed buffer and its absolute starting offset.
+pub(super) fn with_span<M:Media,T,E,F:FnOnce(&[u8],u64)->Result<T,E>>(media:&M,offset:u64,size:u64,
+    consume:F) -> (out:Result<T,SpanError<M::Error,E>>)
+    requires forall|data:&[u8]| interval(media,offset,size,data) ==> #[trigger] consume.requires((data,offset)),
+    ensures match out {
+        Ok(value) => span_result(media,offset,size,consume,Ok(value)),
+        Err(SpanError::Consumer(error)) => span_result(media,offset,size,consume,Err(error)),
+        Err(SpanError::Read(Error::Short)) => offset as int + size > media.image().len(),
+        Err(SpanError::Read(Error::Offset)) => offset as int + size > u64::MAX,
+        Err(SpanError::Read(Error::Length)) => false,
+        Err(SpanError::Read(Error::Io(e))) => failed_within(media,offset,size as nat,e),
+        Err(SpanError::Capacity) => true,
+    },
+{
+    let Ok(len) = usize::try_from(size) else {return Err(SpanError::Capacity);};
+    let mut data = Vec::new();
+    if data.try_reserve_exact(len).is_err() {return Err(SpanError::Capacity);}
+    data.resize(len,0);
+    let buffer = data.as_mut_slice();
+    if let Err(error) = exact(media,offset,buffer) {return Err(SpanError::Read(error));}
+    let bytes = data.as_slice();
+    assert(interval(media,offset,size,bytes));
+    let result = consume(bytes,offset);
+    assert(consume.ensures((bytes,offset),result));
+    assert(span_result(media,offset,size,consume,result));
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(SpanError::Consumer(error)),
+    }
+}
+
+pub(super) enum ExtentError { Overflow, Truncated }
+
+/// Refuse a bounded read before issuing I/O outside the captured prefix.
+pub(super) fn extent(start:u64,len:u64,end:u64) -> (out:Result<u64,ExtentError>)
+    ensures match out {
+        Ok(next)=>next==start as int+len && next<=end,
+        Err(ExtentError::Overflow)=>start as int+len>u64::MAX,
+        Err(ExtentError::Truncated)=>end<start as int+len<=u64::MAX,
+    },
+{
+    let Some(next)=start.checked_add(len) else {return Err(ExtentError::Overflow);};
+    if next>end {return Err(ExtentError::Truncated);}
+    Ok(next)
+}
+
+pub(super) enum FrameError<I,E> { Header(Error<I>), Invalid(E), Capacity, Payload(Error<I>) }
+
+pub(super) open spec fn located<M:Media,E,D,V>(media:&M,offset:u64,decode:D,validate:V,p:Vec<u8>,sum:[u8;32]) -> bool
+    where D:FnOnce(&[u8;52])->Result<super::arena_frame::DecodedFrameHeader,E>,
+        V:FnOnce(super::arena_frame::DecodedFrameHeader,&[u8])->Result<[u8;32],E>
+{
+        &&& offset as int+52+p.len() <= media.image().len()
+        &&& p@ == media.image().subrange(offset as int+52,offset as int+52+p.len())
+        &&& exists|h:&[u8;52],d:super::arena_frame::DecodedFrameHeader,b:&[u8]| b@==p@ &&
+            h@ == media.image().subrange(offset as int,offset as int+52) &&
+            #[trigger] decode.ensures((h,),Ok(d)) && d.payload_len==p.len() &&
+            #[trigger] validate.ensures((d,b),Ok(sum))
+}
+
+type FrameResult<I,E> = Result<(Vec<u8>,[u8;32]),FrameError<I,E>>;
+
+/// Read the header and its declared payload from the same positional handle.
+/// The validators receive exactly the bytes at the requested physical placement.
+pub(super) fn frame<M:Media,E,D,V>(media:&M,offset:u64,decode:D,validate:V)
+    -> (out:FrameResult<M::Error,E>)
+    where D:FnOnce(&[u8;52])->Result<super::arena_frame::DecodedFrameHeader,E>,
+        V:FnOnce(super::arena_frame::DecodedFrameHeader,&[u8])->Result<[u8;32],E>,
+    requires forall|h:&[u8;52]| #[trigger] decode.requires((h,)),
+        forall|d:super::arena_frame::DecodedFrameHeader,p:&[u8]| #[trigger] validate.requires((d,p)),
+    ensures out matches Ok((p,sum)) ==> located(media,offset,decode,validate,p,sum),
+{
+    let mut header=[0u8;52];
+    let header_buf=&mut header[..];
+    if let Err(e)=exact(media,offset,header_buf) {return Err(FrameError::Header(e));}
+    assert(header@ == media.image().subrange(offset as int,offset as int+52));
+    let decoded=match decode(&header) {Ok(h)=>h,Err(e)=>return Err(FrameError::Invalid(e))};
+    let Ok(len)=usize::try_from(decoded.payload_len) else {return Err(FrameError::Capacity);};
+    let mut data=Vec::new();
+    if data.try_reserve_exact(len).is_err() {return Err(FrameError::Capacity);}
+    data.resize(len,0);
+    let Some(start)=offset.checked_add(52) else {return Err(FrameError::Capacity);};
+    let payload_buf=data.as_mut_slice();
+    if let Err(e)=exact(media,start,payload_buf) {return Err(FrameError::Payload(e));}
+    if len==0 {assert(data@ =~= media.image().subrange(start as int,start as int));}
+    let bytes=data.as_slice();
+    let sum=match validate(decoded,bytes) {Ok(s)=>s,Err(e)=>return Err(FrameError::Invalid(e))};
+    assert(decode.ensures((&header,),Ok(decoded)));
+    assert(validate.ensures((decoded,bytes),Ok(sum)));
+    assert(bytes@==data@ && bytes.len()==decoded.payload_len);
+    assert(data@==media.image().subrange(start as int,start as int+data.len()));
+    assert(exists|h:&[u8;52],d:super::arena_frame::DecodedFrameHeader,b:&[u8]| b@==data@ &&
+        h@ == media.image().subrange(offset as int,offset as int+52) &&
+        #[trigger] decode.ensures((h,),Ok(d)) && d.payload_len==data.len() &&
+        #[trigger] validate.ensures((d,b),Ok(sum)));
+    assert(offset as int+52+data.len()<=media.image().len());
+    assert(located(media,offset,decode,validate,data,sum));
+    Ok((data,sum))
+}
+
+}

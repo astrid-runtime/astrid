@@ -16,6 +16,11 @@ use astrid_core::uplink::{InboundMessage, MAX_UPLINKS_PER_CAPSULE, UplinkDescrip
 use astrid_storage::ScopedKvStore;
 use astrid_storage::secret::SecretStore;
 
+#[path = "signed_socket.rs"]
+mod signed_socket;
+pub use signed_socket::SignedSocket;
+pub(crate) use signed_socket::SocketAuthority;
+
 /// An active network stream owned by a capsule.
 ///
 /// Holds either an inbound host-local connection (accepted from the
@@ -29,6 +34,8 @@ use astrid_storage::secret::SecretStore;
 pub enum NetStream {
     /// Inbound Unix-domain socket accepted from the kernel's listener.
     Unix(Arc<tokio::sync::Mutex<LocalStream>>),
+    /// Signed local connection drained by its device retirement barrier.
+    Signed(SignedSocket),
     /// Outbound TCP connection opened via `net.connect-tcp`.
     Tcp(TcpStreamSlot),
 }
@@ -170,6 +177,15 @@ pub trait WorkspaceMountResolver: Send + Sync {
         &self,
         principal: &astrid_core::principal::PrincipalId,
     ) -> Result<PrincipalMount, String>;
+
+    /// Bind this exact admitted UID. Alias-only resolvers cannot establish ownership.
+    async fn resolve_for(
+        &self,
+        _principal: &astrid_core::principal::PrincipalId,
+        _uid: astrid_core::PrincipalUid,
+    ) -> Result<PrincipalMount, String> {
+        Err("workspace resolver does not support UID-bound mounts".to_owned())
+    }
 }
 
 impl std::fmt::Debug for PrincipalMount {
@@ -265,6 +281,9 @@ pub struct HostState {
     /// Explicit kernel-service scope. When false, every long-lived IPC route
     /// is restricted to `principal`; default-principal is still a principal.
     pub system_runtime: bool,
+    /// Immutable owner of a principal-stamped runtime. Shared system and
+    /// unstamped lifecycle stores acquire their bindings at invocation setup.
+    pub(crate) runtime_owner_uid: Option<astrid_core::PrincipalUid>,
     /// The plugin this state belongs to.
     pub capsule_id: CapsuleId,
     /// Per-capsule native operational log under
@@ -358,6 +377,8 @@ pub struct HostState {
     /// principal differs from `self.principal`. When set, overrides `home`
     /// for scheme resolution and security gate checks. Cleared on exit.
     pub invocation_home: Option<PrincipalMount>,
+    /// Durable identity captured when the invocation storage overlays were admitted.
+    pub(crate) invocation_storage_uid: Option<astrid_core::PrincipalUid>,
     /// Per-invocation authoritative workspace branch for the authenticated
     /// caller. Cleared when the invocation returns to the pool.
     pub invocation_workspace: Option<PrincipalMount>,
@@ -608,6 +629,8 @@ pub struct HostState {
     /// Session token for authenticating CLI socket connections. Only set for
     /// the CLI proxy capsule (which has `net_bind` capability).
     pub session_token: Option<std::sync::Arc<astrid_core::session_token::SessionToken>>,
+    /// Registry shared with the kernel that retires signed local sessions.
+    pub device_sessions: astrid_core::profile::device_sessions::DeviceSessions,
     /// Interceptor binding metadata, populated during `WasmEngine::load()`
     /// from `[[interceptor]]` entries in `Capsule.toml`. The kernel
     /// matches incoming IPC messages against these patterns and calls
@@ -681,36 +704,15 @@ pub struct HostState {
     /// without iterating the whole resource table.
     pub process_count_by_principal:
         std::collections::HashMap<astrid_core::principal::PrincipalId, usize>,
-    /// Verified principal bound to each accepted host-local connection,
-    /// keyed by the stream resource rep (`u32`). Populated by the
-    /// `net.unix-listener.accept` path after a successful per-connection
-    /// principal challenge-response (issue #45/#852) and torn down when the
-    /// stream resource drops.
-    ///
-    /// Resource reps are local to a single Store. Each binding carries the
-    /// verified principal and the key of the device that
-    /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
-    /// device's scope as an attenuation floor on the principal's authority.
+    /// Store-local auxiliary bindings for resources without an intrinsic peer identity.
+    /// Signed local streams carry their identity and retirement lease together
+    /// in the stream resource. Its framed reads use that identity directly.
     pub connection_principals: dashmap::DashMap<u32, ConnectionIdentity>,
-    /// The verified principal of the source connection whose inbound frame is
-    /// currently in flight — the ENFORCEMENT side of
-    /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
-    ///
-    /// Set by the framed [`net::tcp-stream.read`](super::host::net) host fn when
-    /// a read returns a data frame on a connection that carries a kernel-bound
-    /// principal; cleared to `None` on a closed/pending read. When the uplink
-    /// (capsule-cli) forwards that frame via `publish-as`, the host stamps THIS
-    /// principal in place of the capsule-supplied name, so a socket client can
-    /// no longer name a principal it has not proven (the self-stamp fix). It
-    /// holds from one framed read until the next, so a forwarded message AND its
-    /// one-shot `client.v1.connect` both attribute to the same verified
-    /// principal.
-    ///
-    /// `None` for an unbound connection (a legacy peer-cred-trusted local
-    /// operator), in which case `publish-as` falls back to the supplied name.
-    /// Per-instance state, NOT the shared `Arc`: the single pooled run-loop
-    /// instance of the uplink both reads the frame and forwards it, so the
-    /// binding lives exactly as long as the in-flight frame.
+    /// One publishable operation captured from the authenticated frame.
+    pub(crate) ingress_publication: Option<IngressPublication>,
+    /// Verified principal of the current ingress frame. A data read from a
+    /// signed stream captures its peer identity for forwarding through
+    /// `publish-as`. An unbound forward uses the reserved anonymous principal.
     pub ingress_principal: Option<astrid_core::principal::PrincipalId>,
     /// The device `key_id` of the source connection whose inbound frame is
     /// currently in flight — the per-device companion to
@@ -749,25 +751,11 @@ pub struct HostState {
     /// connection does NOT earn `LocalSocket`, parallel to how an unbound
     /// principal stamps the reserved `anonymous` identity.
     pub ingress_origin: Option<astrid_events::ipc::MessageOrigin>,
-    /// Host-verified principal each INBOUND uplink connection was accepted
-    /// under, keyed by stream resource rep (`u32`). The lifecycle registry the
-    /// kernel connection counter rides on: `net.unix-listener.{accept,
-    /// poll-accept}` inserts on accept and emits `client.v1.connect`; the
-    /// stream-resource drop removes and emits `client.v1.disconnect`. Both
-    /// emissions stamp the principal stored here, so the pair always balances
-    /// on the identical identity (the connection-tracker leak fix).
-    ///
-    /// Populated for EVERY inbound connection — the handshake-verified
-    /// principal, or the reserved `anonymous` for a legacy/unauthenticated peer
-    /// — so connect/disconnect balance even when unauthenticated. OUTBOUND TCP
-    /// (`connect-tcp`) is never inserted, so a capsule-dialed socket never
-    /// moves the client counter. The emitted principal is ALWAYS the
-    /// host-verified one (never a guest-supplied name), preserving the
-    /// anti-forge boundary (issues #45/#852).
-    ///
-    /// Distinct from [`connection_principals`](Self::connection_principals),
-    /// which stores only authenticated principals (absence ⇒ `publish-as`
-    /// anonymous fallback). The owning Store pairs accept with teardown.
+    /// Authority of the signed resource from which this frame was read.
+    pub(crate) ingress_socket: Option<SocketAuthority>,
+    /// Lifecycle bookkeeping for unsigned inbound sockets, keyed by resource
+    /// handle. Signed connections pair their connect and disconnect events
+    /// through a guard held by the live transport until close or retirement.
     pub client_connections: dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
     /// Bound loopback TCP listeners shared across a run-loop capsule's worker
     /// Stores, keyed by `(host, port)`. When `bind_workers > 1`, each of the N
@@ -866,19 +854,25 @@ impl HostState {
     /// - The per-capsule uplink limit ([`MAX_UPLINKS_PER_CAPSULE`]) has been reached.
     /// - A uplink with the same name and platform already exists.
     pub fn register_uplink(&mut self, descriptor: UplinkDescriptor) -> Result<(), &'static str> {
-        if self.registered_uplinks.len() >= MAX_UPLINKS_PER_CAPSULE {
-            return Err("uplink registration limit reached");
-        }
-        // Reject duplicate name+platform combinations
-        let duplicate = self
-            .registered_uplinks
-            .iter()
-            .any(|c| c.name == descriptor.name && c.platform == descriptor.platform);
-        if duplicate {
-            return Err("duplicate uplink name and platform");
-        }
-        self.registered_uplinks.push(descriptor);
-        Ok(())
+        super::guest_uplink::register(
+            &mut self.registered_uplinks,
+            descriptor,
+            MAX_UPLINKS_PER_CAPSULE,
+            |existing, new| {
+                super::guest_uplink::same_endpoint(
+                    &existing.name,
+                    &existing.platform,
+                    &new.name,
+                    &new.platform,
+                )
+            },
+        )
+        .map_err(|error| match error {
+            super::guest_uplink::RegistrationError::Full => "uplink registration limit reached",
+            super::guest_uplink::RegistrationError::Duplicate => {
+                "duplicate uplink name and platform"
+            },
+        })
     }
 
     /// Return the registered uplinks.
@@ -955,6 +949,7 @@ impl HostState {
 
 #[path = "host_state_connection.rs"]
 mod connection;
+pub(crate) use connection::IngressPublication;
 #[path = "host_state_effective.rs"]
 mod effective;
 #[path = "host_state_hook.rs"]
@@ -969,3 +964,7 @@ mod tests;
 #[cfg(test)]
 #[path = "host_state_cancel_tests.rs"]
 mod cancel_tests;
+
+#[cfg(test)]
+#[path = "host_kv_restart_tests.rs"]
+mod kv_restart_tests;

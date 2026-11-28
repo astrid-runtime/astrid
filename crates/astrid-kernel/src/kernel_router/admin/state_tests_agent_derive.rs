@@ -306,7 +306,7 @@ async fn separate_fleet_caller(kernel: &Arc<Kernel>) -> PrincipalId {
         .await
         .unwrap();
     // Spawning is capability-authorized without any human-device delegation.
-    super::authorize_request(kernel, &caller, None, "agent:create:inherit").unwrap();
+    crate::kernel_router::authorize_request(kernel, &caller, None, "agent:create:inherit").unwrap();
     caller
 }
 

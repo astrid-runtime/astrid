@@ -7,6 +7,10 @@ use super::*;
 #[path = "cleanup_tests.rs"]
 mod cleanup_tests;
 
+#[cfg(unix)]
+#[path = "restart_tests.rs"]
+mod restart_tests;
+
 #[path = "runtime_tree_tests.rs"]
 mod runtime_tree_tests;
 
@@ -211,6 +215,60 @@ impl<F: CallbackFilesystem> CallbackFilesystem for ReadBoundarySpy<F> {
 }
 
 #[tokio::test]
+async fn elapsed_idle_deadline_denies_callback_status_and_sync_despite_renewal() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let caller = PrincipalId::default();
+    let lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Principal(caller.clone()),
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadOnly,
+        "test-provider".into(),
+        root.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        callback(
+            &lease,
+            &lease.lease_token,
+            StorageFilesystemOperationV1::Sync
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(_)
+    ));
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+    state.expiry.elapse_idle_for_test();
+    std::thread::scope(|scope| {
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let other = Arc::clone(&start);
+        let state = &state;
+        scope.spawn(move || {
+            other.wait();
+            state.renew();
+        });
+        start.wait();
+        assert!(lease_status(&kernel, &caller, false, lease.mount_id).is_err());
+    });
+    assert!(
+        matches!(callback(&lease, &lease.lease_token, StorageFilesystemOperationV1::Sync).await,
+        StorageFilesystemOutcomeV1::Failure(error) if error.code == "stale-lease")
+    );
+    assert!(
+        sync_lease(&kernel, &caller, false, lease.mount_id)
+            .await
+            .is_err()
+    );
+    revoke_lease_if_present(&kernel, &caller, false, lease.mount_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn oversized_set_length_and_random_write_preflight_before_full_read() {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
@@ -397,10 +455,7 @@ async fn principal_home_subtree_cannot_reach_capsule_catalog() {
     )
     .unwrap();
 
-    let scoped = PrefixedFilesystem {
-        inner: root,
-        prefix: "home".to_owned(),
-    };
+    let scoped = PrefixedFilesystem::principal_home(root);
     let listing = execute_blocking(
         &scoped,
         StorageFilesystemOperationV1::ReadDirectory {
@@ -1341,6 +1396,31 @@ async fn revoke_drains_a_worker_after_its_waiter_is_cancelled() {
     check_worker_drain(WorkerCase::CancelledWrite).await;
 }
 
+async fn dispatch_v1_operation(
+    state: &Arc<StorageMountLeaseState>,
+    token: &str,
+    operation: StorageFilesystemOperationV1,
+) -> StorageFilesystemOutcomeV1 {
+    let request = StorageFilesystemRequestV1 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        request_id: "worker-drain".into(),
+        lease_token: token.into(),
+        operation,
+    };
+    match dispatch_request(
+        state,
+        CallbackRequest {
+            request,
+            response_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        },
+    )
+    .await
+    {
+        CallbackResponse::V1(response) => response.outcome,
+        CallbackResponse::V2(_) => panic!("expected v1 response"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_drains_administrative_sync_after_its_waiter_is_cancelled() {
     check_worker_drain(WorkerCase::CancelledAdminSync).await;
@@ -1360,6 +1440,33 @@ fn hold_worker(state: &StorageMountLeaseState) -> Arc<MutationTestGate> {
     });
     *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
     gate
+}
+
+fn start_worker(
+    case: WorkerCase,
+    kernel: Arc<Kernel>,
+    state: Arc<StorageMountLeaseState>,
+    caller: PrincipalId,
+    token: String,
+) -> tokio::task::JoinHandle<StorageFilesystemOutcomeV1> {
+    tokio::spawn(async move {
+        if matches!(case, WorkerCase::CancelledAdminSync) {
+            sync_lease(&kernel, &caller, true, state.issued.scope.id)
+                .await
+                .unwrap();
+            return StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done);
+        }
+        dispatch_v1_operation(
+            &state,
+            &token,
+            StorageFilesystemOperationV1::Write {
+                path: "in-flight.bin".to_owned(),
+                offset: 0,
+                data: vec![0x36_u8; 64],
+            },
+        )
+        .await
+    })
 }
 
 async fn check_worker_drain(case: WorkerCase) {
@@ -1391,27 +1498,13 @@ async fn check_worker_drain(case: WorkerCase) {
     }
     let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
     let gate = hold_worker(&state);
-    let mutation_kernel = Arc::clone(&kernel);
-    let mutation_state = Arc::clone(&state);
-    let worker_caller = caller.clone();
-    let mutation = tokio::spawn(async move {
-        if sync {
-            sync_lease(&mutation_kernel, &worker_caller, true, lease.mount_id)
-                .await
-                .unwrap();
-            return StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done);
-        }
-        execute_operation(
-            &mutation_kernel,
-            &mutation_state,
-            StorageFilesystemOperationV1::Write {
-                path: "in-flight.bin".to_owned(),
-                offset: 0,
-                data: vec![0x36_u8; 64],
-            },
-        )
-        .await
-    });
+    let mutation = start_worker(
+        case,
+        Arc::clone(&kernel),
+        Arc::clone(&state),
+        caller.clone(),
+        lease.lease_token.clone(),
+    );
     gate.entered.acquire().await.unwrap().forget();
     assert_eq!(
         state.in_flight_mutations.load(Ordering::Acquire),
@@ -1453,7 +1546,8 @@ async fn check_worker_drain(case: WorkerCase) {
     assert_eq!(state.dirty.load(Ordering::Acquire), !sync);
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!lease.callback_path.exists());
-    let fenced = execute_operation(&kernel, &state, create("after-revoke.txt")).await;
+    let fenced =
+        dispatch_v1_operation(&state, &lease.lease_token, create("after-revoke.txt")).await;
     assert!(matches!(
         fenced,
         StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
@@ -1480,6 +1574,29 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
     .await
     .unwrap();
     let uid = kernel.principal_directory.uid_for(&caller).unwrap();
+    let replaced = astrid_core::PrincipalUid::from_bytes([0xEE; 32]);
+    {
+        use astrid_capsule::context::ProcessStorageMountBroker as _;
+        let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+        assert!(broker.mount_for(&caller, replaced).await.is_err());
+        assert!(kernel.storage_mounts.is_empty());
+    }
+    let denied = issue_bound_lease(
+        &kernel,
+        caller.clone(),
+        LeaseAuthority::Process(replaced),
+        StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerSubtree {
+            prefix: "home".into(),
+        },
+        StorageProviderAccessV1::ReadWrite,
+        "owner-test".to_owned(),
+        temporary.path().join("owner-mount"),
+    )
+    .await
+    .expect_err("process lease must match the admitted UID");
+    assert_eq!(denied, "process projection owner changed");
+    assert!(kernel.storage_mounts.is_empty());
     let owner = astrid_storage::StateOwner::Principal(uid);
     let store = kernel.principal_store.clone().unwrap();
     let branches = astrid_storage::WorkspaceBranchStore::new(store.content());
@@ -1534,13 +1651,13 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         .storage_mounts
         .get(&lease.mount_id)
         .expect("internal branch lease is registered")
-        .target
-        .clone();
+        .issued
+        .scope
+        .target;
     assert!(matches!(
         target,
-        astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch {
-            workspace: actual
-        } if actual == workspace
+        LeaseTarget::WorkspaceBranch(actual_owner, actual_workspace)
+            if StateOwner::from(actual_owner) == owner && actual_workspace == workspace
     ));
     assert_eq!(
         callback(&lease, &lease.lease_token, create("branch.txt")).await,
@@ -1645,4 +1762,55 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
             .unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn lease_management_follows_the_requester_uid_through_alias_reassignment() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let alias = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&alias).unwrap();
+    let lease = issue_lease(
+        &kernel,
+        alias.clone(),
+        false,
+        StorageProviderViewV1::Principal(alias.clone()),
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "requester-test".to_owned(),
+        temporary.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    let renamed = PrincipalId::new("renamed-requester").unwrap();
+    kernel
+        .principal_directory
+        .rename(uid, &alias, renamed.clone())
+        .unwrap();
+    kernel
+        .principal_directory
+        .register(
+            alias.clone(),
+            astrid_core::PrincipalUid::from_bytes([0x42; 32]),
+        )
+        .unwrap();
+
+    assert!(lease_status(&kernel, &alias, false, lease.mount_id).is_err());
+    assert!(
+        sync_lease(&kernel, &alias, false, lease.mount_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        revoke_lease(&kernel, &alias, false, lease.mount_id)
+            .await
+            .is_err()
+    );
+    assert!(lease_status(&kernel, &renamed, false, lease.mount_id).is_ok());
+    assert!(lease_status(&kernel, &alias, true, lease.mount_id).is_ok());
+    revoke_lease(&kernel, &renamed, false, lease.mount_id)
+        .await
+        .unwrap();
+    assert!(kernel.storage_mounts.is_empty());
 }

@@ -1,0 +1,279 @@
+//! Select the record used by a closure walk from the live transaction layers.
+use super::closure_walk::{self as walk, Edge, Source};
+use super::{ObjectId, ObjectKind, ObjectRecord, ObjectReference};
+use std::collections::{BTreeMap, BTreeSet};
+use vstd::prelude::*;
+
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
+    std_specs::{
+        btree::{btree_map_inv, increasing_seq},
+        iter::IteratorSpec,
+    },
+};
+
+verus! {
+
+impl Edge<ObjectId> for ObjectReference {
+    open spec fn target(&self) -> Option<ObjectId> {
+        if self.fields().2 is Owns {Some(self.fields().1)} else {None}
+    }
+
+    fn owned_target(&self) -> Option<ObjectId> {
+        self.owning_target()
+    }
+}
+
+pub(super) struct Layers<'a,K,I,P,L> {
+    pub(super) incoming:&'a BTreeMap<K,I>,
+    pub(super) pending:Option<&'a BTreeMap<K,P>>,
+    pub(super) index:&'a BTreeMap<K,L>,
+}
+
+/// Select a preloaded record. Only the caller decides how to handle a miss.
+fn incoming<'a,K:Ord,I>(id:&K,table:&'a BTreeMap<K,I>) -> (out:Option<&'a I>)
+    requires btree_map_inv(table),obeys_cmp::<K>(),obeys_cmp_concrete_eq::<K>(),
+    ensures out.is_some() == table@.contains_key(*id),
+        out matches Some(record) ==> *record == table@[*id],
+{
+    table.get(id)
+}
+
+/// Immutable object table populated by the recovery arena reader.
+pub(super) struct Preload<'a>(pub(super) &'a BTreeMap<ObjectId,ObjectRecord>);
+
+impl Source<ObjectId> for Preload<'_> {
+    type Error = ObjectId;
+
+    open spec fn valid(&self) -> bool {
+        btree_map_inv(self.0) && obeys_cmp::<ObjectId>() && obeys_cmp_concrete_eq::<ObjectId>()
+    }
+
+    open spec fn edges(&self) -> Map<ObjectId,Set<ObjectId>> {
+        self.0@.map_values(|record:ObjectRecord| walk::children(record.contents().3))
+    }
+
+    open spec fn failed(graph:Map<ObjectId,Set<ObjectId>>,id:ObjectId,error:ObjectId) -> bool {
+        !graph.contains_key(id) && error == id
+    }
+
+    // The caller validates the commit after collecting its complete owning closure.
+    open spec fn commit(&self,_root:ObjectId) -> bool {true}
+    open spec fn root_failed(&self,_root:ObjectId,_error:ObjectId) -> bool {false}
+
+    fn check_root(&mut self,_root:ObjectId) -> Result<(),ObjectId> {Ok(())}
+
+    fn expand(&mut self,id:ObjectId,stack:&mut Vec<walk::Work<ObjectId>>) -> Result<(),ObjectId> {
+        match incoming(&id,self.0) {
+            Some(record) => {
+                walk::schedule(record.references(),stack);
+                Ok(())
+            },
+            None => Err(id),
+        }
+    }
+}
+
+/// Recovery has no pending WAL object table or index fallback after preloading.
+pub(super) fn preloaded<K:Ord+Copy,I>(id:K,table:&BTreeMap<K,I>) -> (out:Result<&I,K>)
+    requires btree_map_inv(table),obeys_cmp::<K>(),obeys_cmp_concrete_eq::<K>(),
+    ensures match out {
+        Ok(r) => table@.contains_key(id) && *r == table@[id],
+        Err(e) => !table@.contains_key(id) && e == id,
+    },
+{
+    match incoming(&id,table) {Some(record) => Ok(record),None => Err(id)}
+}
+
+pub(super) open spec fn in_id_order(ids:Seq<ObjectId>) -> bool {
+    exists|ordered:Seq<&ObjectId>| #[trigger] increasing_seq(ordered) && ids == ordered.unref()
+}
+
+pub(super) open spec fn row_ids(rows:Seq<(ObjectId,&ObjectRecord)>) -> Seq<ObjectId> {
+    rows.map_values(|row:(ObjectId,&ObjectRecord)| row.0)
+}
+
+/// Materialize the least owning closure in the ordered set's iteration order.
+pub(super) fn materialize(
+    table:&BTreeMap<ObjectId,ObjectRecord>,root:ObjectId)
+    -> (out:Result<Vec<(ObjectId,&ObjectRecord)>,walk::Failure<ObjectId,ObjectId>>)
+    requires Preload(table).valid(),
+    ensures match out {
+        Ok(rows) => {
+            let ids = row_ids(rows@).to_set();
+            let graph = Preload(table).edges();
+            &&& in_id_order(row_ids(rows@))
+            &&& walk::closed(root,Set::empty(),graph,ids)
+            &&& forall|nodes:Set<ObjectId>| #[trigger] walk::closed(root,Set::empty(),graph,nodes) ==> ids.subset_of(nodes)
+            &&& exists|rank:Map<ObjectId,nat>| rank.dom() == ids && #[trigger] walk::ranked(graph,Set::empty(),rank)
+            &&& forall|i:int| 0 <= i < rows.len() ==> table@.contains_key(rows@[i].0) &&
+                (#[trigger] rows@[i]).1.contents() == table@[rows@[i].0].contents()
+        },
+        Err(walk::Failure::Cycle(id)) => walk::reaches(Preload(table).edges(),Set::empty(),id,id) &&
+            forall|nodes:Set<ObjectId>| #[trigger] walk::closed(root,Set::empty(),Preload(table).edges(),nodes) ==> nodes.contains(id),
+        Err(walk::Failure::Source(id,e)) => id == e && !table@.contains_key(id) &&
+            forall|nodes:Set<ObjectId>| #[trigger] walk::closed(root,Set::empty(),Preload(table).edges(),nodes) ==> nodes.contains(id),
+        Err(walk::Failure::Root(_)) => false,
+    },
+{
+    let mut source = Preload(table);
+    let seen = walk::walk(&mut source,&BTreeSet::new(),root)?;
+    let mut it = seen.iter();
+    let ghost sequence = it.remaining();
+    let mut rows = Vec::with_capacity(seen.len());
+    while rows.len() < seen.len()
+        invariant
+            Preload(table).valid(),sequence.len() == seen.len(), rows.len() <= seen.len(),
+            increasing_seq(sequence),sequence.unref().to_set() == seen@,it.remaining() == sequence.skip(rows.len() as int),
+            row_ids(rows@) == sequence.unref().take(rows.len() as int),
+            forall|k:ObjectId| seen@.contains(k) ==> table@.contains_key(k),
+            forall|i:int| 0 <= i < rows.len() ==> table@.contains_key(rows@[i].0) &&
+                (#[trigger] rows@[i]).1.contents() == table@[rows@[i].0].contents(),
+        decreases seen.len()-rows.len(),
+    {
+        let ghost i = rows.len() as int;
+        let Some(id) = it.next() else {unreachable!("iterator length matches the closure size")};
+        assert(sequence.unref()[i] == *id);
+        assert(seen@.contains(*id));
+        let record = preloaded(*id,table);
+        let Ok(record) = record else {unreachable!("visited object is present in the immutable preload")};
+        rows.push((*id,record));
+        assert(it.remaining() =~= sequence.skip(i+1));
+        assert(row_ids(rows@) =~= sequence.unref().take(i+1));
+    }
+    assert(row_ids(rows@) =~= sequence.unref());
+    assert(increasing_seq(sequence));
+    assert(seen@.difference(Set::empty()) =~= seen@);
+    Ok(rows)
+}
+
+/// Origin of a declared record during live commit preparation. Reusing an
+/// existing record still requires the caller to compare its complete contents.
+pub(super) enum Placement<'a,P,L> { Unreachable, Pending(&'a P), Indexed(L), NewCommit, NewObject }
+
+pub(super) fn placement<'a,P,L:Copy>(id:ObjectId,commit:ObjectId,reachable:&BTreeSet<ObjectId>,
+    pending:&'a BTreeMap<ObjectId,P>,index:&BTreeMap<ObjectId,L>) -> (out:Placement<'a,P,L>)
+    requires obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        vstd::std_specs::btree::btree_set_inv(reachable),btree_map_inv(pending),btree_map_inv(index),
+    ensures match out {
+        Placement::Unreachable=>!reachable@.contains(id),
+        Placement::Pending(record)=>reachable@.contains(id) && pending@.contains_key(id) && *record==pending@[id],
+        Placement::Indexed(location)=>reachable@.contains(id) && !pending@.contains_key(id) && index@.contains_key(id) && location==index@[id],
+        Placement::NewCommit=>reachable@.contains(id) && !pending@.contains_key(id) && !index@.contains_key(id) && id==commit,
+        Placement::NewObject=>reachable@.contains(id) && !pending@.contains_key(id) && !index@.contains_key(id) && id!=commit,
+    },
+{
+    if !reachable.contains(&id) { return Placement::Unreachable; }
+    if let Some(record)=pending.get(&id) { return Placement::Pending(record); }
+    if let Some(location)=index.get(&id) { return Placement::Indexed(*location); }
+    if id.same(&commit) {Placement::NewCommit} else {Placement::NewObject}
+}
+
+pub(super) enum Fresh { Commit, Object }
+pub(super) enum PlacementError<E> { Collision(ObjectId), Read(E) }
+
+/// A record can be omitted at an existing address only when its full contents
+/// match. A failed indexed read propagates unchanged to the transaction.
+pub(super) fn prepare_row<'a,P,L,E,F,R>(route:Placement<'a,P,L>,id:ObjectId,record:&ObjectRecord,
+    pending:F,read:R) -> (out:Result<Option<Fresh>,PlacementError<E>>)
+    where F:FnOnce(&'a P)->&'a ObjectRecord,R:FnOnce(ObjectId,L)->Result<ObjectRecord,E>,
+    requires vstd::laws_eq::obeys_concrete_eq::<ObjectRecord>(),
+        route matches Placement::Pending(p) ==> pending.requires((p,)),
+        route matches Placement::Indexed(loc) ==> read.requires((id,loc)),
+    ensures match route {
+        Placement::Unreachable=>out matches Ok(None),
+        Placement::NewCommit=>out matches Ok(Some(Fresh::Commit)),
+        Placement::NewObject=>out matches Ok(Some(Fresh::Object)),
+        Placement::Pending(p)=>exists|r:&ObjectRecord| #[trigger] pending.ensures((p,),r) &&
+            (if *r==*record {out matches Ok(None)} else {out matches Err(PlacementError::Collision(k)) && k==id}),
+        Placement::Indexed(loc)=>match out {
+            Ok(None)=>read.ensures((id,loc),Ok(*record)),
+            Err(PlacementError::Read(e))=>read.ensures((id,loc),Err(e)),
+            Err(PlacementError::Collision(k))=>k==id && exists|r:ObjectRecord| r!=*record && #[trigger] read.ensures((id,loc),Ok(r)),
+            _=>false,
+        },
+    },
+{
+    proof {reveal(vstd::laws_eq::obeys_concrete_eq);}
+    match route {
+        Placement::Unreachable=>Ok(None),
+        Placement::NewCommit=>Ok(Some(Fresh::Commit)),
+        Placement::NewObject=>Ok(Some(Fresh::Object)),
+        Placement::Pending(p)=>{
+            let existing=pending(p);
+            if existing==record {Ok(None)} else {Err(PlacementError::Collision(id))}
+        },
+        Placement::Indexed(loc)=>match read(id,loc) {
+            Ok(existing)=>if existing==*record {Ok(None)} else {Err(PlacementError::Collision(id))},
+            Err(e)=>Err(PlacementError::Read(e)),
+        },
+    }
+}
+
+pub(super) enum CommitError { Missing, WrongKind(ObjectKind) }
+
+/// The checked graph traversal has already admitted all owning edges. Check
+/// the remaining fresh-world rule on the exact record named by the journal.
+pub(super) fn commit_kind(rows:&[(ObjectId,&ObjectRecord)],root:ObjectId) -> (out:Result<(),CommitError>)
+    ensures match out {
+        Ok(()) => exists|i:int| 0 <= i < rows.len() && #[trigger] rows@[i].0 == root && rows@[i].1.contents().0 is Commit,
+        Err(CommitError::WrongKind(kind)) => !(kind is Commit) && exists|i:int| 0 <= i < rows.len() &&
+            #[trigger] rows@[i].0 == root && rows@[i].1.contents().0 == kind,
+        Err(CommitError::Missing) => forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].0 != root,
+    },
+{
+    let mut i = 0;
+    while i < rows.len()
+        invariant i <= rows.len(),forall|j:int| 0 <= j < i ==> #[trigger] rows@[j].0 != root,
+        decreases rows.len()-i,
+    {
+        let (id,record) = rows[i];
+        if id.same(&root) {
+            let kind = record.kind();
+            return match kind {ObjectKind::Commit => Ok(()),other => Err(CommitError::WrongKind(other))};
+        }
+        i = i.saturating_add(1);
+    }
+    Err(CommitError::Missing)
+}
+
+/// Incoming records shadow the committed WAL overlay. A media error for the
+/// selected index entry is returned to the walk at that same object identity.
+pub(super) fn load<K:Ord+Copy,I,P,L,R,E,FI,FP,FL,FM>(
+    id:K,layers:&Layers<K,I,P,L>,
+    from_incoming:FI,from_pending:FP,from_index:FL,missing:FM,
+) -> (out:Result<R,E>)
+    where FI:FnOnce(&I)->R,FP:FnOnce(&P)->R,FL:FnOnce(K,&L)->Result<R,E>,FM:FnOnce(K)->E,
+    requires obeys_cmp::<K>(),obeys_cmp_concrete_eq::<K>(),
+        btree_map_inv(layers.incoming),btree_map_inv(layers.index),
+        layers.pending matches Some(table) ==> btree_map_inv(table),
+        forall|value:&I| #[trigger] from_incoming.requires((value,)),
+        forall|value:&P| #[trigger] from_pending.requires((value,)),
+        forall|location:&L| #[trigger] from_index.requires((id,location)),
+        missing.requires((id,)),
+    ensures
+        if layers.incoming@.contains_key(id) {
+            out matches Ok(record) && from_incoming.ensures((&layers.incoming@[id],),record)
+        } else if layers.pending matches Some(table) && table@.contains_key(id) {
+            out matches Ok(record) && from_pending.ensures((&layers.pending.unwrap()@[id],),record)
+        } else if layers.index@.contains_key(id) {
+            from_index.ensures((id,&layers.index@[id]),out)
+        } else {
+            out matches Err(error) && missing.ensures((id,),error)
+        },
+{
+    if let Some(record) = incoming(&id,layers.incoming) {
+        return Ok(from_incoming(record));
+    }
+    let pending = match layers.pending {Some(table) => table.get(&id), None => None};
+    if let Some(record) = pending {
+        return Ok(from_pending(record));
+    }
+    match layers.index.get(&id) {
+        Some(location) => from_index(id,location),
+        None => Err(missing(id)),
+    }
+}
+
+}

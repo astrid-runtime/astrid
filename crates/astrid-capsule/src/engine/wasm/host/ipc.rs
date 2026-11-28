@@ -21,6 +21,7 @@
 //! against the calling capsule's cancellation token so capsule unload
 //! always wins over a stuck wait.
 
+use astrid_events::ipc::DeviceStamp;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -229,8 +230,8 @@ async fn publish_inner(
     state: &mut HostState,
     topic: String,
     payload: String,
-    principal_str: String,
-    device_key_id: Option<&str>,
+    principal: astrid_core::PrincipalId,
+    device: DeviceStamp<'_>,
     request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     origin: astrid_events::ipc::MessageOrigin,
 ) -> Result<(), ErrorCode> {
@@ -249,8 +250,6 @@ async fn publish_inner(
     }
 
     let payload_len = payload.len();
-    let principal = astrid_core::principal::PrincipalId::new(&principal_str)
-        .unwrap_or_else(|_| state.effective_principal());
     let throughput_cap = usize::try_from(state.effective_profile().quotas.max_ipc_throughput_bytes)
         .unwrap_or(usize::MAX);
     state
@@ -309,7 +308,7 @@ async fn publish_inner(
     // Bindgen boundary IN: the guest supplies the topic as `string`; wrap it
     // explicitly (validation already ran above on the raw `&str`).
     let mut message = InternalIpcMessage::new(Topic::from_raw(topic), ipc_payload, state.capsule_uuid)
-            .with_principal(principal_str)
+            .with_principal(principal.into_inner())
             // Carry the host-stamped transport origin of the originating request.
             // A fresh `InternalIpcMessage` defaults to `System`; stamping it here
             // preserves `RemoteGateway` / `LocalSocket` provenance across a
@@ -319,8 +318,9 @@ async fn publish_inner(
             .with_origin(origin);
     // Stamp the host-derived authenticating-device fingerprint so the kernel
     // cap-gate can apply the device's scope as an attenuation floor.
-    if let Some(id) = device_key_id {
+    if let Some(id) = device.fingerprint {
         message = message.with_device_key_id(id);
+        message.device_registration_id = device.registration;
     }
     if let Some(owner) = request_owner {
         message = message.with_request_owner(owner);
@@ -346,9 +346,13 @@ async fn publish_inner(
         astrid_events::DeliveryAdmissionError::InvalidEvent => ErrorCode::InvalidInput,
         astrid_events::DeliveryAdmissionError::Closed => ErrorCode::CapabilityDenied,
     })?;
-    // Retirement while waiting must not let the old invocation commit an
-    // effect after its view has been revoked. Dropping releases all permits.
-    if !state.invocation_authority_active() || cancel_token.is_cancelled() {
+    // Admit after the capacity wait. Retirement serializes with admission
+    // and waits for the guard through publication. Dropping an unadmitted
+    // publication releases its reserved capacity.
+    let _operation = state
+        .begin_host_operation()
+        .map_err(|()| ErrorCode::CapabilityDenied)?;
+    if cancel_token.is_cancelled() {
         return Err(ErrorCode::CapabilityDenied);
     }
     publication
@@ -360,47 +364,67 @@ async fn publish_inner(
     Ok(())
 }
 
+async fn publish_for_caller(
+    state: &mut HostState,
+    topic: String,
+    payload: String,
+) -> Result<(), ErrorCode> {
+    let principal = match state
+        .caller_context
+        .as_ref()
+        .and_then(|message| message.principal.as_deref())
+    {
+        Some(stamp) => {
+            astrid_core::PrincipalId::new(stamp).map_err(|_| ErrorCode::CapabilityDenied)?
+        },
+        None => state.principal.clone(),
+    };
+    // Inherit the originating request's transport origin from the in-flight
+    // caller context (host-populated by the dispatcher), so a fan-out
+    // capsule re-publishing on behalf of a `RemoteGateway` / `LocalSocket`
+    // request preserves that provenance downstream. A run-loop publish with
+    // no caller context (load-time, self-triggered) is `System`. A guest
+    // can never name this origin — it only ever inherits its caller's.
+    let origin = state
+        .caller_context
+        .as_ref()
+        .map(|m| m.origin)
+        .unwrap_or(astrid_events::ipc::MessageOrigin::System);
+    // Preserve the authenticating device's attenuation through capsule
+    // fan-out. The value is host-stamped on ingress and cannot be supplied
+    // by the guest. Self-triggered publishes have no caller context.
+    let device_key_id = state
+        .caller_context
+        .as_ref()
+        .and_then(|message| message.device_key_id.clone());
+    let request_owner = state
+        .caller_context
+        .as_ref()
+        .and_then(|message| message.request_owner);
+    let registration = state
+        .caller_context
+        .as_ref()
+        .and_then(|m| m.device_registration_id);
+    publish_inner(
+        state,
+        topic,
+        payload,
+        principal,
+        DeviceStamp {
+            fingerprint: device_key_id.as_deref(),
+            registration,
+        },
+        request_owner,
+        origin,
+    )
+    .await
+}
+
 impl ipc::Host for HostState {
     async fn publish(&mut self, topic: String, payload: String) -> Result<(), ErrorCode> {
-        let principal_str = self
-            .caller_context
-            .as_ref()
-            .and_then(|c| c.principal.clone())
-            .unwrap_or_else(|| self.principal.to_string());
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        // Inherit the originating request's transport origin from the in-flight
-        // caller context (host-populated by the dispatcher), so a fan-out
-        // capsule re-publishing on behalf of a `RemoteGateway` / `LocalSocket`
-        // request preserves that provenance downstream. A run-loop publish with
-        // no caller context (load-time, self-triggered) is `System`. A guest
-        // can never name this origin — it only ever inherits its caller's.
-        let origin = self
-            .caller_context
-            .as_ref()
-            .map(|m| m.origin)
-            .unwrap_or(astrid_events::ipc::MessageOrigin::System);
-        // Preserve the authenticating device's attenuation through capsule
-        // fan-out. The value is host-stamped on ingress and cannot be supplied
-        // by the guest. Self-triggered publishes have no caller context.
-        let device_key_id = self
-            .caller_context
-            .as_ref()
-            .and_then(|message| message.device_key_id.clone());
-        let request_owner = self
-            .caller_context
-            .as_ref()
-            .and_then(|message| message.request_owner);
-        let result = publish_inner(
-            self,
-            topic,
-            payload,
-            principal_str,
-            device_key_id.as_deref(),
-            request_owner,
-            origin,
-        )
-        .await;
+        let result = publish_for_caller(self, topic, payload).await;
         audit_ipc(
             self,
             "astrid:ipc/host.publish",
@@ -420,6 +444,30 @@ impl ipc::Host for HostState {
         if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
+        let (topic, payload) = if self.ingress_principal.is_some() {
+            // A single authenticated frame authorizes one matching forward. Take
+            // its operation before the first await, including on rejected attempts.
+            let frame = super::net::take_publication(&mut self.ingress_publication)
+                .ok_or(ErrorCode::CapabilityDenied)?;
+            if topic.len() > 256 || payload.len() > MAX_PAYLOAD_BYTES {
+                return Err(ErrorCode::InvalidInput);
+            }
+            let mut value = serde_json::from_str(&payload).map_err(|_| ErrorCode::InvalidInput)?;
+            let body =
+                crate::engine::wasm::host_state::IngressPublication::canonical_payload(&mut value)
+                    .ok_or(ErrorCode::InvalidInput)?;
+            if !super::net::matches_publication(
+                frame.topic.as_bytes(),
+                frame.payload.as_bytes(),
+                topic.as_bytes(),
+                body.as_bytes(),
+            ) {
+                return Err(ErrorCode::CapabilityDenied);
+            }
+            (frame.topic, frame.payload)
+        } else {
+            (topic, payload)
+        };
         // The principal is DERIVED from the source connection, never named by
         // the capsule (issue #45/#852). A connection the kernel verified at the
         // handshake — recorded by the framed `tcp-stream.read` that pulled this
@@ -429,8 +477,8 @@ impl ipc::Host for HostState {
         // principal, and an unproven claim earns no privilege (it fails closed
         // on every capability check). The capsule-supplied name is ignored.
         let effective = match self.ingress_principal.as_ref() {
-            Some(verified) => verified.as_str().to_owned(),
-            None => astrid_core::principal::PrincipalId::anonymous().into_inner(),
+            Some(verified) => verified.clone(),
+            None => astrid_core::principal::PrincipalId::anonymous(),
         };
         // The authenticating device is host-derived from the same in-flight
         // connection (recorded by the framed read that pulled this frame),
@@ -452,16 +500,42 @@ impl ipc::Host for HostState {
             .unwrap_or(astrid_events::ipc::MessageOrigin::System);
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        let result = publish_inner(
-            self,
-            topic,
-            payload,
-            effective,
+        let authority = self.ingress_socket.clone();
+        let guard = super::net::publication_guard(
+            authority.as_ref().map(|socket| {
+                (
+                    socket,
+                    socket.identity.principal.as_str(),
+                    socket.identity.device_key_id.as_deref(),
+                    socket.identity.request_owner.as_u128(),
+                )
+            }),
+            effective.as_str(),
             device_key_id.as_deref(),
-            request_owner,
-            origin,
-        )
-        .await;
+            request_owner.map(astrid_events::ipc::RequestOwnerId::as_u128),
+        );
+        let result = {
+            let publication = publish_inner(
+                self,
+                topic,
+                payload,
+                effective,
+                DeviceStamp {
+                    fingerprint: device_key_id.as_deref(),
+                    registration: authority.as_ref().and_then(|s| s.registration),
+                },
+                request_owner,
+                origin,
+            );
+            match guard {
+                super::net::PublicationGuard::Denied => Err(ErrorCode::CapabilityDenied),
+                super::net::PublicationGuard::Signed(authority) => authority
+                    .run(publication)
+                    .await
+                    .unwrap_or(Err(ErrorCode::CapabilityDenied)),
+                super::net::PublicationGuard::Unbound => publication.await,
+            }
+        };
         audit_ipc(
             self,
             "astrid:ipc/host.publish-as",
@@ -784,7 +858,10 @@ impl HostSubscription for HostState {
         result
     }
 
-    fn subscribe_readiness(&mut self, _self_: Resource<Subscription>) -> Resource<DynPollable> {
+    fn subscribe_readiness(
+        &mut self,
+        _self_: Resource<Subscription>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Real pollable wiring (sourced from the receiver's notify
         // channel) lands with the dedicated pollable commit. Until
         // then, hand out an always-ready sentinel so guests get a

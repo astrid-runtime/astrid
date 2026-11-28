@@ -1,14 +1,15 @@
+use super::read_admission::{self, Attempt};
 use super::{
     ARENA_FILE, ARENA_MAGIC, Arc, BTreeMap, BTreeSet, ClosureObjects, DurableEngine, DurableError,
     DurableInner, FaultPoint, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
     LIFECYCLE_USABLE, ModelError, ObjectCacheStats, ObjectId, ObjectRecord,
     PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
-    ProjectionCacheKey, ROOT_FILE, RecoveryScope, RootGeneration, RootSnapshot, RootState,
-    RootTransaction, append_frame, canonical_record_bytes, encode_object_frame, encode_root_record,
-    ensure_payload_limit, io_error, live_files_mut, materialize_closure, read_indexed_object,
-    read_indexed_objects, usage_from_closure, validate_incremental_closure,
+    ProjectionCacheKey, ROOT_FILE, RecoveryScope, RootSnapshot, RootState, RootTransaction,
+    append_frame, canonical_record_bytes, encode_object_frame, ensure_payload_limit, io_error,
+    live_files_mut, materialize_closure, read_indexed_object, read_indexed_objects,
+    usage_from_closure, validate_incremental_closure,
 };
-use crate::engine::{IdentityProof, KvIdentitySession, ProjectionObserver, ProjectionPhase};
+use crate::engine::{KvIdentitySession, ProjectionObserver, ProjectionPhase};
 use crate::storage_model::ObjectIdentity;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,51 +97,41 @@ where
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
-            let (pending, location, generation) = {
+            let snapshot = {
                 let inner = self.lock_usable_with(&mut recovery)?;
-                let pending = inner
-                    .pending_wal
-                    .get_object(&id)
-                    .map(|object| object.record().clone());
-                (
-                    pending,
-                    inner.index.get(&id).copied(),
+                super::wal::read_snapshot(
+                    inner.pending_wal.object_index(),
+                    &inner.index,
                     inner.arena_generation,
+                    id,
                 )
             };
-            if let Some(record) = pending {
-                if let Some(record) = self.retain_loaded_object_if_current_with(
-                    principal,
-                    id,
-                    generation,
-                    record,
-                    &mut recovery,
-                )? {
-                    return Ok(Some(record));
-                }
-                continue;
-            }
-            let Some(location) = location else {
-                return Ok(None);
-            };
-            let reader_guard = self.arena_reader.read();
-            let Some(reader) = reader_guard.as_ref() else {
-                return Err(DurableError::Closed);
-            };
-            if reader.generation != generation {
-                continue;
-            }
-            let record =
-                read_indexed_object(&reader.file, id, location, &self.identity, self.limits)?;
-            drop(reader_guard);
-            if let Some(record) = self.retain_loaded_object_if_current_with(
+            match read_admission::attempt(
                 principal,
-                id,
-                generation,
-                record,
-                &mut recovery,
+                snapshot.id,
+                snapshot.generation,
+                snapshot.pending,
+                snapshot.location,
+                |generation, object, location| {
+                    let reader_guard = self.arena_reader.read();
+                    let reader = reader_guard.as_ref().ok_or(DurableError::Closed)?;
+                    reader.read(generation, object, location, |file, id, at| {
+                        read_indexed_object(file, id, at, &self.identity, self.limits)
+                    })
+                },
+                |owner, object, generation, record| {
+                    self.retain_loaded_object_if_current_with(
+                        owner,
+                        object,
+                        generation,
+                        record,
+                        &mut recovery,
+                    )
+                },
             )? {
-                return Ok(Some(record));
+                Attempt::Found(record) => return Ok(Some(record)),
+                Attempt::Missing => return Ok(None),
+                Attempt::Retry => {},
             }
         }
     }
@@ -187,24 +178,19 @@ where
     ) -> Result<Vec<Option<Arc<ObjectRecord>>>, DurableError> {
         let mut recovery = RecoveryScope::default();
         self.ensure_cached_read_usable_with(&mut recovery)?;
-        let mut results = vec![None; ids.len()];
-        let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
-        for (index, id) in ids.iter().copied().enumerate() {
-            if let Some(record) = self.object_cache.get(principal, id) {
-                results[index] = Some(record);
-            } else {
-                missing.entry(id).or_default().push(index);
-            }
-        }
-        if missing.is_empty() {
-            return Ok(results);
+        let mut batch = super::batch_slots::prepare(principal, ids, |owner, id| {
+            self.object_cache.get(owner, id)
+        });
+        if batch.missing.is_empty() {
+            return Ok(batch.records);
         }
 
         loop {
             let (pending, locations, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
                 let mut pending = Vec::new();
-                let locations = missing
+                let locations = batch
+                    .missing
                     .keys()
                     .filter_map(|id| {
                         if let Some(object) = inner.pending_wal.get_object(id) {
@@ -233,14 +219,15 @@ where
                 continue;
             }
             for (id, record) in loaded {
-                let cached = self.object_cache.insert(principal, id, record);
-                if let Some(indices) = missing.get(&id) {
-                    for index in indices {
-                        results[*index] = Some(Arc::clone(&cached));
-                    }
-                }
+                super::batch_slots::publish(
+                    &mut batch,
+                    principal,
+                    id,
+                    record,
+                    |owner, object, loaded| self.object_cache.insert(owner, object, loaded),
+                );
             }
-            return Ok(results);
+            return Ok(batch.records);
         }
     }
 
@@ -270,12 +257,15 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation
-            || (!inner.index.contains_key(&id) && inner.pending_wal.get_object(&id).is_none())
-        {
-            return Ok(None);
-        }
-        Ok(Some(self.object_cache.insert(principal, id, record)))
+        Ok(super::read_admission::retain(
+            principal,
+            id,
+            generation,
+            inner.arena_generation,
+            record,
+            |key| inner.index.contains_key(&key) || inner.pending_wal.get_object(&key).is_some(),
+            |owner, key, loaded| self.object_cache.insert(owner, key, loaded),
+        ))
     }
 
     fn ensure_cached_read_usable(&self) -> Result<(), DurableError> {
@@ -596,8 +586,12 @@ where
                 return Err(error);
             },
         };
-        inner.index.insert(id, location);
-        inner.pending_index_locations.push((id, location));
+        super::arena_index::publish(
+            &mut inner.index,
+            &mut inner.pending_index_locations,
+            id,
+            location,
+        );
         inner.validated.insert(id);
         debug_assert_eq!(
             previous_arena_len,
@@ -655,22 +649,23 @@ where
     /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn root(&self, principal: &P) -> Result<Option<RootState>, DurableError> {
         let inner = self.lock_usable()?;
-        Ok(inner.roots_by_principal.get(principal).copied())
+        Ok(super::root_transition::published(
+            &inner.roots_by_principal,
+            principal,
+        ))
     }
 
     pub(crate) fn root_if_ready(&self, principal: &P) -> Option<crate::engine::ReadyKvRoot> {
         // Reject an unusable entry before capturing an old root view. Recovery
         // may replace that view and return to USABLE while lookup is in flight.
-        if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
-            return None;
-        }
-        let root = self.published_roots.get(principal);
-        // Close may clear the map during lookup. That means unavailable, not
-        // a live empty store; preserve the terminal fence after the snapshot.
-        if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
-            return None;
-        }
-        Some(crate::engine::ReadyKvRoot::new(root))
+        let usable =
+            || self.lifecycle.load(std::sync::atomic::Ordering::Acquire) == LIFECYCLE_USABLE;
+        crate::engine::ReadyKvRoot::sample_ready(
+            principal,
+            usable,
+            |owner| self.published_roots.get(owner),
+            usable,
+        )
     }
 
     /// Return a consistent copy of every current principal root.
@@ -756,27 +751,6 @@ where
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
 
-    fn verify_declared_identities(
-        &self,
-        records: &[(ObjectId, ObjectRecord)],
-        proof: &IdentityProof,
-    ) -> Result<(), DurableError> {
-        if proof.matches(&self.preparation_authority) {
-            return Ok(());
-        }
-        for (declared, record) in records {
-            let computed = self.identify(record);
-            if computed != *declared {
-                return Err(ModelError::ObjectIdentityMismatch {
-                    declared: *declared,
-                    computed,
-                }
-                .into());
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn prepare(
         &self,
         inner: &mut DurableInner<P>,
@@ -785,40 +759,28 @@ where
         observer: Option<&dyn ProjectionObserver>,
     ) -> Result<Prepared<P>, DurableError> {
         let RootTransaction {
-            principal,
-            expected,
-            commit: commit_id,
-            records,
-            identity_proof,
-            kv_checkpoint_publication,
+            declaration,
+            mut kv_checkpoint_publication,
         } = transaction;
-        let same_engine = identity_proof.matches(&self.preparation_authority);
-        self.verify_declared_identities(&records, &identity_proof)?;
-        let kv_checkpoint_publication = if same_engine {
-            kv_checkpoint_publication
-        } else {
-            None
-        };
-        let actual = pending_roots
-            .get(&principal)
-            .copied()
-            .or_else(|| inner.roots_by_principal.get(&principal).copied());
-        if actual != expected {
-            return Err(ModelError::RootConflict { expected, actual }.into());
-        }
-        let generation = match actual {
-            Some(root) => root
-                .generation
-                .checked_next()
-                .ok_or(ModelError::ArithmeticOverflow)?,
-            None => RootGeneration::INITIAL,
-        };
-        let root = RootState {
-            generation,
-            commit: commit_id,
-        };
+        let (update, kv_checkpoint_publication) = declaration.admit_records(
+            &self.preparation_authority,
+            |record| self.identify(record),
+            &mut kv_checkpoint_publication,
+        )?;
+        let (selected, records) =
+            super::root_transition::select_update(pending_roots, &inner.roots_by_principal, update)
+                .map_err(|error| match error {
+                    super::root_transition::SelectionError::Conflict { expected, actual } => {
+                        ModelError::RootConflict { expected, actual }
+                    },
+                    super::root_transition::SelectionError::Overflow => {
+                        ModelError::ArithmeticOverflow
+                    },
+                })?;
+        let commit_id = selected.replacement().commit;
 
-        let unique = unique_transaction_records(records)?;
+        let unique = crate::engine::transaction_records::unique(records)
+            .map_err(ModelError::ObjectCollision)?;
         let closure_started = std::time::Instant::now();
         let reachable = self.validate_pending_closure(inner, &unique, commit_id);
         if let Some(observer) = observer {
@@ -832,40 +794,50 @@ where
         let mut objects = Vec::new();
         let mut commit_frame = None;
         for (id, record) in unique {
-            if !reachable.contains(&id) {
+            use super::closure_load::{Fresh, PlacementError};
+            let destination = super::closure_load::placement(
+                id,
+                commit_id,
+                &reachable,
+                inner.pending_wal.object_index(),
+                &inner.index,
+            );
+            let Some(fresh) = super::closure_load::prepare_row(
+                destination,
+                id,
+                &record,
+                |object| object.record(),
+                |id, location| {
+                    let files = live_files_mut(&mut inner.files)?;
+                    read_indexed_object(&files.arena, id, location, &self.identity, self.limits)
+                },
+            )
+            .map_err(|error| match error {
+                PlacementError::Collision(id) => {
+                    DurableError::from(ModelError::ObjectCollision(id))
+                },
+                PlacementError::Read(error) => error,
+            })?
+            else {
                 continue;
-            }
-            if let Some(existing) = inner.pending_wal.get_object(&id) {
-                if existing.record() != &record {
-                    return Err(ModelError::ObjectCollision(id).into());
-                }
-                continue;
-            }
-            if let Some(location) = inner.index.get(&id).copied() {
-                let files = live_files_mut(&mut inner.files)?;
-                let existing =
-                    read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;
-                if existing != record {
-                    return Err(ModelError::ObjectCollision(id).into());
-                }
-                continue;
-            }
+            };
             let payload: Arc<[u8]> =
                 encode_object_frame(self.identity.scheme(), id, &record)?.into();
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
-            if id == commit_id {
+            if matches!(fresh, Fresh::Commit) {
                 commit_frame = Some((id, payload));
             } else {
                 objects.push((id, payload));
             }
         }
-        let principal_bytes = self.principal_codec.encode(&principal);
-        let journal = encode_root_record(self.identity.scheme(), &principal_bytes, expected, root)?;
-        ensure_payload_limit(ROOT_FILE, 0, journal.len(), self.limits)?;
+        let root = selected
+            .encode_journal(self.identity.scheme().into(), |owner| {
+                self.principal_codec.encode(owner)
+            })
+            .ok_or(DurableError::EncodingOverflow)?;
+        ensure_payload_limit(ROOT_FILE, 0, root.journal().len(), self.limits)?;
 
         Ok(Prepared {
-            principal,
-            expected,
             root,
             objects_inserted: u64::try_from(objects.len())
                 .map_err(|_| ModelError::ArithmeticOverflow)?
@@ -873,7 +845,6 @@ where
                 .ok_or(ModelError::ArithmeticOverflow)?,
             objects,
             commit: commit_frame,
-            journal,
             validated: reachable,
             kv_checkpoint_publication,
         })
@@ -913,20 +884,4 @@ where
         }
         Ok(())
     }
-}
-
-fn unique_transaction_records(
-    records: Vec<(ObjectId, ObjectRecord)>,
-) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
-    let mut unique = BTreeMap::new();
-    for (id, record) in records {
-        match unique.get(&id) {
-            Some(existing) if existing == &record => {},
-            Some(_) => return Err(ModelError::ObjectCollision(id).into()),
-            None => {
-                unique.insert(id, record);
-            },
-        }
-    }
-    Ok(unique)
 }

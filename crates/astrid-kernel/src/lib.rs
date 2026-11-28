@@ -29,6 +29,9 @@ mod audit_retention;
 mod audit_retirement_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod audit_sink;
+mod authority_recovery;
+#[cfg(test)]
+mod authority_restart_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod boot_policy;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
@@ -87,7 +90,7 @@ mod runtime_work;
 mod shutdown;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod user_resources;
-pub use native_input::native_input_device_is_live;
+pub use native_input::{native_input_device_is_live, native_input_registration_is_live};
 /// Deterministic CLI-root user/fleet bootstrap and unowned-principal upgrade.
 mod ownership_bootstrap;
 /// Persistent pair-device token store (issue #756).
@@ -161,6 +164,7 @@ struct CapsuleViewLease {
 /// One immutable publication and the projection activated from it.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) struct BoundMaterialization {
+    uid: astrid_core::PrincipalUid,
     snapshot: astrid_storage::CapsulePackageSnapshot,
     runtime_dir: PathBuf,
     manifest: astrid_capsule_types::manifest::CapsuleManifest,
@@ -376,6 +380,7 @@ pub struct Kernel {
     local_egress: std::sync::RwLock<Option<std::collections::HashMap<String, Vec<String>>>>,
     #[cfg(not(target_family = "wasm"))]
     native_secret_inputs: OnceLock<Arc<astrid_capsule::elicitation::PendingSecretElicits>>,
+    device_sessions: astrid_core::profile::device_sessions::DeviceSessions,
     /// Operator-declared capsule IDs permitted to run as explicit system
     /// singletons. Manifest fields can request uplink behavior but cannot grant
     /// this cross-principal authority themselves.
@@ -433,6 +438,9 @@ pub struct Kernel {
     ownership_store: Arc<astrid_storage::OwnershipStore>,
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     user_cpu: Arc<astrid_capsule::user_cpu::UserCpuAccounting>,
+    /// Native lease preparations ordered against requester retirement.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) pending_mount_issues: storage_mount::PendingMountIssues,
     /// Live native filesystem leases, each fixed to one authenticated caller
     /// and one typed storage owner.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -590,35 +598,30 @@ struct PreparedRuntimeReplacement {
     system_runtime: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeResidency {
-    Principal,
-    SystemResident,
-}
-
-impl RuntimeResidency {
-    const fn is_system(self) -> bool {
-        matches!(self, Self::SystemResident)
-    }
-}
+mod runtime_residency;
+use runtime_residency::RuntimeResidency;
 
 fn classify_runtime_residency(
     manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     id: &astrid_capsule_types::CapsuleId,
     system_allowed: bool,
 ) -> Result<RuntimeResidency, anyhow::Error> {
-    let provides_uplink = !manifest.uplinks.is_empty();
-    if provides_uplink && !system_allowed {
-        anyhow::bail!(
-            "capsule '{id}' provides an uplink but is absent from the \
-             operator-owned [[uplinks]] allowlist"
-        );
-    }
-    if system_allowed && (manifest.capabilities.uplink || provides_uplink) {
-        Ok(RuntimeResidency::SystemResident)
-    } else {
-        Ok(RuntimeResidency::Principal)
-    }
+    let decision = runtime_residency::classify(
+        system_allowed,
+        runtime_residency::Uplinks {
+            provides: !manifest.uplinks.is_empty(),
+            capability: manifest.capabilities.uplink,
+        },
+        !manifest.mcp_servers.is_empty(),
+    );
+    decision.map_err(|reason| match reason {
+        runtime_residency::Refusal::UnapprovedProvider => anyhow::anyhow!(
+            "capsule '{id}' provides an uplink but is absent from the operator-owned [[uplinks]] allowlist"
+        ),
+        runtime_residency::Refusal::SystemMcp => anyhow::anyhow!(
+            "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
+        ),
+    })
 }
 
 impl Kernel {
@@ -1004,35 +1007,9 @@ impl Kernel {
 
         // Bootstrap the capability store (persistent) over the injected KV.
         // Key rotation invalidates persisted tokens (fail-secure by design).
-        let capabilities = Arc::new(
-            CapabilityStore::with_kv_store(Arc::clone(&kv))
-                .await
-                .map_err(|e| {
-                    std::io::Error::other(format!("Failed to init capability store: {e}"))
-                })?,
-        );
-
-        // Initialize the MCP process manager with its security layer. Native
-        // only — the MCP host surface belongs to the Wasmtime engine, which the
-        // browser profile does not build. `workspace_root` is set so sandboxed
-        // MCP servers have a writable directory.
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let mcp = {
-            let mcp_config = ServersConfig::load_default().unwrap_or_default();
-            let mcp_manager = ServerManager::new(mcp_config)
-                .with_workspace_root(workspace_root.clone())
-                // MCP is a system service, not a principal-home projection.
-                // Keep native operational logs under the top-level log tree
-                // so boot never recreates `home/<alias>/.local/log`.
-                .with_capsule_log_dir(home.log_dir().join("system").join("mcp"));
-            let mcp_client = McpClient::new(mcp_manager);
-            SecureMcpClient::new(
-                mcp_client,
-                Arc::clone(&capabilities),
-                Arc::clone(&audit_log),
-                session_id.clone(),
-            )
-        };
+        let capabilities = CapabilityStore::with_kv_store(Arc::clone(&kv))
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to init capability store: {e}")))?;
 
         // Establish the physical security boundary (sandbox handle).
         let root_handle = DirHandle::new();
@@ -1058,7 +1035,6 @@ impl Kernel {
             root_handle.clone(),
         ));
 
-        let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
         // Create system-wide identity store backed by the shared KV.
         let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(&kv), "system:identity")
             .map_err(|e| std::io::Error::other(format!("Failed to create identity KV: {e}")))?;
@@ -1081,9 +1057,37 @@ impl Kernel {
                     std::io::Error::other(format!("Failed to create ownership store: {error}"))
                 })?,
         );
-        ownership_store.load().await.map_err(|error| {
+        let ownership = ownership_store.load().await.map_err(|error| {
             std::io::Error::other(format!("Failed to load ownership graph: {error}"))
-        })?;
+        });
+        let (capabilities, allowance_store) = authority_recovery::restore_retirement_fences(
+            ownership,
+            &principal_directory,
+            capabilities,
+            astrid_approval::AllowanceStore::new(),
+        )?;
+
+        // Initialize the MCP process manager with its security layer. Native
+        // only — the MCP host surface belongs to the Wasmtime engine, which the
+        // browser profile does not build. `workspace_root` is set so sandboxed
+        // MCP servers have a writable directory.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let mcp = {
+            let mcp_config = ServersConfig::load_default().unwrap_or_default();
+            let mcp_manager = ServerManager::new(mcp_config)
+                .with_workspace_root(workspace_root.clone())
+                // MCP is a system service, not a principal-home projection.
+                // Keep native operational logs under the top-level log tree
+                // so boot never recreates `home/<alias>/.local/log`.
+                .with_capsule_log_dir(home.log_dir().join("system").join("mcp"));
+            let mcp_client = McpClient::new(mcp_manager);
+            SecureMcpClient::new(
+                mcp_client,
+                Arc::clone(&capabilities),
+                Arc::clone(&audit_log),
+                session_id.clone(),
+            )
+        };
 
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file
@@ -1341,6 +1345,7 @@ impl Kernel {
             local_egress: std::sync::RwLock::new(None),
             #[cfg(not(target_family = "wasm"))]
             native_secret_inputs: OnceLock::new(),
+            device_sessions: astrid_core::profile::device_sessions::DeviceSessions::default(),
             system_capsules: RwLock::new(std::collections::HashSet::new()),
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
@@ -1358,6 +1363,8 @@ impl Kernel {
             ownership_store,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             user_cpu,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            pending_mount_issues: storage_mount::PendingMountIssues::default(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1518,17 +1525,18 @@ impl Kernel {
     /// when they exactly match one authenticated immutable-UID snapshot.
     /// `false` means this is an explicit workspace/project portal and must use
     /// its separate installation receipt policy.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
     fn verify_registry_materialization(
         &self,
         dir: &Path,
         principal: &PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     ) -> anyhow::Result<bool> {
-        let Some(snapshot) = self.published_capsule_snapshot(principal, manifest)? else {
+        let Some((uid, snapshot)) = self.published_capsule_snapshot(principal, manifest, None)?
+        else {
             return Ok(false);
         };
-        self.verify_published_materialization(dir, principal, manifest, &snapshot)?;
+        self.verify_published_materialization(dir, uid, manifest, &snapshot)?;
         Ok(true)
     }
 
@@ -1538,13 +1546,19 @@ impl Kernel {
         &self,
         principal: &PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
-    ) -> anyhow::Result<Option<astrid_storage::CapsulePackageSnapshot>> {
+        expected_uid: Option<astrid_core::PrincipalUid>,
+    ) -> anyhow::Result<
+        Option<(
+            astrid_core::PrincipalUid,
+            astrid_storage::CapsulePackageSnapshot,
+        )>,
+    > {
         let Some(store) = self.principal_store.as_ref() else {
             return Ok(None);
         };
         let uid = self
             .principal_directory
-            .uid_for(principal)
+            .bound_uid(principal, expected_uid)
             .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
         let owner = astrid_storage::StateOwner::Principal(uid);
         let capsule_id = astrid_capsule_types::CapsuleId::new(manifest.package.name.clone())
@@ -1552,6 +1566,7 @@ impl Kernel {
         store
             .capsules()
             .get_snapshot(&owner, capsule_id.as_str())
+            .map(|snapshot| snapshot.map(|snapshot| (uid, snapshot)))
             .map_err(|error| anyhow::anyhow!("read durable capsule registry: {error}"))
     }
 
@@ -1559,14 +1574,10 @@ impl Kernel {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn published_cache_target(
         &self,
-        principal: &PrincipalId,
+        uid: astrid_core::PrincipalUid,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
         snapshot: &astrid_storage::CapsulePackageSnapshot,
     ) -> anyhow::Result<PathBuf> {
-        let uid = self
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
         let digest = blake3::hash(&snapshot.package().archive)
             .to_hex()
             .to_string();
@@ -1587,40 +1598,44 @@ impl Kernel {
     fn validate_published_cache_path(
         &self,
         dir: &Path,
-        principal: &PrincipalId,
+        uid: astrid_core::PrincipalUid,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
         snapshot: &astrid_storage::CapsulePackageSnapshot,
     ) -> anyhow::Result<()> {
+        use capsule_materialization::cache_address::Address;
+
         let cache_root = self.astrid_home.run_dir().join("capsules");
         let relative = dir.strip_prefix(&cache_root).map_err(|_| {
             anyhow::anyhow!("capsule cache path is outside the durable registry cache")
         })?;
         astrid_core::platform_fs::verify_no_redirects(dir)
             .map_err(|error| anyhow::anyhow!("capsule cache path is redirected: {error}"))?;
-        let components: Vec<String> = relative
-            .components()
-            .map(|component| match component {
-                std::path::Component::Normal(value) => Ok(value.to_string_lossy().into_owned()),
-                _ => Err(anyhow::anyhow!(
-                    "capsule cache path contains unsafe components"
-                )),
-            })
-            .collect::<anyhow::Result<_>>()?;
-        if components.len() != 3 {
+        let mut components = relative.components();
+        let mut next = || match components.next() {
+            Some(std::path::Component::Normal(name)) => name.to_str().map(str::as_bytes),
+            _ => None,
+        };
+        let (Some(owner), Some(capsule), Some(digest), None) =
+            (next(), next(), next(), components.next())
+        else {
             anyhow::bail!("capsule cache path does not contain owner/id/digest components");
-        }
-        let uid = self
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
-        if components[0] != uid.to_string() || components[1] != manifest.package.name {
-            anyhow::bail!("capsule cache owner or id does not match authenticated registry scope");
-        }
-        let digest = blake3::hash(&snapshot.package().archive)
-            .to_hex()
-            .to_string();
-        if components[2] != digest {
-            anyhow::bail!("materialized capsule digest does not match durable registry");
+        };
+        let actual = Address {
+            owner,
+            capsule,
+            digest,
+        };
+        let owner = uid.to_string();
+        let digest = blake3::hash(&snapshot.package().archive).to_hex();
+        let expected = Address {
+            owner: owner.as_bytes(),
+            capsule: manifest.package.name.as_bytes(),
+            digest: digest.as_bytes(),
+        };
+        if !actual.matches(&expected) {
+            anyhow::bail!(
+                "capsule cache owner, id or digest does not match authenticated registry scope"
+            );
         }
         Ok(())
     }
@@ -1709,6 +1724,16 @@ impl Kernel {
         dir: PathBuf,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
+        self.load_capsule_for_owner(dir, principal, None).await
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn load_capsule_for_owner(
+        &self,
+        dir: PathBuf,
+        principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
+    ) -> Result<(), anyhow::Error> {
         let _work = self
             .runtime_work
             .admit()
@@ -1717,7 +1742,8 @@ impl Kernel {
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let bound = self.capture_bound_materialization(&dir, principal, &manifest, "load")?;
+        let bound =
+            self.capture_bound_materialization(&dir, principal, &manifest, "load", expected_uid)?;
         let runtime_dir = bound
             .as_ref()
             .map_or_else(|| dir.clone(), |bound| bound.runtime_dir.clone());
@@ -1729,13 +1755,11 @@ impl Kernel {
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let _view_guard = self.lock_capsule_view(principal, &id).await;
         let _load_guard = self.capsule_load_lock.lock().await;
+        if let Some(uid) = expected_uid {
+            self.principal_directory.bound_uid(principal, Some(uid))?;
+        }
         if let Some(bound) = bound.as_ref() {
-            self.confirm_published_materialization(
-                &runtime_dir,
-                principal,
-                &manifest,
-                &bound.snapshot,
-            )?;
+            self.confirm_published_materialization(&runtime_dir, principal, &manifest, bound)?;
         }
         if *principal != PrincipalId::default()
             && self.capabilities.is_principal_retiring(principal).await
@@ -1752,30 +1776,21 @@ impl Kernel {
         // grant unless the operator explicitly promotes it. A manifest that
         // actually provides an uplink must be operator-approved.
         let system_allowed = self.system_capsules.read().await.contains(id.as_str());
-        let system_runtime =
-            classify_runtime_residency(&manifest, &id, system_allowed)?.is_system();
-        if system_runtime && !manifest.mcp_servers.is_empty() {
-            anyhow::bail!(
-                "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
-            );
-        }
+        let residency = classify_runtime_residency(&manifest, &id, system_allowed)?;
+        let system_runtime = residency.is_system();
         self.verify_workspace_capsule_tree(&runtime_dir)?;
 
-        // Mutable runtimes are authority-scoped. A principal always receives a
-        // fresh runtime for its immutable UID; only an explicitly classified
-        // SystemResident service may attach another view to one runtime.
+        let viewer_uid = expected_uid.or_else(|| bound.as_ref().map(|b| b.uid));
         {
             let mut registry = self.capsules.write().await;
-            if registry.get_for(principal, &id).is_some() {
-                return Ok(());
-            }
-            if system_runtime && registry.contains_system_runtime(&id, &wasm_hash) {
-                registry
-                    .register_existing(&id, &wasm_hash, principal)
-                    .map_err(|e| anyhow::anyhow!("Failed to add capsule view: {e}"))?;
-                if let Some(capsule) = registry.get_for(principal, &id) {
-                    capsule.resume_for(principal);
-                }
+            if self.attach_existing_capsule(
+                &mut registry,
+                principal,
+                viewer_uid,
+                &id,
+                &wasm_hash,
+                system_runtime,
+            )? {
                 return Ok(());
             }
         }
@@ -1790,16 +1805,21 @@ impl Kernel {
         // is the authenticated admission set and the installed authority
         // receipt was verified above.
 
-        let principal_uid = self.runtime_principal_uid(system_runtime, principal, &id)?;
-        let scope = principal_uid.map_or(
-            astrid_capsule::registry::RuntimeScope::SystemResident,
-            astrid_capsule::registry::RuntimeScope::Principal,
-        );
+        let principal_uid = residency
+            .owner(principal, viewer_uid, |owner, expected| {
+                self.principal_directory.bound_uid(owner, expected)
+            })
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot load capsule '{id}' for unadmitted principal '{principal}': {error}"
+                )
+            })?;
+        let scope = astrid_capsule::registry::RuntimeScope::from_owner(principal_uid);
         let runtime_id =
             self.capsules
                 .write()
                 .await
-                .reserve_runtime_id(id.clone(), wasm_hash.clone(), scope)?;
+                .reserve_runtime_id(id.clone(), wasm_hash, scope)?;
         let mut capsule = self
             .build_capsule_runtime(
                 manifest,
@@ -1820,43 +1840,113 @@ impl Kernel {
             return Ok(());
         }
 
-        self.publish_initial_runtime(capsule, runtime_id, &wasm_hash, system_runtime, principal)
+        self.publish_initial_runtime(capsule, runtime_id, principal, viewer_uid)
             .await
+    }
+
+    /// Reuse an installed view or attach an explicitly shared singleton under
+    /// the same viewer binding used to discover its package.
+    fn attach_existing_capsule(
+        &self,
+        registry: &mut astrid_capsule::registry::CapsuleRegistry,
+        principal: &PrincipalId,
+        viewer_uid: Option<astrid_core::PrincipalUid>,
+        id: &astrid_capsule_types::CapsuleId,
+        artifact: &astrid_capsule::registry::WasmHash,
+        system_runtime: bool,
+    ) -> anyhow::Result<bool> {
+        let mut attach = |()| {
+            if let Some(runtime) = registry.runtime_id_for(principal, id) {
+                if viewer_uid.is_some_and(|uid| !runtime.key().scope().matches_view_owner(uid)) {
+                    anyhow::bail!("capsule '{id}' belongs to a different principal UID");
+                }
+                return Ok(true);
+            }
+            if system_runtime && registry.contains_system_runtime(id, artifact) {
+                registry.register_existing(id, artifact, principal)?;
+                if let Some(capsule) = registry.get_for(principal, id) {
+                    capsule.resume_for(principal);
+                }
+                return Ok(true);
+            }
+            Ok(false)
+        };
+        if let Some(uid) = viewer_uid {
+            self.principal_directory
+                .with_bound_input(principal, uid, (), attach)
+                .map_err(|()| {
+                    anyhow::anyhow!(
+                        "owner of '{principal}' changed before attaching capsule '{id}'"
+                    )
+                })?
+        } else {
+            attach(())
+        }
     }
 
     async fn publish_initial_runtime(
         &self,
         mut candidate: Box<dyn astrid_capsule::capsule::Capsule>,
         runtime_id: astrid_capsule::registry::RuntimeId,
-        artifact: &astrid_capsule::registry::WasmHash,
-        system_runtime: bool,
         principal: &PrincipalId,
+        viewer_uid: Option<astrid_core::PrincipalUid>,
     ) -> Result<(), anyhow::Error> {
         let id = candidate.id().clone();
         let mut registry = self.capsules.write().await;
-        let already_in_view = registry.get_for(principal, &id).is_some();
-        let system_winner = system_runtime && registry.contains_system_runtime(&id, artifact);
-        if already_in_view || system_winner {
-            if system_winner && !already_in_view {
-                registry.register_existing(&id, artifact, principal)?;
-                if let Some(capsule) = registry.get_for(principal, &id) {
-                    capsule.resume_for(principal);
-                }
-            }
+        let scope = runtime_id.key().scope();
+        let uid = match scope {
+            astrid_capsule::registry::RuntimeScope::Principal(uid) => Some(uid),
+            astrid_capsule::registry::RuntimeScope::SystemResident => viewer_uid,
+        };
+        let attached = self.attach_existing_capsule(
+            &mut registry,
+            principal,
+            uid,
+            &id,
+            runtime_id.key().artifact(),
+            scope == astrid_capsule::registry::RuntimeScope::SystemResident,
+        );
+        if !matches!(attached, Ok(false)) {
             drop(registry);
+            candidate.retire();
             candidate.request_cancel();
             if let Err(error) = candidate.unload().await {
                 tracing::warn!(capsule_id = %id, %principal, %error, "Redundant capsule candidate failed to unload");
             }
-            return Ok(());
+            return attached.map(|_| ());
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let identity = capsule_audit::CapsuleIdentity::of(candidate.as_ref());
-        let owner = Some(principal.clone());
-        if let Err(publication) =
-            registry.try_register_reserved_runtime(candidate, runtime_id, principal, owner)
-        {
+        let register = |candidate| {
+            registry.try_register_reserved_runtime(
+                candidate,
+                runtime_id,
+                principal,
+                Some(principal.clone()),
+            )?;
+            let runtime = registry
+                .get_for(principal, &id)
+                .expect("successful registration installed the principal view");
+            runtime.resume_for(principal);
+            runtime.publish();
+            Ok(())
+        };
+        let publication = match uid {
+            Some(uid) => self
+                .principal_directory
+                .with_bound_input(principal, uid, candidate, register)
+                .unwrap_or_else(|capsule| {
+                    Err(astrid_capsule::registry::RuntimePublicationError {
+                        capsule,
+                        error: astrid_capsule::error::CapsuleError::ExecutionFailed(format!(
+                            "owner of '{principal}' changed before registering capsule '{id}'"
+                        )),
+                    })
+                }),
+            None => register(candidate),
+        };
+        if let Err(publication) = publication {
             drop(registry);
             let mut candidate = publication.capsule;
             candidate.retire();
@@ -1866,33 +1956,10 @@ impl Kernel {
             }
             return Err(anyhow::anyhow!(publication.error));
         }
-        if let Some(capsule) = registry.get_for(principal, &id) {
-            capsule.resume_for(principal);
-            capsule.publish();
-        }
         drop(registry);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         capsule_audit::record_capsule_loaded(self, principal, identity, "load").await;
         Ok(())
-    }
-
-    fn runtime_principal_uid(
-        &self,
-        system_runtime: bool,
-        principal: &PrincipalId,
-        id: &astrid_capsule_types::CapsuleId,
-    ) -> Result<Option<astrid_core::identity::PrincipalUid>, anyhow::Error> {
-        if system_runtime {
-            return Ok(None);
-        }
-        self.principal_directory
-            .uid_for(principal)
-            .map(Some)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "cannot load capsule '{id}' for unadmitted principal '{principal}': {error}"
-                )
-            })
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1918,6 +1985,10 @@ impl Kernel {
             principal,
             &manifest,
             "replacement source",
+            match expected_scope {
+                astrid_capsule::registry::RuntimeScope::Principal(uid) => Some(uid),
+                astrid_capsule::registry::RuntimeScope::SystemResident => None,
+            },
         )?;
         let runtime_dir = bound.as_ref().map_or_else(
             || source_dir.to_path_buf(),
@@ -1935,41 +2006,31 @@ impl Kernel {
         }
         let artifact = capsule_instance_hash(&manifest, &runtime_dir);
         let system_allowed = self.system_capsules.read().await.contains(id.as_str());
-        let system_runtime = classify_runtime_residency(&manifest, id, system_allowed)?.is_system();
-        if system_runtime && !manifest.mcp_servers.is_empty() {
-            anyhow::bail!(
-                "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
-            );
-        }
+        let residency = classify_runtime_residency(&manifest, id, system_allowed)?;
+        let system_runtime = residency.is_system();
         // Replacement authority is the authenticated operator classification
         // and installed receipt, never the ancestry of `source_dir`.
-        let actual_scope = if system_runtime {
-            astrid_capsule::registry::RuntimeScope::SystemResident
-        } else {
-            astrid_capsule::registry::RuntimeScope::Principal(
-                self.principal_directory.uid_for(principal)?,
-            )
-        };
-        if actual_scope != expected_scope {
-            anyhow::bail!(
-                "capsule '{id}' cannot change runtime scope during live replacement: \
-                 running={expected_scope:?}, installed={actual_scope:?}"
-            );
-        }
+        let principal_uid = residency.owner(
+            principal,
+            bound.as_ref().map(|b| b.uid),
+            |owner, expected| self.principal_directory.bound_uid(owner, expected),
+        )?;
+        let actual_scope = astrid_capsule::registry::RuntimeScope::from_owner(principal_uid);
+        let admitted_scope = runtime_residency::replacement_scope(&expected_scope, actual_scope)
+            .map_err(|installed| {
+                anyhow::anyhow!(
+                    "capsule '{id}' cannot change runtime scope during live replacement: \
+                 running={expected_scope:?}, installed={installed:?}"
+                )
+            })?;
         if let Some(bound) = bound.as_ref() {
-            self.confirm_published_materialization(
-                &runtime_dir,
-                principal,
-                &manifest,
-                &bound.snapshot,
-            )?;
+            self.confirm_published_materialization(&runtime_dir, principal, &manifest, bound)?;
         }
-        let principal_uid = self.runtime_principal_uid(system_runtime, principal, id)?;
         let runtime_id =
             self.capsules
                 .write()
                 .await
-                .reserve_runtime_id(id.clone(), artifact, actual_scope)?;
+                .reserve_runtime_id(id.clone(), artifact, admitted_scope)?;
         let mut capsule = self
             .build_capsule_runtime(
                 manifest,
@@ -2094,6 +2155,16 @@ impl Kernel {
     /// Build or refresh one principal's capsule view from its own install set.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
+        self.ensure_principal_loaded_for_owner(principal, None)
+            .await;
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn ensure_principal_loaded_for_owner(
+        &self,
+        principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
+    ) {
         let Some(_work) = self.runtime_work.admit() else {
             return;
         };
@@ -2113,7 +2184,7 @@ impl Kernel {
                 return;
             }
         }
-        let sorted = self.sorted_principal_capsules(principal);
+        let sorted = self.sorted_principal_capsules(principal, expected_uid);
         validate_principal_capsules(principal, &sorted);
 
         let (uplinks, others): (Vec<_>, Vec<_>) =
@@ -2123,7 +2194,10 @@ impl Kernel {
             .map(|(m, _)| m.package.name.clone())
             .collect();
         for (manifest, dir) in &uplinks {
-            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+            if let Err(e) = self
+                .load_capsule_for_owner(dir.clone(), principal, expected_uid)
+                .await
+            {
                 tracing::warn!(
                     %principal,
                     capsule = %manifest.package.name,
@@ -2136,7 +2210,10 @@ impl Kernel {
             .await;
 
         for (manifest, dir) in &others {
-            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+            if let Err(e) = self
+                .load_capsule_for_owner(dir.clone(), principal, expected_uid)
+                .await
+            {
                 tracing::warn!(
                     %principal,
                     capsule = %manifest.package.name,
@@ -2233,7 +2310,7 @@ impl Kernel {
             tracing::debug!(%principal, "Skipping uplink load for principal without a profile");
             return;
         }
-        let sorted = self.sorted_principal_capsules(principal);
+        let sorted = self.sorted_principal_capsules(principal, None);
         validate_principal_capsules(principal, &sorted);
 
         let uplinks: Vec<_> = sorted
@@ -2262,10 +2339,11 @@ impl Kernel {
     fn sorted_principal_capsules(
         &self,
         principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
     ) -> Vec<(astrid_capsule_types::manifest::CapsuleManifest, PathBuf)> {
         use astrid_capsule::toposort::toposort_manifests;
 
-        let mut paths = self.durable_principal_capsule_paths(principal);
+        let mut paths = self.durable_principal_capsule_paths(principal, expected_uid);
         // Workspace capsules are an explicit project portal and remain the
         // lowest-priority discovery source. They never establish authority
         // for an Astrid principal package.
@@ -2295,10 +2373,14 @@ impl Kernel {
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn durable_principal_capsule_paths(&self, principal: &PrincipalId) -> Vec<PathBuf> {
+    fn durable_principal_capsule_paths(
+        &self,
+        principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
+    ) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(store) = self.principal_store.as_ref() {
-            match self.principal_directory.uid_for(principal) {
+            match self.principal_directory.bound_uid(principal, expected_uid) {
                 Ok(uid) => {
                     let owner = astrid_storage::StateOwner::Principal(uid);
                     match store.capsules().list(&owner) {
@@ -2346,7 +2428,7 @@ impl Kernel {
                                     .map(|package| package.manifest().clone());
                                 let materialized = match manifest {
                                     Some(manifest) => self.ensure_published_materialization(
-                                        &target, principal, &manifest, &snapshot,
+                                        &target, uid, &manifest, &snapshot,
                                     ),
                                     None => {
                                         Err(anyhow::anyhow!("durable capsule package is malformed"))
@@ -2884,57 +2966,6 @@ impl Kernel {
         }
     }
 
-    /// Reload a single capsule by id without a daemon restart.
-    ///
-    /// If the capsule is already registered, [`Self::restart_capsule`] re-reads
-    /// its source directory — picking up the new content-addressed bytes a
-    /// reinstall wrote (a live upgrade / hot-swap). If it isn't registered yet,
-    /// the currently-installed set is discovered and loaded (a fresh add;
-    /// already-loaded capsules are skipped by `load_capsule`'s guard). Either
-    /// way `astrid.v1.capsules_loaded` is published so the tool surface
-    /// refreshes. Backs [`astrid_core::kernel_api::KernelRequest::ReloadCapsule`].
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) async fn reload_one_capsule(
-        &self,
-        id: &astrid_capsule_types::CapsuleId,
-        principal: &PrincipalId,
-    ) -> Result<(), anyhow::Error> {
-        let view_guard = self.lock_capsule_view(principal, id).await;
-        let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
-        if registered {
-            if self.capabilities.is_principal_retiring(principal).await {
-                anyhow::bail!("cannot reload capsule '{id}' for retiring principal '{principal}'");
-            }
-            let outcome = self.restart_capsule(id, principal, None).await?;
-            self.publish_capsules_loaded().await;
-            if let RestartOutcome::OldInstanceUnloadFailed(error) = outcome {
-                tracing::warn!(capsule_id = %id, %principal, %error,
-                    "Capsule reloaded but the old runtime failed to unload");
-            }
-        } else {
-            drop(view_guard);
-            // Build or refresh this principal's view from its installed set.
-            self.ensure_principal_loaded(principal).await;
-            if self.capsules.read().await.get_for(principal, id).is_none()
-                && let Some((_, dir)) = self
-                    .sorted_principal_capsules(principal)
-                    .into_iter()
-                    .find(|(manifest, _)| manifest.package.name == id.as_str())
-            {
-                self.load_capsule(dir, principal)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("capsule '{id}' failed to load: {error:#}"))?;
-            }
-            if self.capsules.read().await.get_for(principal, id).is_none() {
-                return Err(anyhow::anyhow!(
-                    "capsule '{id}' was not found in the install directories or failed to load"
-                ));
-            }
-            self.publish_capsules_loaded().await;
-        }
-        Ok(())
-    }
-
     /// Remove every capsule view owned by `principal` before that principal's
     /// persistent state is reclaimed.
     ///
@@ -3454,6 +3485,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         local_egress: std::sync::RwLock::new(None),
         #[cfg(not(target_family = "wasm"))]
         native_secret_inputs: OnceLock::new(),
+        device_sessions: astrid_core::profile::device_sessions::DeviceSessions::default(),
         system_capsules: RwLock::new(std::collections::HashSet::new()),
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),
@@ -3476,6 +3508,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
             std::collections::BTreeMap::default(),
         )),
         ownership_store,
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        pending_mount_issues: storage_mount::PendingMountIssues::default(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mounts: Arc::new(DashMap::new()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -4940,18 +4974,15 @@ fn mint_default_principal_keypair(
     // with the principal's full authority. Dedup by canonical pubkey.
     let pubkey_hex = keypair.export_public_key().to_hex();
     if profile.auth.device_by_pubkey(&pubkey_hex).is_none() {
-        profile
-            .auth
-            .public_keys
-            .push(astrid_core::profile::DeviceKey::new(
-                pubkey_hex,
-                astrid_core::profile::DeviceScope::Full,
-                None,
-                // Stamp the real mint epoch — `0` is the migrated-legacy-key
-                // sentinel, so using it for a freshly minted key would show a
-                // 1970 timestamp in `pair-device list` / audit.
-                i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
-            ));
+        profile.add_device(astrid_core::profile::DeviceKey::new(
+            pubkey_hex,
+            astrid_core::profile::DeviceScope::Full,
+            None,
+            // Stamp the real mint epoch — `0` is the migrated-legacy-key
+            // sentinel, so using it for a freshly minted key would show a
+            // 1970 timestamp in `pair-device list` / audit.
+            i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
+        ));
     }
     if !profile.auth.methods.contains(&AuthMethod::Keypair) {
         profile.auth.methods.push(AuthMethod::Keypair);
@@ -5303,36 +5334,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_residency_policy_distinguishes_grants_from_providers() {
-        let id = CapsuleId::new("uplink-policy").unwrap();
-        let mut capability_only = CapsuleManifest::default();
-        capability_only.capabilities.uplink = true;
-
-        assert_eq!(
-            classify_runtime_residency(&capability_only, &id, false).unwrap(),
-            RuntimeResidency::Principal
-        );
-        assert_eq!(
-            classify_runtime_residency(&capability_only, &id, true).unwrap(),
-            RuntimeResidency::SystemResident
-        );
-
-        let mut provider = CapsuleManifest::default();
-        provider
-            .uplinks
-            .push(astrid_capsule_types::manifest::UplinkDef {
-                name: "test".to_string(),
-                platform: "test".to_string(),
-                profile: astrid_core::UplinkProfile::Chat,
-            });
-        assert!(classify_runtime_residency(&provider, &id, false).is_err());
-        assert_eq!(
-            classify_runtime_residency(&provider, &id, true).unwrap(),
-            RuntimeResidency::SystemResident
-        );
-    }
-
-    #[test]
     fn capsule_discovery_extra_paths_include_principal_capsules_only() {
         let (_d, home) = scratch_home();
         let workspace = tempfile::tempdir().unwrap();
@@ -5505,6 +5506,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_publication_unloads_candidate_when_owner_changed_after_reservation() {
+        use astrid_capsule::registry::{RuntimeScope, WasmHash};
+        let (_dir, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let principal = PrincipalId::new("publish-owner").unwrap();
+        let uid = astrid_core::PrincipalUid::from_bytes([91; 32]);
+        let id = CapsuleId::new("publish-candidate").unwrap();
+        let directory = &kernel.principal_directory;
+        directory.register(principal.clone(), uid).unwrap();
+        let runtime = kernel
+            .capsules
+            .write()
+            .await
+            .reserve_runtime_id(
+                id.clone(),
+                WasmHash::synthetic(id.as_str(), "1.0"),
+                RuntimeScope::Principal(uid),
+            )
+            .unwrap();
+        directory
+            .rename(uid, &principal, PrincipalId::new("renamed-owner").unwrap())
+            .unwrap();
+        directory
+            .register(
+                principal.clone(),
+                astrid_core::PrincipalUid::from_bytes([92; 32]),
+            )
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let candidate = Box::new(CancellableTestCapsule {
+            id: id.clone(),
+            manifest: CapsuleManifest::default(),
+            cancelled: cancelled.clone(),
+            unloaded: unloaded.clone(),
+            cancelled_for: Arc::default(),
+        });
+        let error = kernel
+            .publish_initial_runtime(candidate, runtime, &principal, Some(uid))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed before attaching"),
+            "{error}"
+        );
+        assert!(
+            kernel
+                .capsules
+                .read()
+                .await
+                .get_for(&principal, &id)
+                .is_none()
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(unloaded.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn queued_install_reload_rechecks_owner_before_discovery() {
+        let (_dir, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let principal = PrincipalId::new("queued-owner").unwrap();
+        let original = astrid_core::PrincipalUid::from_bytes([1; 32]);
+        let other = astrid_core::PrincipalUid::from_bytes([2; 32]);
+        let directory = &kernel.principal_directory;
+        directory.register(principal.clone(), original).unwrap();
+        let id = CapsuleId::new("queued-capsule").unwrap();
+        let guard = kernel.lock_capsule_view(&principal, &id).await;
+        let reload = kernel.reload_capsule_for_owner(&id, &principal, Some(original));
+        tokio::pin!(reload);
+        tokio::select! {
+            biased;
+            result = &mut reload => panic!("reload must wait for the view lock: {result:?}"),
+            () = std::future::ready(()) => {},
+        }
+        directory
+            .rename(
+                original,
+                &principal,
+                PrincipalId::new("moved-owner").unwrap(),
+            )
+            .unwrap();
+        directory.register(principal.clone(), other).unwrap();
+        drop(guard);
+        let error = reload
+            .await
+            .expect_err("queued reload must reject alias reassignment");
+        assert!(error.to_string().contains("changed owners"), "{error}");
+    }
+
+    #[tokio::test]
     async fn cancelled_capsule_view_waiter_evicts_dead_key() {
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
@@ -5604,7 +5696,23 @@ mod tests {
                 )
                 .unwrap();
             registry.register_existing(&id, &hash, &bob).unwrap();
-            registry.register_existing(&id, &hash, &alice).unwrap();
+            let viewer = astrid_core::PrincipalUid::from_bytes([83; 32]);
+            let stale = astrid_core::PrincipalUid::from_bytes([84; 32]);
+            kernel
+                .principal_directory
+                .register(alice.clone(), viewer)
+                .unwrap();
+            assert!(
+                kernel
+                    .attach_existing_capsule(&mut registry, &alice, Some(stale), &id, &hash, true)
+                    .is_err()
+            );
+            assert!(registry.get_for(&alice, &id).is_none());
+            assert!(
+                kernel
+                    .attach_existing_capsule(&mut registry, &alice, Some(viewer), &id, &hash, true)
+                    .unwrap()
+            );
         }
 
         let removed = kernel.unload_one_capsule(&id, &alice).await.unwrap();
@@ -6782,6 +6890,7 @@ mod tests {
         let default = astrid_core::PrincipalId::default();
 
         let existing = astrid_core::PrincipalProfile {
+            profile_version: 1,
             grants: vec!["system:status".to_string()],
             ..Default::default()
         };
@@ -6792,6 +6901,16 @@ mod tests {
         seed_default_principal_admin_profile(&home).unwrap();
 
         let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        assert_eq!(profile.profile_version, 2);
+        let registration = profile.auth.public_keys[0]
+            .registration_id
+            .expect("bootstrap registration");
+        seed_default_principal_admin_profile(&home).unwrap();
+        let reloaded = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.auth.public_keys[0].registration_id,
+            Some(registration)
+        );
         // admin not auto-added because grants are non-empty.
         assert!(profile.groups.is_empty());
         assert_eq!(profile.grants, vec!["system:status".to_string()]);

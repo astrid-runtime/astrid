@@ -134,13 +134,91 @@ fn close_fences_a_reader_already_inside_the_published_root_lookup() {
     // that old map guard while close publishes CLOSED and clears its view.
     let entered = receive.recv_timeout(Duration::from_secs(30));
     let closed = engine.close();
-    let released = engine.published_roots.entries.load().is_empty();
+    let released = engine.published_roots.entries.load().is_none();
     let _ = release.send(());
     let ready = reader.join().unwrap();
     assert!(matches!(entered.unwrap(), ReadEvent::Entered));
     closed.unwrap();
     assert!(ready.is_none(), "closed root fast path remained usable");
     assert!(released);
+}
+
+#[test]
+fn refused_slot_replacement_preserves_the_published_snapshot() {
+    use crate::engine::durable::{DurableError, PublishedRoots};
+    use crate::storage_model::{RootGeneration, RootState};
+    use std::collections::BTreeMap;
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Key(u8);
+
+    impl Clone for Key {
+        fn clone(&self) -> Self {
+            // Exercise an embedding that produces a different principal while building slots.
+            Self(if self.0 == 2 { 3 } else { self.0 })
+        }
+    }
+
+    let (commit, _) = transaction("alice", None, b"admitted");
+    let root = RootState {
+        generation: RootGeneration::INITIAL,
+        commit,
+    };
+    let published = PublishedRoots::new(&BTreeMap::from([(Key(1), root)])).unwrap();
+    let candidate = BTreeMap::from([(Key(2), root)]);
+    assert!(matches!(
+        PublishedRoots::new(&candidate),
+        Err(DurableError::InvalidRootProjection)
+    ));
+    assert!(matches!(
+        published.replace(&candidate),
+        Err(DurableError::InvalidRootProjection)
+    ));
+    assert_eq!(published.get(&Key(1)).unwrap().get(), Some(root));
+    assert_eq!(published.get(&Key(2)).unwrap().get(), None);
+    assert_eq!(published.get(&Key(3)).unwrap().get(), None);
+    published.publish(&Key(2), root);
+    for owner in [Key(1), Key(2), Key(3)] {
+        assert!(published.get(&owner).is_none());
+    }
+    published
+        .replace(&BTreeMap::from([(Key(1), root)]))
+        .unwrap();
+    assert_eq!(published.get(&Key(1)).unwrap().get(), Some(root));
+}
+
+#[test]
+fn retained_root_snapshot_shares_live_updates_until_replacement() {
+    use crate::engine::durable::PublishedRoots;
+    use crate::storage_model::{RootGeneration, RootState};
+    use std::collections::BTreeMap;
+
+    let (commit, _) = transaction("alice", None, b"old");
+    let first = RootState {
+        generation: RootGeneration::INITIAL,
+        commit,
+    };
+    let (commit, _) = transaction("alice", Some(first), b"updated");
+    let second = RootState {
+        generation: RootGeneration::new(1),
+        commit,
+    };
+    let published = PublishedRoots::new(&BTreeMap::from([(1u8, first)])).unwrap();
+    let held = published.entries.load_full().unwrap();
+    published.publish(&2, first);
+    assert!(!held.contains_key(&2));
+    published.publish(&1, second);
+    assert_eq!(**held[&1].value.load(), second);
+    assert_eq!(published.get(&2).unwrap().get(), Some(first));
+
+    published.replace(&BTreeMap::from([(1, first)])).unwrap();
+    assert_eq!(published.get(&1).unwrap().get(), Some(first));
+    assert_eq!(published.get(&2).unwrap().get(), None);
+    assert!(!Arc::ptr_eq(
+        &held[&1],
+        &published.entries.load().as_ref().unwrap()[&1]
+    ));
+    assert_eq!(**held[&1].value.load(), second);
 }
 
 struct FailAfterRoot(AtomicBool);
@@ -202,7 +280,10 @@ fn a_read_started_during_poison_cannot_serve_the_pre_recovery_root() {
         engine.lifecycle.load(AtomicOrdering::Acquire),
         super::super::LIFECYCLE_REQUIRES_RECOVERY
     );
-    assert_eq!(engine.published_roots.get(&principal), Some(old));
+    assert_eq!(
+        engine.published_roots.get(&principal).unwrap().get(),
+        Some(old)
+    );
 
     let reader_engine = Arc::clone(&engine);
     let reading = principal.clone();

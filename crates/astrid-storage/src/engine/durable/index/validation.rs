@@ -1,6 +1,6 @@
 //! Bounds invariants for a validated object-index prefix.
 
-use super::{ArenaLocation, DurableError, FRAME_HEADER_LEN, IndexState, corrupt};
+use super::{ArenaLocation, DurableError, IndexState, corrupt};
 
 #[cfg(test)]
 thread_local! {
@@ -46,9 +46,5 @@ pub(super) fn validate_tail(
 }
 
 fn location_end(location: &ArenaLocation) -> Result<u64, DurableError> {
-    location
-        .offset
-        .checked_add(FRAME_HEADER_LEN)
-        .and_then(|end| end.checked_add(location.payload_len))
-        .ok_or(DurableError::EncodingOverflow)
+    location.end().ok_or(DurableError::EncodingOverflow)
 }

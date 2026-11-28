@@ -66,7 +66,6 @@ async fn verify_retired_reservation(wait_for_capacity: bool) {
         event_bus: Arc::downgrade(&bus),
         queues,
         chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        access_resolver: None,
         waits: wait_graph::WaitGraph::default(),
     });
     assert!(bus.register_delivery_admitter(&admitter));
@@ -243,7 +242,6 @@ async fn shared_fallback_queues_detect_cross_principal_wait_cycles() {
         event_bus: Arc::downgrade(&bus),
         queues,
         chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        access_resolver: None,
         waits: wait_graph::WaitGraph::default(),
     };
     let message = |principal: &str, topic: &str, source| AstridEvent::Ipc {
@@ -607,7 +605,6 @@ async fn global_stop_fences_fifo_and_priority_chain_publication() {
                 event_bus: Arc::downgrade(&bus),
                 queues,
                 chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-                access_resolver: None,
                 waits: wait_graph::WaitGraph::default(),
             });
         assert!(bus.register_delivery_admitter(&admitter));

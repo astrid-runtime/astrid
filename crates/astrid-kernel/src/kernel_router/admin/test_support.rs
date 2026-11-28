@@ -146,3 +146,7 @@ async fn operator_fixture_does_not_bypass_missing_or_revoked_delegation() {
         assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists());
     }
 }
+
+#[cfg(any(unix, windows))]
+#[path = "test_support_mounts.rs"]
+pub(crate) mod mounts;

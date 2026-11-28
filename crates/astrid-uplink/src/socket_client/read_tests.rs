@@ -2,6 +2,7 @@
 
 use super::*;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 fn client_pair() -> (SocketClient, tokio::net::UnixStream) {
     let (client, peer) = tokio::net::UnixStream::pair().unwrap();
@@ -77,4 +78,23 @@ async fn unrelated_frames_do_not_reset_the_response_deadline() {
     writer.abort();
     let _ = writer.await;
     assert!(matches!(result, Ok(Err(ReadError::Timeout))));
+}
+
+#[tokio::test]
+async fn tool_call_frame_preserves_the_stamped_principal_and_request() {
+    let (mut client, mut peer) = client_pair();
+    let message = IpcMessage::new(
+        Topic::from_raw("astrid.v1.request.mcp.tool.call"),
+        IpcPayload::RawJson(serde_json::json!({
+            "req_id": "first", "name": "capsule.read", "arguments": {"path": "report"}
+        })),
+        uuid::Uuid::nil(),
+    );
+    let expected = serde_json::to_vec(&message.clone().with_principal("alice")).unwrap();
+    client.send_message(message).await.unwrap();
+    let size = peer.read_u32().await.unwrap();
+    assert_eq!(usize::try_from(size).unwrap(), expected.len());
+    let mut body = vec![0; expected.len()];
+    peer.read_exact(&mut body).await.unwrap();
+    assert_eq!(body, expected);
 }

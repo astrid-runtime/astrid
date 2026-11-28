@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::storage_model::{ObjectId, ObjectIdentity, ObjectRecord, RootState};
+use crate::storage_model::{ModelError, ObjectId, ObjectIdentity, ObjectRecord, RootState};
 
 use super::RootTransaction;
 
@@ -45,6 +45,7 @@ impl<'a> KvIdentitySession<'a> {
         self.identity.identify(record)
     }
 
+    #[cfg(test)]
     pub(crate) fn seal_transaction<P>(
         self,
         principal: P,
@@ -53,29 +54,52 @@ impl<'a> KvIdentitySession<'a> {
         records: Vec<(ObjectId, ObjectRecord)>,
     ) -> RootTransaction<P> {
         RootTransaction {
-            principal,
-            expected,
-            commit,
-            records,
-            identity_proof: IdentityProof::Engine(Arc::clone(self.authority)),
+            declaration: super::root_declaration::Declaration::sealed(
+                super::root_declaration::Update {
+                    principal,
+                    expected,
+                    commit,
+                    records,
+                },
+                Arc::clone(self.authority),
+            ),
             kv_checkpoint_publication: None,
         }
     }
 }
 
-/// Process-local proof that a transaction's declared identities were computed
-/// by the same engine instance that now consumes it.
-#[derive(Debug)]
-pub(crate) enum IdentityProof {
-    Untrusted,
-    Engine(Arc<()>),
+impl<P> RootTransaction<P> {
+    pub(crate) fn from_staged(
+        principal: P,
+        expected: Option<RootState>,
+        commit: ObjectId,
+        staged: std::collections::BTreeMap<ObjectId, ObjectRecord>,
+        session: Option<KvIdentitySession<'_>>,
+    ) -> Self {
+        Self {
+            declaration: super::root_declaration::Declaration::from_staged(
+                principal,
+                expected,
+                commit,
+                staged,
+                session.map(|s| Arc::clone(s.authority)),
+            ),
+            kv_checkpoint_publication: None,
+        }
+    }
 }
 
-impl IdentityProof {
-    pub(crate) fn matches(&self, authority: &Arc<()>) -> bool {
-        match self {
-            Self::Engine(bound) => Arc::ptr_eq(bound, authority),
-            Self::Untrusted => false,
-        }
+impl<P> super::root_declaration::Declaration<P, Arc<()>> {
+    pub(super) fn admit_records<C>(
+        self,
+        authority: &Arc<()>,
+        identify: impl Fn(&ObjectRecord) -> ObjectId,
+        checkpoint: &mut Option<C>,
+    ) -> Result<(super::root_declaration::Update<P>, Option<C>), ModelError> {
+        self.admit_with_checkpoint(authority, Arc::ptr_eq, identify, checkpoint)
+            .map_err(|(declared, computed)| ModelError::ObjectIdentityMismatch {
+                declared,
+                computed,
+            })
     }
 }

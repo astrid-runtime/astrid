@@ -102,7 +102,7 @@ file = "main.wasm"
             .is_ok()
     );
     let barrier = BARRIER.get().unwrap();
-    assert_eq!(kernel.sorted_principal_capsules(&principal).len(), 1);
+    assert_eq!(kernel.sorted_principal_capsules(&principal, None).len(), 1);
     let probe = kernel.capsule_ingress_readiness();
     let mut waiter = tokio::spawn(async move {
         probe

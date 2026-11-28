@@ -28,6 +28,7 @@ path = "src/emit.rs"
 mimalloc = { workspace = true }
 
 [dependencies]
+vstd = { workspace = true }
 astrid-workspace = { workspace = true }
 astrid-build = { workspace = true }
 astrid-emit = { workspace = true }

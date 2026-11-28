@@ -26,7 +26,7 @@ pub(crate) fn measure<T>(operation: impl FnOnce() -> T) -> (T, OutputBytes) {
     (result, OUTPUT.get().unwrap())
 }
 
-pub(super) fn observe(reserved: usize, written: usize) {
+pub(in crate::content_dag::read::traversal) fn observe(reserved: usize, written: usize) {
     if let Some(mut total) = OUTPUT.get() {
         total.reserved = total.reserved.strict_add(reserved);
         total.written = total.written.strict_add(written);

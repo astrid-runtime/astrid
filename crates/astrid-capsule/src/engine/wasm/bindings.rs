@@ -26,7 +26,7 @@
 //! Multi-version coexistence: most packages are pinned at `@1.0.0`, but a
 //! frozen package can ship a successor version that lives alongside the old
 //! one (e.g. `astrid:http@1.0.0` and `astrid:http@1.1.0`). To register both,
-//! add ONE `import astrid:<pkg>/host@<ver>;` line to the `world kernel` below
+//! add ONE `import astrid:<pkg>/host@<ver>;` line to `wit-staging/kernel.wit`
 //! for each version. The single `bindings::Kernel::add_to_linker` call in
 //! `engine/wasm/mod.rs` then auto-wires every version in the world — there is
 //! NO second `add_to_linker` call to add. `build.rs` stages each version into
@@ -37,39 +37,7 @@
 //! versions live on `HostState` (see `engine/wasm/host/http/mod.rs`).
 
 wasmtime::component::bindgen!({
-    inline: "
-        package kernel:host;
-
-        /// Synthetic world that imports every frozen host package plus
-        /// the `astrid:guest/lifecycle` interface (for the
-        /// `capsule-result` type used by `astrid-hook-trigger`). One
-        /// world keeps the generated module deduplicated.
-        ///
-        /// `astrid:io/poll` is the Astrid-owned readiness primitive
-        /// (replaces the historical wasi:io/poll dependency). Every
-        /// readiness operation goes through Astrid host code so it is
-        /// audited, principal-scoped, cancellable, and quota-bounded.
-        world kernel {
-            import astrid:io/error@1.0.0;
-            import astrid:io/poll@1.0.0;
-            import astrid:io/streams@1.0.0;
-            import astrid:fs/host@1.0.0;
-            import astrid:ipc/host@1.0.0;
-            import astrid:kv/host@1.0.0;
-            import astrid:net/host@1.0.0;
-            import astrid:request-context/host@1.0.0;
-            import astrid:http/host@1.0.0;
-            import astrid:http/host@1.1.0;
-            import astrid:sys/host@1.0.0;
-            import astrid:process/host@1.0.0;
-            import astrid:process/host@1.1.0;
-            import astrid:uplink/host@1.0.0;
-            import astrid:elicit/host@1.0.0;
-            import astrid:approval/host@1.0.0;
-            import astrid:identity/host@1.0.0;
-            import astrid:guest/lifecycle@1.0.0;
-        }
-    ",
+    world: "kernel",
     path: "wit-staging",
     // The `pollable` resource is stored in the wasmtime resource table
     // as a `DynPollable` (Future-based) — that is the same internal
@@ -111,8 +79,28 @@ wasmtime::component::bindgen!({
         "astrid:io/streams.stream-error" => wasmtime_wasi::p2::StreamError,
     },
     imports: {
+        "astrid:io/streams.[method]input-stream.blocking-read": async | trappable,
+        "astrid:io/streams.[method]input-stream.blocking-skip": async | trappable,
+        "astrid:io/streams.[method]output-stream.blocking-write-and-flush": async | trappable,
+        "astrid:io/streams.[method]output-stream.blocking-flush": async | trappable,
+        "astrid:io/streams.[method]output-stream.blocking-write-zeroes-and-flush": async | trappable,
         "astrid:io/streams.[method]output-stream.blocking-splice": async | trappable,
+        "astrid:io/streams.[drop]input-stream": async | trappable,
+        "astrid:io/streams.[drop]output-stream": async | trappable,
         "astrid:io/streams": trappable,
+        // Resource exhaustion must reach the guest as a trap before a handle is returned.
+        "astrid:http/host.[method]http-stream.subscribe-readable": trappable,
+        "astrid:http/host.[method]http-stream.body-stream": trappable,
+        "astrid:http/host.[method]http-upload.body-sink": trappable,
+        "astrid:http/host.[method]http-upload.subscribe-writable": trappable,
+        "astrid:net/host.[method]tcp-stream.subscribe-readable": trappable,
+        "astrid:net/host.[method]tcp-stream.read-stream": trappable,
+        "astrid:net/host.[method]tcp-stream.write-stream": trappable,
+        "astrid:net/host.[method]udp-socket.subscribe-readable": trappable,
+        "astrid:net/host.[method]unix-listener.subscribe-readiness": trappable,
+        "astrid:ipc/host.[method]subscription.subscribe-readiness": trappable,
+        "astrid:process/host.[method]process-handle.subscribe-exit": trappable,
+        "astrid:process/host.[method]process-handle.subscribe-logs": trappable,
         // `subscription.recv` is the only host import on the orchestration
         // hot path that *blocks* — every chained capsule (react ->
         // prompt-builder -> registry -> openai-compat) waits here for the

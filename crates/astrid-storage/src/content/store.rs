@@ -11,6 +11,7 @@ use crate::content_dag::{
     VerifiedContent, build_content, build_content_streaming, describe_content, open_content,
     read_opened_content_and_verify,
 };
+use crate::engine::transaction_records;
 use crate::engine::{
     PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
     ProjectionCachePayload, RootTransaction,
@@ -26,6 +27,7 @@ use super::catalog::{
     build_catalog, decode_legacy_catalog, delete, insert, list, list_prefix as catalog_list_prefix,
     lookup, root_from_record, validate_catalog,
 };
+use super::component_labels;
 use super::kv_projection::PrincipalKvAdapter;
 use super::{
     ContentBatchExpectation, ContentEntry, ContentName, ContentReadBatchEntry, ContentWriteOutcome,
@@ -34,9 +36,8 @@ use super::{
 use crate::kv::{KvQuotaResolver, KvValidationCache, validated_projection_quota};
 use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VERSION};
 
-const KV_COMPONENT_LABEL: &[u8] = b"kv";
-const PARENT_LABEL: &[u8] = b"parent";
-pub(super) const STATE_LABEL: &[u8] = b"state";
+const PARENT_LABEL: &[u8] = commit_candidate::PARENT;
+pub(super) const STATE_LABEL: &[u8] = commit_candidate::STATE;
 // Native content transfer target, shared by batched writers and restoration.
 // Coalesces verified I/O while keeping transfer memory independent of file size.
 // This is a soft I/O batch size, not a retention, record, or deployment limit.
@@ -937,45 +938,27 @@ where
     fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
         self.header_at_epoch(principal, self.validated_kv.memo_epoch())
     }
-
-    fn header_at_epoch(
-        &self,
-        principal: &P,
-        epoch: crate::kv::MemoEpoch,
-    ) -> Result<Arc<ContentHeader>, PrincipalContentError> {
-        let root = self.engine.current_root(principal)?;
-        if let Some(root) = root
-            && let Some(header) = self
-                .engine
-                .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
-                .and_then(|entry| entry.downcast::<ContentHeader>())
-            && header.root == Some(root)
-        {
-            return Ok(header);
-        }
-        let header = self.decode_header(principal, root, epoch)?;
-        let Some(root) = root else {
-            return Ok(Arc::new(header));
-        };
-        let header = Arc::new(header);
-        let _ = self.engine.retain_projection_cache(
-            principal,
-            root.commit,
-            DECODED_HEADER_CACHE_KEY,
-            ProjectionCacheEntry::from_shared(Arc::clone(&header)),
-        );
-        Ok(header)
-    }
 }
 
 mod append;
 mod bulk;
+mod commit_candidate;
+mod components;
+#[cfg(test)]
+mod components_tests;
 mod constructors;
 mod handoff;
+mod header_cache;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod header_cache_tests;
+use crate::storage_model::header_graph;
+#[cfg(test)]
+mod header_graph_tests;
 mod internals;
 mod native;
 mod pending_catalog;
 mod projection;
+mod quota_transition;
 mod read_handle;
 mod workspace;
 

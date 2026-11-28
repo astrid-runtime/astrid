@@ -85,6 +85,30 @@ pub(super) fn user_identity(id: u128, key: u8) -> UserIdentity {
 }
 
 #[tokio::test]
+async fn workspace_rejects_an_owner_change_before_binding() {
+    let fixture = fixture().await;
+    let admitted = fixture.directory.uid_for(&fixture.bob).unwrap();
+    assert!(
+        fixture
+            .service
+            .bind_for(&fixture.alice, Some(admitted))
+            .await
+            .is_err()
+    );
+    assert!(fixture.service.bindings.lock().unwrap().is_empty());
+    let current = fixture.directory.uid_for(&fixture.alice).unwrap();
+    assert_eq!(
+        fixture
+            .service
+            .bind_for(&fixture.alice, Some(current))
+            .await
+            .unwrap()
+            .uid,
+        current
+    );
+}
+
+#[tokio::test]
 async fn concurrent_capsules_share_one_uid_branch() {
     let fixture = fixture().await;
     let left = Arc::clone(&fixture.service);
@@ -275,6 +299,45 @@ async fn assigned_fleet_principals_share_base_but_get_independent_branches() {
     assert_eq!(alice.owner, StateOwner::Fleet(fleet.uid));
     assert_eq!(bob.owner, StateOwner::Fleet(fleet.uid));
     assert_ne!(alice.branch, bob.branch);
+
+    let wrong_branch = WorkspaceBranchBinding {
+        branch: bob.branch,
+        ..alice
+    };
+    for op in [WorkspaceCommitOp::Promote, WorkspaceCommitOp::Rollback] {
+        let error = service
+            .finish(&fixture.alice, wrong_branch, op)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "workspace branch binding does not match the kernel lease"
+        );
+        assert_eq!(service.binding_for(&fixture.alice).await.unwrap(), alice);
+        assert_eq!(service.binding_for(&fixture.bob).await.unwrap(), bob);
+    }
+
+    service
+        .finish(&fixture.bob, bob, WorkspaceCommitOp::Rollback)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.branches.binding(&bob.owner, bob.branch),
+        Err(astrid_storage::WorkspaceBranchError::NotFound(id)) if id == bob.branch
+    ));
+    service
+        .finish(&fixture.alice, alice, WorkspaceCommitOp::Promote)
+        .await
+        .unwrap();
+    let receipt = service
+        .branches
+        .binding(&alice.owner, alice.branch)
+        .unwrap();
+    assert_eq!(
+        receipt.lifecycle(),
+        astrid_storage::WorkspaceBindingLifecycle::Promoted
+    );
+    assert_eq!(receipt.binding_uid(), Some(alice.uid));
 }
 
 #[tokio::test]

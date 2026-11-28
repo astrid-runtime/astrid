@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use super::{CapsuleSecurityGate, IdentityOperation, identity_capability_satisfies};
+use super::{CapsuleSecurityGate, IdentityOperation};
 use crate::manifest::CapsuleManifest;
 
 /// Security gate that enforces capabilities based on the manifest.
@@ -414,7 +414,7 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
         operation: IdentityOperation,
     ) -> Result<(), String> {
         let required = operation.required_capability();
-        if identity_capability_satisfies(&self.manifest.capabilities.identity, required) {
+        if operation.permitted_by(&self.manifest.capabilities.identity) {
             Ok(())
         } else {
             Err(format!(

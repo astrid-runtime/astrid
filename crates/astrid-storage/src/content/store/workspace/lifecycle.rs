@@ -5,15 +5,16 @@ use astrid_core::PrincipalUid;
 use crate::content::catalog::{delete, insert, list, root_from_record};
 use crate::content_dag::BuiltContent;
 
+use super::super::quota_transition;
+use super::retry::Step;
 use super::{
     BranchState, CatalogRoot, CatalogValue, ContentHeader, ContentName, MAX_WORKSPACE_BRANCHES,
-    ModelError, ObjectId, ObjectRecord, ObjectReference, PrincipalContentError,
-    PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind, WorkspaceBranchDescriptor,
-    WorkspaceBranchError, WorkspaceBranchStore, WorkspaceUid, decode_branch_record,
-    decode_promotion_receipt, is_workspace_branch_label, is_workspace_receipt_label,
-    make_branch_record, make_branch_record_for_uid, parse_workspace_receipt_uid,
-    parse_workspace_uid, qualify_name, selected_catalog, selected_name, validate_catalog,
-    workspace_ref_label,
+    ModelError, ObjectId, ObjectRecord, PrincipalContentError, PrincipalProjectionEngine,
+    PrincipalProjectionError, ReferenceKind, WorkspaceBranchDescriptor, WorkspaceBranchError,
+    WorkspaceBranchStore, WorkspaceUid, decode_branch_record, decode_promotion_receipt,
+    is_workspace_branch_label, is_workspace_receipt_label, make_branch_record,
+    make_branch_record_for_uid, parse_workspace_receipt_uid, parse_workspace_uid, qualify_name,
+    selected_catalog, selected_name, validate_catalog,
 };
 
 impl<P, E> WorkspaceBranchStore<P, E>
@@ -91,8 +92,11 @@ where
             )?;
             let record_id = self.content.engine.identify_object(&record);
             let mut next = header.as_ref().clone();
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                record_id,
+            );
             let mut records = BTreeMap::new();
             records.append(&mut base_records);
             records.insert(record_id, record);
@@ -235,24 +239,14 @@ where
         else {
             return Ok(());
         };
-        let new_other = header
-            .other_quota_bytes
-            .checked_sub(old_branch_quota)
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let new_used = new_other
-            .checked_add(catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let old_used = header
-            .other_quota_bytes
-            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        if new_used > limit && new_used > old_used {
-            return Err(WorkspaceBranchError::QuotaExceeded {
-                used: new_used,
-                limit,
-            });
-        }
-        Ok(())
+        quota_transition::promote(
+            header.other_quota_bytes,
+            header.catalog.map_or(0, |root| root.summary.quota_bytes),
+            old_branch_quota,
+            catalog.map_or(0, |root| root.summary.quota_bytes),
+            limit,
+        )
+        .map_err(WorkspaceBranchError::from)
     }
 
     pub(super) fn completion_receipt(
@@ -377,26 +371,14 @@ where
         else {
             return Ok(());
         };
-        let old_used = header
-            .other_quota_bytes
-            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let new_other = header
-            .other_quota_bytes
-            .checked_sub(old_branch_quota)
-            .ok_or(PrincipalContentError::AccountingOverflow)?
-            .checked_add(new_branch_quota)
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        let new_used = new_other
-            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
-            .ok_or(PrincipalContentError::AccountingOverflow)?;
-        if new_used > limit && new_used > old_used {
-            return Err(WorkspaceBranchError::QuotaExceeded {
-                used: new_used,
-                limit,
-            });
-        }
-        Ok(())
+        quota_transition::replace_branch(
+            header.catalog.map_or(0, |root| root.summary.quota_bytes),
+            header.other_quota_bytes,
+            old_branch_quota,
+            new_branch_quota,
+            limit,
+        )
+        .map_err(WorkspaceBranchError::from)
     }
 
     pub(super) fn mutate_catalog<F>(
@@ -404,16 +386,15 @@ where
         owner: &P,
         id: WorkspaceUid,
         built: Option<&BuiltContent>,
-        mut mutate: F,
+        mutate: F,
     ) -> Result<(), WorkspaceBranchError>
     where
-        F: FnMut(
+        F: Fn(
             Option<CatalogRoot>,
             &mut BTreeMap<ObjectId, ObjectRecord>,
         ) -> Result<Option<CatalogRoot>, PrincipalContentError>,
     {
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let branch = self.branch(owner, &header, id)?;
             let old_quota = branch.working.map_or(0, |root| root.summary.quota_bytes);
             let mut records = BTreeMap::new();
@@ -422,7 +403,7 @@ where
             }
             let working = mutate(branch.working, &mut records)?;
             if working == branch.working {
-                return Ok(());
+                return Ok(Step::Done(()));
             }
             let new_quota = working.map_or(0, |root| root.summary.quota_bytes);
             self.enforce_quota_change(owner, &header, old_quota, new_quota)?;
@@ -443,16 +424,34 @@ where
             let mut next = header.as_ref().clone();
             next.preserved_state
                 .retain(|reference| parse_workspace_uid(reference.label().as_bytes()) != Some(id));
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                record_id,
+            );
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(()),
-                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(error.into()),
+                Ok(_) => Ok(Step::Done(())),
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
+                    Ok(Step::Conflict)
+                },
+                Err(error) => Err(error.into()),
             }
+        })
+    }
+}
+
+impl From<quota_transition::Refusal> for WorkspaceBranchError {
+    fn from(error: quota_transition::Refusal) -> Self {
+        match error {
+            quota_transition::Refusal::AccountingOverflow => {
+                PrincipalContentError::AccountingOverflow.into()
+            },
+            quota_transition::Refusal::Exceeded { used, limit } => {
+                Self::QuotaExceeded { used, limit }
+            },
         }
     }
 }

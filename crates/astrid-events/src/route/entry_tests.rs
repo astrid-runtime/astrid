@@ -37,11 +37,7 @@ fn ipc_sized(topic: &str, principal: Option<&str>, payload_bytes: usize) -> Arc<
 fn push_and_drain_single_principal() {
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
     for _ in 0..3 {
-        entry.push_with_eviction(
-            ipc("t.x", Some("alice")),
-            Some("alice".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
+        entry.push_with_eviction(ipc("t.x", Some("alice")), MAX_SUBSCRIPTION_BUDGET_BYTES);
     }
     let mut out = Vec::new();
     entry.drr_drain(&mut out, MAX_SUBSCRIPTION_BUDGET_BYTES);
@@ -58,11 +54,7 @@ fn pop_one_takes_exactly_one_and_keeps_the_rest() {
     // remainder — so a fan-out burst lost all-but-one per recv.
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
     for _ in 0..3 {
-        entry.push_with_eviction(
-            ipc("t.x", Some("alice")),
-            Some("alice".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
+        entry.push_with_eviction(ipc("t.x", Some("alice")), MAX_SUBSCRIPTION_BUDGET_BYTES);
     }
     // One pop yields exactly one event...
     assert!(entry.drr_pop_one().is_some());
@@ -81,16 +73,8 @@ fn pop_one_takes_exactly_one_and_keeps_the_rest() {
 #[test]
 fn pop_one_serves_each_principal_without_loss() {
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
-    entry.push_with_eviction(
-        ipc("t.x", Some("alice")),
-        Some("alice".into()),
-        MAX_SUBSCRIPTION_BUDGET_BYTES,
-    );
-    entry.push_with_eviction(
-        ipc("t.x", Some("bob")),
-        Some("bob".into()),
-        MAX_SUBSCRIPTION_BUDGET_BYTES,
-    );
+    entry.push_with_eviction(ipc("t.x", Some("alice")), MAX_SUBSCRIPTION_BUDGET_BYTES);
+    entry.push_with_eviction(ipc("t.x", Some("bob")), MAX_SUBSCRIPTION_BUDGET_BYTES);
     // Two single-pops serve both queued events (round-robin), losing nothing.
     assert!(entry.drr_pop_one().is_some());
     assert!(entry.drr_pop_one().is_some());
@@ -111,16 +95,8 @@ fn drr_two_principals_yield_equal_counts() {
     // pure round-robin. Both principals should each see 2 events.
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
     for _ in 0..2 {
-        entry.push_with_eviction(
-            ipc("t.x", Some("alice")),
-            Some("alice".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
-        entry.push_with_eviction(
-            ipc("t.x", Some("bob")),
-            Some("bob".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
+        entry.push_with_eviction(ipc("t.x", Some("alice")), MAX_SUBSCRIPTION_BUDGET_BYTES);
+        entry.push_with_eviction(ipc("t.x", Some("bob")), MAX_SUBSCRIPTION_BUDGET_BYTES);
     }
     let mut out = Vec::new();
     entry.drr_drain(&mut out, MAX_SUBSCRIPTION_BUDGET_BYTES);
@@ -149,26 +125,10 @@ fn drr_interleaves_when_quantum_caps_per_round() {
     let payload_size = 8 * 1024; // 8 KiB > DRR_QUANTUM_MIN_BYTES/2
     let budget = payload_size * 4 + 1024;
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
-    entry.push_with_eviction(
-        ipc_sized("t.x", Some("alice"), payload_size),
-        Some("alice".into()),
-        budget,
-    );
-    entry.push_with_eviction(
-        ipc_sized("t.x", Some("bob"), payload_size),
-        Some("bob".into()),
-        budget,
-    );
-    entry.push_with_eviction(
-        ipc_sized("t.x", Some("alice"), payload_size),
-        Some("alice".into()),
-        budget,
-    );
-    entry.push_with_eviction(
-        ipc_sized("t.x", Some("bob"), payload_size),
-        Some("bob".into()),
-        budget,
-    );
+    entry.push_with_eviction(ipc_sized("t.x", Some("alice"), payload_size), budget);
+    entry.push_with_eviction(ipc_sized("t.x", Some("bob"), payload_size), budget);
+    entry.push_with_eviction(ipc_sized("t.x", Some("alice"), payload_size), budget);
+    entry.push_with_eviction(ipc_sized("t.x", Some("bob"), payload_size), budget);
 
     let mut out = Vec::new();
     // Drain with budget = payload_size * 4 so 4 messages can be served.
@@ -193,11 +153,7 @@ fn drr_interleaves_when_quantum_caps_per_round() {
 fn drr_isolates_principals_under_burst() {
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
     for _ in 0..200 {
-        entry.push_with_eviction(
-            ipc("t.x", Some("alice")),
-            Some("alice".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
+        entry.push_with_eviction(ipc("t.x", Some("alice")), MAX_SUBSCRIPTION_BUDGET_BYTES);
     }
     // Only alice; bob has zero entries — demand-allocation invariant.
     assert_eq!(entry.fanout.len(), 1);
@@ -213,11 +169,7 @@ fn eviction_drops_oldest_head_under_budget() {
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
 
     for _ in 0..3 {
-        entry.push_with_eviction(
-            ipc_sized("t.alice", Some("alice"), payload_size),
-            Some("alice".into()),
-            budget,
-        );
+        entry.push_with_eviction(ipc_sized("t.alice", Some("alice"), payload_size), budget);
     }
     // Sanity: alice now holds 3 entries.
     assert_eq!(
@@ -231,14 +183,12 @@ fn eviction_drops_oldest_head_under_budget() {
     // Push bob — fits without eviction.
     entry.push_with_eviction(
         ipc_sized("t.bob.terminator", Some("bob"), payload_size / 4),
-        Some("bob".into()),
         budget,
     );
 
     // Force budget overflow by pushing a new large alice.
     entry.push_with_eviction(
         ipc_sized("t.alice.new", Some("alice"), payload_size),
-        Some("alice".into()),
         budget,
     );
 
@@ -266,11 +216,7 @@ fn pathological_message_alone_is_rejected() {
     // budget = 1 KiB; message > 1 KiB → rejected, queue unchanged.
     let small_budget = 1024;
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
-    entry.push_with_eviction(
-        ipc_sized("t.alice", Some("alice"), 4096),
-        Some("alice".into()),
-        small_budget,
-    );
+    entry.push_with_eviction(ipc_sized("t.alice", Some("alice"), 4096), small_budget);
     assert_eq!(entry.fanout.len(), 0);
     assert_eq!(entry.total_bytes, 0);
 }
@@ -280,7 +226,7 @@ fn fairness_under_5000_principals_makes_progress() {
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
     for i in 0..5000 {
         let p = format!("p{i}");
-        entry.push_with_eviction(ipc("t.x", Some(&p)), Some(p), MAX_SUBSCRIPTION_BUDGET_BYTES);
+        entry.push_with_eviction(ipc("t.x", Some(&p)), MAX_SUBSCRIPTION_BUDGET_BYTES);
     }
     let mut out = Vec::new();
     entry.drr_drain(&mut out, MAX_SUBSCRIPTION_BUDGET_BYTES);
@@ -323,18 +269,11 @@ fn scoped_drops_foreign_at_enqueue() {
         Some(Some("alice".into())),
     );
     for _ in 0..3 {
-        entry.push_with_eviction(
-            ipc("t.x", Some("alice")),
-            Some("alice".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
+        entry.push_with_eviction(ipc("t.x", Some("alice")), MAX_SUBSCRIPTION_BUDGET_BYTES);
     }
     for _ in 0..5 {
-        let evicted = entry.push_with_eviction(
-            ipc("t.x", Some("bob")),
-            Some("bob".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
+        let evicted =
+            entry.push_with_eviction(ipc("t.x", Some("bob")), MAX_SUBSCRIPTION_BUDGET_BYTES);
         assert_eq!(evicted, 0, "foreign push is a no-op, never evicts");
     }
     // Only alice's bucket exists; bob's bytes never accrued.
@@ -369,16 +308,11 @@ fn scoped_budget_not_evictable_by_foreign_burst() {
     // Alice writes one entry well within budget.
     entry.push_with_eviction(
         ipc_sized("t.alice.keep", Some("alice"), payload_size),
-        Some("alice".into()),
         budget,
     );
     // Bob floods far past the budget.
     for _ in 0..100 {
-        entry.push_with_eviction(
-            ipc_sized("t.bob.flood", Some("bob"), payload_size),
-            Some("bob".into()),
-            budget,
-        );
+        entry.push_with_eviction(ipc_sized("t.bob.flood", Some("bob"), payload_size), budget);
     }
     // Alice's single entry is intact; bob never entered.
     let alice_q = entry
@@ -400,11 +334,8 @@ fn high_rate_tiny_stream_under_cap_is_not_dropped() {
     // drop them; at the raised cap none may be. This test fails at cap 256.
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
     for _ in 0..1000 {
-        let evicted = entry.push_with_eviction(
-            ipc("t.tok", Some("alice")),
-            Some("alice".into()),
-            MAX_SUBSCRIPTION_BUDGET_BYTES,
-        );
+        let evicted =
+            entry.push_with_eviction(ipc("t.tok", Some("alice")), MAX_SUBSCRIPTION_BUDGET_BYTES);
         assert_eq!(
             evicted, 0,
             "no event may be evicted under the cap and budget"
@@ -424,17 +355,9 @@ fn per_principal_count_cap_drops_oldest_beyond_fallback() {
     // PENDING_PER_PRINCIPAL_FALLBACK + 1 tiny events for one principal: the
     // bucket caps at the constant and the OLDEST (FIFO head) is the drop.
     let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
-    entry.push_with_eviction(
-        ipc("t.oldest", Some("alice")),
-        Some("alice".into()),
-        usize::MAX,
-    );
+    entry.push_with_eviction(ipc("t.oldest", Some("alice")), usize::MAX);
     for _ in 0..PENDING_PER_PRINCIPAL_FALLBACK {
-        entry.push_with_eviction(
-            ipc("t.rest", Some("alice")),
-            Some("alice".into()),
-            usize::MAX,
-        );
+        entry.push_with_eviction(ipc("t.rest", Some("alice")), usize::MAX);
     }
     let bucket = entry
         .fanout

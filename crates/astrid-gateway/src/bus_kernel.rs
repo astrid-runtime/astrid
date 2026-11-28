@@ -42,6 +42,7 @@ pub struct BusKernelClient {
     bus: Arc<EventBus>,
     caller: PrincipalId,
     device_key_id: Option<String>,
+    registration: Option<Uuid>,
     expected_source_id: Uuid,
     timeout: Duration,
 }
@@ -54,6 +55,7 @@ impl BusKernelClient {
             bus,
             caller,
             device_key_id: None,
+            registration: None,
             expected_source_id,
             timeout: DEFAULT_TIMEOUT,
         }
@@ -62,7 +64,14 @@ impl BusKernelClient {
     /// Bind the device `key_id` this caller's bearer was scoped to, if any.
     #[must_use]
     pub fn with_device_key_id(mut self, device_key_id: Option<String>) -> Self {
+        self.registration = None;
         self.device_key_id = device_key_id;
+        self
+    }
+
+    pub(crate) fn with_caller_device(mut self, caller: &crate::auth::CallerContext) -> Self {
+        self.device_key_id.clone_from(&caller.device_key_id);
+        self.registration = caller.registration_id.map(Into::into);
         self
     }
 
@@ -95,9 +104,13 @@ impl BusKernelClient {
         &self,
         req: KernelRequest,
     ) -> std::result::Result<KernelResponse, KernelClientError> {
-        let (msg, want_response) =
-            build_request_message(&self.caller, self.device_key_id.as_deref(), &req)
-                .map_err(|source| KernelClientError::Build { source })?;
+        let (msg, want_response) = build_request_message(
+            &self.caller,
+            self.device_key_id.as_deref(),
+            self.registration,
+            &req,
+        )
+        .map_err(|source| KernelClientError::Build { source })?;
         let topic = want_response.as_str().to_string();
 
         let mut receiver = self.bus.subscribe_topic(want_response.as_str());
@@ -186,6 +199,7 @@ impl BusKernelClient {
 fn build_request_message(
     caller: &PrincipalId,
     device_key_id: Option<&str>,
+    registration: Option<Uuid>,
     req: &KernelRequest,
 ) -> Result<(IpcMessage, Topic)> {
     let correlation = Uuid::new_v4().simple().to_string();
@@ -199,6 +213,7 @@ fn build_request_message(
         .with_origin(MessageOrigin::RemoteGateway);
     if let Some(kid) = device_key_id {
         msg = msg.with_device_key_id(kid);
+        msg.device_registration_id = registration;
     }
     Ok((msg, want_response))
 }
@@ -279,9 +294,14 @@ mod tests {
     #[test]
     fn request_message_stamps_gateway_origin_principal_and_device_key() {
         let caller = PrincipalId::new("regular-user").unwrap();
-        let (msg, want_response) =
-            build_request_message(&caller, Some("abcdef0123456789"), &KernelRequest::GetStatus)
-                .expect("build request");
+        let generation = Uuid::new_v4();
+        let (msg, want_response) = build_request_message(
+            &caller,
+            Some("abcdef0123456789"),
+            Some(generation),
+            &KernelRequest::GetStatus,
+        )
+        .expect("build request");
 
         assert!(msg.topic.as_str().starts_with("astrid.v1.request.status."));
         assert!(
@@ -291,14 +311,15 @@ mod tests {
         );
         assert_eq!(msg.principal.as_deref(), Some("regular-user"));
         assert_eq!(msg.device_key_id.as_deref(), Some("abcdef0123456789"));
+        assert_eq!(msg.device_registration_id, Some(generation));
         assert_eq!(msg.origin, MessageOrigin::RemoteGateway);
     }
 
     #[test]
     fn request_message_omits_device_key_for_full_authority_bearer() {
         let caller = PrincipalId::new("regular-user").unwrap();
-        let (msg, _) =
-            build_request_message(&caller, None, &KernelRequest::GetStatus).expect("build request");
+        let (msg, _) = build_request_message(&caller, None, None, &KernelRequest::GetStatus)
+            .expect("build request");
 
         assert_eq!(msg.principal.as_deref(), Some("regular-user"));
         assert!(msg.device_key_id.is_none());

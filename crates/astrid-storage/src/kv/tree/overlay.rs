@@ -3,43 +3,36 @@
 //! Nodes are immutable and reference-counted, so each published projection
 //! reuses the previous projection and copies only one balanced search path.
 
-use std::cmp::Ordering;
-use std::sync::Arc;
+mod snapshot;
+pub(super) use snapshot::OverlayMap;
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct OverlayMap {
-    root: Option<Arc<Node>>,
-}
-
-#[derive(Debug)]
-struct Entry {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
-}
-
-#[derive(Debug)]
-struct Node {
-    entry: Arc<Entry>,
-    left: Option<Arc<Self>>,
-    right: Option<Arc<Self>>,
-    height: u32,
-}
+use super::{
+    ObjectId, checkpoint_totals, checkpoint_value, delta_mutation, delta_totals, key_projection,
+    mutation_replay, replay_values,
+};
+use crate::kv::encoding;
+pub(super) mod batch;
+mod range;
+mod traversal;
+mod update;
+use traversal::Node;
 
 impl OverlayMap {
     pub(super) fn get(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
-        let mut cursor = self.root.as_deref();
-        while let Some(node) = cursor {
-            match key.cmp(node.entry.key.as_slice()) {
-                Ordering::Less => cursor = node.left.as_deref(),
-                Ordering::Greater => cursor = node.right.as_deref(),
-                Ordering::Equal => return Some(&node.entry.value),
-            }
-        }
-        None
+        traversal::lookup(self.root.as_ref(), key)
     }
 
     pub(super) fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
-        self.root = Some(insert(self.root.take(), Arc::new(Entry { key, value })));
+        update::put(&mut self.root, key, value);
+    }
+
+    pub(super) fn stage<E>(
+        &mut self,
+        key: Vec<u8>,
+        replacement: Option<Vec<u8>>,
+        encode: impl FnOnce(&Vec<u8>) -> Result<checkpoint_value::ValueSlot, E>,
+    ) -> Result<delta_mutation::Mutation, E> {
+        update::stage(&mut self.root, key, replacement, encode)
     }
 
     pub(super) fn range<'a>(
@@ -47,26 +40,20 @@ impl OverlayMap {
         start: &'a [u8],
         end: &'a [u8],
     ) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
-        let mut cursor = self.root.as_deref();
-        let mut stack = Vec::new();
+        let mut cursor = range::Range::new(self.root.as_ref(), start, end);
         std::iter::from_fn(move || {
-            while let Some(node) = cursor {
-                if node.entry.key.as_slice() >= start {
-                    stack.push(node);
-                    cursor = node.left.as_deref();
-                } else {
-                    cursor = node.right.as_deref();
-                }
-            }
-            let node = stack.pop()?;
-            if node.entry.key.as_slice() >= end {
-                cursor = None;
-                stack.clear();
-                return None;
-            }
-            cursor = node.right.as_deref();
-            Some((node.entry.key.as_slice(), node.entry.value.as_deref()))
+            let entry = cursor.next_entry()?;
+            Some((entry.key.as_slice(), entry.value.as_deref()))
         })
+    }
+
+    pub(super) fn project_presence(
+        &self,
+        keys: &mut std::collections::BTreeMap<Vec<u8>, bool>,
+        start: &[u8],
+        end: &[u8],
+    ) {
+        range::apply_presence(self.root.as_ref(), start, end, keys);
     }
 
     pub(super) fn all(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
@@ -83,101 +70,6 @@ fn collect_all(node: Option<&Node>, entries: &mut Vec<(Vec<u8>, Option<Vec<u8>>)
     collect_all(node.left.as_deref(), entries);
     entries.push((node.entry.key.clone(), node.entry.value.clone()));
     collect_all(node.right.as_deref(), entries);
-}
-
-fn insert(root: Option<Arc<Node>>, entry: Arc<Entry>) -> Arc<Node> {
-    let Some(node) = root else {
-        return make_node(entry, None, None);
-    };
-    let rebuilt = match entry.key.as_slice().cmp(node.entry.key.as_slice()) {
-        Ordering::Less => make_node(
-            Arc::clone(&node.entry),
-            Some(insert(node.left.clone(), entry)),
-            node.right.clone(),
-        ),
-        Ordering::Greater => make_node(
-            Arc::clone(&node.entry),
-            node.left.clone(),
-            Some(insert(node.right.clone(), entry)),
-        ),
-        Ordering::Equal => make_node(entry, node.left.clone(), node.right.clone()),
-    };
-    rebalance(rebuilt)
-}
-
-fn make_node(entry: Arc<Entry>, left: Option<Arc<Node>>, right: Option<Arc<Node>>) -> Arc<Node> {
-    Arc::new(Node {
-        entry,
-        height: height(left.as_ref())
-            .max(height(right.as_ref()))
-            .saturating_add(1),
-        left,
-        right,
-    })
-}
-
-fn rebalance(node: Arc<Node>) -> Arc<Node> {
-    let balance = i64::from(height(node.left.as_ref()))
-        .saturating_sub(i64::from(height(node.right.as_ref())));
-    if balance > 1 {
-        let Some(left) = node.left.as_ref() else {
-            return node;
-        };
-        let node = if height(left.left.as_ref()) < height(left.right.as_ref()) {
-            make_node(
-                Arc::clone(&node.entry),
-                Some(rotate_left(left)),
-                node.right.clone(),
-            )
-        } else {
-            node
-        };
-        return rotate_right(&node);
-    }
-    if balance < -1 {
-        let Some(right) = node.right.as_ref() else {
-            return node;
-        };
-        let node = if height(right.right.as_ref()) < height(right.left.as_ref()) {
-            make_node(
-                Arc::clone(&node.entry),
-                node.left.clone(),
-                Some(rotate_right(right)),
-            )
-        } else {
-            node
-        };
-        return rotate_left(&node);
-    }
-    node
-}
-
-fn rotate_left(node: &Arc<Node>) -> Arc<Node> {
-    let Some(right) = node.right.as_ref() else {
-        return Arc::clone(node);
-    };
-    let left = make_node(
-        Arc::clone(&node.entry),
-        node.left.clone(),
-        right.left.clone(),
-    );
-    make_node(Arc::clone(&right.entry), Some(left), right.right.clone())
-}
-
-fn rotate_right(node: &Arc<Node>) -> Arc<Node> {
-    let Some(left) = node.left.as_ref() else {
-        return Arc::clone(node);
-    };
-    let right = make_node(
-        Arc::clone(&node.entry),
-        left.right.clone(),
-        node.right.clone(),
-    );
-    make_node(Arc::clone(&left.entry), left.left.clone(), Some(right))
-}
-
-fn height(node: Option<&Arc<Node>>) -> u32 {
-    node.map_or(0, |node| node.height)
 }
 
 #[cfg(test)]
@@ -216,6 +108,38 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn range_and_presence_match_the_same_snapshot_at_every_boundary() {
+        let mut overlay = OverlayMap::default();
+        let mut expected = BTreeMap::new();
+        for key in [7, 3, 11, 1, 5, 9, 13, 2, 10] {
+            let value = (key % 3 != 0).then(|| vec![key]);
+            overlay.insert(vec![key], value.clone());
+            expected.insert(vec![key], value);
+        }
+        let checkpoint: BTreeMap<_, _> = (0..16).step_by(2).map(|key| (vec![key], true)).collect();
+        for start in 0..=15 {
+            for end in 0..=15 {
+                let selected: Vec<_> = expected
+                    .iter()
+                    .filter(|(key, _)| start <= key[0] && key[0] < end)
+                    .map(|(key, value)| (key.as_slice(), value.as_deref()))
+                    .collect();
+                assert_eq!(
+                    overlay.range(&[start], &[end]).collect::<Vec<_>>(),
+                    selected
+                );
+                let mut projected = checkpoint.clone();
+                overlay.project_presence(&mut projected, &[start], &[end]);
+                let mut expected_presence = checkpoint.clone();
+                for (key, value) in selected {
+                    expected_presence.insert(key.to_vec(), value.is_some());
+                }
+                assert_eq!(projected, expected_presence);
+            }
+        }
+    }
+
     #[test]
     fn unrelated_overlay_insert_reuses_existing_payload_allocation() {
         let mut overlay = OverlayMap::default();

@@ -1,12 +1,9 @@
 //! One publication epoch invalidates pre-purge work without owner tombstones.
-use super::KvValidationCache;
+use super::{KvValidationCache, MemoEpoch};
 use crate::content::CatalogValidation;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MemoEpoch(u64);
 
 #[derive(Clone, Copy)]
 pub(super) struct MemoSnapshot {
@@ -16,13 +13,13 @@ pub(super) struct MemoSnapshot {
 
 impl<P: Ord> KvValidationCache<P> {
     pub(crate) fn memo_epoch(&self) -> MemoEpoch {
-        MemoEpoch(self.epoch.load(Ordering::Acquire))
+        MemoEpoch::new(self.epoch.load(Ordering::Acquire))
     }
 
     pub(super) fn epoch_is_current(&self, epoch: MemoEpoch) -> bool {
         // Exhaustion conservatively disables memo publication, never wraps to
         // a ticket held by old work. Authoritative reads remain unaffected.
-        epoch.0 != u64::MAX && self.memo_epoch() == epoch
+        epoch.is_current(self.memo_epoch())
     }
 
     pub(crate) fn forget_owner(&self, owner: &P, catalogs: &Mutex<BTreeMap<P, CatalogValidation>>) {
@@ -30,7 +27,7 @@ impl<P: Ord> KvValidationCache<P> {
         // already-admitted work even though its immutable root did not change.
         let mut projections = self.projections.lock();
         self.epoch.store(
-            self.epoch.load(Ordering::Relaxed).saturating_add(1),
+            MemoEpoch::new(self.epoch.load(Ordering::Relaxed)).after_purge(),
             Ordering::Release,
         );
         self.trees.lock().remove(owner);

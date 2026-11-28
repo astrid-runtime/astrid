@@ -9,6 +9,9 @@ use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::error::{StorageError, StorageResult};
 
+mod binding;
+pub(crate) use binding::recovery_aliases;
+
 /// Live, capability-bound mapping between mutable principal aliases and
 /// stable durable UIDs.
 ///
@@ -113,6 +116,22 @@ impl PrincipalDirectory {
             })
     }
 
+    /// Resolve the alias and keep a previously admitted owner when supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the alias is missing or has changed owners.
+    pub fn bound_uid(
+        &self,
+        alias: &PrincipalId,
+        expected: Option<PrincipalUid>,
+    ) -> StorageResult<PrincipalUid> {
+        let observed = self.uid_for(alias)?;
+        binding::select(expected.map(|uid| *uid.as_bytes()), *observed.as_bytes())
+            .map(PrincipalUid::from_bytes)
+            .ok_or_else(|| StorageError::InvalidKey(format!("principal {alias} changed owners")))
+    }
+
     /// Run a synchronous native operation while this UID remains registered.
     ///
     /// The current alias is borrowed under the directory read lock. Renames,
@@ -133,15 +152,38 @@ impl PrincipalDirectory {
         operation: impl FnOnce(&PrincipalId) -> std::io::Result<T>,
     ) -> std::io::Result<Option<T>> {
         let state = self.inner.read();
-        let Some(alias) = state.principals.get(&uid) else {
-            return Ok(None);
-        };
-        if state.aliases.get(alias) != Some(&uid) {
-            return Ok(None);
-        }
-        let result = operation(alias);
+        let result = binding::with_live_alias(&state.aliases, &state.principals, &uid, operation);
         drop(state);
-        result.map(Some)
+        result.ok().transpose()
+    }
+
+    /// Run a synchronous operation with an owned input while both sides of the
+    /// captured binding match. The callback must not re-enter the directory
+    /// or wait for work requiring its write lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original input for cleanup when either binding has changed.
+    pub fn with_bound_input<T, R>(
+        &self,
+        alias: &PrincipalId,
+        uid: PrincipalUid,
+        input: T,
+        operation: impl FnOnce(T) -> R,
+    ) -> Result<R, T> {
+        let state = self.inner.read();
+        let (forward, reverse) =
+            binding::observations(&state.aliases, &state.principals, alias, &uid);
+        let result = binding::with_pair(
+            alias.as_str().as_bytes(),
+            uid.as_bytes(),
+            forward.map(PrincipalUid::as_bytes),
+            reverse.map(|id| id.as_str().as_bytes()),
+            input,
+            operation,
+        );
+        drop(state);
+        result
     }
 
     /// Resolve a durable UID to its current alias.
@@ -160,6 +202,20 @@ impl PrincipalDirectory {
                     "principal uid {uid} has no registered live alias"
                 ))
             })
+    }
+
+    /// Replay the ownership snapshot under one stable principal-directory read guard.
+    /// The sink runs synchronously and must not re-enter the directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from the sink and stops recovery.
+    pub fn replay_retirements<S: crate::RetirementSink<PrincipalId>>(
+        &self,
+        ownership: &crate::OwnershipSnapshot,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
+        ownership.replay_retirements(&self.inner.read().principals, sink)
     }
 
     /// Whether a durable UID currently names an admitted live principal.

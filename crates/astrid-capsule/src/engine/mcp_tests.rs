@@ -18,11 +18,33 @@ mod tests {
             crate::capsule::CapsuleId::from_static("multi-mcp"),
             7,
         );
-        let first = crate::engine::mcp::runtime_server_id("multi-mcp", "first", &runtime);
-        let second = crate::engine::mcp::runtime_server_id("multi-mcp", "second", &runtime);
+        let first = crate::engine::mcp::runtime_server_id("first", &runtime);
+        let second = crate::engine::mcp::runtime_server_id("second", &runtime);
         assert_ne!(first, second);
         assert!(first.ends_with("generation-7"));
         assert!(second.ends_with("generation-7"));
+    }
+
+    #[test]
+    fn mcp_registration_preserves_scope_and_decimal_generation() {
+        use crate::registry::{RuntimeId, RuntimeScope};
+        let uid = astrid_core::PrincipalUid::from_bytes([0xab; 32]);
+        for generation in [0, 9, 10, 99, 100, u64::MAX - 1] {
+            for (scope, label) in [
+                (RuntimeScope::SystemResident, "system".to_owned()),
+                (RuntimeScope::Principal(uid), format!("principal-{uid}")),
+            ] {
+                let runtime = RuntimeId::for_test_scope(
+                    crate::capsule::CapsuleId::from_static("multi-mcp"),
+                    generation,
+                    scope,
+                );
+                assert_eq!(
+                    crate::engine::mcp::runtime_server_id("local:tools", &runtime),
+                    format!("capsule:multi-mcp:server-local:tools:{label}:generation-{generation}")
+                );
+            }
+        }
     }
 
     fn dummy_manifest(command: &str, allowed_commands: Vec<&str>) -> CapsuleManifest {
@@ -78,6 +100,72 @@ mod tests {
             publishes: ::std::collections::HashMap::new(),
             subscribes: ::std::collections::HashMap::new(),
             tools: ::std::vec::Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_native_network_request_cannot_prepare_or_activate() {
+        let root = tempdir().unwrap();
+        let kv = astrid_storage::ScopedKvStore::new(
+            std::sync::Arc::new(astrid_storage::MemoryKvStore::new()),
+            "test",
+        )
+        .unwrap();
+        let context = CapsuleContext::new(
+            astrid_core::PrincipalId::default(),
+            root.path().into(),
+            None,
+            kv,
+            std::sync::Arc::new(astrid_events::EventBus::new()),
+            None,
+        );
+        for (domain, tcp) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut manifest = dummy_manifest("test-command", vec!["test-command"]);
+            manifest.capabilities.uplink = true;
+            if tcp {
+                manifest
+                    .capabilities
+                    .net_connect
+                    .push("example.org:443".into());
+            }
+            if domain {
+                manifest.capabilities.net.push("example.org".into());
+            }
+            let server = manifest.mcp_servers[0].clone();
+            let mut engine = McpHostEngine::new(
+                manifest,
+                server,
+                root.path().into(),
+                test_secure_mcp_client(),
+            )
+            .with_runtime_id(Some(crate::registry::RuntimeId::for_test(
+                crate::capsule::CapsuleId::from_static("test-capsule"),
+                1,
+            )));
+            if !domain && !tcp {
+                engine.load(&context).await.unwrap();
+                let config = engine.prepared_config().unwrap();
+                assert_eq!(config.transport, astrid_mcp::Transport::Stdio);
+                assert_eq!(config.command.as_deref(), Some("test-command"));
+                assert!(!config.trusted && !config.allow_network);
+                continue;
+            }
+            assert!(
+                engine
+                    .load(&context)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot enforce destination-scoped network access")
+            );
+            assert!(
+                engine
+                    .activate()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not been prepared")
+            );
         }
     }
 
@@ -141,6 +229,7 @@ mod tests {
             cli_socket_listener: None,
             capsule_registry: None,
             session_token: None,
+            device_sessions: Default::default(),
             allowance_store: None,
             identity_store: None,
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
@@ -220,6 +309,7 @@ mod tests {
             cli_socket_listener: None,
             capsule_registry: None,
             session_token: None,
+            device_sessions: Default::default(),
             allowance_store: None,
             identity_store: None,
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
@@ -313,6 +403,7 @@ mod tests {
             cli_socket_listener: None,
             capsule_registry: None,
             session_token: None,
+            device_sessions: Default::default(),
             allowance_store: None,
             identity_store: None,
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),

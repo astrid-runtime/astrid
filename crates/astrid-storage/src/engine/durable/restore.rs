@@ -86,9 +86,14 @@ where
     let persisted = persist_restore(&mut inner, &objects, &journal);
     match persisted {
         Ok((locations, arena_len)) => {
-            for location in locations {
-                inner.index.insert(location.0, location.1);
-                inner.pending_index_locations.push(location);
+            let state = &mut *inner;
+            for (id, location) in locations {
+                super::arena_index::publish(
+                    &mut state.index,
+                    &mut state.pending_index_locations,
+                    id,
+                    location,
+                );
             }
             inner.validated.extend(validated);
             inner.roots_by_principal = restore.roots;
@@ -157,14 +162,13 @@ where
         }
         let mut declared = BTreeSet::new();
         for (id, record) in snapshot.records() {
-            let computed = engine.identify(record);
-            if computed != *id {
-                return Err(ModelError::ObjectIdentityMismatch {
-                    declared: *id,
-                    computed,
-                }
-                .into());
-            }
+            crate::engine::transaction_records::check_identity(*id, record, &|record| {
+                engine.identify(record)
+            })
+            .map_err(|(declared, computed)| ModelError::ObjectIdentityMismatch {
+                declared,
+                computed,
+            })?;
             if !declared.insert(*id) {
                 return Err(DurableError::InvalidRestore(
                     "one snapshot declares a duplicate object",

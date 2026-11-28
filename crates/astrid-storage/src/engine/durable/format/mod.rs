@@ -1,23 +1,18 @@
 //! Native arena and root-journal framing, parsing, and recovery.
 
-#[cfg(test)]
-use super::File;
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, CHECKSUM_START, DurableError, DurableIo,
-    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, IdentityScheme, ModelError,
-    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    PersistentObjectIdentity, RecoveryLimits, ReferenceKind, ReferenceLabel, SeekFrom, io,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, DurableError, DurableIo, FRAME_HEADER_LEN,
+    FRAME_HEADER_LEN_USIZE, FRAME_VERSION, IdentityScheme, ModelError, ObjectClass,
+    ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
+    PersistentObjectIdentity, RecoveryLimits, ReferenceKind, ReferenceLabel, SeekFrom,
+    frame_repair, frame_scan, io, root_wire,
 };
+#[cfg(test)]
+use super::{CHECKSUM_START, File};
 #[cfg(test)]
 use std::fs::OpenOptions;
 #[cfg(test)]
 use std::path::Path;
-
-const IDENTITY_PREFIX_BYTES: usize = 8;
-const CURRENT_DIGEST_BYTES: u32 = 32;
-const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
-const MIN_REFERENCE_WIRE_BYTES: usize =
-    std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
 #[cfg(test)]
 thread_local! {
@@ -25,19 +20,29 @@ thread_local! {
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+mod arena_history;
+mod arena_span;
+mod checkpoint_reader;
+mod duplicates;
+const _: () = assert!(arena_span::HEADER_BYTES == FRAME_HEADER_LEN_USIZE);
+
 mod framed_append;
 mod indexed;
+mod indexed_frame;
 mod location;
+mod positional_read;
 mod positioned;
 #[cfg(test)]
 mod positioned_tests;
 mod prepared;
 mod reader;
+mod recovered_record;
 mod scan;
 #[cfg(test)]
 mod scan_tests;
 #[cfg(test)]
 mod tests;
+mod verified_record;
 
 pub(super) use framed_append::{FramedAppendStream, TRANSFER_BUFFER_BYTES};
 #[cfg(test)]
@@ -53,12 +58,52 @@ pub(super) use location::{
     scan_frames_range_with_source, scan_frames_with_source,
 };
 pub(super) use positioned::read_frame_at;
-pub(super) use prepared::{PreparedFrame, append_prepared_frames};
-use reader::SliceReader;
+pub(super) use prepared::append_prepared_frames;
 #[cfg(test)]
-pub(super) use scan::scan_frames_prefix;
+use reader::SliceReader;
 use scan::{FrameScanBound, read_frame_preserving_cursor_within, scan_frames_with_bound};
-pub(super) use scan::{scan_frames, scan_frames_range, scan_frames_with_protected_prefix};
+pub(super) use scan::{RecoveryFile, scan_frames, scan_frames_range, scan_recovery_file};
+#[cfg(test)]
+pub(super) use scan::{scan_frames_prefix, scan_frames_with_protected_prefix};
+
+struct CopyReader<'a, F>(&'a mut F, RecoveryLimits);
+
+impl<F: DurableIo> duplicates::Media for CopyReader<'_, F> {
+    fn bounded(&mut self, at: u64, end: u64) -> Option<Vec<u8>> {
+        read_frame_preserving_cursor_within(self.0, ARENA_FILE, ARENA_MAGIC, at, self.1, end).ok()
+    }
+}
+
+pub(in crate::engine::durable) fn duplicate_range(
+    arena: &mut impl DurableIo,
+    map: &BTreeMap<ObjectId, ArenaLocation>,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+    at: u64,
+    end: u64,
+) -> bool {
+    duplicates::check(&mut CopyReader(arena, limits), map, scheme.into(), at, end)
+}
+
+struct CheckpointInput<'a, F>(&'a mut F);
+
+impl<F: DurableIo> checkpoint_reader::Input for CheckpointInput<'_, F> {
+    type Error = io::Error;
+
+    fn length(&self) -> io::Result<u64> {
+        self.0.durable_metadata().map(|metadata| metadata.len())
+    }
+
+    fn seek(&mut self, at: u64) -> io::Result<()> {
+        self.0.seek(SeekFrom::Start(at)).map(|_| ())
+    }
+
+    fn read<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        let mut field = [0; N];
+        self.0.read_exact(&mut field)?;
+        Ok(field)
+    }
+}
 
 pub(super) fn verify_indexed_location<F: DurableIo>(
     arena: &mut F,
@@ -67,78 +112,55 @@ pub(super) fn verify_indexed_location<F: DurableIo>(
     scheme: IdentityScheme,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let file_len = arena
-        .durable_metadata()
-        .map_err(|source| io_error("read indexed arena metadata", source))?
-        .len();
-    let frame_end = location
-        .offset
-        .checked_add(FRAME_HEADER_LEN)
-        .and_then(|value| value.checked_add(location.payload_len))
-        .ok_or(DurableError::EncodingOverflow)?;
-    if frame_end > file_len {
-        return Err(corrupt(
+    use checkpoint_reader::Error;
+    checkpoint_reader::check(
+        &mut CheckpointInput(arena),
+        ARENA_MAGIC,
+        FRAME_VERSION,
+        location,
+        scheme.into(),
+        expected_id,
+        limits.max_frame_bytes,
+    )
+    .map_err(|error| match error {
+        Error::Length(e) => io_error("read indexed arena metadata", e),
+        Error::Seek(e) => io_error("seek indexed arena header", e),
+        Error::HeaderRead(e) => io_error("read indexed arena header", e),
+        Error::IdentityRead(e) => io_error("read indexed object identity", e),
+        Error::Overflow => DurableError::EncodingOverflow,
+        Error::Extent => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame extends beyond the arena",
-        ));
-    }
-    arena
-        .seek(SeekFrom::Start(location.offset))
-        .map_err(|source| io_error("seek indexed arena header", source))?;
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    arena
-        .read_exact(&mut header)
-        .map_err(|source| io_error("read indexed arena header", source))?;
-    if header[..8] != ARENA_MAGIC
-        || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
-        || header[10..12] != [0, 0]
-    {
-        return Err(corrupt(
+        ),
+        Error::Header => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame header is invalid",
-        ));
-    }
-    let payload_len = u64::from_le_bytes(
-        header[12..20]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
-    );
-    if payload_len > limits.max_frame_bytes {
-        return Err(DurableError::FrameTooLarge {
+        ),
+        Error::Limit(declared) => DurableError::FrameTooLarge {
             file: ARENA_FILE,
             offset: location.offset,
-            declared: payload_len,
+            declared,
             limit: limits.max_frame_bytes,
-        });
-    }
-    let checksum: [u8; 32] = header[CHECKSUM_START..]
-        .try_into()
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    if payload_len != location.payload_len || checksum != location.checksum {
-        return Err(corrupt(
+        },
+        Error::Placement => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame header does not match the cache",
-        ));
-    }
-    let mut identity_bytes = [0_u8; IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE];
-    arena
-        .read_exact(&mut identity_bytes)
-        .map_err(|source| io_error("read indexed object identity", source))?;
-    let mut reader = SliceReader::new(&identity_bytes);
-    let actual = reader
-        .identity(scheme)
-        .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
-    if actual != expected_id {
-        return Err(corrupt(
+        ),
+        Error::Short => corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed frame payload is shorter than its object identity",
+        ),
+        Error::Tag(e) => corrupt(ARENA_FILE, location.offset, e.detail()),
+        Error::Name => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed object identity mismatch",
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 pub(super) fn verify_indexed_tail<F: DurableIo>(
@@ -146,17 +168,25 @@ pub(super) fn verify_indexed_tail<F: DurableIo>(
     location: ArenaLocation,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
-    let payload_len =
-        u64::try_from(frame.payload().len()).map_err(|_| DurableError::EncodingOverflow)?;
-    if payload_len != location.payload_len || frame.checksum() != location.checksum {
-        return Err(corrupt(
+    arena_span::at_location(
+        location.offset,
+        location.payload_len,
+        location.checksum,
+        |at| {
+            let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, at, limits)?;
+            let sum = frame.checksum();
+            Ok((frame.into_payload(), sum))
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        arena_span::IndexedError::Read(error) => error,
+        arena_span::IndexedError::Placement => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed arena tail no longer matches the cache",
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 fn validate_positioned_header(
@@ -166,12 +196,19 @@ fn validate_positioned_header(
     header: &[u8; FRAME_HEADER_LEN_USIZE],
     limits: RecoveryLimits,
 ) -> Result<DecodedFrameHeader, DurableError> {
-    if header[..8] != magic {
-        return Err(corrupt(file_name, offset, "frame magic mismatch"));
-    }
-    let decoded = decode_frame_header(file_name, offset, header)?;
-    check_frame_payload_limit(file_name, offset, decoded.payload_len, limits)?;
-    Ok(decoded)
+    use arena_frame::PositionedHeaderError;
+    arena_frame::positioned_header(header, magic, FRAME_VERSION, limits.max_frame_bytes).map_err(
+        |error| match error {
+            PositionedHeaderError::Magic => corrupt(file_name, offset, "frame magic mismatch"),
+            PositionedHeaderError::Header(e) => frame_header_error(file_name, offset, &e),
+            PositionedHeaderError::Limit(declared) => DurableError::FrameTooLarge {
+                file: file_name,
+                offset,
+                declared,
+                limit: limits.max_frame_bytes,
+            },
+        },
+    )
 }
 
 fn check_frame_payload_limit(
@@ -198,42 +235,39 @@ fn validate_positioned_payload(
     decoded: DecodedFrameHeader,
     payload: &[u8],
 ) -> Result<[u8; 32], DurableError> {
-    if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?
-        != decoded.payload_len
+    arena_frame::check_payload(decoded, magic, payload, frame_checksum).map_err(|error| match error
     {
-        return Err(corrupt(file_name, offset, "frame payload length mismatch"));
+        arena_frame::PayloadError::Length => {
+            corrupt(file_name, offset, "frame payload length mismatch")
+        },
+        arena_frame::PayloadError::Checksum => {
+            corrupt(file_name, offset, "frame checksum mismatch")
+        },
+    })
+}
+
+impl<F: DurableIo> positional_read::Media for F {
+    type Error = io::Error;
+
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.durable_read_at(buffer, offset)
     }
-    let actual = frame_checksum(magic, decoded.payload_len, payload);
-    if actual != decoded.checksum {
-        return Err(corrupt(file_name, offset, "frame checksum mismatch"));
-    }
-    Ok(actual)
 }
 
 fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<()> {
-    let mut filled = 0_usize;
-    while filled != buffer.len() {
-        let relative = u64::try_from(filled)
-            .map_err(|_| io::Error::other("positional read offset overflow"))?;
-        let position = offset
-            .checked_add(relative)
-            .ok_or_else(|| io::Error::other("positional read offset overflow"))?;
-        let read = positioned_read(file, &mut buffer[filled..], position)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "positional read reached end of file",
-            ));
-        }
-        filled = filled
-            .checked_add(read)
-            .ok_or_else(|| io::Error::other("positional read length overflow"))?;
-    }
-    Ok(())
+    positional_read::exact(file, offset, buffer).map_err(positional_error)
 }
 
-fn positioned_read<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    file.durable_read_at(buffer, offset)
+fn positional_error(error: positional_read::Error<io::Error>) -> io::Error {
+    match error {
+        positional_read::Error::Offset => io::Error::other("positional read offset overflow"),
+        positional_read::Error::Length => io::Error::other("positional read length overflow"),
+        positional_read::Error::Short => io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "positional read reached end of file",
+        ),
+        positional_read::Error::Io(error) => error,
+    }
 }
 
 #[cfg(test)]
@@ -263,52 +297,38 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
 ) -> Result<(BTreeMap<ObjectId, ArenaLocation>, Option<ArenaLocation>), DurableError> {
     #[cfg(test)]
     RECOVERY_ARENA_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
-    let scheme = identity.scheme();
-    let mut index = BTreeMap::<ObjectId, ArenaLocation>::new();
-    let mut tail = None;
-    scan_frames_with_protected_prefix(
+    let mut history = arena_history::History::new(
+        identity.scheme().into(),
+        |r: &ObjectRecord| identity.identify(r),
+        |length, bytes: &[u8]| frame_checksum(ARENA_MAGIC, length, bytes),
+    );
+    scan_recovery_file(
         arena,
-        ARENA_FILE,
-        ARENA_MAGIC,
         limits,
-        protected_len,
-        |offset, payload, _source| {
-            let (id, record) = decode_object_frame(payload, scheme)
-                .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
-            let computed = identity.identify(&record);
-            if computed != id {
-                return Err(corrupt(ARENA_FILE, offset, "object identity mismatch"));
-            }
-            if encode_object_frame(scheme, id, &record)? != payload {
-                return Err(corrupt(ARENA_FILE, offset, "object frame is not canonical"));
-            }
-            let payload_len =
-                u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-            let checksum = frame_checksum(ARENA_MAGIC, payload_len, payload);
-            let location = ArenaLocation {
-                offset,
-                payload_len,
-                checksum,
-            };
-            match index.get(&id) {
-                Some(existing)
-                    if existing.payload_len == payload_len && existing.checksum == checksum => {},
-                Some(_) => {
-                    return Err(DurableError::RecoveryModel {
-                        file: ARENA_FILE,
-                        offset,
-                        source: ModelError::ObjectCollision(id),
-                    });
+        RecoveryFile::Arena { protected_len },
+        &mut history,
+        |offset, _, error| {
+            use recovered_record::{Error, IndexError};
+            match error {
+                IndexError::Record(Error::Decode(e)) => {
+                    corrupt(ARENA_FILE, offset, body_error_detail(e))
                 },
-                None => {
-                    index.insert(id, location);
+                IndexError::Record(Error::Identity) => {
+                    corrupt(ARENA_FILE, offset, "object identity mismatch")
+                },
+                IndexError::Record(Error::Overflow) => DurableError::EncodingOverflow,
+                IndexError::Record(Error::Canonical) => {
+                    corrupt(ARENA_FILE, offset, "object frame is not canonical")
+                },
+                IndexError::Collision(id) => DurableError::RecoveryModel {
+                    file: ARENA_FILE,
+                    offset,
+                    source: ModelError::ObjectCollision(id),
                 },
             }
-            tail = Some(location);
-            Ok(())
         },
     )?;
-    Ok((index, tail))
+    Ok(history.finish())
 }
 
 #[cfg(test)]
@@ -321,38 +341,21 @@ pub(in crate::engine::durable) fn recovery_arena_scans() -> usize {
     RECOVERY_ARENA_SCANS.with(std::cell::Cell::get)
 }
 
-#[derive(Clone, Copy)]
-struct DecodedFrameHeader {
-    payload_len: u64,
-    checksum: [u8; 32],
-}
+use super::arena_frame::{self, DecodedFrameHeader};
 
-fn decode_frame_header(
+fn frame_header_error(
     file_name: &'static str,
     offset: u64,
-    header: &[u8; FRAME_HEADER_LEN_USIZE],
-) -> Result<DecodedFrameHeader, DurableError> {
-    let version = u16::from_le_bytes([header[8], header[9]]);
-    if version != FRAME_VERSION {
-        return Err(corrupt(file_name, offset, "unsupported frame version"));
+    error: &arena_frame::HeaderError,
+) -> DurableError {
+    match error {
+        arena_frame::HeaderError::Version => {
+            corrupt(file_name, offset, "unsupported frame version")
+        },
+        arena_frame::HeaderError::Reserved => {
+            corrupt(file_name, offset, "reserved header bytes are non-zero")
+        },
     }
-    if header[10..12] != [0, 0] {
-        return Err(corrupt(
-            file_name,
-            offset,
-            "reserved header bytes are non-zero",
-        ));
-    }
-    Ok(DecodedFrameHeader {
-        payload_len: u64::from_le_bytes(
-            header[12..20]
-                .try_into()
-                .map_err(|_| DurableError::EncodingOverflow)?,
-        ),
-        checksum: header[CHECKSUM_START..]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
-    })
 }
 
 pub(super) fn append_frame<F: DurableIo>(
@@ -360,21 +363,18 @@ pub(super) fn append_frame<F: DurableIo>(
     magic: [u8; 8],
     payload: &[u8],
 ) -> Result<ArenaLocation, DurableError> {
-    let payload_len = u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    let checksum = frame_checksum(magic, payload_len, payload);
-    let offset = file
-        .seek(SeekFrom::End(0))
-        .map_err(|source| io_error("seek durable append", source))?;
-    let header = frame_header(magic, payload_len, checksum);
-    file.write_all(&header)
-        .map_err(|source| io_error("append durable frame header", source))?;
-    file.write_all(payload)
-        .map_err(|source| io_error("append durable frame payload", source))?;
-    Ok(ArenaLocation {
-        offset,
-        payload_len,
-        checksum,
-    })
+    arena_frame::append_one(file, magic, FRAME_VERSION, payload, frame_checksum)
+        .map_err(single_frame_error)
+}
+
+pub(super) fn single_frame_error(error: arena_frame::SingleError<io::Error>) -> DurableError {
+    use arena_frame::SingleError;
+    match error {
+        SingleError::Length => DurableError::EncodingOverflow,
+        SingleError::Seek(source) => io_error("seek durable append", source),
+        SingleError::Header(source) => io_error("append durable frame header", source),
+        SingleError::Payload(source) => io_error("append durable frame payload", source),
+    }
 }
 
 pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
@@ -382,6 +382,61 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
     magic: [u8; 8],
     payloads: &[T],
 ) -> Result<Vec<ArenaLocation>, DurableError> {
+    let buffers = allocate_frame_batch(payloads)?;
+    super::arena_frame::append_batch(
+        file,
+        payloads,
+        AsRef::as_ref,
+        frame_checksum,
+        magic,
+        FRAME_VERSION,
+        buffers,
+    )
+    .map_err(batch_error)
+}
+
+impl<F: DurableIo> super::arena_frame::BatchFile for F {
+    type Error = io::Error;
+
+    fn seek_end(&mut self) -> io::Result<u64> {
+        self.seek(SeekFrom::End(0))
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes)
+    }
+}
+
+fn batch_error(error: super::arena_frame::BatchError<io::Error>) -> DurableError {
+    use super::arena_frame::BatchError;
+    match error {
+        BatchError::Seek(source) => io_error("seek durable batch append", source),
+        BatchError::Overflow => DurableError::EncodingOverflow,
+        BatchError::Write(source) => io_error("append durable frame batch", source),
+    }
+}
+
+pub(super) fn prepare_frame_batch<T: AsRef<[u8]>, F: DurableIo>(
+    file: &mut F,
+    magic: [u8; 8],
+    payloads: &[T],
+) -> Result<(Vec<u8>, Vec<ArenaLocation>), DurableError> {
+    let buffers = allocate_frame_batch(payloads)?;
+    super::arena_frame::prepare_at_end(
+        file,
+        payloads,
+        AsRef::as_ref,
+        frame_checksum,
+        magic,
+        FRAME_VERSION,
+        buffers,
+    )
+    .map_err(batch_error)
+}
+
+fn allocate_frame_batch<T: AsRef<[u8]>>(
+    payloads: &[T],
+) -> Result<(Vec<u8>, Vec<ArenaLocation>), DurableError> {
     let capacity = payloads.iter().try_fold(0_usize, |total, payload| {
         let payload = payload.as_ref();
         total
@@ -397,30 +452,7 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
     locations
         .try_reserve_exact(payloads.len())
         .map_err(|_| DurableError::EncodingOverflow)?;
-    let base = file
-        .seek(SeekFrom::End(0))
-        .map_err(|source| io_error("seek durable batch append", source))?;
-    for payload in payloads {
-        let payload = payload.as_ref();
-        let payload_len =
-            u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let checksum = frame_checksum(magic, payload_len, payload);
-        let relative = u64::try_from(encoded.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let offset = base
-            .checked_add(relative)
-            .ok_or(DurableError::EncodingOverflow)?;
-        let header = frame_header(magic, payload_len, checksum);
-        encoded.extend_from_slice(&header);
-        encoded.extend_from_slice(payload);
-        locations.push(ArenaLocation {
-            offset,
-            payload_len,
-            checksum,
-        });
-    }
-    file.write_all(&encoded)
-        .map_err(|source| io_error("append durable frame batch", source))?;
-    Ok(locations)
+    Ok((encoded, locations))
 }
 
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
@@ -449,12 +481,7 @@ pub(super) fn frame_header(
     payload_len: u64,
     checksum: [u8; 32],
 ) -> [u8; FRAME_HEADER_LEN_USIZE] {
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    header[..8].copy_from_slice(&magic);
-    header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
-    header[12..20].copy_from_slice(&payload_len.to_le_bytes());
-    header[CHECKSUM_START..].copy_from_slice(&checksum);
-    header
+    super::arena_frame::header(magic, FRAME_VERSION, payload_len, checksum)
 }
 
 pub(super) fn corrupt(file: &'static str, offset: u64, detail: &'static str) -> DurableError {
@@ -483,11 +510,8 @@ pub(super) fn ensure_payload_limit(
     Ok(())
 }
 
-fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
-    bytes.extend_from_slice(&scheme.algorithm().to_le_bytes());
-    bytes.extend_from_slice(&scheme.construction().to_le_bytes());
-    bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
-    bytes.extend_from_slice(id.as_bytes());
+pub(super) fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
+    verified_record::append_identity(bytes, scheme.into(), *id.as_bytes());
 }
 
 pub(super) fn encode_object_frame(
@@ -495,28 +519,7 @@ pub(super) fn encode_object_frame(
     id: ObjectId,
     record: &ObjectRecord,
 ) -> Result<Vec<u8>, DurableError> {
-    let canonical_len = u64::try_from(record.canonical_bytes().len())
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    let reference_count =
-        u64::try_from(record.references().len()).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut bytes = Vec::new();
-    encode_identity(&mut bytes, scheme, id);
-    bytes.extend_from_slice(&record.kind().code().to_le_bytes());
-    bytes.extend_from_slice(&record.format_version().get().to_le_bytes());
-    bytes.push(record.class().code());
-    bytes.extend_from_slice(&record.logical_bytes().to_le_bytes());
-    bytes.extend_from_slice(&canonical_len.to_le_bytes());
-    bytes.extend_from_slice(&reference_count.to_le_bytes());
-    bytes.extend_from_slice(record.canonical_bytes());
-    for reference in record.references() {
-        let label_len = u64::try_from(reference.label().as_bytes().len())
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        bytes.extend_from_slice(&label_len.to_le_bytes());
-        bytes.extend_from_slice(reference.label().as_bytes());
-        encode_identity(&mut bytes, scheme, reference.target());
-        bytes.push(reference.kind().code());
-    }
-    Ok(bytes)
+    verified_record::encode(scheme.into(), id, record).map_err(|()| DurableError::EncodingOverflow)
 }
 
 /// Check the fixed identity prefix of a canonical object frame without
@@ -526,88 +529,74 @@ pub(super) fn object_frame_declares_identity(
     scheme: IdentityScheme,
     id: ObjectId,
 ) -> bool {
-    const IDENTITY_BYTES: usize = IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE;
-    frame_payload.len() >= IDENTITY_BYTES
-        && frame_payload[..2] == scheme.algorithm().to_le_bytes()
-        && frame_payload[2..4] == scheme.construction().to_le_bytes()
-        && frame_payload[4..8] == CURRENT_DIGEST_BYTES.to_le_bytes()
-        && frame_payload[8..IDENTITY_BYTES] == *id.as_bytes()
+    verified_record::declares(frame_payload, scheme.into(), id)
 }
 
 pub(super) fn canonical_record_bytes(
     frame_payload: &[u8],
     scheme: IdentityScheme,
 ) -> Result<&[u8], DurableError> {
-    let mut reader = SliceReader::new(frame_payload);
-    reader
-        .identity(scheme)
-        .map_err(|detail| corrupt(ARENA_FILE, 0, detail))?;
-    frame_payload
-        .get(reader.offset..)
-        .ok_or(DurableError::EncodingOverflow)
+    verified_record::canonical_suffix(frame_payload, scheme.into())
+        .map_err(|error| corrupt(ARENA_FILE, 0, error.detail()))
 }
 
 pub(super) fn decode_object_frame(
     bytes: &[u8],
     scheme: IdentityScheme,
 ) -> Result<(ObjectId, ObjectRecord), &'static str> {
-    let mut reader = SliceReader::new(bytes);
-    let id = reader.identity(scheme)?;
-    let kind = ObjectKind::from_code(reader.u16()?).ok_or("unknown object-kind code")?;
-    let version =
-        ObjectFormatVersion::new(reader.u16()?).ok_or("object-format version must be non-zero")?;
-    let class = ObjectClass::from_code(reader.u8()?).ok_or("unknown object-class code")?;
-    let logical_bytes = reader.u64()?;
-    let canonical_len = reader.usize_len()?;
-    let reference_count = reader.usize_len()?;
-    let canonical_bytes = reader.take(canonical_len)?.to_vec();
-    // Empty records have no reference bytes to decode. Avoid an out-of-line
-    // decoder call while keeping the trailing-byte and record checks below.
-    let references = if reference_count == 0 {
-        Vec::new()
-    } else {
-        decode_references(&mut reader, scheme, reference_count)?
-    };
-    if reader.remaining() != 0 {
-        return Err("trailing object-frame bytes");
-    }
-    let record = ObjectRecord::new(
-        kind,
-        version,
-        canonical_bytes,
-        references,
-        logical_bytes,
-        class,
-    )
-    .map_err(|_| "non-canonical object references")?;
-    Ok((id, record))
+    recovered_record::unpack(bytes, scheme.into()).map_err(body_error_detail)
 }
 
+/// Decode a published frame only if both its wire name and computed identity match the commit.
+pub(super) fn published_record<I: PersistentObjectIdentity>(
+    payload: &[u8],
+    expected: ObjectId,
+    identity: &I,
+) -> Option<ObjectRecord> {
+    verified_record::confirmed(payload, identity.scheme().into(), expected, |record| {
+        *identity.identify(record).as_bytes()
+    })
+    .ok()
+}
+
+/// Confirm a prepared WAL frame before retaining its immutable payload and record.
+pub(super) fn pending_object_frame<I: PersistentObjectIdentity>(
+    frame: &std::sync::Arc<[u8]>,
+    id: ObjectId,
+    identity: &I,
+) -> Result<verified_record::PendingFrame<ObjectRecord>, DurableError> {
+    let scheme = identity.scheme();
+    verified_record::pending(frame, scheme.into(), id, |record| {
+        *identity.identify(record).as_bytes()
+    })
+    .map_err(|error| {
+        corrupt(
+            super::WAL_FILE,
+            0,
+            match error {
+                verified_record::Error::Decode(error) => body_error_detail(error),
+                verified_record::Error::Identifier | verified_record::Error::Identity => {
+                    "WAL overlay object identity mismatch"
+                },
+            },
+        )
+    })
+}
+
+fn body_error_detail(
+    error: verified_record::DecodeError<verified_record::BodyError>,
+) -> &'static str {
+    match error {
+        verified_record::DecodeError::Tag(e) => e.detail(),
+        verified_record::DecodeError::Record(e) => e.detail(),
+    }
+}
+
+#[cfg(test)]
 fn decode_references(
     reader: &mut SliceReader<'_>,
     scheme: IdentityScheme,
     count: usize,
 ) -> Result<Vec<ObjectReference>, &'static str> {
-    if count > reader.remaining() / MIN_REFERENCE_WIRE_BYTES {
-        return Err("reference count exceeds frame capacity");
-    }
-    let mut references = Vec::new();
-    // The complete count is known: growth slack would live as long as the
-    // immutable decoded record, including while retained in the object cache.
-    references
-        .try_reserve_exact(count)
-        .map_err(|_| "reference allocation failed")?;
-    for _ in 0..count {
-        let label_len = reader.usize_len()?;
-        let label = reader.take(label_len)?.to_vec();
-        let target = reader.identity(scheme)?;
-        let reference_kind =
-            ReferenceKind::from_code(reader.u8()?).ok_or("unknown reference-kind code")?;
-        references.push(ObjectReference::new(
-            ReferenceLabel::new(label),
-            target,
-            reference_kind,
-        ));
-    }
-    Ok(references)
+    reader.references(scheme, count)
 }

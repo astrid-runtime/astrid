@@ -65,6 +65,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::auth::CallerContext;
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
@@ -278,16 +279,7 @@ pub async fn post_prompt(
         session_id: session_id.clone(),
         context: body.context,
     };
-    let msg = IpcMessage::new(Topic::user_prompt(), payload, Uuid::nil())
-        .with_principal(caller.principal.to_string())
-        .with_request_owner(caller.request_owner)
-        // Host-stamp the transport origin: this prompt entered over the gateway
-        // HTTP listener (a remote API caller, even with a valid bearer), NOT the
-        // local Unix socket. It drives the SAME react/openai-compat egress path
-        // a local operator does, so the downstream local-egress consent gate
-        // must be able to tell them apart — a remote request must never earn
-        // local-operator privilege. Propagated unchanged through fan-out.
-        .with_origin(astrid_events::ipc::MessageOrigin::RemoteGateway);
+    let msg = caller.stamp_ipc(IpcMessage::new(Topic::user_prompt(), payload, Uuid::nil()));
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.prompt"),
         message: msg,
@@ -468,7 +460,8 @@ pub async fn get_requests(
 /// continuation (deltas + final `response`) streams back over the still-open
 /// `POST /api/agent/prompt` SSE connection — NOT this request.
 ///
-/// The reply is stamped with the caller's verified principal. The host waiter
+/// The gateway stamps the reply with the authenticated principal, request owner,
+/// gateway origin and any authenticated device identity. The host waiter
 /// enforces same-principal: a reply whose principal differs from the one the
 /// elicit is being collected for is rejected, so a caller who merely observed
 /// another principal's forwarded `request_id` cannot answer or cancel it.
@@ -500,7 +493,7 @@ pub async fn post_elicit_response(
     body.validate()
         .map_err(|m| GatewayError::BadRequest(m.to_string()))?;
 
-    publish_elicit_response(&bus, caller.principal.as_str(), body);
+    publish_elicit_response(&bus, &caller, body);
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -541,7 +534,7 @@ pub async fn post_approval_response(
     body.validate()
         .map_err(|m| GatewayError::BadRequest(m.to_string()))?;
 
-    publish_approval_response(&bus, caller.principal.as_str(), body, caller.request_owner);
+    publish_approval_response(&bus, &caller, body);
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -558,7 +551,7 @@ pub async fn post_approval_response(
 /// client-supplied field, is what gets stamped here.
 fn publish_elicit_response(
     bus: &astrid_events::EventBus,
-    principal: &str,
+    caller: &CallerContext,
     body: ElicitResponseRequest,
 ) {
     let payload = IpcPayload::ElicitResponse {
@@ -566,12 +559,11 @@ fn publish_elicit_response(
         value: body.value,
         values: body.values,
     };
-    let msg = IpcMessage::new(
+    let msg = caller.stamp_ipc(IpcMessage::new(
         Topic::elicit_response(body.request_id),
         payload,
         Uuid::nil(),
-    )
-    .with_principal(principal);
+    ));
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.elicit_response"),
         message: msg,
@@ -580,9 +572,8 @@ fn publish_elicit_response(
 
 fn publish_approval_response(
     bus: &astrid_events::EventBus,
-    principal: &str,
+    caller: &CallerContext,
     body: ApprovalResponseRequest,
-    request_owner: RequestOwnerId,
 ) {
     let request_id = body.request_id;
     let payload = IpcPayload::ApprovalResponse {
@@ -590,9 +581,11 @@ fn publish_approval_response(
         decision: body.decision,
         reason: body.reason,
     };
-    let msg = IpcMessage::new(Topic::approval_response(&request_id), payload, Uuid::nil())
-        .with_principal(principal)
-        .with_request_owner(request_owner);
+    let msg = caller.stamp_ipc(IpcMessage::new(
+        Topic::approval_response(&request_id),
+        payload,
+        Uuid::nil(),
+    ));
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.approval_response"),
         message: msg,

@@ -10,6 +10,7 @@ description = "Engine-agnostic capsule types shared by all Astrid capsule engine
 
 [dependencies]
 web-time = "1.1.0"
+vstd = { workspace = true }
 astrid-core = { workspace = true }
 dashmap = { workspace = true }
 event-listener = "5.4.2"
@@ -25,6 +26,7 @@ nix = { workspace = true }
 
 [lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_verify_core)'] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

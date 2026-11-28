@@ -8,13 +8,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use astrid_core::PrincipalUid;
 use astrid_core::dirs::AstridHome;
-use astrid_core::{PrincipalId, PrincipalUid};
 use astrid_storage::PrincipalDirectory;
 
 use super::host_state::HostState;
 use super::{PrincipalInvocationGuard, PrincipalInvocationTracker};
 
+mod admission;
+pub(super) mod dispatch;
 pub(super) mod eager;
 
 type LogFile = Arc<Mutex<File>>;
@@ -83,14 +85,14 @@ impl super::WasmEngine {
 #[derive(Default)]
 pub(super) struct DeferredBindings {
     root: Option<Arc<NativeLogRoot>>,
-    owner: Option<Arc<PendingLog>>,
-    invocation: Option<Arc<PendingLog>>,
+    owner: Option<Arc<BoundLog>>,
+    invocation: Option<Arc<BoundLog>>,
 }
 
 impl DeferredBindings {
     pub(super) fn for_factory(
         root: Option<Arc<NativeLogRoot>>,
-        owner: Option<Arc<PendingLog>>,
+        owner: Option<Arc<BoundLog>>,
     ) -> Self {
         Self {
             root,
@@ -111,40 +113,75 @@ impl DeferredBindings {
 #[derive(Default)]
 pub(super) struct Binding {
     pub(super) file: Option<LogFile>,
-    pub(super) pending: Option<Arc<PendingLog>>,
+    pub(super) bound: Option<Arc<BoundLog>>,
 }
 
-pub(super) struct PendingLog {
+pub(super) struct BoundLog {
     uid: PrincipalUid,
+    source: LogSource,
+    directory: PrincipalDirectory,
+    tracker: Arc<PrincipalInvocationTracker>,
+}
+
+enum LogSource {
+    Eager(LogFile),
+    Deferred(DeferredFile),
+}
+
+struct DeferredFile {
     // Immutable relative target pins the UTC date at binding installation.
     target: PathBuf,
     root: Arc<NativeLogRoot>,
-    directory: PrincipalDirectory,
-    tracker: Arc<PrincipalInvocationTracker>,
     opened: OnceLock<Option<LogFile>>,
 }
 
 pub(super) fn bind(
     root: Option<&Arc<NativeLogRoot>>,
     directory: &PrincipalDirectory,
-    principal: &PrincipalId,
     capsule: &str,
     prune: bool,
     tracker: &Arc<PrincipalInvocationTracker>,
     captured_uid: Option<PrincipalUid>,
 ) -> Binding {
-    let Some(root) = root else {
-        return Binding {
-            file: super::open_capsule_log(directory, principal, capsule, prune),
-            pending: None,
-        };
-    };
     let Some(uid) = captured_uid else {
         return Binding::default();
     };
     if !valid_name(capsule) {
         return Binding::default();
     }
+    let eager_binding = || {
+        let file = directory
+            .with_live_uid_binding(uid, |current| {
+                let Some(_operation) = tracker.begin(current) else {
+                    return Ok(None);
+                };
+                let log_dir = match root {
+                    Some(root) => root.home.log_dir(),
+                    None => AstridHome::resolve()?.log_dir(),
+                };
+                Ok(eager::open_capsule_log_at_uid(
+                    &log_dir, uid, capsule, prune,
+                ))
+            })
+            .ok()
+            .flatten()
+            .flatten();
+        let binding = file.as_ref().map(|file| {
+            Arc::new(BoundLog {
+                uid,
+                directory: directory.clone(),
+                tracker: Arc::clone(tracker),
+                source: LogSource::Eager(Arc::clone(file)),
+            })
+        });
+        Binding {
+            file,
+            bound: binding,
+        }
+    };
+    let Some(root) = root else {
+        return eager_binding();
+    };
     let group = Path::new("log")
         .join("principals")
         .join(uid.to_string())
@@ -155,115 +192,88 @@ pub(super) fn bind(
     let absent = std::fs::symlink_metadata(root.home.root().join(&group))
         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
     if !absent {
-        let file = directory
-            .with_live_uid_binding(uid, |current| {
-                let Some(_operation) = tracker.begin(current) else {
-                    return Ok(None);
-                };
-                Ok(eager::open_capsule_log_at_uid(
-                    &root.home.log_dir(),
-                    uid,
-                    capsule,
-                    prune,
-                ))
-            })
-            .ok()
-            .flatten()
-            .flatten();
-        return Binding {
-            file,
-            pending: None,
-        };
+        return eager_binding();
     }
     Binding {
         file: None,
-        pending: Some(Arc::new(PendingLog {
+        bound: Some(Arc::new(BoundLog {
             uid,
-            target: group.join(format!("{}.log", super::today_date_string())),
-            root: Arc::clone(root),
             directory: directory.clone(),
             tracker: Arc::clone(tracker),
-            opened: OnceLock::new(),
+            source: LogSource::Deferred(DeferredFile {
+                target: group.join(format!("{}.log", super::today_date_string())),
+                root: Arc::clone(root),
+                opened: OnceLock::new(),
+            }),
         })),
     }
 }
 
-pub(super) fn install_invocation(
-    state: &mut HostState,
-    principal: &PrincipalId,
-    uid: PrincipalUid,
-) {
+pub(super) fn install_invocation(state: &mut HostState, uid: PrincipalUid) {
     state.deferred_logs.clear_invocation();
-    let Some(root) = state.deferred_logs.root.as_ref() else {
-        state.invocation_capsule_log = super::open_capsule_log(
-            &state.principal_directory,
-            principal,
-            state.capsule_id.as_str(),
-            false,
-        );
-        return;
-    };
     let Some(tracker) = state.principal_invocations.as_ref() else {
         state.invocation_capsule_log = None;
         return;
     };
     let binding = bind(
-        Some(root),
+        state.deferred_logs.root.as_ref(),
         &state.principal_directory,
-        principal,
         state.capsule_id.as_str(),
         false,
         tracker,
         Some(uid),
     );
     state.invocation_capsule_log = binding.file;
-    state.deferred_logs.invocation = binding.pending;
+    state.deferred_logs.invocation = binding.bound;
 }
 
-pub(super) struct ResolvedLog {
-    pub(super) file: Option<LogFile>,
-    // A different owner's first-open/write must drain under that owner's fence,
-    // not merely under the invoking principal's already-admitted operation.
-    _owner_operation: Option<PrincipalInvocationGuard>,
-}
+pub(super) type ResolvedLog<'a> =
+    dispatch::Destination<LogFile, admission::Operation<'a, PrincipalInvocationGuard>>;
 
-impl PendingLog {
-    fn admit(
+impl BoundLog {
+    fn resolve<'a>(
         &self,
-        principal: &PrincipalId,
-        admitted: Option<&PrincipalInvocationGuard>,
-    ) -> Option<Option<PrincipalInvocationGuard>> {
-        let covered = admitted.is_some_and(|guard| {
-            Arc::ptr_eq(&guard.tracker, &self.tracker) && &guard.principal == principal
-        });
-        if covered {
-            Some(None)
-        } else {
-            self.tracker.begin(principal).map(Some)
-        }
+        admitted: Option<&'a PrincipalInvocationGuard>,
+    ) -> Option<ResolvedLog<'a>> {
+        self.with_operation(admitted, |operation| {
+            // Admission failure deliberately does not initialize the cache:
+            // a resumed view can retry. Only an attempted filesystem open is
+            // cached, and no lifecycle guard is retained beyond this write.
+            let opened = match &self.source {
+                LogSource::Eager(file) => Some(file),
+                LogSource::Deferred(deferred) => deferred
+                    .opened
+                    .get_or_init(|| {
+                        #[cfg(test)]
+                        tests::before_open().ok()?;
+                        let file = deferred.root.open(&deferred.target).ok()?;
+                        Some(Arc::new(Mutex::new(file)))
+                    })
+                    .as_ref(),
+            };
+            opened.map(|opened| ResolvedLog::Managed(Arc::clone(opened), operation))
+        })
     }
 
-    fn resolve(&self, admitted: Option<&PrincipalInvocationGuard>) -> Option<ResolvedLog> {
+    fn with_operation<'a, T>(
+        &self,
+        admitted: Option<&'a PrincipalInvocationGuard>,
+        run: impl FnOnce(admission::Operation<'a, PrincipalInvocationGuard>) -> Option<T>,
+    ) -> Option<T> {
         // Resolve only the immutable UID's current live alias. A rename keeps
         // the UID/date destination; alias reuse can never select another UID.
         self.directory
             .with_live_uid_binding(self.uid, |current| {
-                let Some(operation) = self.admit(current, admitted) else {
+                let Some(operation) = admission::admit(
+                    &self.tracker,
+                    current,
+                    admitted,
+                    PrincipalInvocationGuard::belongs_to,
+                    PrincipalInvocationTracker::begin,
+                ) else {
                     return Ok(None);
                 };
-                // Admission failure deliberately does not initialize the cache:
-                // a resumed view can retry. Only an attempted filesystem open is
-                // cached, and no lifecycle guard is retained beyond this write.
-                let opened = self.opened.get_or_init(|| {
-                    #[cfg(test)]
-                    tests::before_open().ok()?;
-                    let file = self.root.open(&self.target).ok()?;
-                    Some(Arc::new(Mutex::new(file)))
-                });
-                Ok(opened.as_ref().map(|opened| ResolvedLog {
-                    file: Some(Arc::clone(opened)),
-                    _owner_operation: operation,
-                }))
+                Ok(run(operation))
             })
             .ok()
             .flatten()
@@ -271,62 +281,67 @@ impl PendingLog {
     }
 }
 
-pub(super) fn resolve(
+pub(super) fn resolve<'a>(
     state: &mut HostState,
-    admitted: Option<&PrincipalInvocationGuard>,
-) -> ResolvedLog {
+    admitted: Option<&'a PrincipalInvocationGuard>,
+) -> ResolvedLog<'a> {
     // Explicit file injection always wins. The public getter remains pure and
     // never realizes pending state, including for external hook/recv contexts.
     if let Some(file) = &state.invocation_capsule_log {
         return resolve_file(file, state.deferred_logs.invocation.as_ref(), admitted);
     }
     if let Some(pending) = &state.deferred_logs.invocation
+        && matches!(pending.source, LogSource::Deferred(_))
         && let Some(resolved) = pending.resolve(admitted)
     {
-        state.invocation_capsule_log = resolved.file.clone();
+        state.invocation_capsule_log = resolved.file().cloned();
         return resolved;
     }
     if let Some(file) = &state.capsule_log {
         return resolve_file(file, state.deferred_logs.owner.as_ref(), admitted);
     }
     if let Some(pending) = &state.deferred_logs.owner
+        && matches!(pending.source, LogSource::Deferred(_))
         && let Some(resolved) = pending.resolve(admitted)
     {
-        state.capsule_log = resolved.file.clone();
+        state.capsule_log = resolved.file().cloned();
         return resolved;
     }
-    ResolvedLog {
-        file: None,
-        _owner_operation: None,
-    }
+    ResolvedLog::Absent
 }
 
-fn resolve_file(
+fn resolve_file<'a>(
     file: &LogFile,
-    pending: Option<&Arc<PendingLog>>,
-    admitted: Option<&PrincipalInvocationGuard>,
-) -> ResolvedLog {
-    // Only files known to originate in our private cache carry its owner fence.
+    pending: Option<&Arc<BoundLog>>,
+    admitted: Option<&'a PrincipalInvocationGuard>,
+) -> ResolvedLog<'a> {
+    // All engine-bound handles carry their owner fence on every write.
     // Arbitrary explicit File injections retain the existing eager interface.
-    let cached = pending.filter(|pending| {
-        pending
-            .opened
-            .get()
-            .and_then(Option::as_ref)
-            .is_some_and(|opened| Arc::ptr_eq(opened, file))
+    let cached = pending.and_then(|pending| {
+        let managed = match &pending.source {
+            LogSource::Eager(file) => Some(file),
+            LogSource::Deferred(deferred) => deferred.opened.get().and_then(Option::as_ref),
+        };
+        managed.map(|opened| (pending.as_ref(), opened))
     });
-    if let Some(pending) = cached {
-        // The FD stays UID-bound, but aliases and their lifecycle views can
-        // change. Reuse the same live-binding admission for warm writes;
-        // the initialized OnceLock performs no filesystem open or lookup.
-        return pending.resolve(admitted).unwrap_or(ResolvedLog {
-            file: None,
-            _owner_operation: None,
-        });
-    }
-    ResolvedLog {
-        file: Some(Arc::clone(file)),
-        _owner_operation: None,
+    dispatch::resolve_warm(
+        &mut WarmAdmission(admitted),
+        Arc::clone(file),
+        cached,
+        Arc::ptr_eq,
+    )
+}
+
+struct WarmAdmission<'a>(Option<&'a PrincipalInvocationGuard>);
+
+impl<'a> dispatch::Admission<BoundLog, admission::Operation<'a, PrincipalInvocationGuard>>
+    for WarmAdmission<'a>
+{
+    fn acquire(
+        &mut self,
+        binding: &BoundLog,
+    ) -> Option<admission::Operation<'a, PrincipalInvocationGuard>> {
+        binding.with_operation(self.0, Some)
     }
 }
 

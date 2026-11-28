@@ -1,3 +1,5 @@
+mod network;
+
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,18 +14,20 @@ use crate::manifest::{CapsuleManifest, McpServerDef};
 
 use astrid_mcp::SecureMcpClient;
 
-pub(super) fn runtime_server_id(
-    capsule: &str,
-    server: &str,
-    runtime_id: &crate::registry::RuntimeId,
-) -> String {
-    let scope = match runtime_id.key().scope() {
-        crate::registry::RuntimeScope::Principal(uid) => format!("principal-{uid}"),
-        crate::registry::RuntimeScope::SystemResident => "system".to_string(),
-    };
-    format!(
-        "capsule:{capsule}:server-{server}:{scope}:generation-{}",
-        runtime_id.generation()
+use crate::registry::generation::RuntimeId as RegistryId;
+
+#[path = "mcp_registration.rs"]
+mod registration;
+
+pub(super) fn runtime_server_id(server: &str, runtime_id: &crate::registry::RuntimeId) -> String {
+    registration::runtime_name(
+        runtime_id,
+        server,
+        crate::capsule::CapsuleId::as_str,
+        |scope| match scope {
+            crate::registry::RuntimeScope::Principal(uid) => Some(uid.to_string()),
+            crate::registry::RuntimeScope::SystemResident => None,
+        },
     )
 }
 
@@ -80,6 +84,11 @@ impl McpHostEngine {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn prepared_config(&self) -> Option<&astrid_mcp::ServerConfig> {
+        self.pending_config.as_ref()
+    }
+
     #[must_use]
     pub(crate) fn with_runtime_id(
         mut self,
@@ -116,6 +125,17 @@ impl ExecutionEngine for McpHostEngine {
                 original_command_str
             )));
         }
+
+        // Native process sandboxes expose an on/off network switch. A
+        // destination grant must never be widened to that switch.
+        let Some(settings) = network::admit(
+            &self.manifest.capabilities.net,
+            &self.manifest.capabilities.net_connect,
+        ) else {
+            return Err(CapsuleError::UnsupportedEntryPoint(
+                "native stdio MCP cannot enforce destination-scoped network access; use an Astrid WASM component for network requests".into(),
+            ));
+        };
 
         let mut command_str = original_command_str.clone();
 
@@ -193,13 +213,7 @@ impl ExecutionEngine for McpHostEngine {
                 "MCP host engine requires a preallocated runtime generation".to_string(),
             )
         })?;
-        let server_id =
-            runtime_server_id(&self.manifest.package.name, &self.server_def.id, runtime_id);
-
-        // Determine network access from the capsule's `net` capability.
-        // If the capsule declared any net domains, allow network access.
-        let allow_network =
-            !self.manifest.capabilities.net.is_empty() || self.manifest.capabilities.uplink;
+        let server_id = runtime_server_id(&self.server_def.id, runtime_id);
 
         let config = astrid_mcp::ServerConfig {
             name: server_id.clone(),
@@ -208,7 +222,9 @@ impl ExecutionEngine for McpHostEngine {
             env: resolved_env,
             cwd: Some(self.capsule_dir.clone()),
             restart_policy: astrid_mcp::RestartPolicy::Always, // Host engines should restart on crash
-            allow_network,
+            transport: astrid_mcp::Transport::Stdio,
+            trusted: settings.trusted,
+            allow_network: settings.allow_network,
             ..Default::default()
         };
 
@@ -318,19 +334,12 @@ impl ExecutionEngine for McpHostEngine {
             CapsuleError::ExecutionFailed(format!("failed to deserialize interceptor payload: {e}"))
         })?;
 
-        // Use call_tool with the `astrid_hook_intercept` tool so we get
-        // a response back (request-response interceptor pattern).
-        let tool_args = serde_json::json!({
-            "hook": action,
-            "payload": params,
-        });
-
         // Interceptor hooks are kernel-internal infrastructure, not
         // user-facing tool calls. Use the bare inner McpClient directly -
         // no capability check needed for the kernel invoking its own hooks.
         let client = self.mcp_client.inner().clone();
 
-        let result = client.call_tool(&server_id, "astrid_hook_intercept", tool_args);
+        let result = client.call_hook(&server_id, action, params);
         let result = tokio::select! {
             () = self.cancelled.cancelled() => {
                 return Err(CapsuleError::ExecutionFailed(

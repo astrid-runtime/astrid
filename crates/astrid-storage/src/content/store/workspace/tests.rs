@@ -29,6 +29,40 @@ fn content_with_engine() -> (Arc<TestContent>, Arc<TestEngine>) {
 }
 
 #[test]
+fn filesystem_replacement_publishes_only_to_the_selected_owner_and_branch() {
+    let content = content();
+    let owner = owner();
+    let other = StateOwner::Principal(PrincipalUid::from_bytes([8; 32]));
+    let backing = crate::AstridFilesystem::new(Arc::clone(&content), owner);
+    let foreign = crate::AstridFilesystem::new(Arc::clone(&content), other);
+    let path = FilesystemPath::new("café-資料").unwrap();
+    backing.write(&path, b"base").unwrap();
+    foreign.write(&path, b"else").unwrap();
+
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let first = WorkspaceUid::from_bytes([1; 16]);
+    let second = WorkspaceUid::from_bytes([2; 16]);
+    branches.begin_with_uid(&owner, first).unwrap();
+    branches.begin_with_uid(&owner, second).unwrap();
+    branches
+        .filesystem(owner, first)
+        .write(&path, b"selected")
+        .unwrap();
+
+    let key = ContentName::new(path.as_str()).unwrap();
+    assert_eq!(
+        branches.read(&owner, first, &key).unwrap().unwrap(),
+        b"selected"
+    );
+    assert_eq!(
+        branches.read(&owner, second, &key).unwrap().unwrap(),
+        b"base"
+    );
+    assert_eq!(content.read(&owner, &key).unwrap().unwrap(), b"base");
+    assert_eq!(content.read(&other, &key).unwrap().unwrap(), b"else");
+}
+
+#[test]
 fn workspace_streaming_preserves_base_and_failed_source_does_not_publish() {
     use std::io::{self, Read};
     struct Failing;
@@ -897,4 +931,51 @@ fn workspace_subtree_replacement_resolves_all_pending_catalog_mutations() {
             .unwrap(),
         Some(b"old/alpha".to_vec())
     );
+}
+
+#[test]
+fn reference_rewrite_preserves_legacy_labels_and_unrelated_objects() {
+    let id = WorkspaceUid::from_bytes([0xab; 16]);
+    let peer = WorkspaceUid::from_bytes([0xba; 16]);
+    let canonical = format!("workspace-promoted/{id}");
+    assert_eq!(
+        reference_transition::encode_receipt(id.as_bytes()),
+        canonical.as_bytes()
+    );
+
+    let bare = "aB".repeat(16);
+    for spelling in [bare.clone(), format!("workspace/{bare}")] {
+        assert_eq!(parse_workspace_uid(spelling.as_bytes()), Some(id));
+        let receipt = format!("workspace-promoted/{spelling}");
+        assert_eq!(parse_workspace_receipt_uid(receipt.as_bytes()), Some(id));
+        assert_eq!(parse_workspace_uid(receipt.as_bytes()), None);
+    }
+    let object = ObjectId::new([7; 32]);
+    let reference = |bytes: Vec<u8>| ObjectReference::owns(ReferenceLabel::new(bytes), object);
+    let keep = [
+        reference(peer.to_string().into_bytes()),
+        reference(vec![0xff; 32]),
+        reference(format!("workspace-promoted/{peer}").into_bytes()),
+        reference(format!("Workspace/{bare}").into_bytes()),
+    ];
+    let mut records = vec![
+        reference(bare.into_bytes()),
+        keep[0].clone(),
+        keep[1].clone(),
+        reference(id.to_string().into_bytes()),
+        keep[2].clone(),
+        reference(canonical.as_bytes().to_vec()),
+        keep[3].clone(),
+    ];
+    let target = ObjectId::new([8; 32]);
+    reference_transition::rewrite(&mut records, id.as_bytes(), Some(target));
+    assert_eq!(&records[..keep.len()], &keep);
+    let receipt = records.last().unwrap();
+    assert_eq!(
+        receipt,
+        &ObjectReference::owns(ReferenceLabel::new(canonical.into_bytes()), target)
+    );
+    reference_transition::rewrite(&mut records, id.as_bytes(), None);
+    reference_transition::rewrite(&mut records, id.as_bytes(), None);
+    assert_eq!(records, keep);
 }

@@ -1,6 +1,10 @@
 //! Per-connection egress queues for the native local transport.
 
-use std::collections::{HashMap, VecDeque};
+use astrid_events::ipc::DeviceStamp;
+use std::collections::HashMap;
+
+use super::delivery_queue::{DeliveryQueue, Receipt};
+use super::reply_claim::Phase;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use astrid_events::ipc::{IpcMessage, RequestOwnerId, Topic};
@@ -10,37 +14,39 @@ use super::{CLIENT_EGRESS_CAPACITY, EVENT_SOURCE, MAX_PAYLOAD_BYTES, event_topic
 
 const CLIENT_EGRESS_BYTE_BUDGET: usize = 4 * MAX_PAYLOAD_BYTES;
 
-struct QueuedEvent {
-    event: Arc<AstridEvent>,
-    bytes: usize,
-}
-
 fn request_owner_allows(message: &IpcMessage, client_owner: RequestOwnerId) -> bool {
     if message.topic == Topic::approval_request() {
         let expected_owner = client_owner.to_string();
         return match &message.payload {
             astrid_types::ipc::IpcPayload::ApprovalRequired { request_owner, .. }
             | astrid_types::ipc::IpcPayload::GrantRequired { request_owner, .. } => {
-                message.source_id == uuid::Uuid::nil()
-                    && message.request_owner == Some(client_owner)
-                    && request_owner.as_str() == expected_owner.as_str()
+                super::recipient::approval_owner(
+                    message.source_id.as_u128(),
+                    message.request_owner.map(RequestOwnerId::as_u128),
+                    client_owner.as_u128(),
+                    request_owner.as_bytes(),
+                    expected_owner.as_bytes(),
+                )
             },
             _ => false,
         };
     }
-    message
-        .request_owner
-        .is_none_or(|owner| owner == client_owner)
+    super::recipient::ordinary_owner(
+        message.request_owner.map(RequestOwnerId::as_u128),
+        client_owner.as_u128(),
+    )
+}
+
+struct PendingReply {
+    owner: RequestOwnerId,
+    phase: Phase,
 }
 
 #[derive(Default)]
 struct QueueState {
-    events: VecDeque<QueuedEvent>,
-    human_replies: HashMap<ReplyKey, RequestOwnerId>,
-    claimed_replies: std::collections::HashSet<ReplyKey>,
+    events: DeliveryQueue<Arc<AstridEvent>>,
+    human_replies: HashMap<ReplyKey, PendingReply>,
     human_reply_bytes: usize,
-    bytes: usize,
-    overflowed: bool,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -78,6 +84,9 @@ impl ReplyKey {
 }
 
 pub(super) struct EgressQueue {
+    principal: String,
+    device: astrid_events::ipc::OwnedDeviceStamp,
+    owner: RequestOwnerId,
     state: Mutex<QueueState>,
     ready: tokio::sync::Notify,
 }
@@ -119,9 +128,6 @@ pub(super) enum TryRecvError {
 }
 
 struct ClientQueue {
-    principal: String,
-    device_key_id: Option<String>,
-    request_owner: RequestOwnerId,
     session: Arc<RwLock<Option<ActiveTurn>>>,
     queue: Arc<EgressQueue>,
 }
@@ -129,7 +135,7 @@ struct ClientQueue {
 struct ActiveTurn {
     session_id: String,
     request_owner: RequestOwnerId,
-    correlation: Option<super::turn_correlation::ResponseCorrelation>,
+    correlation: Option<super::recipient::ResponseCorrelation>,
 }
 
 impl ClientQueue {
@@ -150,7 +156,7 @@ impl ClientQueue {
                 )
             });
         }
-        request_owner_allows(message, self.request_owner)
+        request_owner_allows(message, self.queue.owner)
             || session
                 .as_ref()
                 .is_some_and(|turn| request_owner_allows(message, turn.request_owner))
@@ -170,7 +176,6 @@ pub(super) struct Registry {
 pub(super) struct Subscription {
     id: uuid::Uuid,
     registry: Weak<Registry>,
-    principal: String,
     session: Arc<RwLock<Option<ActiveTurn>>>,
     queue: Arc<EgressQueue>,
 }
@@ -184,7 +189,8 @@ pub(super) struct HumanReplyClaim<'a> {
 
 impl HumanReplyClaim<'_> {
     pub(super) fn complete(mut self) {
-        self.receiver.complete_human_reply(&self.key, self.owner);
+        self.receiver
+            .finish_human_reply(&self.key, self.owner, true);
         self.completed = true;
     }
 }
@@ -195,12 +201,7 @@ impl Drop for HumanReplyClaim<'_> {
             return;
         }
         self.receiver
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .claimed_replies
-            .remove(&self.key);
+            .finish_human_reply(&self.key, self.owner, false);
     }
 }
 
@@ -267,8 +268,8 @@ impl Registry {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !routing::should_deliver(
                     message,
-                    &client.principal,
-                    client.device_key_id.as_deref(),
+                    &client.queue.principal,
+                    client.queue.device.as_stamp(),
                     session.as_ref().map(|turn| turn.session_id.as_str()),
                 ) {
                     continue;
@@ -285,7 +286,7 @@ impl Registry {
                 // Legacy kernel elicitation has principal authority but
                 // no invocation owner. Bind its delivered copy to this
                 // authenticated connection, never to an unrelated chat.
-                let mut delivered = connection_owned_elicitation(&event, client.request_owner);
+                let mut delivered = connection_owned_elicitation(&event, client.queue.owner);
                 if turn_key.is_some()
                     && message.request_owner.is_none()
                     && let AstridEvent::Ipc { message, .. } = Arc::make_mut(&mut delivered)
@@ -320,24 +321,30 @@ impl Registry {
         registry
     }
 
+    #[cfg(test)]
+    pub(super) fn subscribe_principal(
+        self: &Arc<Self>,
+        principal: String,
+        owner: RequestOwnerId,
+    ) -> Subscription {
+        self.subscribe(principal, DeviceStamp::default(), owner)
+    }
+
     pub(super) fn subscribe(
         self: &Arc<Self>,
         principal: String,
-        device_key_id: Option<String>,
+        device: DeviceStamp<'_>,
         request_owner: RequestOwnerId,
     ) -> Subscription {
         let id = uuid::Uuid::new_v4();
         let session = Arc::new(RwLock::new(None));
-        let queue = Arc::new(EgressQueue::new());
+        let queue = Arc::new(EgressQueue::new(principal, device, request_owner));
         self.clients
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 id,
                 ClientQueue {
-                    principal: principal.clone(),
-                    device_key_id,
-                    request_owner,
                     session: Arc::clone(&session),
                     queue: Arc::clone(&queue),
                 },
@@ -345,7 +352,6 @@ impl Registry {
         Subscription {
             id,
             registry: Arc::downgrade(self),
-            principal,
             session,
             queue,
         }
@@ -366,10 +372,12 @@ impl Subscription {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed
-            || state.human_replies.get(&key) != Some(&owner)
-            || !state.claimed_replies.insert(key.clone())
-        {
+        let closed = state.events.is_closed();
+        if !state.human_replies.get_mut(&key).is_some_and(|reply| {
+            reply
+                .phase
+                .claim(reply.owner.as_u128(), owner.as_u128(), closed)
+        }) {
             return Err("human reply is no longer available on this connection");
         }
         Ok(Some(HumanReplyClaim {
@@ -393,17 +401,17 @@ impl Subscription {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let key = ReplyKey::from_reply(message);
-            let Some(owner) = state.human_replies.get(&key) else {
+            let Some(reply) = state.human_replies.get(&key) else {
                 return if key.selection_id.is_some() {
                     Err("selection reply does not match a request on this connection")
                 } else {
                     Ok(None) // Standalone model-selection command.
                 };
             };
-            if state.overflowed || state.claimed_replies.contains(&key) {
+            if state.events.is_closed() || reply.phase != Phase::Available {
                 return Err("selection reply does not match the delivered request");
             }
-            return Ok(Some(*owner));
+            return Ok(Some(reply.owner));
         }
         if !topic.starts_with("astrid.v1.approval.response.")
             && !topic.starts_with("astrid.v1.elicit.response.")
@@ -423,45 +431,66 @@ impl Subscription {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed {
+        if state.events.is_closed() {
             return Err("human request delivery overflowed");
         }
-        if state
-            .claimed_replies
-            .contains(&ReplyKey::from_reply(message))
-        {
-            return Err("human reply is already awaiting runtime delivery");
-        }
-        state
+        let reply = state
             .human_replies
             .get(&ReplyKey {
                 topic: expected,
                 selection_id: None,
             })
-            .copied()
-            .map(Some)
-            .ok_or("human reply does not match a request on this connection")
+            .ok_or("human reply does not match a request on this connection")?;
+        if reply.phase != Phase::Available {
+            return Err("human reply is already awaiting runtime delivery");
+        }
+        Ok(Some(reply.owner))
     }
 
-    pub(super) fn complete_human_reply(&self, key: &ReplyKey, owner: RequestOwnerId) {
+    fn finish_human_reply(&self, key: &ReplyKey, owner: RequestOwnerId, committed: bool) {
         let mut state = self
             .queue
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
-            .human_replies
-            .get(key)
-            .is_some_and(|existing| *existing == owner)
-            && state.human_replies.remove(key).is_some()
-        {
+        if state.human_replies.get_mut(key).is_some_and(|reply| {
+            reply
+                .phase
+                .finish(reply.owner.as_u128(), owner.as_u128(), committed)
+        }) {
+            state.human_replies.remove(key);
             state.human_reply_bytes = state.human_reply_bytes.saturating_sub(key.bytes());
-            state.claimed_replies.remove(key);
         }
     }
 
-    pub(super) fn egress_queue(&self) -> Arc<EgressQueue> {
-        Arc::clone(&self.queue)
+    pub(super) fn egress_queue(
+        &self,
+        owner: RequestOwnerId,
+        principal: &str,
+        device: DeviceStamp<'_>,
+    ) -> Option<Arc<EgressQueue>> {
+        fn writer<'a>(
+            owner: RequestOwnerId,
+            principal: &'a str,
+            device: DeviceStamp<'a>,
+        ) -> super::delivery_queue::Writer<'a> {
+            super::delivery_queue::Writer {
+                owner: owner.as_u128(),
+                principal,
+                fingerprint: device.fingerprint,
+                registration: device.registration.map(|id| id.as_u128()),
+            }
+        }
+        super::delivery_queue::bind_writer(
+            writer(
+                self.queue.owner,
+                &self.queue.principal,
+                self.queue.device.as_stamp(),
+            ),
+            writer(owner, principal, device),
+            &self.queue,
+        )
+        .map(Arc::clone)
     }
     pub(super) fn begin_turn(&self, session: &str) -> bool {
         let Some(registry) = self.registry.upgrade() else {
@@ -478,7 +507,7 @@ impl Subscription {
             .active_turns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry((self.principal.clone(), session.to_owned()))
+            .entry((self.queue.principal.clone(), session.to_owned()))
         {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(self.id);
@@ -523,7 +552,7 @@ impl Subscription {
                 .active_turns
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let key = (self.principal.clone(), turn.session_id);
+            let key = (self.queue.principal.clone(), turn.session_id);
             if active.get(&key) == Some(&self.id) {
                 active.remove(&key);
             }
@@ -550,8 +579,11 @@ impl Subscription {
 }
 
 impl EgressQueue {
-    fn new() -> Self {
+    fn new(principal: String, device: DeviceStamp<'_>, owner: RequestOwnerId) -> Self {
         Self {
+            principal,
+            device: device.into(),
+            owner,
             state: Mutex::new(QueueState::default()),
             ready: tokio::sync::Notify::new(),
         }
@@ -562,7 +594,7 @@ impl EgressQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed {
+        if state.events.is_closed() {
             return;
         }
         let human_reply = event_message(&event).and_then(|message| {
@@ -606,25 +638,21 @@ impl EgressQueue {
             state
                 .human_replies
                 .get(topic)
-                .is_some_and(|existing| existing != owner)
+                .is_some_and(|existing| existing.owner != *owner)
                 || (!state.human_replies.contains_key(topic)
                     && (state.human_replies.len() >= CLIENT_EGRESS_CAPACITY
                         || topic.bytes()
                             > CLIENT_EGRESS_BYTE_BUDGET.saturating_sub(state.human_reply_bytes)))
         });
-        if state.events.len() >= CLIENT_EGRESS_CAPACITY
-            || bytes > CLIENT_EGRESS_BYTE_BUDGET.saturating_sub(state.bytes)
-            || reply_overflow
-        {
-            // Release retained frames immediately. The affected connection
-            // observes Lagged and fail-closes; other clients have independent
-            // queues and remain available.
-            state.events.clear();
+        if !state.events.enqueue(
+            event,
+            bytes,
+            CLIENT_EGRESS_CAPACITY,
+            CLIENT_EGRESS_BYTE_BUDGET,
+            reply_overflow,
+        ) {
             state.human_replies.clear();
-            state.claimed_replies.clear();
             state.human_reply_bytes = 0;
-            state.bytes = 0;
-            state.overflowed = true;
             drop(state);
             self.ready.notify_one();
             return;
@@ -633,10 +661,11 @@ impl EgressQueue {
             if !state.human_replies.contains_key(&topic) {
                 state.human_reply_bytes = state.human_reply_bytes.saturating_add(topic.bytes());
             }
-            state.human_replies.insert(topic, owner);
+            state.human_replies.entry(topic).or_insert(PendingReply {
+                owner,
+                phase: Phase::Available,
+            });
         }
-        state.bytes = state.bytes.saturating_add(bytes);
-        state.events.push_back(QueuedEvent { event, bytes });
         drop(state);
         self.ready.notify_one();
     }
@@ -651,12 +680,10 @@ impl EgressQueue {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.overflowed {
-                    return Err(RecvError::Lagged);
-                }
-                if let Some(queued) = state.events.pop_front() {
-                    state.bytes = state.bytes.saturating_sub(queued.bytes);
-                    return Ok(queued.event);
+                match state.events.receive() {
+                    Receipt::Event(event) => return Ok(event),
+                    Receipt::Closed => return Err(RecvError::Lagged),
+                    Receipt::Empty => {},
                 }
             }
             ready.await;
@@ -668,14 +695,11 @@ impl EgressQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed {
-            return Err(TryRecvError::Lagged);
+        match state.events.receive() {
+            Receipt::Event(event) => Ok(event),
+            Receipt::Closed => Err(TryRecvError::Lagged),
+            Receipt::Empty => Err(TryRecvError::Empty),
         }
-        let Some(queued) = state.events.pop_front() else {
-            return Err(TryRecvError::Empty);
-        };
-        state.bytes = state.bytes.saturating_sub(queued.bytes);
-        Ok(queued.event)
     }
 }
 
@@ -690,7 +714,7 @@ impl Drop for Subscription {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
         if let Some(session) = self.session() {
-            let key = (self.principal.clone(), session);
+            let key = (self.queue.principal.clone(), session);
             let mut active = registry
                 .active_turns
                 .lock()

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::PrincipalId;
 use astrid_core::local_transport::{self, LocalListener, LocalStream};
@@ -39,10 +38,25 @@ use tokio::sync::watch;
 use crate::Kernel;
 
 mod admin_projection;
+mod lease_authority;
+use lease_authority::callback::{
+    Admission, Admitted, Destinations, Effect, Issued, OperationClass, admit, prepare_worker,
+};
+use lease_authority::destination::Backend;
+use lease_authority::worker::Worker;
+use lease_authority::{
+    LeaseAuthority, LeaseTarget, resolve_owner,
+    subtree::{BoundSubtree, Subtree},
+};
+mod requester_lifecycle;
+use requester_lifecycle::{Issue, Requester};
+pub(crate) use requester_lifecycle::{PendingMountIssues, retire_requester};
 #[cfg(target_os = "macos")]
 mod callback_resolver;
+mod expiry;
 mod filesystem;
 mod volume_info;
+use expiry::LeaseExpiry;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
 #[cfg(any(unix, windows))]
 mod process_broker;
@@ -54,7 +68,6 @@ pub(super) use process_broker::{
     platform_process_provider_name, retry_failed_projection, validate_process_provider_ready,
 };
 
-const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 const MAX_CALLBACK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const LEASE_MANIFEST_NAME: &str = "lease.json";
 
@@ -73,20 +86,29 @@ enum CallbackResponse {
     V2(StorageFilesystemResponseV2),
 }
 
+struct LeaseScope {
+    id: StorageMountId,
+    requester: Requester,
+    target: LeaseTarget,
+}
+
+struct MountBacking {
+    home: astrid_core::dirs::AstridHome,
+    store: Option<astrid_storage::RuntimePrincipalStore>,
+    mutations: Arc<tokio::sync::Mutex<()>>,
+}
+
 /// In-memory authority fixed when a native filesystem lease is issued.
 pub(crate) struct StorageMountLeaseState {
-    mount_id: StorageMountId,
-    requested_by: PrincipalId,
-    owner: StateOwner,
     view: StorageProviderViewV1,
-    target: StorageFilesystemTargetV1,
+    issued: Issued<LeaseScope, MountBacking>,
     access: StorageProviderAccessV1,
     provider: String,
     mountpoint: PathBuf,
     resource_path: PathBuf,
     callback_path: PathBuf,
     token_hash: [u8; 32],
-    expires_at_epoch_secs: AtomicU64,
+    expiry: LeaseExpiry,
     revoked: AtomicBool,
     dirty: AtomicBool,
     in_flight_mutations: AtomicU64,
@@ -123,13 +145,8 @@ struct MutationTestGate {
 }
 
 impl StorageMountLeaseState {
-    fn is_owned_by(&self, caller: &PrincipalId) -> bool {
-        &self.requested_by == caller
-    }
-
     fn is_live(&self) -> bool {
-        !self.revoked.load(Ordering::Acquire)
-            && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
+        lease_authority::callback::live(self.revoked.load(Ordering::Acquire), self.expiry.live())
     }
 
     #[cfg(test)]
@@ -138,21 +155,18 @@ impl StorageMountLeaseState {
     }
 
     fn renew(&self) {
-        self.expires_at_epoch_secs.store(
-            now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS),
-            Ordering::Release,
-        );
+        self.expiry.renew();
     }
 
     fn public_lease(&self, token: String) -> StorageMountLeaseV1 {
         StorageMountLeaseV1 {
-            mount_id: self.mount_id,
+            mount_id: self.issued.scope.id,
             view: self.view.clone(),
             access: self.access,
             resource_path: self.resource_path.clone(),
             callback_path: self.callback_path.clone(),
             lease_token: token,
-            expires_at_epoch_secs: self.expires_at_epoch_secs.load(Ordering::Acquire),
+            expires_at_epoch_secs: self.expiry.epoch_secs(),
         }
     }
 }
@@ -169,14 +183,49 @@ pub(crate) async fn issue_lease(
     provider: String,
     mountpoint: PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
+    issue_bound_lease(
+        kernel,
+        caller,
+        LeaseAuthority::Management { allow_cross_owner },
+        view,
+        target,
+        access,
+        provider,
+        mountpoint,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn issue_bound_lease(
+    kernel: &Arc<Kernel>,
+    caller: PrincipalId,
+    authority: LeaseAuthority,
+    view: StorageProviderViewV1,
+    target: StorageFilesystemTargetV1,
+    access: StorageProviderAccessV1,
+    provider: String,
+    mountpoint: PathBuf,
+) -> Result<StorageMountLeaseV1, String> {
     if provider.is_empty() || provider.len() > 128 || provider.chars().any(char::is_control) {
         return Err("native storage provider identity is invalid".to_owned());
     }
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
-    let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
+    let (requester_uid, allow_cross_owner) = authority.requester(kernel, &caller)?;
     let mount_id = StorageMountId::new();
+    let requester = Requester::new(&caller, requester_uid);
+    let issue = Issue::admit(kernel, mount_id, &caller, &requester).await?;
+    let target = resolve_owner(
+        kernel,
+        &caller,
+        requester_uid,
+        allow_cross_owner,
+        &view,
+        target,
+    )
+    .await?;
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
     #[cfg(not(unix))]
@@ -197,21 +246,30 @@ pub(crate) async fn issue_lease(
     let callback_path = resource_path.join("control.sock");
     #[cfg(not(unix))]
     let callback_path = resource_path.join("control.endpoint");
+    let expiry = LeaseExpiry::new()?;
     astrid_core::platform_fs::ensure_private_directory(&resource_path)
         .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
-        mount_id,
-        requested_by: caller,
-        owner,
         view,
-        target,
+        issued: Issued {
+            scope: LeaseScope {
+                id: mount_id,
+                requester,
+                target,
+            },
+            backing: MountBacking {
+                home: kernel.astrid_home.clone(),
+                store: kernel.principal_store.clone(),
+                mutations: Arc::clone(&kernel.storage_mount_mutations),
+            },
+        },
         access,
         provider,
         mountpoint,
         resource_path: resource_path.clone(),
         callback_path: callback_path.clone(),
         token_hash,
-        expires_at_epoch_secs: AtomicU64::new(now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS)),
+        expiry,
         revoked: AtomicBool::new(false),
         dirty: AtomicBool::new(false),
         in_flight_mutations: AtomicU64::new(0),
@@ -231,12 +289,17 @@ pub(crate) async fn issue_lease(
         cleanup_resource(&resource_path, &callback_path);
         return Err(format!("write private mount manifest: {error}"));
     }
-    kernel.storage_mounts.insert(mount_id, Arc::clone(&state));
-
-    #[cfg(any(unix, windows))]
-    {
-        let weak_kernel = Arc::downgrade(kernel);
-        astrid_runtime::spawn(serve_listener(weak_kernel, state, listener, shutdown_rx));
+    if !issue.install(kernel, &state, || {
+        #[cfg(any(unix, windows))]
+        astrid_runtime::spawn(serve_listener(
+            Arc::downgrade(kernel),
+            Arc::clone(&state),
+            listener,
+            shutdown_rx,
+        ));
+    }) {
+        cleanup_resource(&resource_path, &callback_path);
+        return Err("storage mount requester retired during issuance".to_owned());
     }
     Ok(lease)
 }
@@ -251,9 +314,9 @@ pub(crate) fn lease_status(
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
     state.renew();
     Ok(json!({
-        "mount_id": state.mount_id,
+        "mount_id": state.issued.scope.id,
         "view": state.view,
-        "target": state.target,
+        "target": state.issued.scope.target.wire(),
         "access": state.access,
         "provider": state.provider,
         "mountpoint": state.mountpoint,
@@ -261,7 +324,7 @@ pub(crate) fn lease_status(
         "callback_path": state.callback_path,
         "dirty": state.dirty.load(Ordering::Acquire),
         "in_flight_mutations": state.in_flight_mutations.load(Ordering::Acquire),
-        "expires_at_epoch_secs": state.expires_at_epoch_secs.load(Ordering::Acquire),
+        "expires_at_epoch_secs": state.expiry.epoch_secs(),
     }))
 }
 
@@ -273,49 +336,53 @@ pub(crate) async fn sync_lease(
     mount_id: StorageMountId,
 ) -> Result<(), String> {
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
-    let guard = Arc::clone(&kernel.storage_mount_mutations)
+    let guard = Arc::clone(&state.issued.backing.mutations)
         .lock_owned()
         .await;
     if !state.is_live() {
         return Err("storage mount lease is expired or revoked".to_owned());
     }
-    let store = kernel
-        .principal_store
+    let store = state
+        .issued
+        .backing
+        .store
         .clone()
         .ok_or_else(|| "native principal store is unavailable".to_owned())?;
-    let owner = state.owner;
-    let target = state.target.clone();
+    let target = state.issued.scope.target;
+    let worker = Worker::new(guard, (target, store, state));
     tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        #[cfg(test)]
-        tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
-        match target {
-            StorageFilesystemTargetV1::OwnerRoot => AstridFilesystem::new(store.content(), owner)
-                .sync()
-                .map_err(|error| error.to_string()),
-            StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
-                WorkspaceBranchStore::new(store.content())
-                    .filesystem(owner, workspace)
-                    .sync()
-                    .map_err(|error| error.to_string())
-            },
-            StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
-                if prefix == "shared" {
-                    AstridFilesystem::new_fleet_shared(store.content(), owner)
+        worker.run(|_guard, (target, store, state)| {
+            #[cfg(test)]
+            tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
+            match target {
+                LeaseTarget::OwnerRoot(owner) => {
+                    AstridFilesystem::new(store.content(), owner.into())
                         .sync()
                         .map_err(|error| error.to_string())
-                } else {
-                    let filesystem = PrefixedFilesystem {
-                        inner: AstridFilesystem::new(store.content(), owner),
-                        prefix,
-                    };
+                },
+                LeaseTarget::WorkspaceBranch(owner, workspace) => {
+                    WorkspaceBranchStore::new(store.content())
+                        .filesystem(owner.into(), workspace)
+                        .sync()
+                        .map_err(|error| error.to_string())
+                },
+                LeaseTarget::Subtree(BoundSubtree::FleetShared(uid)) => {
+                    AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(uid))
+                        .sync()
+                        .map_err(|error| error.to_string())
+                },
+                LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid)) => {
+                    let filesystem = PrefixedFilesystem::principal_home(AstridFilesystem::new(
+                        store.content(),
+                        StateOwner::Principal(uid),
+                    ));
                     filesystem.sync().map_err(|error| error.to_string())
-                }
-            },
-        }?;
-        state.dirty.store(false, Ordering::Release);
-        state.renew();
-        Ok(())
+                },
+            }?;
+            state.dirty.store(false, Ordering::Release);
+            state.renew();
+            Ok(())
+        })
     })
     .await
     .map_err(|error| format!("mount sync worker failed: {error}"))?
@@ -365,7 +432,7 @@ fn lookup_lease(
     else {
         return Ok(None);
     };
-    if !state.is_owned_by(caller) && !allow_cross_owner {
+    if !allow_cross_owner && !state.is_owned_by(kernel.principal_directory.uid_for(caller).ok()) {
         return Err("storage mount lease belongs to another principal".to_owned());
     }
     Ok(Some(state))
@@ -389,104 +456,9 @@ async fn finish_revoke(kernel: &Kernel, state: Arc<StorageMountLeaseState>) -> R
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    kernel.storage_mounts.remove(&state.mount_id);
+    kernel.storage_mounts.remove(&state.issued.scope.id);
     cleanup_resource(&state.resource_path, &state.callback_path);
     Ok(())
-}
-
-async fn resolve_owner(
-    kernel: &Kernel,
-    caller: &PrincipalId,
-    allow_cross_owner: bool,
-    view: &StorageProviderViewV1,
-    target: StorageFilesystemTargetV1,
-) -> Result<(StateOwner, StorageFilesystemTargetV1), String> {
-    let owner = match view {
-        StorageProviderViewV1::Principal(principal) => {
-            if principal != caller && !allow_cross_owner {
-                return Err("principal filesystem view belongs to another principal".to_owned());
-            }
-            kernel
-                .principal_directory
-                .uid_for(principal)
-                .map(StateOwner::Principal)
-                .map_err(|error| {
-                    format!("principal `{principal}` has no immutable storage identity: {error}")
-                })?
-        },
-        StorageProviderViewV1::Fleet(fleet) => {
-            if !allow_cross_owner {
-                let caller_uid = kernel
-                    .principal_directory
-                    .uid_for(caller)
-                    .map_err(|error| {
-                        format!("principal `{caller}` has no immutable storage identity: {error}")
-                    })?;
-                let ownership = kernel
-                    .ownership_store()
-                    .load()
-                    .await
-                    .map_err(|error| format!("read fleet ownership graph: {error}"))?;
-                let admitted = ownership
-                    .principal_owner(caller_uid)
-                    .is_some_and(|owner| owner.fleet_uid == *fleet);
-                if !admitted {
-                    return Err(
-                        "requested fleet filesystem is outside the caller's fleet".to_owned()
-                    );
-                }
-            }
-            StateOwner::Fleet(*fleet)
-        },
-        StorageProviderViewV1::Admin => {
-            if !allow_cross_owner {
-                return Err("system filesystem view requires global storage authority".to_owned());
-            }
-            StateOwner::System
-        },
-    };
-
-    if let StorageFilesystemTargetV1::WorkspaceBranch { workspace } = &target {
-        let store = kernel
-            .principal_store
-            .clone()
-            .ok_or_else(|| "native principal store is unavailable".to_owned())?;
-        let branches = WorkspaceBranchStore::new(store.content());
-        let descriptor = branches
-            .describe(&owner, *workspace)
-            .map_err(|error| format!("resolve workspace branch: {error}"))?;
-        // A caller-scoped branch lease may only target the branch that the
-        // kernel's durable workspace binding assigned to that immutable UID.
-        // Fleet membership authorizes the shared base owner, not another
-        // principal's divergent branch. Global storage authority may inspect
-        // an explicitly selected branch through the administrative path.
-        if !allow_cross_owner {
-            let caller_uid = kernel
-                .principal_directory
-                .uid_for(caller)
-                .map_err(|error| format!("resolve workspace branch caller UID: {error}"))?;
-            if descriptor.binding_uid() != Some(caller_uid) {
-                return Err(
-                    "workspace branch is not bound to the authenticated principal".to_owned(),
-                );
-            }
-        }
-    }
-    if let StorageFilesystemTargetV1::OwnerSubtree { prefix } = &target {
-        if prefix != "home" && prefix != "shared" {
-            return Err("owner subtree prefix is not a kernel-admitted attachment".to_owned());
-        }
-        if prefix == "home" && !matches!(owner, StateOwner::Principal(_)) {
-            return Err("principal HOME must resolve to the principal owner".to_owned());
-        }
-        if prefix == "shared" && !matches!(owner, StateOwner::Fleet(_)) {
-            return Err("Fleet shared attachment requires a Fleet owner".to_owned());
-        }
-        FilesystemPath::new(prefix.clone())
-            .map_err(|error| format!("resolve owner subtree prefix: {error}"))?;
-    }
-
-    Ok((owner, target))
 }
 
 #[cfg(any(unix, windows))]
@@ -569,7 +541,7 @@ async fn serve_listener(
                 if !state.is_live() {
                     state.revoked.store(true, Ordering::Release);
                     if let Some(kernel) = kernel.upgrade() {
-                        kernel.storage_mounts.remove(&state.mount_id);
+                        kernel.storage_mounts.remove(&state.issued.scope.id);
                     }
                     cleanup_resource(&state.resource_path, &state.callback_path);
                     break;
@@ -599,7 +571,8 @@ async fn serve_listener(
 
 #[cfg(any(unix, windows))]
 async fn handle_connection(
-    kernel: Arc<Kernel>,
+    // Keep the issuing kernel alive for this connection.
+    _kernel: Arc<Kernel>,
     state: Arc<StorageMountLeaseState>,
     mut stream: LocalStream,
 ) {
@@ -607,7 +580,7 @@ async fn handle_connection(
         let Ok(Some(request)) = read_request(&mut stream).await else {
             return;
         };
-        let response = dispatch_request(&kernel, &state, request).await;
+        let response = dispatch_request(&state, request).await;
         if write_response(&mut stream, response).await.is_err() {
             return;
         }
@@ -746,19 +719,30 @@ async fn write_response(
 }
 
 async fn dispatch_request(
-    kernel: &Kernel,
     state: &Arc<StorageMountLeaseState>,
     callback: CallbackRequest,
 ) -> CallbackResponse {
     let request = callback.request;
     let request_id = request.request_id.clone();
-    let outcome = if !state.is_live() {
-        failure("stale-lease", "storage mount lease is expired or revoked")
-    } else if !token_matches(&state.token_hash, &request.lease_token) {
-        failure("unauthorized", "storage mount lease token is invalid")
-    } else {
-        state.renew();
-        execute_operation(kernel, state, request.operation).await
+    let live = state.is_live();
+    let authenticated = live && token_matches(&state.token_hash, &request.lease_token);
+    let outcome = match admit(
+        state.issued.bind(state),
+        live,
+        authenticated,
+        state.access == StorageProviderAccessV1::ReadWrite,
+        request.operation,
+    ) {
+        Admission::Stale => failure("stale-lease", "storage mount lease is expired or revoked"),
+        Admission::Unauthorized => failure("unauthorized", "storage mount lease token is invalid"),
+        Admission::ReadOnly => {
+            state.renew();
+            failure("read-only", "storage mount lease is read-only")
+        },
+        Admission::Accepted(operation) => {
+            state.renew();
+            execute_operation(operation).await
+        },
     };
     let response = StorageFilesystemResponseV1 {
         protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
@@ -802,81 +786,81 @@ fn response_v2(response: StorageFilesystemResponseV1) -> StorageFilesystemRespon
     }
 }
 
-async fn execute_operation(
-    kernel: &Kernel,
-    state: &Arc<StorageMountLeaseState>,
-    operation: StorageFilesystemOperationV1,
-) -> StorageFilesystemOutcomeV1 {
-    if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
-        return volume_info::read(kernel).await;
-    }
-    let is_mutation = is_mutation(&operation);
-    let is_sync = matches!(&operation, StorageFilesystemOperationV1::Sync);
-    if is_mutation && state.access != StorageProviderAccessV1::ReadWrite {
-        return failure("read-only", "storage mount lease is read-only");
-    }
-    let guard = if requires_mutation_serialization(&operation) {
-        let guard = Arc::clone(&kernel.storage_mount_mutations)
-            .lock_owned()
-            .await;
-        if !state.is_live() {
-            return failure("stale-lease", "storage mount lease is expired or revoked");
-        }
-        Some(guard)
+type CallbackAdmission<'a> = Admitted<
+    Destinations<&'a Arc<StorageMountLeaseState>, &'a LeaseScope, &'a MountBacking>,
+    StorageFilesystemOperationV1,
+>;
+
+async fn execute_operation(admission: CallbackAdmission<'_>) -> StorageFilesystemOutcomeV1 {
+    let (state, target, backing, operation, class) = match admission.into_effect() {
+        Effect::Volume(_lease, _scope, backing) => return volume_info::read(&backing.home).await,
+        Effect::Filesystem(state, scope, backing, operation, class) => {
+            (state, scope.target, backing, operation, class)
+        },
+    };
+    let is_mutation = matches!(class, OperationClass::Write);
+    let guard = if class.requires_serialization() {
+        Some(Arc::clone(&backing.mutations).lock_owned().await)
     } else {
         None
     };
-    let Some(store) = kernel.principal_store.clone() else {
-        return failure("unavailable", "native principal store is unavailable");
+    let live_after_wait = guard.is_none() || state.is_live();
+    let Some(worker) = prepare_worker(
+        guard,
+        live_after_wait,
+        (Arc::clone(state), target),
+        operation,
+    ) else {
+        return failure("stale-lease", "storage mount lease is expired or revoked");
     };
-    let owner = state.owner;
-    let target = state.target.clone();
-    let runtime_home = kernel.astrid_home.clone();
     let in_flight = is_mutation.then(|| InFlightMutation::begin(state));
-    let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        // A cancelled waiter cannot join a blocking worker. The worker owns
-        // serialization through both the filesystem effect and dirty accounting.
-        let _guard = guard;
-        let _in_flight = in_flight;
-        #[cfg(test)]
-        if is_mutation {
-            tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
-        }
-        let result = match target {
-            StorageFilesystemTargetV1::OwnerRoot => {
-                let filesystem = AstridFilesystem::new(store.content(), owner);
-                if owner == StateOwner::System && is_mutation {
-                    admin_projection::execute(&runtime_home, &store, operation)
-                } else {
+        worker.run(|_guard, ((state, target), operation, class)| {
+            let backing = &state.issued.backing;
+            let Some(store) = &backing.store else {
+                return failure("unavailable", "native principal store is unavailable");
+            };
+            let _in_flight = in_flight;
+            let is_mutation = matches!(class, OperationClass::Write);
+            let is_sync = matches!(class, OperationClass::Sync);
+            #[cfg(test)]
+            if is_mutation {
+                tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
+            }
+            let result = match target.backend(&operation) {
+                Backend::SystemProjection => {
+                    admin_projection::execute(&backing.home, store, operation)
+                },
+                Backend::Filesystem(LeaseTarget::OwnerRoot(owner)) => {
+                    let filesystem = AstridFilesystem::new(store.content(), owner.into());
                     execute_blocking(&filesystem, operation)
-                }
-            },
-            StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
-                let branches = WorkspaceBranchStore::new(store.content());
-                let filesystem = branches.filesystem(owner, workspace);
-                execute_blocking(&filesystem, operation)
-            },
-            StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
-                if prefix == "shared" {
-                    let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
+                },
+                Backend::Filesystem(LeaseTarget::WorkspaceBranch(owner, workspace)) => {
+                    let branches = WorkspaceBranchStore::new(store.content());
+                    let filesystem = branches.filesystem(owner.into(), workspace);
                     execute_blocking(&filesystem, operation)
-                } else {
-                    let filesystem = PrefixedFilesystem {
-                        inner: AstridFilesystem::new(store.content(), owner),
-                        prefix,
-                    };
+                },
+                Backend::Filesystem(LeaseTarget::Subtree(BoundSubtree::FleetShared(uid))) => {
+                    let filesystem =
+                        AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(uid));
                     execute_blocking(&filesystem, operation)
-                }
-            },
-        };
-        if result.is_ok() && (is_mutation || is_sync) {
-            state.dirty.store(is_mutation, Ordering::Release);
-        }
-        match result {
-            Ok(success) => StorageFilesystemOutcomeV1::Success(success),
-            Err(error) => map_filesystem_error(&error),
-        }
+                },
+                Backend::Filesystem(LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid))) => {
+                    let filesystem = PrefixedFilesystem::principal_home(AstridFilesystem::new(
+                        store.content(),
+                        StateOwner::Principal(uid),
+                    ));
+                    execute_blocking(&filesystem, operation)
+                },
+            };
+            if result.is_ok() && (is_mutation || is_sync) {
+                state.dirty.store(is_mutation, Ordering::Release);
+            }
+            match result {
+                Ok(success) => StorageFilesystemOutcomeV1::Success(success),
+                Err(error) => map_filesystem_error(&error),
+            }
+        })
     })
     .await
     .unwrap_or_else(|error| failure("internal", &format!("filesystem worker failed: {error}")))
@@ -932,21 +916,6 @@ fn failure(code: &str, message: &str) -> StorageFilesystemOutcomeV1 {
     })
 }
 
-fn is_mutation(operation: &StorageFilesystemOperationV1) -> bool {
-    matches!(
-        operation,
-        StorageFilesystemOperationV1::Write { .. }
-            | StorageFilesystemOperationV1::SetLength { .. }
-            | StorageFilesystemOperationV1::Create { .. }
-            | StorageFilesystemOperationV1::Remove { .. }
-            | StorageFilesystemOperationV1::Rename { .. }
-    )
-}
-
-fn requires_mutation_serialization(operation: &StorageFilesystemOperationV1) -> bool {
-    is_mutation(operation) || matches!(operation, StorageFilesystemOperationV1::Sync)
-}
-
 fn generate_lease_token() -> Result<(String, [u8; 32]), String> {
     let mut secret = [0_u8; 32];
     SysRng
@@ -965,12 +934,6 @@ fn token_hash(token: &str) -> [u8; 32] {
 
 fn token_matches(expected: &[u8; 32], supplied: &str) -> bool {
     bool::from(expected.ct_eq(&token_hash(supplied)))
-}
-
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 fn write_private_manifest(path: &Path, lease: &StorageMountLeaseV1) -> io::Result<()> {

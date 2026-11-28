@@ -16,12 +16,9 @@
 //! the real principal, disconnect decremented `anonymous` (a saturating no-op),
 //! and the real principal's counter leaked `+1` per connection, unbounded.
 //!
-//! Emitting from the host fixes this at the root: the host holds the
-//! handshake-verified principal for the connection's whole lifetime (stored in
-//! [`HostState::client_connections`](crate::engine::wasm::host_state::HostState::client_connections)),
-//! so connect AND disconnect carry the IDENTICAL host-verified principal and
-//! the counter balances. A legacy/unauthenticated peer balances on the reserved
-//! `anonymous` identity.
+//! For a signed peer, the live transport owns the handshake principal through
+//! disconnect. The Store tracks unsigned inbound peers in its lifecycle map
+//! under the reserved anonymous principal. Both events use the same identity.
 //!
 //! SECURITY INVARIANT: the stamped principal is ALWAYS the host-verified one
 //! recorded at the handshake — never a value supplied by guest/capsule code.
@@ -49,7 +46,8 @@ const EVENT_SOURCE: &str = "net_client_lifecycle";
 pub(super) fn register_and_emit_connect(state: &HostState, rep: u32, principal: PrincipalId) {
     state.client_connections.insert(rep, principal.clone());
     publish_lifecycle(
-        state,
+        &state.event_bus,
+        state.capsule_uuid,
         Topic::client_connect(),
         IpcPayload::RawJson(serde_json::json!({})),
         &principal,
@@ -72,7 +70,8 @@ pub(super) fn emit_client_disconnect(state: &HostState, rep: u32) {
 
 fn publish_disconnect(state: &HostState, principal: &PrincipalId) {
     publish_lifecycle(
-        state,
+        &state.event_bus,
+        state.capsule_uuid,
         Topic::client_disconnect(),
         IpcPayload::RawJson(serde_json::json!({ "reason": "socket closed" })),
         principal,
@@ -87,20 +86,60 @@ pub(crate) fn disconnect_remaining_clients(state: &mut HostState) {
     }
 }
 
+/// Balance a signed connection on transport retirement even when its guest
+/// retains the resource handle. This owner travels with the OS socket.
+#[derive(Debug)]
+pub(crate) struct SignedLifecycle {
+    bus: astrid_events::EventBus,
+    capsule: uuid::Uuid,
+    principal: PrincipalId,
+}
+
+impl SignedLifecycle {
+    pub(crate) fn connect(state: &HostState, principal: PrincipalId) -> Self {
+        let owner = Self {
+            bus: state.event_bus.clone(),
+            capsule: state.capsule_uuid,
+            principal,
+        };
+        publish_lifecycle(
+            &owner.bus,
+            owner.capsule,
+            Topic::client_connect(),
+            IpcPayload::RawJson(serde_json::json!({})),
+            &owner.principal,
+        );
+        owner
+    }
+}
+
+impl Drop for SignedLifecycle {
+    fn drop(&mut self) {
+        publish_lifecycle(
+            &self.bus,
+            self.capsule,
+            Topic::client_disconnect(),
+            IpcPayload::RawJson(serde_json::json!({ "reason": "socket closed" })),
+            &self.principal,
+        );
+    }
+}
+
 /// Publish a lifecycle event on the kernel event bus stamped with the
 /// host-verified `principal`. The host is trusted, so this bypasses the
 /// guest-facing publish capability/quota gates — but the principal is never
 /// guest-controlled, so the anti-forge boundary is preserved.
 fn publish_lifecycle(
-    state: &HostState,
+    bus: &astrid_events::EventBus,
+    capsule: uuid::Uuid,
     topic: Topic,
     payload: IpcPayload,
     principal: &PrincipalId,
 ) {
-    let message = InternalIpcMessage::new(topic, payload, state.capsule_uuid)
-        .with_principal(principal.as_str());
-    state.event_bus.publish(AstridEvent::Ipc {
-        metadata: EventMetadata::new(EVENT_SOURCE).with_session_id(state.capsule_uuid),
+    let message =
+        InternalIpcMessage::new(topic, payload, capsule).with_principal(principal.as_str());
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new(EVENT_SOURCE).with_session_id(capsule),
         message,
     });
 }

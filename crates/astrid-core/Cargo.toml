@@ -13,6 +13,7 @@ default = []
 test-support = []
 
 [dependencies]
+vstd = { workspace = true, features = ["std"] }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }

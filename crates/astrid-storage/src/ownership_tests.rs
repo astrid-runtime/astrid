@@ -640,14 +640,17 @@ async fn malformed_persisted_graph_fails_closed() {
     let backend = Arc::new(MemoryKvStore::new());
     let raw: Arc<dyn KvStore> = backend.clone();
     let store = OwnershipStore::new(raw, PrincipalDirectory::default()).unwrap();
-    backend
-        .set(OWNERSHIP_NAMESPACE, GRAPH_KEY, b"not-json".to_vec())
-        .await
-        .unwrap();
-    assert!(matches!(
-        store.load().await,
-        Err(OwnershipError::Serialization(_))
-    ));
+    assert_eq!(store.load().await.unwrap(), OwnershipSnapshot::default());
+    for bytes in [b"".as_slice(), b"not-json"] {
+        backend
+            .set(OWNERSHIP_NAMESPACE, GRAPH_KEY, bytes.to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load().await,
+            Err(OwnershipError::Serialization(_))
+        ));
+    }
 }
 
 #[tokio::test]
@@ -942,4 +945,16 @@ async fn stale_assignment_retries_and_observes_deletion_reservation() {
             .principal_owner(principal_uid)
             .is_none()
     );
+}
+
+#[test]
+fn pending_deletions_keep_the_durable_record_format() {
+    let legacy = r#"{"alias":"retained"}"#;
+    let reservation: PrincipalDeletionReservation = serde_json::from_str(legacy).unwrap();
+    assert_eq!(reservation.alias.as_ref().unwrap().as_str(), "retained");
+    assert_eq!(reservation.fleet, None);
+    assert_eq!(serde_json::to_string(&reservation).unwrap(), legacy);
+    let unnamed: PrincipalDeletionReservation = serde_json::from_str("{}").unwrap();
+    assert!(unnamed.alias.is_none());
+    assert!(serde_json::from_str::<PrincipalDeletionReservation>(r#"{"unknown":null}"#).is_err());
 }

@@ -2,6 +2,59 @@ use super::runtime_tests::*;
 use super::*;
 
 #[tokio::test]
+async fn guest_kv_view_cannot_follow_a_reused_alias() {
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        open_runtime_principal_store(&AstridHome::from_path(root.path()), unlimited_quota())
+            .await
+            .unwrap();
+    let original = create_test_principal(&store, "alice").await;
+    let alias = PrincipalId::new("alice").unwrap();
+    let namespace = "alice:capsule:test";
+    let legacy = store.kv();
+    legacy
+        .set(namespace, "state", b"original".to_vec())
+        .await
+        .unwrap();
+    let first = store
+        .principal_capsule_kv(&alias, original, "test")
+        .unwrap();
+    assert_eq!(
+        first.get("state").await.unwrap().as_deref(),
+        Some(b"original".as_slice())
+    );
+    assert!(
+        first
+            .with_namespace("alice:capsule:other")
+            .unwrap()
+            .get("state")
+            .await
+            .is_err()
+    );
+
+    let directory = store.principal_directory();
+    directory.unregister(&alias, original);
+    let replacement = PrincipalUid::from_bytes([0x91; 32]);
+    directory.register(alias.clone(), replacement).unwrap();
+    let second = store
+        .principal_capsule_kv(&alias, replacement, "test")
+        .unwrap();
+    assert!(second.get("state").await.unwrap().is_none());
+    second.set("state", b"replacement".to_vec()).await.unwrap();
+    assert!(first.get("state").await.is_err());
+    assert!(first.clear_prefix("").await.is_err());
+    assert!(
+        store
+            .principal_capsule_kv(&alias, original, "test")
+            .is_err()
+    );
+    assert_eq!(
+        legacy.get(namespace, "state").await.unwrap().as_deref(),
+        Some(b"replacement".as_slice())
+    );
+}
+
+#[tokio::test]
 async fn explicit_compaction_checkpoints_small_kv_delta_chains() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());

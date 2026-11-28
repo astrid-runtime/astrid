@@ -1,5 +1,7 @@
 //! Reservation-before-publication for bounded, ordered event delivery.
 
+pub(crate) mod commit;
+
 use std::sync::Weak;
 
 use crate::{AstridEvent, EventBus};

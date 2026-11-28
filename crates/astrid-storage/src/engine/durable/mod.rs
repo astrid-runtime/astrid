@@ -24,11 +24,11 @@ use crate::storage_model::{
     ObjectKind, ObjectRecord, ObjectReference, PhysicalModelError, PrincipalUsage, ReferenceKind,
     ReferenceLabel, RootGeneration, RootState,
 };
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use fs2::FileExt;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
-use crate::engine::{CommitOutcome, RootSnapshot, RootTransaction};
+use crate::engine::{CommitOutcome, RootSnapshot, RootTransaction, root_declaration};
 use group::CommitGroup;
 pub use group::GroupCommitPolicy;
 
@@ -38,13 +38,11 @@ const INDEX_FILE: &str = "objects.index";
 const LOCK_FILE: &str = "store.lock";
 const WAL_FILE: &str = "transactions.wal";
 const WAL_WRITE_BUFFER_BYTES: usize = 64 * 1024;
-const ARENA_MAGIC: [u8; 8] = *b"ASTOBJ1\0";
-const ROOT_MAGIC: [u8; 8] = *b"ASTROOT\0";
-const INDEX_MAGIC: [u8; 8] = *b"ASTIDX1\0";
-const FRAME_VERSION: u16 = 1;
-const FRAME_HEADER_LEN: u64 = 52;
-const FRAME_HEADER_LEN_USIZE: usize = 52;
-const CHECKSUM_START: usize = 20;
+use arena_frame::INDEX_MAGIC;
+const FRAME_HEADER_LEN: u64 = arena_frame::WIDTH as u64;
+const FRAME_HEADER_LEN_USIZE: usize = arena_frame::WIDTH;
+#[cfg(test)]
+use arena_frame::CHECKSUM_START;
 const LIFECYCLE_USABLE: u8 = 0;
 const LIFECYCLE_REQUIRES_RECOVERY: u8 = 1;
 const LIFECYCLE_CLOSED: u8 = 2;
@@ -380,6 +378,8 @@ pub enum DurableError {
     },
     /// Another process or engine instance holds the store lock.
     LockHeld(PathBuf),
+    /// The constructed principal-to-root map disagreed with the recovered journal.
+    InvalidRootProjection,
     /// Recovery limits were zero or not representable by this process.
     InvalidLimits,
     /// A complete stored frame failed structural or checksum validation.
@@ -453,6 +453,8 @@ impl fmt::Display for DurableError {
             Self::LockHeld(path) => {
                 write!(formatter, "principal store is locked: {}", path.display())
             },
+            Self::InvalidRootProjection => formatter
+                .write_str("constructed principal root map disagrees with the recovered journal"),
             Self::InvalidLimits => {
                 formatter.write_str("recovery frame limit must be non-zero and process-addressable")
             },
@@ -543,12 +545,7 @@ impl From<ContentError> for DurableError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ArenaLocation {
-    offset: u64,
-    payload_len: u64,
-    checksum: [u8; 32],
-}
+use arena_frame::{ARENA_MAGIC, ArenaLocation, FRAME_VERSION, PreparedFrame, ROOT_MAGIC};
 
 #[derive(Debug)]
 struct DurableInner<P: Ord> {
@@ -574,11 +571,7 @@ struct DurableFiles {
     arena_tail: Option<ArenaLocation>,
 }
 
-#[derive(Debug)]
-struct ArenaReader {
-    file: File,
-    generation: u64,
-}
+type ArenaReader = read_admission::Reader<File>;
 
 struct PublishedRoot {
     value: ArcSwap<RootState>,
@@ -593,46 +586,72 @@ impl PublishedRoot {
 }
 
 struct PublishedRoots<P: Ord> {
-    entries: ArcSwap<BTreeMap<P, Arc<PublishedRoot>>>,
+    entries: ArcSwapOption<BTreeMap<P, Arc<PublishedRoot>>>,
 }
 
 impl<P> PublishedRoots<P>
 where
     P: Clone + Ord,
 {
-    fn new(roots: &BTreeMap<P, RootState>) -> Self {
-        Self {
-            entries: ArcSwap::from_pointee(Self::entries(roots)),
-        }
+    fn new(roots: &BTreeMap<P, RootState>) -> Result<Self, DurableError> {
+        Self::install(roots, |slots| Self {
+            entries: ArcSwapOption::from_pointee(slots),
+        })
     }
 
-    fn entries(roots: &BTreeMap<P, RootState>) -> BTreeMap<P, Arc<PublishedRoot>> {
-        roots
+    fn install<T>(
+        roots: &BTreeMap<P, RootState>,
+        write: impl FnOnce(BTreeMap<P, Arc<PublishedRoot>>) -> T,
+    ) -> Result<T, DurableError> {
+        let slots = roots
             .iter()
             .map(|(principal, root)| (principal.clone(), Arc::new(PublishedRoot::new(*root))))
-            .collect()
+            .collect();
+        journal_closure::install(roots, slots, |slot| **slot.value.load(), write)
+            .ok_or(DurableError::InvalidRootProjection)
     }
 
-    fn get(&self, principal: &P) -> Option<RootState> {
-        self.entries
-            .load()
-            .get(principal)
-            .map(|root| **root.value.load())
+    fn get(&self, principal: &P) -> Option<crate::engine::ReadyKvRoot> {
+        let snapshot = self.entries.load();
+        let slots = snapshot.as_ref()?;
+        Some(crate::engine::ReadyKvRoot::new(root_transition::sample(
+            slots,
+            principal,
+            |slot| **slot.value.load(),
+        )))
     }
 
     fn publish(&self, principal: &P, root: RootState) {
-        let current = self.entries.load();
-        if let Some(published) = current.get(principal) {
-            published.value.store(Arc::new(root));
+        let snapshot = self.entries.load();
+        let Some(slots) = snapshot.as_ref() else {
             return;
-        }
-        let mut next = (**current).clone();
-        next.insert(principal.clone(), Arc::new(PublishedRoot::new(root)));
-        self.entries.store(Arc::new(next));
+        };
+        root_transition::publish_slot(
+            slots,
+            principal,
+            root,
+            |slot, replacement| slot.value.store(Arc::new(replacement)),
+            |current, owner, replacement| {
+                let candidate = current
+                    .iter()
+                    .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
+                    .collect();
+                let next = journal_closure::extend(
+                    current,
+                    candidate,
+                    owner,
+                    owner.clone(),
+                    Arc::new(PublishedRoot::new(replacement)),
+                    Arc::ptr_eq,
+                );
+                // A rejected copy makes even absence untrustworthy until a full replacement.
+                self.entries.store(next.map(Arc::new));
+            },
+        );
     }
 
-    fn replace(&self, roots: &BTreeMap<P, RootState>) {
-        self.entries.store(Arc::new(Self::entries(roots)));
+    fn replace(&self, roots: &BTreeMap<P, RootState>) -> Result<(), DurableError> {
+        Self::install(roots, |slots| self.entries.store(Some(Arc::new(slots))))
     }
 }
 
@@ -726,20 +745,24 @@ mod media;
 pub(in crate::engine::durable) use media::{DurableIo, File, StoreLock};
 
 #[derive(Debug)]
+enum CommitFrontier {
+    Wal,
+    Journal(frontier::JournalFlush<crate::volume::VolumeFile>),
+}
+
+#[derive(Debug)]
 struct Persisted {
+    frontier: CommitFrontier,
     locations: Vec<(ObjectId, ArenaLocation)>,
     arena_len: u64,
 }
 
 #[derive(Debug)]
 struct Prepared<P: Ord> {
-    principal: P,
-    expected: Option<RootState>,
-    root: RootState,
+    root: root_transition::PreparedRoot<P, RootState>,
     objects_inserted: u64,
     objects: Vec<(ObjectId, Arc<[u8]>)>,
     commit: Option<(ObjectId, Arc<[u8]>)>,
-    journal: Vec<u8>,
     validated: BTreeSet<ObjectId>,
     kv_checkpoint_publication: Option<crate::kv::KvCheckpointPublication>,
 }
@@ -810,25 +833,56 @@ impl<P: Ord, I, C> DurableEngine<P, I, C> {
     }
 }
 
+mod arena_frame;
+mod arena_index;
+mod arena_vectors;
+mod batch_slots;
+#[path = "index/admission.rs"]
+mod checkpoint_admission;
+mod direct_placement;
+mod frame_probe;
+mod frame_repair;
+mod frame_scan;
+mod read_admission;
+mod recovered_closure;
+mod recovery_barrier;
 mod staging;
 
 use crate::engine::durable_cache as cache;
 mod checkpoint_worker;
 #[cfg(test)]
 mod checkpoint_worker_tests;
+mod closure_load;
+mod closure_walk;
 mod compaction;
 mod faults;
 mod format;
+mod frontier;
 mod group;
+#[path = "wal/group_publication.rs"]
+mod group_publication;
 mod index;
+mod journal_apply;
+mod journal_closure;
+mod journal_history;
+mod journal_payload;
+mod journal_preload;
+mod journal_snapshot;
+mod journal_transition;
+mod journal_visitor;
 mod lifecycle;
+#[path = "wal/merge_rows.rs"]
+mod merge_rows;
 mod native_io;
 mod recovery;
 mod representation_engine;
 mod representations;
 mod restore;
 mod retirement;
+mod root_transition;
+mod root_wire;
 mod roots;
+
 mod validation;
 mod wal;
 
@@ -838,6 +892,7 @@ pub use cache::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
     ObjectCacheStats, PrincipalObjectCacheBudget,
 };
+use checkpoint_admission::IndexState;
 use compaction::recover_interrupted_compaction;
 pub use compaction::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
@@ -846,7 +901,7 @@ pub use compaction::{
 };
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{
-    FramedAppendStream, PreparedFrame, append_frame, append_frames, append_prepared_frames,
+    FramedAppendStream, append_frame, append_frames, append_prepared_frames,
     canonical_record_bytes, corrupt, decode_object_frame, encode_object_frame,
     ensure_payload_limit, io_error, read_indexed_object, read_indexed_object_with_payload,
     read_indexed_objects, recover_arena, scan_frames, verify_indexed_location, verify_indexed_tail,
@@ -854,16 +909,18 @@ use format::{
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans, open_rw};
-use index::{IndexState, recover_index, replace_index, replace_volume_index};
+use index::{recover_index, replace_index, replace_volume_index};
 use native_io::{
     create_private as create_private_file_capability, open_directory as open_directory_capability,
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
 use recovery::{RecoveryScope, recover_store, recover_volume};
-use roots::{encode_root_record, encode_root_snapshot, recover_root_history, recover_roots};
+#[cfg(test)]
+use roots::encode_root_record;
+use roots::{encode_root_snapshot, recover_root_history, recover_roots};
 use validation::{
     ClosureObjects, materialize_closure, preload_indexed_closures, recovery_closure_error,
-    usage_from_closure, validate_commit_closure, validate_incremental_closure,
+    usage_from_closure, validate_incremental_closure,
 };
 
 #[cfg(test)]

@@ -13,10 +13,13 @@ pub(super) async fn response(
     authorization: &AuthorizedRequest,
     target: Option<&PrincipalId>,
 ) -> KernelResponse {
-    let visibility = target.map_or_else(
-        || CapsuleVisibility::new(authorization),
-        |principal| CapsuleVisibility::for_target(authorization, principal),
-    );
+    let visibility = match target {
+        Some(principal) => match CapsuleVisibility::for_target(authorization, principal) {
+            Ok(visibility) => visibility,
+            Err(error) => return KernelResponse::Error(error.to_string()),
+        },
+        None => CapsuleVisibility::new(authorization),
+    };
     let subject = visibility.principal.clone();
     let manifests = visible_inventory_manifests(kernel, &visibility).await;
     let registry = kernel.capsules.read().await;

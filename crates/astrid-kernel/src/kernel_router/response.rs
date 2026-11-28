@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::principal::PrincipalId;
-use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::ipc::{DeviceStamp, IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::KernelResponse;
 use serde::Serialize;
 
@@ -18,11 +18,11 @@ pub(crate) fn publish_response<R: Serialize>(
     kernel: &Arc<crate::Kernel>,
     response_topic: Topic,
     principal: &str,
-    device_key_id: Option<&str>,
+    device: DeviceStamp<'_>,
     res: R,
 ) {
     if let Ok(val) = serde_json::to_value(res) {
-        publish_response_value(kernel, response_topic, principal, device_key_id, val);
+        publish_response_value(kernel, response_topic, principal, device, val);
     }
 }
 
@@ -38,7 +38,7 @@ pub(crate) fn publish_response_value(
     kernel: &Arc<crate::Kernel>,
     response_topic: Topic,
     principal: &str,
-    device_key_id: Option<&str>,
+    device: DeviceStamp<'_>,
     val: serde_json::Value,
 ) {
     let mut msg = IpcMessage::new(
@@ -47,7 +47,8 @@ pub(crate) fn publish_response_value(
         kernel.session_id.0,
     )
     .with_principal(principal);
-    msg.device_key_id = device_key_id.map(str::to_owned);
+    msg.device_key_id = device.fingerprint.map(str::to_owned);
+    msg.device_registration_id = device.registration;
     let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("kernel_router"),
         message: msg,
@@ -88,13 +89,13 @@ impl KeepalivePinger {
         kernel: &Arc<crate::Kernel>,
         response_topic: Topic,
         principal: &PrincipalId,
-        device_key_id: Option<&str>,
+        device: DeviceStamp<'_>,
     ) -> Self {
         Self::spawn_with_interval(
             kernel,
             response_topic,
             principal,
-            device_key_id,
+            device,
             KEEPALIVE_INTERVAL,
         )
     }
@@ -106,12 +107,12 @@ impl KeepalivePinger {
         kernel: &Arc<crate::Kernel>,
         response_topic: Topic,
         principal: &PrincipalId,
-        device_key_id: Option<&str>,
+        device: DeviceStamp<'_>,
         interval: Duration,
     ) -> Self {
         let kernel = Arc::clone(kernel);
         let principal = principal.to_string();
-        let device_key_id = device_key_id.map(str::to_owned);
+        let device = astrid_events::ipc::OwnedDeviceStamp::from(device);
         let handle = astrid_runtime::spawn(async move {
             loop {
                 astrid_runtime::time::sleep(interval).await;
@@ -122,7 +123,7 @@ impl KeepalivePinger {
                     &kernel,
                     response_topic.clone(),
                     &principal,
-                    device_key_id.as_deref(),
+                    device.as_stamp(),
                     val,
                 );
             }
@@ -184,7 +185,10 @@ mod tests {
             &kernel,
             response_topic,
             "alice",
-            Some("device-a"),
+            DeviceStamp {
+                fingerprint: Some("device-a"),
+                registration: Some(uuid::Uuid::from_u128(17)),
+            },
             KernelResponse::Success(serde_json::json!({"ok": true})),
         );
 
@@ -194,6 +198,10 @@ mod tests {
         };
         assert_eq!(message.principal.as_deref(), Some("alice"));
         assert_eq!(message.device_key_id.as_deref(), Some("device-a"));
+        assert_eq!(
+            message.device_registration_id,
+            Some(uuid::Uuid::from_u128(17))
+        );
     }
 
     /// The keepalive pinger publishes `KernelResponse::Working` frames on the
@@ -219,7 +227,10 @@ mod tests {
             &kernel,
             response_topic.clone(),
             &principal,
-            Some("device-a"),
+            DeviceStamp {
+                fingerprint: Some("device-a"),
+                registration: Some(uuid::Uuid::from_u128(17)),
+            },
             interval,
         );
 
@@ -241,6 +252,10 @@ mod tests {
                     {
                         assert_eq!(message.principal.as_deref(), Some("alice"));
                         assert_eq!(message.device_key_id.as_deref(), Some("device-a"));
+                        assert_eq!(
+                            message.device_registration_id,
+                            Some(uuid::Uuid::from_u128(17))
+                        );
                         working_seen += 1;
                     }
                 },

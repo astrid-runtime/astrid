@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
 
-use crate::content_dag::{ContentReadError, ContentSource, describe_content};
+use crate::content_dag::{ChunkingProfile, FORMAT_VERSION, file_wire};
 use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
     ReferenceKind, ReferenceLabel,
 };
 
 use super::super::{ContentEntry, ContentName, PrincipalContentError};
+
+use super::CatalogSummary;
 
 const CATALOG_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(2) {
     Some(version) => version,
@@ -20,32 +21,6 @@ const BRANCH_BYTES: usize = 57;
 const FILE_LABEL: &[u8] = b"file";
 const LEFT_LABEL: &[u8] = b"left";
 const RIGHT_LABEL: &[u8] = b"right";
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CatalogSummary {
-    pub(crate) logical_bytes: u64,
-    pub(crate) quota_bytes: u64,
-    pub(crate) entries: u64,
-}
-
-impl CatalogSummary {
-    fn combine(left: Self, right: Self) -> Result<Self, PrincipalContentError> {
-        Ok(Self {
-            logical_bytes: left
-                .logical_bytes
-                .checked_add(right.logical_bytes)
-                .ok_or(PrincipalContentError::AccountingOverflow)?,
-            quota_bytes: left
-                .quota_bytes
-                .checked_add(right.quota_bytes)
-                .ok_or(PrincipalContentError::AccountingOverflow)?,
-            entries: left
-                .entries
-                .checked_add(right.entries)
-                .ok_or(PrincipalContentError::AccountingOverflow)?,
-        })
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CatalogValue {
@@ -89,9 +64,8 @@ impl Node {
     fn summary(&self) -> Result<CatalogSummary, PrincipalContentError> {
         match self {
             Self::Leaf { name, value } => leaf_summary(name, *value),
-            Self::Branch { left, right, .. } => {
-                CatalogSummary::combine(left.summary, right.summary)
-            },
+            Self::Branch { left, right, .. } => CatalogSummary::join(left.summary, right.summary)
+                .ok_or(PrincipalContentError::AccountingOverflow),
         }
     }
 }
@@ -558,7 +532,8 @@ fn validate_exit(
     values.insert(
         object,
         ValidatedRange {
-            summary: CatalogSummary::combine(left_value.summary, right_value.summary)?,
+            summary: CatalogSummary::join(left_value.summary, right_value.summary)
+                .ok_or(PrincipalContentError::AccountingOverflow)?,
             min: left_value.min,
             max: right_value.max,
         },
@@ -588,35 +563,23 @@ fn validate_file_length(
     value: CatalogValue,
     load: &mut impl FnMut(ObjectId) -> Result<ObjectRecord, PrincipalContentError>,
 ) -> Result<(), PrincipalContentError> {
-    let record = load(value.file)?;
-    let source = SingleObjectSource {
-        object: value.file,
-        record,
-    };
-    let descriptor = describe_content(&source, value.file).map_err(|error| match error {
-        ContentReadError::Content(error) => PrincipalContentError::Content(error),
-        ContentReadError::Source(error) => match error {},
-    })?;
-    if descriptor.logical_bytes() != value.logical_bytes {
-        return Err(invalid(
+    file_wire::check_length(
+        value.file,
+        value.logical_bytes,
+        FORMAT_VERSION,
+        load,
+        ChunkingProfile::fastcdc_v2020,
+    )
+    .map_err(|error| match error {
+        file_wire::LengthError::Load(error) => error,
+        file_wire::LengthError::Decode(error) => {
+            PrincipalContentError::Content(error.at(value.file))
+        },
+        file_wire::LengthError::Mismatch => invalid(
             value.file,
             "content catalog and file logical lengths disagree",
-        ));
-    }
-    Ok(())
-}
-
-struct SingleObjectSource {
-    object: ObjectId,
-    record: ObjectRecord,
-}
-
-impl ContentSource for SingleObjectSource {
-    type Error = Infallible;
-
-    fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error> {
-        Ok((id == self.object).then(|| self.record.clone()))
-    }
+        ),
+    })
 }
 
 fn descend(
@@ -700,7 +663,8 @@ fn intern_branch(
     identify: &impl Fn(&ObjectRecord) -> ObjectId,
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
 ) -> Result<CatalogRoot, PrincipalContentError> {
-    let summary = CatalogSummary::combine(left.summary, right.summary)?;
+    let summary = CatalogSummary::join(left.summary, right.summary)
+        .ok_or(PrincipalContentError::AccountingOverflow)?;
     let mut bytes = Vec::with_capacity(BRANCH_BYTES);
     bytes.push(BRANCH_TAG);
     bytes.extend_from_slice(&bit.to_le_bytes());
@@ -727,14 +691,8 @@ fn intern(
     identify: &impl Fn(&ObjectRecord) -> ObjectId,
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
 ) -> Result<CatalogRoot, PrincipalContentError> {
-    let object = identify(&record);
-    match records.get(&object) {
-        Some(existing) if existing == &record => {},
-        Some(_) => return Err(invalid(object, "content catalog identity collision")),
-        None => {
-            records.insert(object, record);
-        },
-    }
+    let object = crate::engine::transaction_records::stage(records, record, identify)
+        .map_err(|id| invalid(id, "content catalog identity collision"))?;
     Ok(CatalogRoot { object, summary })
 }
 
@@ -809,7 +767,8 @@ fn decode_branch(object: ObjectId, record: &ObjectRecord) -> Result<Node, Princi
     let bit = read_u64(bytes, 1)?;
     let left_summary = decode_summary(bytes, 9)?;
     let right_summary = decode_summary(bytes, 33)?;
-    CatalogSummary::combine(left_summary, right_summary)?;
+    CatalogSummary::join(left_summary, right_summary)
+        .ok_or(PrincipalContentError::AccountingOverflow)?;
     if record.logical_bytes() != 0 {
         return Err(invalid(
             object,
@@ -833,16 +792,8 @@ fn leaf_summary(
     name: &ContentName,
     value: CatalogValue,
 ) -> Result<CatalogSummary, PrincipalContentError> {
-    let name_bytes = u64::try_from(name.as_str().len())
-        .map_err(|_| PrincipalContentError::AccountingOverflow)?;
-    Ok(CatalogSummary {
-        logical_bytes: value.logical_bytes,
-        quota_bytes: value
-            .logical_bytes
-            .checked_add(name_bytes)
-            .ok_or(PrincipalContentError::AccountingOverflow)?,
-        entries: 1,
-    })
+    CatalogSummary::leaf(name.as_str().as_bytes(), value.logical_bytes)
+        .ok_or(PrincipalContentError::AccountingOverflow)
 }
 
 fn encode_summary(bytes: &mut Vec<u8>, summary: CatalogSummary) {

@@ -28,6 +28,19 @@ impl rmcp::ServerHandler for ModernMrtrServer {
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if request.name == "ping" {
+            return Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text("pong"),
+            ])
+            .into());
+        }
+        if request.name == "astrid_hook_intercept" {
+            let arguments = serde_json::Value::from(request.arguments);
+            return Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text(arguments.to_string()),
+            ])
+            .into());
+        }
         if request.input_responses.is_none() {
             let params = rmcp::model::ElicitRequestParams::FormElicitationParams {
                 meta: None,
@@ -168,8 +181,13 @@ async fn client_lifecycle_falls_back_to_legacy_initialize() {
     );
 }
 
-#[tokio::test]
-async fn modern_tool_call_drives_mrtr_through_astrid_elicitation() {
+async fn test_peer(
+    name: &str,
+) -> (
+    McpService,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let server = ModernMrtrServer::default();
     let calls = Arc::clone(&server.calls);
     let (server_transport, client_transport) = tokio::io::duplex(8192);
@@ -183,10 +201,68 @@ async fn modern_tool_call_drives_mrtr_through_astrid_elicitation() {
 
     let mut capabilities = CapabilitiesHandler::new();
     capabilities.elicitation = Some(Box::new(TestElicitationHandler));
-    let client = AstridClientHandler::new("test-server", Arc::new(capabilities))
+    let client = AstridClientHandler::new(name, Arc::new(capabilities))
         .serve_with_lifecycle(client_transport, mcp_client_lifecycle())
         .await
         .expect("Astrid client should negotiate modern MCP");
+    (client, calls, server_task)
+}
+
+async fn register_test_peer(
+    manager: &ServerManager,
+    name: &str,
+) -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (client, calls, server_task) = test_peer(name).await;
+    // Complete discovery with the same tools/list exchange used at registration.
+    client.list_all_tools().await.unwrap();
+    let mut entry = RunningServer::new(ServerConfig::stdio(name, "fixture"));
+    entry.service = Some(client);
+    manager.running.write().await.insert(name.to_owned(), entry);
+    (calls, server_task)
+}
+
+#[tokio::test]
+async fn tool_call_reaches_only_the_selected_generation_peer() {
+    let manager = ServerManager::new(ServersConfig::default());
+    let (old_calls, old_task) = register_test_peer(&manager, "generation-1").await;
+    let (calls, task) = register_test_peer(&manager, "generation-2").await;
+    let client = crate::McpClient::new(manager);
+    let result = client
+        .call_tool("generation-2", "ping", serde_json::Value::Null)
+        .await
+        .expect("selected peer should answer");
+    assert_eq!(result.text_content(), "pong");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(old_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let payload = serde_json::json!({"items": [null, 7], "hook": "nested"});
+    let hook = client
+        .call_hook("generation-2", "inspect", payload.clone())
+        .await
+        .unwrap();
+    let observed: serde_json::Value = serde_json::from_str(&hook.text_content()).unwrap();
+    assert_eq!(
+        observed,
+        serde_json::json!({"hook": "inspect", "payload": payload})
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(old_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    client.server_manager().stop_all().await.unwrap();
+    for server in [old_task, task] {
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("server should stop after its client disconnects")
+            .expect("server task should not panic");
+    }
+}
+
+#[tokio::test]
+async fn modern_tool_call_drives_mrtr_through_astrid_elicitation() {
+    let (client, calls, server_task) = test_peer("test-server").await;
     let result = client
         .call_tool(rmcp::model::CallToolRequestParams::new("greet"))
         .await
@@ -645,59 +721,45 @@ fn test_build_unsandboxed_command() {
 
 #[test]
 fn test_build_sandboxed_command_adds_sandbox_prefix() {
-    // Probe-gated: on Linux this needs a working bwrap to exercise the
-    // wrapper. CI runners often have bwrap installed but the kernel
-    // sysctl blocks user namespaces — sandbox_prefix() returns Err under
-    // the default Required policy. Skipping there preserves the test's
-    // intent (verify the wrapper is invoked when sandboxing is possible)
-    // without making CI dependent on host-kernel configuration.
+    let workspace = tempfile::tempdir().unwrap();
+    let manager = ServerManager::new(ServersConfig::default())
+        .with_workspace_root(workspace.path().to_owned())
+        .with_sandbox_policy(astrid_workspace::SandboxPolicy::Required);
+    let config = ServerConfig::stdio("test", "echo").with_args(["two words", "--literal", ""]);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
+
     #[cfg(target_os = "linux")]
-    if !linux_sandbox_actually_available() {
-        eprintln!("skipping: bwrap probe failed — sandbox not exercised on this host");
+    if astrid_workspace::ProcessSandboxConfig::new(workspace.path())
+        .with_policy(astrid_workspace::SandboxPolicy::Required)
+        .sandbox_prefix()
+        .is_err()
+    {
+        assert!(result.is_err());
         return;
     }
-
-    let configs = ServersConfig::default();
-    let manager = ServerManager::new(configs)
-        .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"));
-
-    let config = ServerConfig::stdio("test", "echo").with_args(["hello"]);
-
-    let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
-        .expect("should build sandboxed command");
-
-    let program = cmd.as_std().get_program().to_string_lossy().to_string();
-
-    #[cfg(target_os = "linux")]
-    assert_eq!(
-        Some(program.as_str()),
-        astrid_workspace::sandbox::packaged_bwrap_path(),
-        "expected packaged bwrap wrapper, got: {program}"
-    );
-    #[cfg(target_os = "macos")]
-    assert_eq!(program, "sandbox-exec");
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    assert!(
-        std::path::Path::new(&program).is_absolute(),
-        "unsupported platform should still use resolved absolute path, got: {program}"
-    );
-}
-
-/// Linux-only: does the host kernel actually grant unprivileged user
-/// namespaces to `bwrap`? Mirrors `astrid_workspace::bwrap_available`
-/// but inlined here so the test doesn't depend on internal symbols.
-#[cfg(target_os = "linux")]
-fn linux_sandbox_actually_available() -> bool {
-    std::process::Command::new(
-        astrid_workspace::sandbox::packaged_bwrap_path().unwrap_or("/usr/bin/bwrap"),
-    )
-    .args(["--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"])
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .status()
-    .is_ok_and(|s| s.success())
+    assert!(result.is_err());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::ffi::OsStr;
+        let cmd = result.expect("required sandbox must supply the platform wrapper");
+        let program = cmd.as_std().get_program();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            program.to_str(),
+            astrid_workspace::sandbox::packaged_bwrap_path()
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(program, OsStr::new("sandbox-exec"));
+        let resolved = which::which("echo").unwrap();
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert!(args.ends_with(&[
+            resolved.as_os_str(),
+            OsStr::new("two words"),
+            OsStr::new("--literal"),
+            OsStr::new("")
+        ]));
+    }
 }
 
 #[test]
@@ -714,7 +776,7 @@ fn test_build_sandboxed_command_resolves_absolute_binary_path() {
     let config = ServerConfig::stdio("test", "echo");
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build sandboxed command");
 
     // The resolved binary should appear as an absolute path — either in
@@ -744,7 +806,7 @@ fn test_build_sandboxed_command_rejects_unresolvable_binary() {
 
     let config = ServerConfig::stdio("test", "nonexistent-binary-xyz-12345");
 
-    let result = manager.build_sandboxed_command("test", "nonexistent-binary-xyz-12345", &config);
+    let result = manager.prepare_stdio_command("test", "nonexistent-binary-xyz-12345", &config);
     assert!(result.is_err(), "unresolvable binary should fail");
     let err = result.unwrap_err().to_string();
     assert!(
@@ -756,9 +818,9 @@ fn test_build_sandboxed_command_rejects_unresolvable_binary() {
 #[test]
 fn test_trusted_server_bypasses_sandbox() {
     let config = ServerConfig::stdio("test", "echo").trusted();
-
-    let cmd = build_unsandboxed_command("test", "echo", &config);
-
+    let cmd = ServerManager::new(ServersConfig::default())
+        .prepare_stdio_command("test", "echo", &config)
+        .unwrap();
     let program = cmd.as_std().get_program().to_string_lossy().to_string();
     assert_eq!(
         program, "echo",
@@ -777,7 +839,7 @@ fn test_sandboxed_command_clears_env() {
     let config = ServerConfig::stdio("test", "echo").with_env("SAFE_VAR", "value");
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     let envs: Vec<_> = cmd
@@ -830,7 +892,7 @@ fn test_sandboxed_command_blocks_dangerous_env() {
         .with_env("SAFE_VAR", "ok");
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     let envs: Vec<_> = cmd
@@ -870,7 +932,7 @@ fn test_writable_root_priority_cwd_first() {
     config.cwd = Some(cwd_dir.clone());
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     let current_dir = cmd.as_std().get_current_dir();
@@ -895,7 +957,7 @@ fn test_writable_root_priority_workspace_second() {
     // No cwd set, should fall back to workspace_root for sandbox config.
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     // Under Off the sandbox prefix is suppressed, so the assertion is
@@ -932,7 +994,7 @@ fn test_relative_allowed_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_read_path(std::path::PathBuf::from("relative/path"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "relative allowed_read_paths should be rejected"
@@ -941,7 +1003,7 @@ fn test_relative_allowed_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_write_path(std::path::PathBuf::from("another/relative"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "relative allowed_write_paths should be rejected"
@@ -957,7 +1019,7 @@ fn test_double_quote_in_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_read_path(std::path::PathBuf::from("/data/tricky\"path"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "paths with double-quotes should be rejected to prevent SBPL injection"
@@ -966,7 +1028,7 @@ fn test_double_quote_in_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_write_path(std::path::PathBuf::from("/output/also\"bad"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "write paths with double-quotes should also be rejected"
@@ -1028,7 +1090,7 @@ fn test_build_sandboxed_command_rejects_non_utf8_workspace_root() {
     let manager = ServerManager::new(configs).with_workspace_root(bad_path);
 
     let config = ServerConfig::stdio("test", "echo");
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "non-UTF-8 workspace root should be rejected through build_sandboxed_command, got: {result:?}"

@@ -20,6 +20,15 @@ fn bob() -> PrincipalId {
     PrincipalId::new("bob").expect("valid")
 }
 
+#[test]
+fn marker_recovery_folds_duplicate_rows_with_bounded_stack() {
+    let mut markers = vec![Marker::Consumed; 65_536];
+    markers.push(Marker::Revoked);
+    let status = TokenStatus::recover_markers(&markers);
+    assert!(status.is_used());
+    assert!(status.is_revoked());
+}
+
 #[tokio::test]
 async fn test_in_memory_store() {
     let store = CapabilityStore::in_memory();
@@ -437,6 +446,51 @@ async fn test_mark_used_survives_restart() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revoked_and_used_token_stays_closed_after_restart() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
+    let keypair = test_keypair();
+
+    let token = CapabilityToken::create_with_options(
+        ResourcePattern::exact("mcp://test:tool").unwrap(),
+        vec![Permission::Invoke],
+        TokenScope::Persistent,
+        keypair.key_id(),
+        AuditEntryId::new(),
+        &keypair,
+        None,
+        true,
+        default_principal(),
+    );
+
+    let token_id = token.id.clone();
+    store.add(token).await.unwrap();
+    store.mark_used(&token_id).await.unwrap();
+    store.revoke(&token_id).await.unwrap();
+
+    // Reload. Both markers are replayed for the token: a retry neither
+    // consumes it again nor reads it.
+    drop(store);
+    let store2 = CapabilityStore::with_kv_store(kv).await.unwrap();
+    assert!(store2.is_used(&token_id).await);
+    assert!(matches!(
+        store2.get(&token_id).await,
+        Err(CapabilityError::TokenRevoked { .. })
+    ));
+    assert!(matches!(
+        store2.mark_used(&token_id).await,
+        Err(CapabilityError::TokenRevoked { .. })
+    ));
+    assert!(
+        !store2
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
+}
+
 #[tokio::test]
 async fn test_find_capability_excludes_used_single_use() {
     let store = CapabilityStore::in_memory();
@@ -677,4 +731,130 @@ async fn test_persistent_v1_token_rejected_after_upgrade() {
         matches!(result, Err(CapabilityError::InvalidSignature)),
         "v1 tokens must be rejected with InvalidSignature; got {result:?}"
     );
+}
+
+fn single_use_token() -> CapabilityToken {
+    let key = test_keypair();
+    CapabilityToken::create_with_options(
+        ResourcePattern::exact("mcp://test:tool").unwrap(),
+        vec![Permission::Invoke],
+        TokenScope::Persistent,
+        key.key_id(),
+        AuditEntryId::new(),
+        &key,
+        None,
+        true,
+        alice(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_fences_a_validated_token_before_consumption() {
+    let store = Arc::new(CapabilityStore::in_memory());
+    let token = single_use_token();
+    let id = token.id.clone();
+    store.add(token).await.unwrap();
+
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let contender = {
+        let store = Arc::clone(&store);
+        let id = id.clone();
+        tokio::spawn(async move {
+            store
+                .use_checked(&id, move |_| {
+                    checked_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+        })
+    };
+
+    checked_rx.await.unwrap();
+    store.revoke(&id).await.unwrap();
+    resume_tx.send(()).unwrap();
+    assert!(matches!(
+        contender.await.unwrap(),
+        Err(CapabilityError::TokenRevoked { .. })
+    ));
+    assert!(!store.is_used(&id).await);
+}
+
+#[path = "store/canceled_consume_tests.rs"]
+mod canceled_consume;
+
+#[tokio::test]
+async fn operation_binding_mismatch_does_not_consume_the_grant() {
+    let store = CapabilityStore::in_memory();
+    let token = single_use_token();
+    let id = token.id.clone();
+    let validator = crate::CapabilityValidator::new(&store).trust_issuer(token.issuer);
+    store.add(token).await.unwrap();
+
+    assert!(matches!(
+        validator
+            .authorize_by_id(&bob(), "mcp://test:tool", Permission::Invoke, &id)
+            .await,
+        Err(CapabilityError::InvalidSignature),
+    ));
+    assert!(matches!(
+        validator
+            .authorize_by_id(&alice(), "mcp://test:other", Permission::Invoke, &id)
+            .await,
+        Err(CapabilityError::InsufficientPermission { .. }),
+    ));
+    assert!(!store.is_used(&id).await);
+    validator
+        .authorize_by_id(&alice(), "mcp://test:tool", Permission::Invoke, &id)
+        .await
+        .unwrap();
+    assert!(store.is_used(&id).await);
+}
+
+#[tokio::test]
+async fn unreadable_marker_identity_prevents_authority_startup() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    kv.set(NS_REVOKED, "invalid-id", PRESENCE_MARKER.to_vec())
+        .await
+        .unwrap();
+    assert!(matches!(
+        CapabilityStore::with_kv_store(kv).await,
+        Err(CapabilityError::StorageError(_)),
+    ));
+}
+
+#[tokio::test]
+async fn token_markers_keep_uuid_wire_format_and_accept_legacy_spellings() {
+    let uuid = uuid::Uuid::from_bytes([
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ]);
+    let id = TokenId::from_uuid(uuid);
+    let canonical = "01234567-89ab-cdef-fedc-ba9876543210";
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
+    store.mark_used(&id).await.unwrap();
+    store.revoke(&id).await.unwrap();
+    for namespace in [NS_REVOKED, NS_USED] {
+        assert_eq!(kv.list_keys(namespace).await.unwrap(), [canonical]);
+    }
+    for spelling in [
+        uuid.simple().to_string(),
+        canonical.to_uppercase(),
+        uuid.urn().to_string(),
+        uuid.braced().to_string(),
+    ] {
+        let legacy: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        legacy
+            .set(NS_USED, &spelling, PRESENCE_MARKER.to_vec())
+            .await
+            .unwrap();
+        let recovered = CapabilityStore::with_kv_store(legacy).await.unwrap();
+        assert!(recovered.is_used(&id).await);
+    }
 }

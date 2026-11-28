@@ -1,0 +1,156 @@
+//! Resolve and remove device registrations by unique fingerprint.
+
+use vstd::prelude::*;
+
+verus! {
+
+/// Accept the exact selected record only when it has the generation captured at ingress.
+pub(super) fn match_generation<T, F: Fn(&T) -> Option<u128>>(
+    selected: Option<&T>, expected: Option<u128>, generation: F,
+) -> (result: Option<&T>)
+    requires forall|r: &T| #[trigger] generation.requires((r,)),
+    ensures match selected {
+        None => result.is_none(),
+        Some(record) => exists|live: Option<u128>| generation.ensures((record,), live)
+            && result == (if live == expected { Some(record) } else { None }),
+    },
+{
+    let record = selected?;
+    let live = generation(record);
+    let matches = match (live, expected) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        _ => false,
+    };
+    if matches { Some(record) } else { None }
+}
+
+pub(super) open spec fn observed<T, F: Fn(&T) -> &str>(
+    identify: F, registration: T, requested: &str, matched: bool,
+) -> bool {
+    exists|k: &str| identify.ensures((&registration,), k) && (k@ == requested@) == matched
+}
+
+/// Return the unique matching index shared by live admission and revocation.
+fn unique_index<T, F: Fn(&T) -> &str>(
+    registrations: &[T], requested: &str, identify: F,
+) -> (index: Option<usize>)
+    requires forall|r: &T| #[trigger] identify.requires((r,)),
+    ensures
+        match index {
+            Some(i) => i < registrations.len()
+                && forall|j: int| 0 <= j < registrations.len() ==>
+                    observed(identify, #[trigger] registrations@[j], requested, j == i),
+            None => (forall|j: int| 0 <= j < registrations.len() ==>
+                    observed(identify, #[trigger] registrations@[j], requested, false))
+                || exists|i: int, j: int| 0 <= i < j < registrations.len()
+                    && observed(identify, registrations@[i], requested, true)
+                    && observed(identify, registrations@[j], requested, true),
+        },
+{
+    let mut found: Option<usize> = None;
+    let mut i = 0usize;
+    while i < registrations.len()
+        invariant
+            i <= registrations.len(),
+            found matches Some(n) ==> n < i,
+            forall|r: &T| #[trigger] identify.requires((r,)),
+            forall|j: int| 0 <= j < i ==> observed(identify, #[trigger] registrations@[j], requested, found == Some(j as usize)),
+        decreases registrations.len() - i,
+    {
+        let k = identify(&registrations[i]);
+        assert(observed(identify, registrations@[i as int], requested, k@ == requested@));
+        if k == requested {
+            if let Some(_previous) = found {
+                assert(observed(identify, registrations@[_previous as int], requested, true));
+                return None;
+            }
+            found = Some(i);
+        }
+        i = i.saturating_add(1);
+    }
+    found
+}
+
+pub(super) fn resolve_unique<'a, T, F: Fn(&T) -> &str>(
+    registrations: &'a [T], requested: &str, identify: F,
+) -> (selected: Option<&'a T>)
+    requires forall|r: &T| #[trigger] identify.requires((r,)),
+    ensures
+        match selected {
+            Some(device) => exists|i: int| 0 <= i < registrations.len()
+                && *device == registrations@[i]
+                && forall|j: int| 0 <= j < registrations.len() ==>
+                    observed(identify, #[trigger] registrations@[j], requested, j == i),
+            None => (forall|j: int| 0 <= j < registrations.len() ==>
+                    observed(identify, #[trigger] registrations@[j], requested, false))
+                || exists|i: int, j: int| 0 <= i < j < registrations.len()
+                    && observed(identify, registrations@[i], requested, true)
+                    && observed(identify, registrations@[j], requested, true),
+        },
+{
+    let index = unique_index(registrations, requested, identify)?;
+    Some(&registrations[index])
+}
+
+pub(super) open spec fn unique_at<T,F:Fn(&T)->&str>(
+    rows:Seq<T>, key:&str, identify:F, i:int,
+) -> bool {
+    &&& 0 <= i < rows.len()
+    &&& forall|j:int| 0 <= j < rows.len() ==>
+        observed(identify, #[trigger] rows[j], key, j == i)
+}
+
+/// Combine the live profile policy, unique fingerprint and captured generation.
+pub(super) fn active<'a,T,F:Fn(&T)->&str + Copy,G:Fn(&T)->Option<u128> + Copy>(
+    enabled:bool, keypair:bool, rows:&'a [T], key:&str, expected:Option<u128>,
+    identify:F, generation:G,
+) -> (selected:Option<&'a T>)
+    requires
+        forall|r:&T| #[trigger] identify.requires((r,)),
+        forall|r:&T| #[trigger] generation.requires((r,)),
+    ensures match selected {
+        Some(record) => enabled && keypair && generation.ensures((record,),expected)
+            && exists|i:int| unique_at(rows@,key,identify,i) && *record == rows@[i],
+        None => !enabled || !keypair
+            || (forall|j:int| 0 <= j < rows.len() ==> observed(identify, #[trigger] rows@[j],key,false))
+            || (exists|i:int,j:int| 0 <= i < j < rows.len()
+                && observed(identify,rows@[i],key,true) && observed(identify,rows@[j],key,true))
+            || (exists|i:int,g:Option<u128>| unique_at(rows@,key,identify,i)
+                && generation.ensures((&rows@[i],),g) && g != expected),
+    },
+{
+    let keys = super::device_admission::enabled_keys(enabled,keypair,rows)?;
+    let record = resolve_unique(keys,key,identify)?;
+    let ghost i = choose|i:int| 0 <= i < rows.len() && *record == rows@[i]
+        && forall|j:int| 0 <= j < rows.len() ==>
+            observed(identify, #[trigger] rows@[j],key,j == i);
+    assert(unique_at(rows@,key,identify,i));
+    match_generation(Some(record),expected,generation)
+}
+
+/// The key projection in the profile adapter reads the record's fingerprint.
+pub(super) fn remove_unique<T, F: Fn(&T) -> &str>(
+    registrations: &mut Vec<T>, requested: &str, identify: F,
+) -> (removed: Option<T>)
+    requires forall|r: &T| #[trigger] identify.requires((r,)),
+    ensures
+        match removed {
+            Some(device) => exists|index: int| 0 <= index < old(registrations).len()
+                && device == old(registrations)@[index]
+                && final(registrations)@ == old(registrations)@.remove(index)
+                && forall|j: int| 0 <= j < old(registrations).len() ==>
+                    observed(identify, #[trigger] old(registrations)@[j], requested, j == index),
+            None => final(registrations)@ == old(registrations)@
+                && ((forall|j: int| 0 <= j < old(registrations).len() ==>
+                    observed(identify, #[trigger] old(registrations)@[j], requested, false))
+                    || exists|i: int, j: int| 0 <= i < j < old(registrations).len()
+                        && observed(identify, old(registrations)@[i], requested, true)
+                        && observed(identify, old(registrations)@[j], requested, true)),
+        },
+{
+    let index = unique_index(registrations.as_slice(), requested, identify)?;
+    Some(registrations.remove(index))
+}
+
+}

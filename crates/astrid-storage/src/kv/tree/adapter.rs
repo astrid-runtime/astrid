@@ -55,18 +55,19 @@ where
         }
         let blocking = self.blocking_store();
         let cache = self.hot_cache.clone();
-        let cache_owner = owner.clone();
-        let cache_key = composite.clone();
         run_blocking(move || {
-            let (read_root, value) = blocking.read(owner, |context, header| {
-                context
-                    .projected_get(header, &composite)
-                    .map(|value| (header.root, value))
+            let read = super::hot_lookup::PointRead::load(owner, composite, |owner, key| {
+                blocking.read(owner, |context, header| {
+                    context
+                        .projected_get(header, key)
+                        .map(|value| (header.root, value))
+                })
             })?;
-            if let Some(cache) = cache {
-                cache.insert(&cache_owner, read_root, cache_key, value.as_deref());
-            }
-            Ok(value)
+            Ok(read.retain(|owner, key, root, value| {
+                if let Some(cache) = cache {
+                    cache.insert(owner, root, key, value.as_deref());
+                }
+            }))
         })
         .await
     }
@@ -79,19 +80,9 @@ where
         let blocking = self.blocking_store();
         run_blocking(move || {
             blocking.mutate(&owner, |context, header| {
-                let previous = context.projected_get(header, &composite)?;
-                if previous.as_deref() == Some(value.as_slice()) {
-                    return Ok(((), Vec::new(), false));
-                }
-                Ok((
-                    (),
-                    vec![Replacement::observed(
-                        composite.clone(),
-                        previous,
-                        Some(value.clone()),
-                    )],
-                    true,
-                ))
+                Replacement::set_at(header, &composite, &value, |header, key| {
+                    context.projected_get(header, key)
+                })
             })
         })
         .await
@@ -261,22 +252,13 @@ where
         let blocking = self.blocking_store();
         run_blocking(move || {
             blocking.mutate(&owner, |context, header| {
-                let current = context.projected_get(header, &composite)?;
-                if current.as_deref() != expected.as_deref() {
-                    return Ok((false, Vec::new(), false));
-                }
-                if current.as_deref() == Some(new.as_slice()) {
-                    return Ok((true, Vec::new(), false));
-                }
-                Ok((
-                    true,
-                    vec![Replacement::observed(
-                        composite.clone(),
-                        current,
-                        Some(new.clone()),
-                    )],
-                    true,
-                ))
+                Replacement::compare_at(
+                    header,
+                    &composite,
+                    expected.as_deref(),
+                    &new,
+                    |header, key| context.projected_get(header, key),
+                )
             })
         })
         .await

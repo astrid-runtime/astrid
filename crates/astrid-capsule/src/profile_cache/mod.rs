@@ -21,12 +21,38 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
 
+mod command;
 mod load;
 use load::{ProfileLoad, ProfileLoadToken};
 
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{CommandAlwaysGrant, PrincipalProfile, ProfileError, ProfileResult};
+use astrid_core::profile::{
+    CommandAlwaysGrant, DeviceKeyId, PrincipalProfile, ProfileError, ProfileResult,
+};
+use astrid_events::ipc::DeviceStamp;
+
+fn current_consent_device(profile: &PrincipalProfile, stamp: DeviceStamp<'_>) -> bool {
+    match stamp.fingerprint {
+        Some(raw) => DeviceKeyId::new(raw).ok().is_some_and(|key| {
+            profile
+                .active_registration(&key, stamp.registration)
+                .is_some()
+        }),
+        None => stamp.registration.is_none(),
+    }
+}
+
+/// Outcome of removing a key from an existing principal profile.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeviceRemoval {
+    /// The profile file did not exist when the update began.
+    PrincipalMissing,
+    /// The profile exists and has no matching key.
+    DeviceMissing,
+    /// The updated file is published and the cached principal invalidated.
+    Removed(DeviceKeyId),
+}
 
 /// Lazy, process-lifetime cache of resolved [`PrincipalProfile`] values.
 ///
@@ -108,6 +134,11 @@ impl PrincipalProfileCache {
         Ok(profile)
     }
 
+    /// Profile root captured by this kernel, including for uncached authentication.
+    pub(crate) fn home(&self) -> &AstridHome {
+        &self.astrid_home
+    }
+
     /// Resolve the profile for `principal`, populating the cache on first use.
     ///
     /// The first call for a given principal reads
@@ -180,6 +211,34 @@ impl PrincipalProfileCache {
         state.invalidate(principal);
     }
 
+    /// Remove a paired device while serializing the full profile update with consent writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a profile error if the existing file cannot be read, validated or saved.
+    pub fn remove_paired_device(
+        &self,
+        principal: &PrincipalId,
+        key: &DeviceKeyId<impl AsRef<str>>,
+    ) -> ProfileResult<DeviceRemoval> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut profile = match PrincipalProfile::load_required(&self.astrid_home, principal) {
+            Err(ProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DeviceRemoval::PrincipalMissing);
+            },
+            result => result?,
+        };
+        let Some(removed) = profile.auth.remove_device(key) else {
+            return Ok(DeviceRemoval::DeviceMissing);
+        };
+        profile.save(&self.astrid_home, principal)?;
+        state.invalidate(principal);
+        Ok(DeviceRemoval::Removed(removed))
+    }
+
     /// Persist an operator-consented local-egress endpoint to `principal`'s
     /// profile on disk under `capsule_id` (`network.capsule_egress[capsule_id]`),
     /// then invalidate the cache so the next resolve reloads it.
@@ -214,7 +273,13 @@ impl PrincipalProfileCache {
         capsule_id: &str,
         endpoint: &str,
     ) -> ProfileResult<()> {
-        self.persist_egress_for_profile(principal, capsule_id, endpoint, None)
+        self.persist_egress_for_profile(
+            principal,
+            capsule_id,
+            endpoint,
+            None,
+            [DeviceStamp::default(); 2],
+        )
     }
 
     pub(crate) fn persist_egress_for_profile(
@@ -223,6 +288,7 @@ impl PrincipalProfileCache {
         capsule_id: &str,
         endpoint: &str,
         expected: Option<&Arc<PrincipalProfile>>,
+        devices: [DeviceStamp<'_>; 2],
     ) -> ProfileResult<()> {
         // Serialize the load-modify-save against any other writer on this cache
         // (and against a concurrent `resolve` populating the same key) by
@@ -256,6 +322,14 @@ impl PrincipalProfileCache {
         if expected.is_some_and(|admitted| admitted.as_ref() != &profile) {
             return Err(ProfileError::Invalid(
                 "principal profile changed on disk during consent".into(),
+            ));
+        }
+        if !devices
+            .into_iter()
+            .all(|stamp| current_consent_device(&profile, stamp))
+        {
+            return Err(ProfileError::Invalid(
+                "egress approval device registration changed".into(),
             ));
         }
         let entries = profile
@@ -300,7 +374,7 @@ impl PrincipalProfileCache {
     /// The load-modify-save runs under the same cache write lock as
     /// [`Self::persist_egress`]. Both methods load the current profile from
     /// disk while holding that lock, so these two methods cannot drop each
-    /// other's writes. Other profile writers do not share this lock.
+    /// other's writes. Paired-device removal uses this lock as well.
     ///
     /// Host persist always supplies `Some(pristine hosted portal path)`, not
     /// the process-local `CoW` merged path. This method does not invent a
@@ -329,6 +403,7 @@ impl PrincipalProfileCache {
             command,
             workspace_root,
             astrid_core::profile::CommandApprovalLocation::Hosted,
+            [Default::default(); 2],
         )
     }
 
@@ -346,15 +421,45 @@ impl PrincipalProfileCache {
             command,
             None,
             astrid_core::profile::CommandApprovalLocation::AstridWorkspace,
+            [Default::default(); 2],
         )
     }
 
-    fn persist_command_at(
+    /// Keep paired-device removal excluded until the in-memory session grant is installed.
+    pub(crate) fn with_session_devices(
+        &self,
+        principal: &PrincipalId,
+        devices: [DeviceStamp<'_>; 2],
+        expected: Option<&Arc<PrincipalProfile>>,
+        install: impl FnOnce(),
+    ) -> ProfileResult<()> {
+        let guard = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = self.load_consent_profile(principal)?;
+        if expected.is_some_and(|snapshot| {
+            !guard
+                .profiles
+                .get(principal)
+                .is_some_and(|p| Arc::ptr_eq(p, snapshot))
+                || snapshot.as_ref() != &profile
+        }) {
+            return Err(ProfileError::Invalid(
+                "principal profile changed during consent".into(),
+            ));
+        }
+        command::on_current_profile(profile, devices, current_consent_device, |_| install())
+            .ok_or_else(|| ProfileError::Invalid("approval device registration changed".into()))
+    }
+
+    pub(crate) fn persist_command_at(
         &self,
         principal: &PrincipalId,
         command: &str,
         workspace_root: Option<&str>,
         location: astrid_core::profile::CommandApprovalLocation,
+        devices: [astrid_events::ipc::DeviceStamp<'_>; 2],
     ) -> ProfileResult<()> {
         let command = command.trim();
         if command.is_empty() {
@@ -387,26 +492,29 @@ impl PrincipalProfileCache {
 
         let path = self.astrid_home.profile_path(principal);
         // Approval cannot resurrect a principal removed while the prompt was open.
-        let mut profile = self.load_consent_profile(principal)?;
+        let profile = self.load_consent_profile(principal)?;
+        // Device removal can have published since the registry guards were acquired.
+        command::on_current_profile(profile, devices, current_consent_device, |mut profile| {
+            let already = profile.approvals.command_always.iter().any(|grant| {
+                grant.command == command
+                    && grant.location == location
+                    && grant.workspace_root.as_deref() == workspace_root
+            });
+            if already {
+                guard.profiles.insert(principal.clone(), Arc::new(profile));
+                return Ok(());
+            }
 
-        let already = profile.approvals.command_always.iter().any(|grant| {
-            grant.command == command
-                && grant.location == location
-                && grant.workspace_root.as_deref() == workspace_root
-        });
-        if already {
-            guard.profiles.insert(principal.clone(), Arc::new(profile));
-            return Ok(());
-        }
-
-        profile.approvals.command_always.push(CommandAlwaysGrant {
-            command: command.to_string(),
-            location,
-            workspace_root: workspace_root.map(str::to_string),
-        });
-        profile.save_to_path(&path)?;
-        guard.invalidate(principal);
-        Ok(())
+            profile.approvals.command_always.push(CommandAlwaysGrant {
+                command: command.to_string(),
+                location,
+                workspace_root: workspace_root.map(str::to_string),
+            });
+            profile.save_to_path(&path)?;
+            guard.invalidate(principal);
+            Ok(())
+        })
+        .ok_or_else(|| ProfileError::Invalid("approval device registration changed".into()))?
     }
 
     /// Number of principals currently cached. Test-only introspection.

@@ -39,6 +39,7 @@
 //! An unknown / `None` / `anonymous` caller, or any profile-resolution
 //! error, yields **no** capsule access — never default-allow.
 
+use astrid_events::ipc::DeviceStamp;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -257,7 +258,7 @@ impl CapsuleAccessResolver {
     pub(crate) fn resolve_access(
         &self,
         principal: Option<&str>,
-        device_key_id: Option<&str>,
+        device_stamp: DeviceStamp<'_>,
     ) -> Option<ResolvedCapsuleAccess> {
         let principal_str = principal?;
         if principal_str.is_empty() || principal_str == "anonymous" {
@@ -295,7 +296,8 @@ impl CapsuleAccessResolver {
             );
             return None;
         }
-        let device_scope = match device_key_id {
+        let device_scope = match device_stamp.fingerprint {
+            None if device_stamp.registration.is_some() => return None,
             None => None,
             Some(raw_key_id) => {
                 let key_id = match DeviceKeyId::new(raw_key_id) {
@@ -311,7 +313,8 @@ impl CapsuleAccessResolver {
                         return None;
                     },
                 };
-                let Some(device) = profile.active_device(&key_id) else {
+                let Some(device) = profile.active_registration(&key_id, device_stamp.registration)
+                else {
                     warn!(
                         security_event = true,
                         principal = %pid,
@@ -346,21 +349,22 @@ impl CapsuleAccessResolver {
     /// principal's exact capsule grant set.
     #[must_use]
     pub fn is_capsule_allowed(&self, principal: Option<&str>, capsule: &CapsuleId) -> bool {
-        self.resolve_access(principal, None)
+        self.resolve_access(principal, DeviceStamp::default())
             .is_some_and(|access| access.is_capsule_allowed(capsule))
     }
 
     /// Return true when the caller may bypass principal-view narrowing.
     #[must_use]
     pub fn is_admin(&self, principal: Option<&str>) -> bool {
-        self.resolve_access(principal, None).is_some_and(|access| {
-            CapabilityCheck::new(
-                access.profile.as_ref(),
-                access.groups.as_ref(),
-                access.principal.clone(),
-            )
-            .has("*")
-        })
+        self.resolve_access(principal, DeviceStamp::default())
+            .is_some_and(|access| {
+                CapabilityCheck::new(
+                    access.profile.as_ref(),
+                    access.groups.as_ref(),
+                    access.principal.clone(),
+                )
+                .has("*")
+            })
     }
 }
 
@@ -402,6 +406,13 @@ mod tests {
 
     fn cap(id: &str) -> CapsuleId {
         CapsuleId::from_static(id)
+    }
+
+    fn stamp(device: &DeviceKey) -> DeviceStamp<'_> {
+        DeviceStamp {
+            fingerprint: Some(&device.key_id),
+            registration: device.registration_id.map(Into::into),
+        }
     }
 
     fn device(seed: char, scope: DeviceScope) -> DeviceKey {
@@ -515,12 +526,7 @@ mod tests {
                 deny: vec!["capsule:access:any".into()],
             },
         );
-        let ids = [
-            full.key_id.clone(),
-            list_only.key_id.clone(),
-            access_any.key_id.clone(),
-            access_denied.key_id.clone(),
-        ];
+
         write(
             &home,
             "root",
@@ -529,17 +535,26 @@ mod tests {
                 capsules: vec!["identity".into()],
                 auth: AuthConfig {
                     methods: vec![AuthMethod::Keypair],
-                    public_keys: vec![full, list_only, access_any, access_denied],
+                    public_keys: vec![
+                        full.clone(),
+                        list_only.clone(),
+                        access_any.clone(),
+                        access_denied.clone(),
+                    ],
                 },
                 ..PrincipalProfile::default()
             },
         );
 
-        let no_device = r.resolve_access(Some("root"), None).unwrap();
-        let full = r.resolve_access(Some("root"), Some(&ids[0])).unwrap();
-        let list_only = r.resolve_access(Some("root"), Some(&ids[1])).unwrap();
-        let access_any = r.resolve_access(Some("root"), Some(&ids[2])).unwrap();
-        let denied = r.resolve_access(Some("root"), Some(&ids[3])).unwrap();
+        let no_device = r
+            .resolve_access(Some("root"), DeviceStamp::default())
+            .unwrap();
+        let full = r.resolve_access(Some("root"), stamp(&full)).unwrap();
+        let list_only = r.resolve_access(Some("root"), stamp(&list_only)).unwrap();
+        let access_any = r.resolve_access(Some("root"), stamp(&access_any)).unwrap();
+        let denied = r
+            .resolve_access(Some("root"), stamp(&access_denied))
+            .unwrap();
         assert!(no_device.is_capsule_allowed(&cap("registry")));
         assert!(full.is_capsule_allowed(&cap("registry")));
         assert!(list_only.has_global_capsule_view());
@@ -564,7 +579,9 @@ mod tests {
             },
         );
 
-        let access = r.resolve_access(Some("operator"), None).unwrap();
+        let access = r
+            .resolve_access(Some("operator"), DeviceStamp::default())
+            .unwrap();
         assert!(access.has_global_capsule_view());
         assert!(access.is_capsule_allowed(&cap("identity")));
         assert!(!access.is_capsule_allowed(&cap("registry")));
@@ -583,7 +600,10 @@ mod tests {
                 ..PrincipalProfile::default()
             },
         );
-        assert!(r.resolve_access(Some("disabled"), None).is_none());
+        assert!(
+            r.resolve_access(Some("disabled"), DeviceStamp::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -602,7 +622,9 @@ mod tests {
             },
         );
 
-        let before = resolver.resolve_access(Some("operator"), None).unwrap();
+        let before = resolver
+            .resolve_access(Some("operator"), DeviceStamp::default())
+            .unwrap();
         assert!(!before.has_global_capsule_view());
         assert!(!before.has_unrestricted_capsule_access());
 
@@ -617,12 +639,16 @@ mod tests {
             )
             .unwrap();
         groups.store(Arc::new(promoted));
-        let promoted = resolver.resolve_access(Some("operator"), None).unwrap();
+        let promoted = resolver
+            .resolve_access(Some("operator"), DeviceStamp::default())
+            .unwrap();
         assert!(promoted.has_global_capsule_view());
         assert!(promoted.has_unrestricted_capsule_access());
 
         groups.store(Arc::new(GroupConfig::builtin_only()));
-        let demoted = resolver.resolve_access(Some("operator"), None).unwrap();
+        let demoted = resolver
+            .resolve_access(Some("operator"), DeviceStamp::default())
+            .unwrap();
         assert!(!demoted.has_global_capsule_view());
         assert!(!demoted.has_unrestricted_capsule_access());
     }
@@ -631,31 +657,43 @@ mod tests {
     fn malformed_unknown_and_revoked_device_ids_fail_closed() {
         let (_d, home, cache, r) = fixture_with_cache();
         let full = device('d', DeviceScope::Full);
-        let full_id = full.key_id.clone();
+
         let mut profile = PrincipalProfile {
             groups: vec![BUILTIN_ADMIN.to_string()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair],
-                public_keys: vec![full],
+                public_keys: vec![full.clone()],
             },
             ..PrincipalProfile::default()
         };
         write(&home, "root", &profile);
 
-        assert!(r.resolve_access(Some("root"), Some(&full_id)).is_some());
+        assert!(r.resolve_access(Some("root"), stamp(&full)).is_some());
         assert!(
-            r.resolve_access(Some("root"), Some("not-a-key-id"))
-                .is_none()
+            r.resolve_access(
+                Some("root"),
+                DeviceStamp {
+                    fingerprint: Some("not-a-key-id"),
+                    ..stamp(&full)
+                }
+            )
+            .is_none()
         );
         assert!(
-            r.resolve_access(Some("root"), Some("0000000000000000"))
-                .is_none()
+            r.resolve_access(
+                Some("root"),
+                DeviceStamp {
+                    fingerprint: Some("0000000000000000"),
+                    ..stamp(&full)
+                }
+            )
+            .is_none()
         );
 
         profile.auth.public_keys.clear();
         write(&home, "root", &profile);
         cache.invalidate(&PrincipalId::new("root").unwrap());
-        assert!(r.resolve_access(Some("root"), Some(&full_id)).is_none());
+        assert!(r.resolve_access(Some("root"), stamp(&full)).is_none());
     }
 
     #[test]
@@ -663,18 +701,17 @@ mod tests {
         let (_dir, home, cache, resolver) = fixture_with_cache();
         let principal = PrincipalId::new("operator").unwrap();
         let key = device('b', DeviceScope::Full);
-        let key_id = key.key_id.clone();
         let mut profile = PrincipalProfile {
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair],
-                public_keys: vec![key],
+                public_keys: vec![key.clone()],
             },
             ..PrincipalProfile::default()
         };
         write(&home, "operator", &profile);
         assert!(
             resolver
-                .resolve_access(Some("operator"), Some(&key_id))
+                .resolve_access(Some("operator"), stamp(&key))
                 .is_some()
         );
 
@@ -684,10 +721,14 @@ mod tests {
             .retain(|method| *method != AuthMethod::Keypair);
         write(&home, "operator", &profile);
         cache.invalidate(&principal);
-        assert!(resolver.resolve_access(Some("operator"), None).is_some());
         assert!(
             resolver
-                .resolve_access(Some("operator"), Some(&key_id))
+                .resolve_access(Some("operator"), DeviceStamp::default())
+                .is_some()
+        );
+        assert!(
+            resolver
+                .resolve_access(Some("operator"), stamp(&key))
                 .is_none()
         );
     }
@@ -696,17 +737,17 @@ mod tests {
     fn one_dispatch_snapshot_cannot_fall_back_after_revocation() {
         let (_d, home, cache, r) = fixture_with_cache();
         let full = device('e', DeviceScope::Full);
-        let full_id = full.key_id.clone();
+
         let mut profile = PrincipalProfile {
             groups: vec![BUILTIN_ADMIN.to_string()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair],
-                public_keys: vec![full],
+                public_keys: vec![full.clone()],
             },
             ..PrincipalProfile::default()
         };
         write(&home, "root", &profile);
-        let in_flight = r.resolve_access(Some("root"), Some(&full_id)).unwrap();
+        let in_flight = r.resolve_access(Some("root"), stamp(&full)).unwrap();
 
         profile.auth.public_keys.clear();
         write(&home, "root", &profile);
@@ -714,6 +755,6 @@ mod tests {
 
         assert!(in_flight.has_global_capsule_view());
         assert!(in_flight.is_capsule_allowed(&cap("registry")));
-        assert!(r.resolve_access(Some("root"), Some(&full_id)).is_none());
+        assert!(r.resolve_access(Some("root"), stamp(&full)).is_none());
     }
 }

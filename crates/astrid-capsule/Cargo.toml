@@ -19,6 +19,7 @@ test-support = []
 # alternate host (e.g. a browser WebAssembly build) can reuse the machinery
 # without the Wasmtime engine. Native-only deps live in the target table below.
 [dependencies]
+vstd = { workspace = true }
 astrid-approval = { workspace = true }
 astrid-capabilities = { workspace = true }
 astrid-capsule-types = { workspace = true }
@@ -103,17 +104,17 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 
 [dev-dependencies]
+wit-component = { workspace = true }
+wit-parser = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-mcp = { workspace = true, features = ["test-support"] }
 astrid-uplink = { workspace = true, features = ["test-support"] }
-# Test-only: build a synthetic `reqwest::Response` (via `reqwest::Response::from`)
-# for hermetic stream-quota tests, with no network.
-http = "1"
 wasm-encoder = { workspace = true, features = ["wasmparser"] }
 wat = { workspace = true }
 
 [lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_verify_core)'] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

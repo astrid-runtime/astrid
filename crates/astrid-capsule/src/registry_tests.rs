@@ -101,34 +101,8 @@ fn recreated_alias_cannot_inherit_old_runtime_generation() {
     assert!(!Arc::ptr_eq(&removed.capsule, &current));
 }
 
-#[test]
-fn removing_system_owner_revokes_every_dependent_view() {
-    let mut registry = CapsuleRegistry::new();
-    let owner = PrincipalId::default();
-    let alice = pid("alice");
-    let bob = pid("bob");
-    let id = CapsuleId::from_static("operator-service");
-    let artifact = test_hash("operator-service-bytes");
-    registry
-        .register_system_runtime(
-            Box::new(MockCapsule::new("operator-service")),
-            artifact.clone(),
-            &owner,
-        )
-        .unwrap();
-    registry.register_existing(&id, &artifact, &alice).unwrap();
-    registry.register_existing(&id, &artifact, &bob).unwrap();
-
-    let removed = registry.unregister_for(&owner, &id).unwrap();
-    assert!(removed.torn_down);
-    assert!(registry.get_for(&alice, &id).is_none());
-    assert!(registry.get_for(&bob, &id).is_none());
-    assert!(registry.is_empty());
-    assert_eq!(removed.removed_principals.len(), 3);
-    for principal in [&owner, &alice, &bob] {
-        assert!(removed.removed_principals.contains(principal));
-    }
-}
+#[path = "registry/departure_tests.rs"]
+mod departure;
 
 #[test]
 fn artifact_replacement_removes_retired_public_source_identity() {
@@ -261,12 +235,22 @@ fn principal_generation_replacement_is_atomic_and_stale_safe() {
         )
         .unwrap();
 
+    let current = replaced.installed(&registry).unwrap();
     assert!(replaced.runtime_id.generation() > old.generation());
+    assert!(!registry.is_current_runtime(&alice, &id, &old));
+    assert_eq!(
+        registry.principals_viewing_runtime(&replaced.runtime_id),
+        vec![alice.clone()]
+    );
     assert_eq!(
         registry.runtime_id_for(&alice, &id),
-        Some(replaced.runtime_id)
+        Some(replaced.runtime_id.clone())
     );
     assert!(Arc::ptr_eq(&replaced.previous, &old_arc));
+    assert!(Arc::ptr_eq(
+        &current,
+        &registry.get_for(&alice, &id).unwrap()
+    ));
     assert!(!Arc::ptr_eq(
         &old_arc,
         &registry.get_for(&alice, &id).unwrap()
@@ -277,6 +261,17 @@ fn principal_generation_replacement_is_atomic_and_stale_safe() {
             .is_none(),
         "a source id for old bytes must not resolve the replacement"
     );
+    let successor = registry
+        .replace_principal_runtime(
+            &replaced.runtime_id,
+            Box::new(MockCapsule::new("replaceable")),
+            test_hash("next"),
+            &alice,
+            uid(1),
+        )
+        .expect("replace the installed generation");
+    assert!(replaced.installed(&registry).is_none());
+    assert!(Arc::ptr_eq(&successor.previous, &current));
 }
 
 #[path = "registry/system_replacement_tests.rs"]
@@ -688,6 +683,9 @@ fn same_hash_creates_one_runtime_per_principal() {
     let bob_capsule = registry.get_for(&bob, &id).expect("bob sees capsule");
     assert!(!Arc::ptr_eq(&alice_capsule, &bob_capsule));
     assert_ne!(alice_runtime, bob_runtime);
+    assert!(registry.is_current_runtime(&alice, &id, &alice_runtime));
+    assert!(!registry.is_current_runtime(&bob, &id, &alice_runtime));
+    assert!(!registry.is_current_runtime(&alice, &id, &bob_runtime));
     assert_eq!(registry.len(), 2);
     assert_eq!(registry.refcount_for_hash(&hash), Some(2));
 
@@ -788,21 +786,17 @@ fn unregister_one_principal_does_not_touch_peer_runtime() {
             uid(2),
         )
         .expect("register bob");
+    let retiring = registry.get_for(&alice, &id).unwrap();
+    let peer = registry.get_for(&bob, &id).unwrap();
     let peer_source = registry.source_id_for(&bob, &id).unwrap();
 
     let removed = registry
         .unregister_for(&alice, &id)
         .expect("alice unregister");
-    assert_eq!(removed.capsule.id().as_str(), "shared-capsule");
+    assert!(Arc::ptr_eq(&removed.capsule, &retiring));
     assert!(removed.torn_down);
-    assert!(
-        registry.get_for(&alice, &id).is_none(),
-        "alice's view no longer contains the capsule"
-    );
-    assert!(
-        registry.get_for(&bob, &id).is_some(),
-        "bob's independent runtime remains registered"
-    );
+    assert!(registry.get_for(&alice, &id).is_none());
+    assert!(Arc::ptr_eq(&registry.get_for(&bob, &id).unwrap(), &peer));
     assert_eq!(registry.len(), 1);
     assert_eq!(registry.refcount_for_hash(&hash), Some(1));
     assert_eq!(
@@ -962,3 +956,6 @@ fn hash_for_and_principals_viewing_hash_separate_two_versions_of_one_id() {
         "two distinct hashes → two runtime instances"
     );
 }
+
+#[path = "registry/source_lookup_tests.rs"]
+mod source_lookup_tests;

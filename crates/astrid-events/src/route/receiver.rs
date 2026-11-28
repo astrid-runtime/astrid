@@ -48,41 +48,32 @@ impl RoutedEventReceiver {
     /// [`try_drain`](Self::try_drain).
     pub fn try_recv_one(&mut self) -> Option<Arc<AstridEvent>> {
         let mut entry = self.route_entry.lock();
-        entry.drr_pop_one()
+        let event = entry.drr_pop_one()?;
+        entry.gate().release(event)
     }
 
     /// Receive one event, optionally bounded by `timeout`. Returns the
     /// first event from the next DRR round.
     pub async fn recv(&mut self, timeout: Option<std::time::Duration>) -> Option<Arc<AstridEvent>> {
+        let gate = self.route_entry.lock().gate().clone();
         loop {
-            // Fast path: pop exactly ONE event. Draining a full batch here
-            // (`drr_drain`) and returning only its first element would discard
-            // the rest of the batch — those events are removed from the queue
-            // but never handed back, so they are lost. The host recv pairs this
-            // single pop with a `try_drain` for the remainder, so taking one
-            // event and leaving the rest in the entry is loss-free even when a
-            // burst of events (e.g. a fan-out where every responder replies at
-            // once) lands between two recv calls.
-            {
-                let mut entry = self.route_entry.lock();
-                if let Some(first) = entry.drr_pop_one() {
-                    return Some(first);
-                }
+            if let Some(event) = self.try_recv_one() {
+                return Some(event);
             }
-
-            // Slow path: park until notified or timeout.
-            match timeout {
-                Some(dur) => {
-                    if astrid_runtime::time::timeout(dur, self.notify.notified())
-                        .await
-                        .is_err()
-                    {
-                        return None;
-                    }
-                },
-                None => {
-                    self.notify.notified().await;
-                },
+            let notified = async {
+                tokio::select! {
+                    () = gate.wait_until_retired() => false,
+                    () = self.notify.notified() => true,
+                }
+            };
+            let retry = match timeout {
+                Some(limit) => astrid_runtime::time::timeout(limit, notified)
+                    .await
+                    .unwrap_or(false),
+                None => notified.await,
+            };
+            if !retry {
+                return None;
             }
         }
     }
@@ -93,7 +84,7 @@ impl RoutedEventReceiver {
         let mut out = Vec::new();
         let mut entry = self.route_entry.lock();
         let _ = entry.drr_drain(&mut out, budget);
-        out
+        entry.gate().release(out).unwrap_or_default()
     }
 
     /// Returns and resets the cumulative count of dropped messages.

@@ -75,7 +75,8 @@ pub struct StorageMountLeaseV1 {
     pub callback_path: PathBuf,
     /// Random bearer secret used only on the private callback endpoint.
     pub lease_token: String,
-    /// Unix epoch second after which callbacks fail closed.
+    /// Current Unix expiry cutoff. Idle expiry or revocation can close the
+    /// lease earlier, and successful renewal can move this cutoff.
     pub expires_at_epoch_secs: u64,
 }
 
@@ -197,15 +198,8 @@ fn canonical_challenge_path(path: &Path) -> Result<String, String> {
         .ok_or_else(|| "challenge path is not valid UTF-8".to_owned())
 }
 
-/// Provider-independent filesystem entry kind.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum StorageFilesystemEntryKindV1 {
-    /// Regular byte file.
-    File,
-    /// Namespace directory.
-    Directory,
-}
+mod operation;
+pub use operation::{StorageFilesystemEntryKindV1, StorageFilesystemOperationV1};
 
 /// Provider-independent filesystem metadata.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -217,74 +211,6 @@ pub struct StorageFilesystemEntryV1 {
     pub kind: StorageFilesystemEntryKindV1,
     /// Logical file length, or zero for a directory.
     pub logical_bytes: u64,
-}
-
-/// One filesystem operation over the owner already bound to the lease.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case", tag = "operation")]
-pub enum StorageFilesystemOperationV1 {
-    /// Read volume presentation and current backing capacity as JSON Data.
-    /// The object contains `volume_name`, `block_size`, `total_blocks`, `free_blocks`,
-    /// and `available_blocks`. Capacity is physical, not a quota reservation.
-    VolumeInfo,
-    /// Inspect a relative path. The empty string is the root.
-    Stat {
-        /// Canonical slash-separated relative path.
-        path: String,
-    },
-    /// Enumerate direct children.
-    ReadDirectory {
-        /// Canonical slash-separated relative path.
-        path: String,
-    },
-    /// Read one exact file range.
-    Read {
-        /// Canonical slash-separated relative path.
-        path: String,
-        /// Initial byte offset.
-        offset: u64,
-        /// Requested byte count, bounded by [`STORAGE_FILESYSTEM_MAX_IO_BYTES`].
-        length: u64,
-    },
-    /// Replace a range, extending with zeroes when necessary.
-    Write {
-        /// Canonical slash-separated relative path.
-        path: String,
-        /// Initial byte offset.
-        offset: u64,
-        /// Replacement bytes, bounded by [`STORAGE_FILESYSTEM_MAX_IO_BYTES`].
-        data: Vec<u8>,
-    },
-    /// Set exact file length, truncating or zero-extending.
-    SetLength {
-        /// Canonical slash-separated relative path.
-        path: String,
-        /// New logical byte length.
-        length: u64,
-    },
-    /// Create an empty regular file or directory.
-    Create {
-        /// Canonical slash-separated relative path.
-        path: String,
-        /// Requested entry kind.
-        kind: StorageFilesystemEntryKindV1,
-    },
-    /// Remove one file or empty directory.
-    Remove {
-        /// Canonical slash-separated relative path.
-        path: String,
-    },
-    /// Rename an entry within the same mounted owner view.
-    Rename {
-        /// Existing relative path.
-        from: String,
-        /// New relative path.
-        to: String,
-        /// Atomically replace a compatible destination when it exists.
-        replace: bool,
-    },
-    /// Flush all acknowledged mutations to durable storage.
-    Sync,
 }
 
 /// One authenticated request on a private mount callback endpoint.

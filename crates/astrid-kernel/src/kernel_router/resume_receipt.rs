@@ -1,11 +1,11 @@
 //! Principal-scoped durable capsule-install resume receipts.
 
+mod validation;
+
 use std::sync::Arc;
 
 use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{
-    CapsuleInstallResumeReceipt, InstalledCapsuleGeneration, KernelResponse,
-};
+use astrid_core::kernel_api::{CapsuleInstallResumeReceipt, KernelResponse};
 use astrid_storage::ScopedKvStore;
 
 use crate::Kernel;
@@ -93,18 +93,18 @@ pub(super) async fn put(
             return KernelResponse::Error(format!("write capsule resume receipt: {error}"));
         },
     };
-    if !swapped {
+    let Some((store, key, encoded)) = validation::after_swap(swapped, (store, key, encoded)) else {
         return KernelResponse::Error(
             "capsule install resume receipt changed concurrently; retry".to_owned(),
         );
-    }
+    };
     let read_back = match store.get(key).await {
         Ok(read_back) => read_back,
         Err(error) => {
             return KernelResponse::Error(format!("verify capsule resume receipt write: {error}"));
         },
     };
-    if read_back.as_deref() != Some(encoded.as_slice()) {
+    if !validation::confirmed(&encoded, read_back.as_deref()) {
         return KernelResponse::Error("capsule resume receipt write did not read back".to_owned());
     }
     KernelResponse::Success(serde_json::json!({ "stored": true }))
@@ -131,20 +131,14 @@ fn principal_store(kernel: &Arc<Kernel>, caller: &PrincipalId) -> Result<ScopedK
 }
 
 fn valid_receipt(receipt: &CapsuleInstallResumeReceipt, key: &str) -> bool {
-    receipt.id == key && is_digest(&receipt.archive_digest) && valid_generation(&receipt.generation)
-}
-
-fn valid_generation(generation: &InstalledCapsuleGeneration) -> bool {
-    is_digest(&generation.archive)
-        && is_digest(&generation.metadata)
-        && is_digest(&generation.authority)
-}
-
-fn is_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    validation::valid(
+        &receipt.id,
+        key,
+        receipt.archive_digest.as_bytes(),
+        receipt.generation.archive.as_bytes(),
+        receipt.generation.metadata.as_bytes(),
+        receipt.generation.authority.as_bytes(),
+    )
 }
 
 #[cfg(test)]
@@ -167,6 +161,101 @@ mod tests {
             id: id.to_owned(),
             archive_digest: "b".repeat(64),
             generation: generation(seed),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_receipt_requests_use_policy_after_the_owner_change() {
+        use crate::kernel_router::{
+            ManagementRateLimiter, handle_request, install_batch::InstallBatchRegistry,
+        };
+        use astrid_core::{
+            identity::PrincipalUid, kernel_api::KernelRequest, profile::PrincipalProfile,
+        };
+        use astrid_events::ipc::{IpcPayload, Topic};
+
+        let home = tempfile::tempdir().unwrap();
+        let kernel = crate::test_kernel_with_home(AstridHome::from_path(home.path())).await;
+        let directory = kernel.principal_directory();
+        let mut limits = ManagementRateLimiter::from_kernel(&kernel);
+        let mut batches = InstallBatchRegistry::default();
+
+        for (alias, request) in [
+            (
+                "receipt-reader",
+                KernelRequest::GetCapsuleInstallResumeReceipt {
+                    id: "capsule".into(),
+                },
+            ),
+            (
+                "receipt-writer",
+                KernelRequest::PutCapsuleInstallResumeReceipt {
+                    receipt: receipt("capsule", 'a'),
+                },
+            ),
+        ] {
+            let owner = PrincipalId::new(alias).unwrap();
+            let old_uid = PrincipalUid::from_bytes(*blake3::hash(alias.as_bytes()).as_bytes());
+            let new_alias = PrincipalId::new(format!("{alias}-retired")).unwrap();
+            let new_uid =
+                PrincipalUid::from_bytes(*blake3::hash(new_alias.as_str().as_bytes()).as_bytes());
+            directory.register(owner.clone(), old_uid).unwrap();
+            let profile = PrincipalProfile {
+                grants: vec!["self:capsule:install".into()],
+                ..Default::default()
+            };
+            profile.save(&kernel.astrid_home, &owner).unwrap();
+            let mut rx = kernel
+                .event_bus
+                .subscribe_topic(Topic::kernel_response(alias).as_str());
+            let guard = kernel.admin_write_lock.lock().await;
+            let mut pending = std::pin::pin!(handle_request(
+                &kernel,
+                &mut limits,
+                &mut batches,
+                Topic::kernel_request(alias),
+                owner.clone(),
+                astrid_events::ipc::DeviceStamp::default(),
+                request
+            ));
+            tokio::select! {
+                biased;
+                () = &mut pending => panic!("receipt ran while the owner change was pending"),
+                () = std::future::ready(()) => {}
+            }
+            directory.rename(old_uid, &owner, new_alias).unwrap();
+            directory.register(owner.clone(), new_uid).unwrap();
+            let disabled = PrincipalProfile {
+                enabled: false,
+                ..profile
+            };
+            disabled.save(&kernel.astrid_home, &owner).unwrap();
+            kernel.profile_cache.invalidate(&owner);
+            drop(guard);
+            pending.await;
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+                panic!("expected IPC response");
+            };
+            let IpcPayload::RawJson(value) = &message.payload else {
+                panic!("expected kernel response");
+            };
+            let response: KernelResponse = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                matches!(&response, KernelResponse::Error(reason) if reason.contains("disabled")),
+                "{response:?}"
+            );
+            assert!(
+                principal_store(&kernel, &owner)
+                    .unwrap()
+                    .get("capsule")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -197,6 +286,28 @@ mod tests {
             get(&kernel, &caller, "scoped-capsule").await,
             KernelResponse::CapsuleInstallResumeReceipt(Some(found)) if found == value
         ));
+    }
+
+    #[tokio::test]
+    async fn receipts_require_the_addressed_capsule_and_a_valid_authority_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let kernel = crate::test_kernel_with_home(AstridHome::from_path(directory.path())).await;
+        let caller = PrincipalId::default();
+        let store = principal_store(&kernel, &caller).unwrap();
+        let other = serde_json::to_vec(&receipt("other", 'a')).unwrap();
+        store.set("target", other.clone()).await.unwrap();
+        assert!(matches!(
+            get(&kernel, &caller, "target").await,
+            KernelResponse::CapsuleInstallResumeReceipt(None)
+        ));
+
+        let mut malformed = receipt("target", 'b');
+        malformed.generation.authority.replace_range(63.., "G");
+        assert!(matches!(
+            put(&kernel, &caller, malformed).await,
+            KernelResponse::Error(_)
+        ));
+        assert_eq!(store.get("target").await.unwrap(), Some(other));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

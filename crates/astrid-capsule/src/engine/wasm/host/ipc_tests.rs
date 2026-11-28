@@ -522,6 +522,9 @@ async fn publish_as_verified_principal_overrides_claimed_name() {
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
     // The framed read recorded the connection's verified principal.
+    state.ingress_publication = crate::engine::wasm::host_state::IngressPublication::from_frame(
+        br#"{"topic":"client.v1.connect","payload":{}}"#,
+    );
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
     let request_owner = astrid_events::ipc::RequestOwnerId::generate();
     state.ingress_request_owner = Some(request_owner);
@@ -599,51 +602,44 @@ async fn publish_as_unbound_connection_is_stamped_anonymous() {
 /// drops `device_key_id`, so the stamping must be observed on the internal
 /// `IpcMessage` the kernel cap-gate actually reads — subscribe straight on
 /// the bus, not through `IpcHost::subscribe`.
-fn first_device_key_id(
+fn first_device_binding(
     receiver: &mut astrid_events::EventReceiver,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<uuid::Uuid>) {
     let event = receiver.try_recv().expect("one published message");
     match &*event {
-        AstridEvent::Ipc { message, .. } => {
-            (message.principal.clone(), message.device_key_id.clone())
-        },
+        AstridEvent::Ipc { message, .. } => (
+            message.device_key_id.clone(),
+            message.device_registration_id,
+        ),
         _ => panic!("expected an Ipc event"),
     }
 }
 
-/// `publish_as` stamps the host-derived `ingress_device_key_id` onto the
-/// outbound message alongside the verified principal, so the kernel cap-gate
-/// can resolve the device's scope. The key_id is host-derived (from the
-/// in-flight connection), never the capsule-supplied name.
 #[tokio::test]
-async fn publish_as_stamps_host_derived_device_key_id() {
+async fn publish_as_refuses_a_device_stamp_without_a_session() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.has_uplink_capability = true;
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     // The framed read recorded the connection's verified principal AND the
     // device key_id that authenticated it.
+    state.ingress_publication = crate::engine::wasm::host_state::IngressPublication::from_frame(
+        br#"{"topic":"client.v1.connect","payload":{}}"#,
+    );
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
     state.ingress_device_key_id = Some("dev-abc123".to_string());
 
     let mut receiver = state.event_bus.subscribe_topic("client.v1.connect");
 
-    IpcHost::publish_as(
+    let result = IpcHost::publish_as(
         &mut state,
         "client.v1.connect".to_string(),
         "{}".to_string(),
         "default".to_string(),
     )
-    .await
-    .expect("publish_as should succeed");
-
-    let (principal, device_key_id) = first_device_key_id(&mut receiver);
-    assert_eq!(principal.as_deref(), Some("claude"));
-    assert_eq!(
-        device_key_id.as_deref(),
-        Some("dev-abc123"),
-        "publish_as must stamp the host-derived device key_id for cap-gate scoping"
-    );
+    .await;
+    assert!(matches!(result, Err(ErrorCode::CapabilityDenied)));
+    assert!(receiver.try_recv().is_none());
 }
 
 /// An unbound (unauthenticated) connection carries no device key_id, so
@@ -669,7 +665,8 @@ async fn publish_as_unbound_stamps_no_device_key_id() {
     .await
     .expect("publish_as should succeed");
 
-    let (_principal, device_key_id) = first_device_key_id(&mut receiver);
+    let (device_key_id, registration) = first_device_binding(&mut receiver);
+    assert_eq!(registration, None);
     assert_eq!(
         device_key_id, None,
         "an unbound connection must not stamp a device key_id"
@@ -691,7 +688,8 @@ async fn self_triggered_publish_stamps_no_device_key_id() {
         .await
         .expect("publish should succeed");
 
-    let (_principal, device_key_id) = first_device_key_id(&mut receiver);
+    let (device_key_id, registration) = first_device_binding(&mut receiver);
+    assert_eq!(registration, None);
     assert_eq!(
         device_key_id, None,
         "a publish without caller context must not borrow forwarding state"
@@ -705,18 +703,20 @@ async fn publish_inherits_device_key_id_from_caller_context() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
-    state.caller_context = Some(
-        caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
-            .with_device_key_id("dev-abc123"),
-    );
+    let generation = uuid::Uuid::new_v4();
+    let mut caller = caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
+        .with_device_key_id("dev-abc123");
+    caller.device_registration_id = Some(generation);
+    state.caller_context = Some(caller);
 
     let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
     IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
         .await
         .expect("publish should succeed");
 
-    let (_principal, device_key_id) = first_device_key_id(&mut receiver);
+    let (device_key_id, registration) = first_device_binding(&mut receiver);
     assert_eq!(device_key_id.as_deref(), Some("dev-abc123"));
+    assert_eq!(registration, Some(generation));
 }
 
 #[tokio::test]
@@ -740,6 +740,20 @@ async fn publish_inherits_authenticated_request_owner_from_caller_context() {
         panic!("expected an Ipc event");
     };
     assert_eq!(message.request_owner, Some(owner));
+}
+
+#[tokio::test]
+async fn invalid_caller_stamp_denies_publication_before_quota_or_delivery() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_owned()];
+    state.caller_context = Some(
+        caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
+            .with_principal("invalid@caller"),
+    );
+    let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
+    let result = IpcHost::publish(&mut state, "capsule.v1.ping".to_owned(), "{}".to_owned()).await;
+    assert!(matches!(result, Err(ErrorCode::CapabilityDenied)));
+    assert!(receiver.try_recv().is_none());
 }
 
 /// Pull the `origin` off the first published message.
@@ -895,6 +909,9 @@ async fn publish_as_bound_connection_stamps_local_socket_origin() {
     state.has_uplink_capability = true;
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     // The framed read off a bound connection recorded LocalSocket.
+    state.ingress_publication = crate::engine::wasm::host_state::IngressPublication::from_frame(
+        br#"{"topic":"client.v1.connect","payload":{}}"#,
+    );
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
     state.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
 

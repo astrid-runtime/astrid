@@ -68,10 +68,26 @@ impl KernelProcessStorageMountBroker {
 #[cfg(any(unix, windows))]
 #[async_trait::async_trait]
 impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorageMountBroker {
-    #[allow(clippy::too_many_lines)]
     async fn mount(
         &self,
         principal: &PrincipalId,
+    ) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
+        let kernel = self
+            .kernel
+            .upgrade()
+            .ok_or_else(|| "kernel has shut down".to_owned())?;
+        let uid = kernel
+            .principal_directory
+            .uid_for(principal)
+            .map_err(|error| error.to_string())?;
+        self.mount_for(principal, uid).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn mount_for(
+        &self,
+        principal: &PrincipalId,
+        principal_uid: astrid_core::PrincipalUid,
     ) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
         let kernel = self
             .kernel
@@ -86,11 +102,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         // capsules for one immutable UID from racing to create duplicate
         // provider pairs; subsequent callers take the cached fast path.
         let projections = self.projections.lock().await;
-        let binding = service.bind(principal).await?;
-        let principal_uid = kernel
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| format!("resolve principal process projection identity: {error}"))?;
+        let binding = service.bind_for_uid(principal, principal_uid).await?;
         let branch_view = match binding.owner {
             StateOwner::Principal(_) => StorageProviderViewV1::Principal(principal.clone()),
             StateOwner::Fleet(uid) => StorageProviderViewV1::Fleet(uid),
@@ -140,20 +152,16 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             None
         };
 
-        let owner_uid = kernel
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| format!("resolve principal owner for HOME: {error}"))?;
-        ensure_owner_home(&kernel, owner_uid).await?;
+        ensure_owner_home(&kernel, principal_uid).await?;
         let parent_pid = std::process::id();
         let parent_start = parent_start_identity(parent_pid)
             .ok_or_else(|| "resolve process creation identity for provider lifetime".to_owned())?;
 
         let provider = platform_process_provider_name();
-        let branch_lease = issue_lease(
+        let branch_lease = issue_bound_lease(
             &kernel,
             principal.clone(),
-            false,
+            LeaseAuthority::Process(principal_uid),
             branch_view,
             StorageFilesystemTargetV1::WorkspaceBranch {
                 workspace: binding.branch,
@@ -163,10 +171,10 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             workspace_mountpoint.clone(),
         )
         .await?;
-        let owner_lease = match issue_lease(
+        let owner_lease = match issue_bound_lease(
             &kernel,
             principal.clone(),
-            false,
+            LeaseAuthority::Process(principal_uid),
             // HOME is always the acting principal's owner-local root.  A
             // principal assigned to a Fleet still receives a private HOME;
             // the Fleet workspace branch above is an explicit separate view.
@@ -190,10 +198,10 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         let shared_lease = if let (StateOwner::Fleet(fleet_uid), Some(shared_mountpoint)) =
             (binding.owner, fleet_shared_mountpoint.as_ref())
         {
-            match issue_lease(
+            match issue_bound_lease(
                 &kernel,
                 principal.clone(),
-                false,
+                LeaseAuthority::Process(principal_uid),
                 StorageProviderViewV1::Fleet(fleet_uid),
                 StorageFilesystemTargetV1::OwnerSubtree {
                     prefix: "shared".to_owned(),

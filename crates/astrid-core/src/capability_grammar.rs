@@ -18,6 +18,8 @@
 //! metacharacters, no double-glob — so that capability strings round-trip
 //! through TOML and the audit log without escaping surprises.
 
+mod matcher;
+
 use thiserror::Error;
 
 /// Upper bound on the total length of a capability pattern, in bytes.
@@ -181,36 +183,14 @@ pub fn validate_capability(cap: &str) -> Result<(), CapabilityGrammarError> {
 ///   must agree.
 #[must_use]
 pub fn capability_matches(pattern: &str, cap: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
+    matcher::matches(pattern.as_bytes(), cap.as_bytes())
+}
 
-    // Walk both strings segment-by-segment with iterators — no Vec
-    // allocation on the hot path. The enforcement preamble evaluates
-    // this on every admin-API request and per-group-capability, so
-    // saving the two `Vec<&str>` collections is worthwhile.
-    let mut pat_iter = pattern.split(':').peekable();
-    let mut cap_iter = cap.split(':');
-
-    loop {
-        match (pat_iter.next(), cap_iter.next()) {
-            (Some("*"), Some(_)) => {
-                // Trailing `*` absorbs every remaining resource segment.
-                // A middle `*` matches exactly one and we continue the loop.
-                if pat_iter.peek().is_none() {
-                    return true;
-                }
-            },
-            (Some(p), Some(c)) => {
-                if p != c {
-                    return false;
-                }
-            },
-            (None, None) => return true,
-            // Pattern and resource had different segment counts.
-            (Some(_), None) | (None, Some(_)) => return false,
-        }
-    }
+/// Whether every concrete capability matching `child` also matches `parent`.
+/// Both patterns must have passed [`validate_capability`].
+#[must_use]
+pub fn capability_pattern_covers(parent: &str, child: &str) -> bool {
+    matcher::covers(parent.as_bytes(), child.as_bytes())
 }
 
 /// Coarse category for dashboard grouping. Dashboards bucket

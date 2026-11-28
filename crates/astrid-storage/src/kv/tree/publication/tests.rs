@@ -86,3 +86,62 @@ fn admitted_checkpoint_cannot_publish_after_no_op_owner_forget() {
     assert!(cache.projections.lock().is_empty());
     assert!(cache.trees.lock().is_empty());
 }
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn only_issuing_durable_engine_publishes_the_sealed_checkpoint() {
+    use crate::engine::{DurableEngine, RecoveryLimits};
+    use crate::kv::tree_tests::Utf8Codec;
+    use crate::principal_state::Blake3ObjectIdentityV1;
+    use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
+
+    let open = |dir: &std::path::Path| {
+        DurableEngine::open(
+            dir,
+            Blake3ObjectIdentityV1,
+            Utf8Codec,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap()
+    };
+    let issuer_dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let issuer = open(issuer_dir.path());
+    let peer = open(peer_dir.path());
+    let owner = "alice".to_owned();
+    let session = issuer.captured_identity_session();
+    let record = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        vec![],
+        vec![],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let id = session.identify(&record);
+    let cache = Arc::new(KvValidationCache::default());
+    let sealed = || {
+        session
+            .seal_transaction(owner.clone(), None, id, vec![(id, record.clone())])
+            .with_kv_checkpoint_publication(|declared_owner, declared_commit| {
+                KvCheckpointPublication::new(
+                    Arc::clone(&cache),
+                    declared_owner.clone(),
+                    declared_commit,
+                    Projection::empty(),
+                    TreeValidation::EMPTY,
+                    cache.memo_epoch(),
+                )
+            })
+    };
+    let peer_root = peer.commit(sealed()).unwrap().root();
+    assert_eq!(peer_root.commit, id);
+    assert!(cache.projections.lock().is_empty());
+    assert!(cache.trees.lock().is_empty());
+
+    let issuer_root = issuer.commit(sealed()).unwrap().root();
+    assert_eq!(issuer_root, peer_root);
+    assert!(cache.projections.lock().contains_key(&owner));
+    assert!(cache.trees.lock().contains_key(&owner));
+}

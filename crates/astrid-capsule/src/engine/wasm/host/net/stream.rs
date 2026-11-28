@@ -8,6 +8,26 @@ use crate::engine::wasm::bindings::astrid::net::host::NetReadStatus;
 /// Bounded timeout on a `connect-tcp` outbound handshake.
 pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Hand Tokio only the address slice accepted for this destination port.
+pub(super) async fn connect_resolved(
+    answers: &[std::net::SocketAddr],
+    port: u16,
+    allowed_ip: impl Fn(std::net::IpAddr) -> bool,
+) -> Result<tokio::net::TcpStream, super::ErrorCode> {
+    super::destinations::connect(
+        answers,
+        port,
+        |address, allowed_port| address.port() == allowed_port && allowed_ip(address.ip()),
+        tokio::net::TcpStream::connect,
+    )
+    .map_err(|error| match error {
+        super::destinations::Refusal::Empty => super::ErrorCode::NameUnresolvable,
+        super::destinations::Refusal::Denied => super::ErrorCode::AirlockRejected,
+    })?
+    .await
+    .map_err(super::map_io_err)
+}
+
 /// Host-side cap on a single byte-stream read/peek buffer.
 pub(super) const MAX_BYTES_PER_CALL: usize = 10 * 1024 * 1024;
 

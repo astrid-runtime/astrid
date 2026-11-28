@@ -16,7 +16,7 @@ async fn production_row(
         kernel,
         Topic::from_raw("astrid.v1.admin.quota.set"),
         caller.clone(),
-        device,
+        crate::kernel_router::tests::capture_test_device(kernel, caller, device.as_deref()),
         AdminKernelRequest {
             request_id: Some("quota-audit".into()),
             kind: AdminRequestKind::QuotaSet {

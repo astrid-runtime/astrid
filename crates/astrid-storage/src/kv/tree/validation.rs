@@ -286,41 +286,27 @@ where
         value: &ValueSlot,
         certificate: ValidatedCheckpoint,
     ) -> StorageResult<Vec<u8>> {
-        use super::node::decode_value;
         use crate::content_dag::{
             read_verified_content, verified_content_from_certified_membership,
         };
-        match value {
-            ValueSlot::Inline(bytes) => Ok(bytes.clone()),
-            ValueSlot::Spilled { object, length } => {
-                let record = self.record(*object)?;
-                if record.format_version() == super::context::value::chunked_value_version() {
-                    let opened = self.open_chunked_value(*object, *length, &record)?;
-                    let membership = certificate
-                        .membership_for_retrieved_file(opened.descriptor().file())
-                        .ok_or_else(|| {
-                            invalid(
-                                *object,
-                                "chunked KV value lacks a matching tree certificate",
-                            )
-                        })?;
-                    let verified = verified_content_from_certified_membership(opened, membership)
-                        .ok_or_else(|| {
-                        invalid(
-                            *object,
-                            "chunked KV value membership disagrees with opened content",
-                        )
-                    })?;
-                    read_verified_content(self, verified).map_err(|error| {
-                        StorageError::Serialization(format!(
-                            "read chunked KV value {object:?}: {error}"
-                        ))
-                    })
-                } else {
-                    decode_value(*object, *length, &record)
-                }
-            },
-        }
+        self.resolve_slot(value, |object, length, record| {
+            let opened = self.open_chunked_value(object, length, record)?;
+            let membership = certificate
+                .membership_for_retrieved_file(opened.descriptor().file())
+                .ok_or_else(|| {
+                    invalid(object, "chunked KV value lacks a matching tree certificate")
+                })?;
+            let verified = verified_content_from_certified_membership(opened, membership)
+                .ok_or_else(|| {
+                    invalid(
+                        object,
+                        "chunked KV value membership disagrees with opened content",
+                    )
+                })?;
+            read_verified_content(self, verified).map_err(|error| {
+                StorageError::Serialization(format!("read chunked KV value {object:?}: {error}"))
+            })
+        })
     }
 
     fn validate_page(

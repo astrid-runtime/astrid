@@ -1,6 +1,6 @@
 //! Caller-coordinated durability batching for principal-root commits.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::storage_model::{ModelError, ObjectId};
 use parking_lot::{Condvar, Mutex};
 
+use super::frontier::Published;
 use super::representations::{PendingRepresentationUpdate, RepresentationStore};
 
 use super::{
@@ -23,6 +24,9 @@ mod cache_admission_tests;
 #[cfg(test)]
 mod checkpoint_publication_tests;
 mod commit_cache;
+#[cfg(test)]
+mod leader_lease_tests;
+mod receipt;
 mod representations_maintenance;
 mod wal;
 
@@ -94,7 +98,7 @@ impl Default for GroupCommitPolicy {
 
 pub(super) struct CommitGroup<P> {
     leader_active: bool,
-    queue: VecDeque<QueuedCommit<P>>,
+    queue: Vec<QueuedCommit<P>>,
     #[cfg(test)]
     drain_gate: Option<DrainGate>,
 }
@@ -116,7 +120,7 @@ impl<P> Default for CommitGroup<P> {
     fn default() -> Self {
         Self {
             leader_active: false,
-            queue: VecDeque::new(),
+            queue: Vec::new(),
             #[cfg(test)]
             drain_gate: None,
         }
@@ -136,53 +140,52 @@ impl<P> CommitGroup<P> {
 /// leave `leader_active` true forever and wedge later commits.
 struct LeaderLease<'a, P> {
     group: &'a Mutex<CommitGroup<P>>,
+    receipt: &'a Arc<CommitReceipt>,
     active: bool,
 }
 
 impl<'a, P> LeaderLease<'a, P> {
-    const fn new(group: &'a Mutex<CommitGroup<P>>) -> Self {
+    const fn new(group: &'a Mutex<CommitGroup<P>>, receipt: &'a Arc<CommitReceipt>) -> Self {
         Self {
             group,
+            receipt,
             active: true,
         }
     }
 
-    fn release(&mut self) -> Option<Arc<CommitReceipt>> {
+    fn release(&mut self) {
         if !self.active {
-            return None;
+            return;
         }
         self.active = false;
-        let mut group = self.group.lock();
-        group
-            .queue
-            .front()
-            .map(|next| Arc::clone(&next.receipt))
-            .or_else(|| {
-                group.leader_active = false;
-                None
-            })
+        let (departing, successor) = {
+            let mut group = self.group.lock();
+            let owns_front = group
+                .queue
+                .first()
+                .is_some_and(|next| Arc::ptr_eq(&next.receipt, self.receipt));
+            let group = &mut *group;
+            QueuedCommit::handoff(&mut group.queue, &mut group.leader_active, owns_front)
+        };
+        if let Some(next) = successor {
+            next.promote();
+        }
+        // A transaction may own a principal with a custom destructor.
+        drop(departing);
     }
 }
 
 impl<P> Drop for LeaderLease<'_, P> {
     fn drop(&mut self) {
-        if let Some(next) = self.release() {
-            next.promote();
-        }
+        self.release();
     }
 }
 
-struct QueuedCommit<P> {
-    transaction: RootTransaction<P>,
-    receipt: Arc<CommitReceipt>,
-    observer: Option<Arc<dyn ProjectionObserver>>,
-}
+type QueuedCommit<P> =
+    receipt::Submission<RootTransaction<P>, CommitReceipt, Option<Arc<dyn ProjectionObserver>>>;
 
-struct AcceptedCommit<P: Ord> {
-    prepared: Prepared<P>,
-    receipt: Arc<CommitReceipt>,
-    observer: Option<Arc<dyn ProjectionObserver>>,
-}
+type AcceptedCommit<P> =
+    receipt::Accepted<Prepared<P>, Arc<CommitReceipt>, Option<Arc<dyn ProjectionObserver>>>;
 
 #[derive(Clone, Copy)]
 struct PendingRepresentations<'a> {
@@ -205,50 +208,42 @@ impl<'a> PendingRepresentations<'a> {
     }
 }
 
-#[derive(Default)]
-struct ReceiptValue {
-    result: Option<Result<CommitOutcome, DurableError>>,
-    promoted: bool,
-}
+use receipt::Action as ReceiptAction;
 
 #[derive(Default)]
 struct CommitReceipt {
-    value: Mutex<ReceiptValue>,
+    value: Mutex<receipt::Slot<Result<CommitOutcome, DurableError>>>,
     ready: Condvar,
 }
 
-enum ReceiptAction {
-    Lead,
-    Complete(Result<CommitOutcome, DurableError>),
+struct WakeReceipts;
+
+impl receipt::Delivery<Arc<CommitReceipt>, Result<CommitOutcome, DurableError>> for WakeReceipts {
+    fn send(&mut self, receipt: Arc<CommitReceipt>, result: Result<CommitOutcome, DurableError>) {
+        receipt.complete(result);
+    }
 }
 
 impl CommitReceipt {
     fn complete(&self, result: Result<CommitOutcome, DurableError>) {
         let mut value = self.value.lock();
-        if value.result.is_none() {
-            value.promoted = false;
-            value.result = Some(result);
+        if value.complete(result) {
             self.ready.notify_one();
         }
     }
 
     fn promote(&self) {
         let mut value = self.value.lock();
-        if value.result.is_none() && !value.promoted {
-            value.promoted = true;
+        if value.promote() {
             self.ready.notify_one();
         }
     }
 
-    fn wait(&self) -> ReceiptAction {
+    fn wait(&self) -> ReceiptAction<Result<CommitOutcome, DurableError>> {
         let mut value = self.value.lock();
         loop {
-            if let Some(result) = value.result.take() {
-                return ReceiptAction::Complete(result);
-            }
-            if value.promoted {
-                value.promoted = false;
-                return ReceiptAction::Lead;
+            if let Some(action) = value.poll() {
+                return action;
             }
             self.ready.wait(&mut value);
         }
@@ -301,22 +296,19 @@ where
     ) -> Result<CommitOutcome, DurableError> {
         let receipt = Arc::new(CommitReceipt::default());
         let mut lead = {
-            let mut group = self.commit_group.lock();
-            group.queue.push_back(QueuedCommit {
+            let mut guard = self.commit_group.lock();
+            let group = &mut *guard;
+            QueuedCommit::enqueue(
+                &mut group.queue,
+                &mut group.leader_active,
                 transaction,
-                receipt: Arc::clone(&receipt),
+                &receipt,
                 observer,
-            });
-            if group.leader_active {
-                false
-            } else {
-                group.leader_active = true;
-                true
-            }
+            )
         };
         loop {
             if lead {
-                self.run_one_commit_group();
+                self.run_one_commit_group(&receipt);
             }
             match receipt.wait() {
                 ReceiptAction::Lead => {
@@ -362,8 +354,8 @@ where
         (entered_rx, release_tx)
     }
 
-    fn run_one_commit_group(&self) {
-        let mut lease = LeaderLease::new(&self.commit_group);
+    fn run_one_commit_group(&self, receipt: &Arc<CommitReceipt>) {
+        let mut lease = LeaderLease::new(&self.commit_group, receipt);
         if !self.group_policy.initial_delay().is_zero() {
             std::thread::sleep(self.group_policy.initial_delay());
         }
@@ -390,14 +382,11 @@ where
 
         let batch: Vec<_> = {
             let mut group = self.commit_group.lock();
-            group.queue.drain(..).collect()
+            QueuedCommit::drain(&mut group.queue)
         };
         self.process_commit_group(batch);
 
-        let next_leader = lease.release();
-        if let Some(next) = next_leader {
-            next.promote();
-        }
+        lease.release();
     }
 
     fn process_commit_group(&self, batch: Vec<QueuedCommit<P>>) {
@@ -439,25 +428,15 @@ where
             &mut pending_frames,
         );
         for request in batch {
-            match self.prepare(
-                &mut inner,
-                request.transaction,
-                &pending_roots,
-                request.observer.as_deref(),
-            ) {
-                Ok(mut prepared) => {
-                    if let Err(error) = reserve_group_frames(&mut prepared, &mut pending_frames) {
-                        completions.push((request.receipt, Err(error)));
-                        continue;
-                    }
-                    pending_roots.insert(prepared.principal.clone(), prepared.root);
-                    accepted.push(AcceptedCommit {
-                        prepared,
-                        receipt: request.receipt,
-                        observer: request.observer,
-                    });
-                },
-                Err(error) => completions.push((request.receipt, Err(error))),
+            match request.prepare(|transaction, observer| {
+                let mut prepared =
+                    self.prepare(&mut inner, transaction, &pending_roots, observer.as_deref())?;
+                reserve_group_frames(&mut prepared, &mut pending_frames)?;
+                prepared.root.stage(&mut pending_roots);
+                Ok(prepared)
+            }) {
+                Ok(entry) => accepted.push(entry),
+                Err((receipt, error)) => completions.push((receipt, Err(error))),
             }
         }
 
@@ -467,9 +446,7 @@ where
                 Err(error) => {
                     drop(inner);
                     complete_failed_group(&mut completions, accepted, error);
-                    for (receipt, result) in completions {
-                        receipt.complete(result);
-                    }
+                    receipt::deliver(&mut WakeReceipts, completions);
                     return;
                 },
             };
@@ -487,9 +464,7 @@ where
         // Releasing superseded value buffers can be expensive; the writer
         // must already be available to other principals.
         drop(retired_projections);
-        for (receipt, result) in completions {
-            receipt.complete(result);
-        }
+        receipt::deliver(&mut WakeReceipts, completions);
         self.warm_published_commits(published_commits);
         // Complete the batch before maintenance. New batches still serialize on
         // the same engine writer while a representation generation is replaced.
@@ -534,51 +509,60 @@ where
         // capture a half-mutated tip.
         let mut publication_poison =
             super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
-        match self.persist_group(inner, representations.as_deref_mut(), &accepted) {
-            Ok(persisted) => {
-                for location in persisted.locations {
-                    inner.index.insert(location.0, location.1);
-                    inner.pending_index_locations.push(location);
+        let persisted = super::frontier::PersistedGroup::persist(accepted, |batch| {
+            self.persist_group(inner, representations.as_deref_mut(), batch)
+        });
+        let published = match persisted {
+            Err(failure) => Err(failure),
+            Ok(group) => group.publish(|persisted| {
+                for (id, location) in persisted.locations {
+                    super::arena_index::publish(
+                        &mut inner.index,
+                        &mut inner.pending_index_locations,
+                        id,
+                        location,
+                    );
                 }
                 debug_assert!(
                     live_files_mut(&mut inner.files)
                         .map_or(true, |files| files.arena_len >= previous_arena_len)
                 );
-                let frontier = self.publish_commit_frontier(inner, persisted.arena_len);
-                if let Err(error) = frontier {
-                    self.mark_requires_recovery(inner);
-                    publication_poison.disarm();
-                    complete_failed_group(completions, accepted, error);
-                } else {
-                    publication_poison.disarm();
-                    for mut accepted in accepted {
-                        retired_projections
-                            .extend(self.publish_durable_root(inner, &mut accepted.prepared));
-                        if let Some((id, payload)) = accepted.prepared.commit.take()
+                self.publish_commit_frontier(inner, persisted.arena_len, persisted.frontier)
+            }),
+        };
+        match published {
+            Ok((published_group, ())) => {
+                publication_poison.disarm();
+                receipt::release(
+                    published_group,
+                    completions,
+                    (inner, retired_projections, published_commits),
+                    |(inner, retired_projections, published_commits), mut prepared| {
+                        let (published, retired) = self.publish_durable_root(inner, &mut prepared);
+                        retired_projections.extend(retired);
+                        if let Some((id, payload)) = prepared.commit.take()
                             && let Some(location) = inner.index.get(&id).copied()
                             && inner.pending_wal.get_object(&id).is_none()
                         {
                             published_commits.insert(
-                                accepted.prepared.principal.clone(),
+                                prepared.root.owner().clone(),
                                 PublishedCommitPayload {
-                                    root: accepted.prepared.root,
+                                    root: published,
                                     arena_generation: inner.arena_generation,
                                     location,
                                     payload,
                                 },
                             );
                         }
-                        completions.push((
-                            accepted.receipt,
-                            Ok(CommitOutcome {
-                                root: accepted.prepared.root,
-                                objects_inserted: accepted.prepared.objects_inserted,
-                            }),
-                        ));
-                    }
-                }
+                        let outcome = CommitOutcome {
+                            root: published,
+                            objects_inserted: prepared.objects_inserted,
+                        };
+                        ((inner, retired_projections, published_commits), outcome)
+                    },
+                );
             },
-            Err(error) => {
+            Err((accepted, error)) => {
                 self.mark_requires_recovery(inner);
                 publication_poison.disarm();
                 complete_failed_group(completions, accepted, error);
@@ -593,33 +577,37 @@ where
         &self,
         inner: &mut DurableInner<P>,
         prepared: &mut Prepared<P>,
-    ) -> Option<crate::kv::RetiredKvProjection> {
+    ) -> (
+        crate::storage_model::RootState,
+        Option<crate::kv::RetiredKvProjection>,
+    ) {
         inner.validated.extend(prepared.validated.iter().copied());
-        inner
-            .roots_by_principal
-            .insert(prepared.principal.clone(), prepared.root);
-        // Publish validation before the lock-free root, without waiting on a
-        // cache lock under the engine writer. The caller releases any evicted
-        // value buffers only after dropping that writer.
-        let retired = prepared
-            .kv_checkpoint_publication
-            .take()
-            .and_then(|publication| publication.try_publish(prepared.root));
-        self.published_roots
-            .publish(&prepared.principal, prepared.root);
-        retired
+        prepared.root.publish(
+            &mut inner.roots_by_principal,
+            |_, _, replacement| {
+                prepared
+                    .kv_checkpoint_publication
+                    .take()
+                    .and_then(|publication| publication.try_publish(replacement))
+            },
+            |owner, replacement, _| self.published_roots.publish(owner, replacement),
+        )
     }
 
     fn publish_commit_frontier(
         &self,
         inner: &mut DurableInner<P>,
         arena_len: u64,
+        frontier: super::CommitFrontier,
     ) -> Result<(), DurableError> {
-        if self.transaction_wal.is_enabled() {
-            Self::advance_wal_arena_frontier(inner, arena_len)
-        } else {
-            self.advance_index_frontier(inner, arena_len)?;
-            self.sync_volume()
+        match frontier {
+            super::CommitFrontier::Wal => Self::advance_wal_arena_frontier(inner, arena_len),
+            super::CommitFrontier::Journal(receipt) => {
+                super::frontier::finish_journal(receipt, || {
+                    self.advance_index_frontier(inner, arena_len)
+                })
+                .map(|_| ())
+            },
         }
     }
 
@@ -727,7 +715,7 @@ where
         }
         self.fail_if(FaultPoint::BeforeRootCas)?;
 
-        self.publish_group_roots(files, accepted)?;
+        let receipt = self.publish_group_roots(files, accepted)?;
         let arena_len = files
             .arena
             .metadata()
@@ -735,6 +723,7 @@ where
             .len();
 
         Ok(Persisted {
+            frontier: super::CommitFrontier::Journal(receipt),
             locations: ids
                 .into_iter()
                 .zip(object_locations)
@@ -748,25 +737,20 @@ where
         &self,
         files: &mut DurableFiles,
         accepted: &[AcceptedCommit<P>],
-    ) -> Result<(), DurableError> {
-        let journals: Vec<_> = accepted
-            .iter()
-            .map(|accepted| accepted.prepared.journal.as_slice())
-            .collect();
+    ) -> Result<super::frontier::JournalFlush<crate::volume::VolumeFile>, DurableError> {
+        let journals =
+            super::frontier::journals(accepted, |entry| entry.prepared.root.journal().as_slice());
         let publication_started = Instant::now();
-        append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
-        record_group(
+        let (encoded, _) =
+            super::format::prepare_frame_batch(&mut files.roots, ROOT_MAGIC, &journals)?;
+        let mut journal = RootJournalBatch {
+            file: &mut files.roots,
             accepted,
-            ProjectionPhase::RootPublication,
             publication_started,
-        );
-        let flush_started = Instant::now();
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush grouped root-journal frames", source))?;
-        record_group(accepted, ProjectionPhase::Flush, flush_started);
-        self.fail_if(FaultPoint::AfterRootCas)
+        };
+        let receipt = super::frontier::persist_journal(&mut journal, &encoded)?;
+        self.fail_if(FaultPoint::AfterRootCas)?;
+        Ok(receipt)
     }
 
     fn append_group_representations<'a>(
@@ -821,6 +805,42 @@ where
             )?);
         }
         representations.append_direct_update(&direct)
+    }
+}
+
+struct RootJournalBatch<'a, P: Ord> {
+    file: &'a mut File,
+    accepted: &'a [AcceptedCommit<P>],
+    publication_started: Instant,
+}
+
+impl<P: Ord> super::frontier::JournalSink for RootJournalBatch<'_, P> {
+    type Error = DurableError;
+    type Container = crate::volume::VolumeFile;
+
+    fn write_batch(&mut self, bytes: &[u8]) -> Result<(), DurableError> {
+        use std::io::Write;
+        self.file
+            .write_all(bytes)
+            .map_err(|source| io_error("append durable frame batch", source))?;
+        record_group(
+            self.accepted,
+            ProjectionPhase::RootPublication,
+            self.publication_started,
+        );
+        Ok(())
+    }
+
+    fn flush_batch(
+        &mut self,
+    ) -> Result<super::frontier::JournalFlush<Self::Container>, DurableError> {
+        let started = Instant::now();
+        let scope = self
+            .file
+            .flush_region()
+            .map_err(|source| io_error("flush grouped root-journal frames", source))?;
+        record_group(self.accepted, ProjectionPhase::Flush, started);
+        Ok(scope)
     }
 }
 
@@ -889,13 +909,9 @@ fn complete_failed_group<P: Ord>(
     accepted: Vec<AcceptedCommit<P>>,
     error: DurableError,
 ) {
-    let mut first = Some(error);
-    for accepted in accepted {
-        completions.push((
-            accepted.receipt,
-            Err(first.take().unwrap_or(DurableError::RequiresRecovery)),
-        ));
-    }
+    receipt::reject(accepted, completions, error, || {
+        DurableError::RequiresRecovery
+    });
 }
 
 #[cfg(test)]

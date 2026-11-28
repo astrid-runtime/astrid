@@ -1,7 +1,7 @@
 //! Admission and LRU access under the cache-state lock.
 
 use super::principals::CachedPrincipals;
-use super::{CacheState, CachedObject, PrincipalEntry, association_weight};
+use super::{CacheState, PrincipalEntry, association_weight, resident};
 use crate::storage_model::{ObjectId, ObjectRecord};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,15 +20,7 @@ impl<P: Clone + Ord> CacheState<P> {
         let tick = self.tick();
         let principal_key = self.principal_key(principal);
         let principals = CachedPrincipals::new(Arc::clone(&principal_key));
-        self.entries.insert(
-            object,
-            CachedObject {
-                record,
-                weight,
-                last_access: tick,
-                principals,
-            },
-        );
+        resident::install(&mut self.entries, object, record, weight, tick, principals);
         self.lru.insert((tick, object));
         let partition = self.principals.entry(principal_key).or_default();
         partition.entries.insert(
@@ -59,21 +51,19 @@ impl<P: Clone + Ord> CacheState<P> {
         let membership = Arc::clone(self.principals.get_key_value(principal)?.0);
         // Resolve both directions before mutating either LRU. Admission owns
         // membership registration; hits only update these existing entries.
-        let partition = self.principals.get_mut(principal)?;
-        let principal_entry = partition.entries.get_mut(&object)?;
-        let entry = self.entries.get_mut(&object)?;
-        #[cfg(debug_assertions)]
-        debug_assert!(entry.principals.contains(&membership));
-        self.clock = self.clock.saturating_add(1);
-        let tick = self.clock;
-        let previous_tick = entry.last_access;
-        entry.last_access = tick;
-        self.lru.remove(&(previous_tick, object));
-        self.lru.insert((tick, object));
-        let previous_tick = principal_entry.last_access;
-        principal_entry.last_access = tick;
-        partition.lru.remove(&(previous_tick, object));
-        partition.lru.insert((tick, object));
-        Some(Arc::clone(&entry.record))
+        resident::visit(
+            principal,
+            object,
+            &mut self.principals,
+            &mut self.entries,
+            &mut self.clock,
+            &mut self.lru,
+            |members| {
+                #[cfg(not(debug_assertions))]
+                let _ = members;
+                #[cfg(debug_assertions)]
+                debug_assert!(members.contains(&membership));
+            },
+        )
     }
 }

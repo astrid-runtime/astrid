@@ -93,17 +93,25 @@ async fn concurrent_repair_of_missing_projection_converges() {
         std::fs::remove_dir_all(&target).expect("clear projection");
     }
 
-    let workers = (0..8).map(|_| {
-        let kernel = Arc::clone(&kernel);
-        let target = target.clone();
-        let principal = principal.clone();
-        let snapshot = snapshot.clone();
-        let manifest = manifest.clone();
-        thread::spawn(move || {
-            kernel.ensure_published_materialization(&target, &principal, &manifest, &snapshot)
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let kernel = Arc::clone(&kernel);
+            let target = target.clone();
+            let barrier = barrier.clone();
+            let snapshot = snapshot.clone();
+            let manifest = manifest.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                kernel.ensure_published_materialization(&target, uid, &manifest, &snapshot)
+            })
         })
-    });
-    let results: Vec<_> = workers.map(|worker| worker.join().expect("join")).collect();
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("join"))
+        .collect();
     for result in &results {
         assert!(
             result.is_ok(),
@@ -111,7 +119,48 @@ async fn concurrent_repair_of_missing_projection_converges() {
         );
     }
     kernel
-        .verify_published_materialization(&target, &principal, &manifest, &snapshot)
+        .verify_published_materialization(&target, uid, &manifest, &snapshot)
         .expect("canonical projection");
     assert!(target.join("Capsule.toml").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repair_rejects_another_owners_snapshot_before_cache_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
+    let capsule = "owned-projection";
+    publish_env_capsule(&kernel, capsule);
+    let (_, snapshot, manifest) = published_target(&kernel, &PrincipalId::default(), capsule);
+    let uid = astrid_core::PrincipalUid::from_bytes([0xf1; 32]);
+    let alias = PrincipalId::new("unrelated-owner").unwrap();
+    kernel.principal_directory.register(alias, uid).unwrap();
+    let digest = blake3::hash(&snapshot.package().archive)
+        .to_hex()
+        .to_string();
+    let target = astrid_capsule_install::resolve_cache_target_dir(
+        &kernel.astrid_home,
+        uid,
+        capsule,
+        &digest,
+        false,
+        None,
+        kernel.workspace_layout(),
+    )
+    .unwrap();
+    assert!(
+        kernel
+            .ensure_published_materialization(&target, uid, &manifest, &snapshot)
+            .is_err()
+    );
+    assert!(!target.exists());
+    std::fs::create_dir_all(&target).unwrap();
+    let sentinel = target.join("existing");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    assert!(
+        kernel
+            .ensure_published_materialization(&target, uid, &manifest, &snapshot)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+    assert!(!target.join("Capsule.toml").exists());
 }

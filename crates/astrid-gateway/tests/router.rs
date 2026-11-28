@@ -90,6 +90,9 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
     })
 }
 
+#[path = "router/device_identity.rs"]
+mod device_identity;
+
 fn fresh_state_with_audit_log() -> (Arc<GatewayState>, Arc<AuditLog>, SessionId) {
     let session_id = SessionId::from_uuid(uuid::Uuid::new_v4());
     let audit_log = Arc::new(AuditLog::in_memory(KeyPair::generate()));

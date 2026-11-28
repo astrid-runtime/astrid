@@ -15,6 +15,19 @@ fn system_generation_replacement_swaps_every_view() {
         )
         .unwrap();
     registry.register_existing(&id, &old_hash, &bob).unwrap();
+    let carol = pid("carol");
+    registry
+        .register_principal_runtime(
+            Box::new(MockCapsule::new("system-service")),
+            test_hash("private-artifact"),
+            &carol,
+            uid(3),
+        )
+        .expect("register an unrelated principal view");
+    let previous = registry.get_for(&bob, &id).unwrap();
+    let private = registry.get_for(&carol, &id).unwrap();
+    let private_source = capsule_source_uuid(&id, &test_hash("private-artifact"));
+    let new_source = capsule_source_uuid(&id, &test_hash("system-new"));
 
     let replaced = registry
         .replace_system_runtime(
@@ -24,6 +37,26 @@ fn system_generation_replacement_swaps_every_view() {
         )
         .unwrap();
 
+    let viewers = registry.principals_viewing_runtime(&replaced.runtime_id);
+    assert_eq!(viewers.len(), 2);
+    assert!(viewers.contains(&alice) && viewers.contains(&bob));
+    assert!(registry.principals_viewing_runtime(&old).is_empty());
+    let current = replaced.installed(&registry).unwrap();
+    for principal in [&alice, &bob] {
+        let routed = registry
+            .find_instance_by_uuid_for(principal, &new_source)
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &routed));
+    }
+    assert!(
+        registry
+            .find_instance_by_uuid_for(&carol, &new_source)
+            .is_none()
+    );
+    let private_route = registry
+        .find_instance_by_uuid_for(&carol, &private_source)
+        .unwrap();
+    assert!(Arc::ptr_eq(&private, &private_route));
     assert_eq!(
         registry.runtime_id_for(&alice, &id),
         Some(replaced.runtime_id.clone())
@@ -32,10 +65,12 @@ fn system_generation_replacement_swaps_every_view() {
         registry.runtime_id_for(&bob, &id),
         Some(replaced.runtime_id)
     );
+    assert!(Arc::ptr_eq(&replaced.previous, &previous));
     assert!(Arc::ptr_eq(
-        &registry.get_for(&alice, &id).unwrap(),
-        &registry.get_for(&bob, &id).unwrap()
+        &current,
+        &registry.get_for(&alice, &id).unwrap()
     ));
+    assert!(Arc::ptr_eq(&current, &registry.get_for(&bob, &id).unwrap()));
 }
 
 #[test]

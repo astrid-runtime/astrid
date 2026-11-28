@@ -104,6 +104,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         ),
         principal: astrid_core::PrincipalId::default(),
         system_runtime: false,
+        runtime_owner_uid: None,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,
@@ -125,6 +126,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         principal_store: None,
         tmp: None,
         invocation_home: None,
+        invocation_storage_uid: None,
         invocation_workspace: None,
         invocation_tmp: None,
         invocation_secret_store: None,
@@ -170,6 +172,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         principal_cancel_tokens: HostState::new_principal_cancel_tokens(),
         invocation_cancel_token: None,
         session_token: None,
+        device_sessions: Default::default(),
         interceptor_handles: Vec::new(),
         allowance_store: None,
         identity_store: None,
@@ -188,12 +191,46 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         client_connections: HostState::new_client_connections(),
         shared_listeners: Arc::new(dashmap::DashMap::new()),
         share_tcp_listeners: false,
+        ingress_publication: None,
         ingress_principal: None,
         ingress_device_key_id: None,
         ingress_request_owner: None,
         ingress_origin: None,
+        ingress_socket: None,
         recv_yielded: false,
         no_yield_windows: 0,
         audit_sink: None,
     }
+}
+
+/// Install a real device stamp and matching on-disk profile for stream tests.
+pub(crate) fn register_stream_caller(
+    state: &mut HostState,
+    path: &std::path::Path,
+) -> astrid_core::profile::DeviceKeyId {
+    use astrid_core::dirs::AstridHome;
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope, PrincipalProfile};
+    use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+    let principal = state.effective_principal();
+    let home = AstridHome::from_path(path);
+    let key = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let key_id = DeviceKeyId::new(key.key_id.clone()).unwrap();
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(key.clone());
+    profile.save(&home, &principal).unwrap();
+    state.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
+    let mut message = IpcMessage::new(
+        Topic::from_raw("stream.test"),
+        IpcPayload::RawJson(serde_json::Value::Null),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(principal.to_string());
+    message.device_key_id = Some(key.key_id);
+    message.device_registration_id = key.registration_id.map(Into::into);
+    state.caller_context = Some(message);
+
+    key_id
 }

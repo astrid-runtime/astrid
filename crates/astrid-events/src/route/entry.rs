@@ -207,6 +207,10 @@ impl RouteEntry {
         }
     }
 
+    pub(super) fn gate(&self) -> &RouteAdmissionGate {
+        &self.gate
+    }
+
     pub(crate) fn with_receipt_publisher(mut self, publisher: Uuid) -> Self {
         self.receipt_publisher = Some(publisher);
         self
@@ -231,35 +235,35 @@ impl RouteEntry {
     ///
     /// [`dispatch_to_routes`]: crate::bus::EventBus
     pub(crate) fn accepts(&self, publisher: &PrincipalKey) -> bool {
+        use super::scope::Scope;
         if !self.gate.is_published() {
             return false;
         }
-        match &self.scope {
-            RouteAdmission::All => true,
-            RouteAdmission::Exact(expected) => expected == publisher,
-            RouteAdmission::PrincipalOrSystem(expected) => {
-                publisher.as_ref().is_none_or(|actual| actual == expected)
-            },
-        }
+        let scope = match &self.scope {
+            RouteAdmission::All => Scope::All,
+            RouteAdmission::Exact(None) => Scope::System,
+            RouteAdmission::Exact(Some(owner)) => Scope::Principal(owner.as_bytes()),
+            RouteAdmission::PrincipalOrSystem(owner) => Scope::PrincipalOrSystem(owner.as_bytes()),
+        };
+        scope.accepts(publisher.as_deref().map(str::as_bytes))
     }
 
-    pub(crate) fn accepts_event(&self, publisher: &PrincipalKey, event: &AstridEvent) -> bool {
-        if !self.accepts(publisher) {
-            return false;
-        }
-        if let (Some(owner), AstridEvent::Ipc { message, .. }) = (self.receipt_publisher, event)
-            && !crate::ipc::delivery_failure::visible_to(message, owner)
-        {
-            return false;
-        }
-        let Some(expected_owner) = self.request_owner else {
-            return true;
+    pub(crate) fn admitted_message<'a>(
+        &self,
+        event: &'a AstridEvent,
+    ) -> Option<&'a crate::ipc::IpcMessage> {
+        let AstridEvent::Ipc { message, .. } = event else {
+            return None;
         };
-        matches!(
-            event,
-            AstridEvent::Ipc { message, .. }
-                if message.request_owner == Some(expected_owner)
-        )
+        (self.accepts(&message.principal)
+            && super::scope::accepts_owner(
+                self.request_owner.map(RequestOwnerId::as_u128),
+                message.request_owner.map(RequestOwnerId::as_u128),
+            )
+            && self
+                .receipt_publisher
+                .is_none_or(|owner| crate::ipc::delivery_failure::visible_to(message, owner)))
+        .then_some(message)
     }
 
     /// Push an event into the route, applying oldest-head eviction under
@@ -268,7 +272,6 @@ impl RouteEntry {
     pub(crate) fn push_with_eviction(
         &mut self,
         event: Arc<AstridEvent>,
-        principal: PrincipalKey,
         budget_bytes: usize,
     ) -> usize {
         // Defence in depth: enforce the self-scope at the very TOP, before
@@ -277,10 +280,10 @@ impl RouteEntry {
         // even if a future caller forgets the `accepts()` gate in
         // `dispatch_to_routes`. A scoped route's budget is therefore only
         // ever consumable by its own principal.
-        if !self.accepts_event(&principal, &event) {
+        let Some(message) = self.admitted_message(&event) else {
             return 0;
-        }
-
+        };
+        let principal = message.principal.clone();
         let msg_size = ipc_size_of(&event);
 
         if msg_size > budget_bytes {

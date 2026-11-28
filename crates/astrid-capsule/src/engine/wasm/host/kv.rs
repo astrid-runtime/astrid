@@ -2,7 +2,8 @@
 //!
 //! Per-(principal, capsule) namespaced key-value store. Reads and writes
 //! are routed to the invoking principal's `ScopedKvStore`, falling back
-//! to the capsule owner's store when no invocation is in scope.
+//! to the runtime load-time store. Principal runtimes use their owner namespace.
+//! The explicit system runtime uses an isolated neutral store.
 
 use crate::engine::wasm::bindings::astrid::kv::host::{self as kv, ErrorCode, KeyPage};
 use crate::engine::wasm::host::util;
@@ -27,40 +28,22 @@ fn store_err(op: &str, msg: impl std::fmt::Display) -> ErrorCode {
 
 impl kv::Host for HostState {
     fn kv_get(&mut self, key: String) -> Result<Option<Vec<u8>>, ErrorCode> {
-        let _operation = self.begin_kv_operation()?;
-        let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-            kv.get(&key).await
-        })
-        .map_err(|e| store_err("kv_get", e))
+        self.with_kv_operation("kv_get", async |kv| kv.get(&key).await)
     }
 
     fn kv_set(&mut self, key: String, value: Vec<u8>) -> Result<(), ErrorCode> {
-        let _operation = self.begin_kv_operation()?;
-        let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-            kv.set(&key, value).await
-        })
-        .map_err(|e| store_err("kv_set", e))
+        self.with_kv_operation("kv_set", async |kv| kv.set(&key, value).await)
     }
 
     fn kv_delete(&mut self, key: String) -> Result<(), ErrorCode> {
-        let _operation = self.begin_kv_operation()?;
-        let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-            kv.delete(&key).await
-        })
-        .map(|_| ())
-        .map_err(|e| store_err("kv_delete", e))
+        self.with_kv_operation("kv_delete", async |kv| kv.delete(&key).await)
+            .map(|_| ())
     }
 
     fn kv_list_keys(&mut self, prefix: String) -> Result<Vec<String>, ErrorCode> {
-        let _operation = self.begin_kv_operation()?;
-        let kv = self.effective_kv().clone();
-        let keys = util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
+        let keys = self.with_kv_operation("kv_list_keys", async |kv| {
             kv.list_keys_with_prefix(&prefix).await
-        })
-        .map_err(|e| store_err("kv_list_keys", e))?;
+        })?;
         if keys.len() > 1024 {
             return Err(ErrorCode::TooLarge);
         }
@@ -73,17 +56,13 @@ impl kv::Host for HostState {
         cursor: Option<String>,
         limit: u32,
     ) -> Result<KeyPage, ErrorCode> {
-        let _operation = self.begin_kv_operation()?;
         // Underlying ScopedKvStore doesn't expose paging yet — emulate by
         // listing-with-prefix then slicing. Acceptable for 1.0 because
         // the store backend has a 1024-key cap; revisit if a capsule
         // legitimately needs unbounded paging.
-        let kv = self.effective_kv().clone();
-        let mut keys =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                kv.list_keys_with_prefix(&prefix).await
-            })
-            .map_err(|e| store_err("kv_list_keys_page", e))?;
+        let mut keys = self.with_kv_operation("kv_list_keys_page", async |kv| {
+            kv.list_keys_with_prefix(&prefix).await
+        })?;
         keys.sort();
         let limit = if limit == 0 { 1024 } else { limit.min(1024) } as usize;
         let start = cursor
@@ -104,12 +83,7 @@ impl kv::Host for HostState {
     }
 
     fn kv_clear_prefix(&mut self, prefix: String) -> Result<u64, ErrorCode> {
-        let _operation = self.begin_kv_operation()?;
-        let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-            kv.clear_prefix(&prefix).await
-        })
-        .map_err(|e| store_err("kv_clear_prefix", e))
+        self.with_kv_operation("kv_clear_prefix", async |kv| kv.clear_prefix(&prefix).await)
     }
 
     fn kv_cas(
@@ -118,7 +92,6 @@ impl kv::Host for HostState {
         expected: Option<Vec<u8>>,
         new: Vec<u8>,
     ) -> Result<(), ErrorCode> {
-        let _operation = self.begin_kv_operation()?;
         // Atomic compare-and-swap is delegated to the storage layer. Every
         // `KvStore` implementation must make the comparison and mutation one
         // linearizable operation. A concurrent capsule's winning commit
@@ -129,23 +102,42 @@ impl kv::Host for HostState {
         // Translate at the boundary so capsule code can pattern-match
         // `Err(CasMismatch)` for the routine lost-race retry and use
         // `?` for everything else.
-        let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-            match kv.compare_and_swap(&key, expected.as_deref(), new).await {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(ErrorCode::CasMismatch),
-                Err(e) => Err(store_err("kv_cas", e)),
-            }
-        })
+        let swapped = self.with_kv_operation("kv_cas", async |kv| {
+            kv.compare_and_swap(&key, expected.as_deref(), new).await
+        })?;
+        if swapped {
+            Ok(())
+        } else {
+            Err(ErrorCode::CasMismatch)
+        }
     }
 }
 
 impl HostState {
-    fn begin_kv_operation(
+    /// Hold lifecycle admission until the backend future returns. The
+    /// callback receives the store selected for this invocation.
+    fn with_kv_operation<T>(
         &self,
-    ) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ErrorCode> {
-        self.begin_host_operation().map_err(|()| {
+        name: &str,
+        operation: impl AsyncFnOnce(&astrid_storage::ScopedKvStore) -> astrid_storage::StorageResult<T>,
+    ) -> Result<T, ErrorCode> {
+        let guard = self.begin_host_operation().map_err(|()| {
             ErrorCode::Unknown("principal capsule view is retired or unauthorized".to_string())
-        })
+        })?;
+        crate::engine::wasm::guest_kv::dispatch(
+            guard,
+            self.effective_kv(),
+            operation,
+            |_owner, store, operation| {
+                util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
+                    let _device = self.begin_device_operation().map_err(|()| {
+                        ErrorCode::Unknown("device registration unavailable".into())
+                    })?;
+                    operation(store)
+                        .await
+                        .map_err(|error| store_err(name, error))
+                })
+            },
+        )
     }
 }

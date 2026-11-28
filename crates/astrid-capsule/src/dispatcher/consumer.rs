@@ -42,7 +42,7 @@ pub(super) async fn run_consumer(
         };
         match next {
             Ok(Some(work)) => {
-                invoke_work(capsule.as_ref(), &key, work).await;
+                invoke_work(&queues, capsule.as_ref(), &key, work).await;
             },
             Ok(None) => {
                 // No queued work or outstanding permits remain. A replacement
@@ -96,6 +96,7 @@ pub(super) fn evict_idle(
 }
 
 async fn invoke_work(
+    queues: &ConsumerQueues,
     capsule: &dyn Capsule,
     key: &(RuntimeId, PrincipalKey),
     work: InterceptorWork,
@@ -111,7 +112,7 @@ async fn invoke_work(
     match wait_graph::ACTIVE_CONSUMER
         .scope(
             key.clone(),
-            capsule.invoke_interceptor(&work.action, &work.payload, caller),
+            queues.invoke(capsule, &work.action, &work.payload, caller),
         )
         .await
     {

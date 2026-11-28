@@ -85,6 +85,21 @@ async fn hosted_always_rejects_empty_portal_identity() {
 }
 
 #[tokio::test]
+async fn unusable_portal_preserves_nonpersistent_decisions() {
+    let home = tempfile::tempdir().unwrap();
+    for (reply, expected) in [
+        ("approve", ApprovalDecision::Approved),
+        ("approve_session", ApprovalDecision::ApprovedSession),
+        ("deny", ApprovalDecision::Denied),
+    ] {
+        let mut state = persistent_test_state(home.path());
+        state.hosted_workspace_root.clear();
+        let response = answer_action_request(state, reply).await.unwrap();
+        assert_eq!(response.decision, expected);
+    }
+}
+
+#[tokio::test]
 async fn durable_always_survives_without_request_owner() {
     let home = tempfile::tempdir().unwrap();
     let persist = answer_action_request(persistent_test_state(home.path()), "approve_always")

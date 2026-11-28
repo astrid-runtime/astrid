@@ -12,12 +12,14 @@ use std::sync::Arc;
 
 type Inner = InMemoryEngine<StateOwner, Blake3ObjectIdentityV1>;
 
-pub(super) struct InterleavingEngine {
-    inner: Inner,
+pub(super) struct InterleavingEngine<E = Inner> {
+    inner: E,
     pub(super) before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-impl PrincipalProjectionEngine<StateOwner> for InterleavingEngine {
+impl<E: PrincipalProjectionEngine<StateOwner>> PrincipalProjectionEngine<StateOwner>
+    for InterleavingEngine<E>
+{
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
         self.inner.identify_object(record)
     }
@@ -52,18 +54,26 @@ impl PrincipalProjectionEngine<StateOwner> for InterleavingEngine {
     }
 
     fn flush_projection(&self) -> Result<(), PrincipalProjectionError> {
-        Ok(())
+        self.inner.flush_projection()
     }
 }
 
-pub(super) fn fixture() -> (
-    Arc<InterleavingEngine>,
-    WorkspaceBranchStore<StateOwner, InterleavingEngine>,
+pub(super) type Fixture<E> = (
+    Arc<InterleavingEngine<E>>,
+    WorkspaceBranchStore<StateOwner, InterleavingEngine<E>>,
     StateOwner,
     WorkspaceUid,
-) {
+);
+
+pub(super) fn fixture() -> Fixture<Inner> {
+    fixture_with_engine(Inner::new(Blake3ObjectIdentityV1))
+}
+
+pub(super) fn fixture_with_engine<E: PrincipalProjectionEngine<StateOwner>>(
+    inner: E,
+) -> Fixture<E> {
     let engine = Arc::new(InterleavingEngine {
-        inner: Inner::new(Blake3ObjectIdentityV1),
+        inner,
         before_commit: Mutex::new(None),
     });
     let content = Arc::new(PrincipalContentStore::from_engine(Arc::clone(&engine)));

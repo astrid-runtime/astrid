@@ -1,11 +1,14 @@
 //! Real first-write routing, sealed opt-in, failure and identity fencing.
 
+mod mirror;
+
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use super::*;
 use crate::engine::wasm::bindings::astrid::sys::host::{Host as SysHost, LogLevel};
 use crate::engine::wasm::test_fixtures::{minimal_host_state, open_log};
+use astrid_core::PrincipalId;
 use astrid_storage::identity::IdentityStore as _;
 
 fn bind(
@@ -19,7 +22,6 @@ fn bind(
     super::bind(
         root,
         directory,
-        principal,
         capsule,
         prune,
         tracker,
@@ -29,7 +31,7 @@ fn bind(
 
 fn install_invocation(state: &mut HostState, principal: &PrincipalId) {
     let uid = state.principal_directory.uid_for(principal).unwrap();
-    super::install_invocation(state, principal, uid);
+    super::install_invocation(state, uid);
 }
 
 fn fixture() -> (
@@ -54,7 +56,7 @@ fn fixture() -> (
         &tracker,
     );
     state.capsule_log = owner.file;
-    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), owner.pending);
+    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), owner.bound);
     (parent, root, state, tracker)
 }
 
@@ -71,8 +73,17 @@ fn caller(state: &mut HostState, principal: &PrincipalId) {
     );
 }
 
-fn contents(root: &NativeLogRoot, pending: &PendingLog) -> String {
-    std::fs::read_to_string(root.home.root().join(&pending.target)).unwrap()
+impl BoundLog {
+    fn deferred(&self) -> &DeferredFile {
+        match &self.source {
+            LogSource::Deferred(file) => file,
+            LogSource::Eager(_) => panic!("expected first-write binding"),
+        }
+    }
+}
+
+fn contents(root: &NativeLogRoot, pending: &BoundLog) -> String {
+    std::fs::read_to_string(root.home.root().join(&pending.deferred().target)).unwrap()
 }
 
 #[tokio::test]
@@ -94,9 +105,9 @@ async fn silent_ten_thousand_bindings_share_one_root_without_native_log_trees() 
         .collect::<Vec<_>>();
     for binding in &bindings {
         assert!(binding.file.is_none());
-        let pending = binding.pending.as_ref().unwrap();
-        assert!(Arc::ptr_eq(&pending.root, &root));
-        assert!(pending.opened.get().is_none());
+        let pending = binding.bound.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&pending.deferred().root, &root));
+        assert!(pending.deferred().opened.get().is_none());
     }
     assert!(state.effective_capsule_log().is_none());
     assert!(!root.home.log_dir().join("principals").exists());
@@ -134,12 +145,18 @@ async fn invocation_file_then_pending_then_owner_precedence_is_preserved() {
             .unwrap()
             .contains("explicit wins")
     );
-    assert!(!root.home.root().join(&invocation.target).exists());
-    assert!(!root.home.root().join(&owner.target).exists());
+    assert!(
+        !root
+            .home
+            .root()
+            .join(&invocation.deferred().target)
+            .exists()
+    );
+    assert!(!root.home.root().join(&owner.deferred().target).exists());
     state.invocation_capsule_log = None;
     state.log(LogLevel::Info, "caller pending wins".into());
     assert!(contents(&root, &invocation).contains("caller pending wins"));
-    assert!(!root.home.root().join(&owner.target).exists());
+    assert!(!root.home.root().join(&owner.deferred().target).exists());
     state.invocation_capsule_log = None;
     state.deferred_logs.clear_invocation();
     state.log(LogLevel::Warn, "owner fallback".into());
@@ -154,7 +171,7 @@ async fn first_open_failure_is_cached_until_binding_reinstallation() {
     astrid_core::platform_fs::ensure_private_directory(&root.home.log_dir()).unwrap();
     std::fs::write(&blocker, b"not a directory").unwrap();
     state.log(LogLevel::Info, "falls back".into());
-    assert!(old.opened.get().is_some_and(Option::is_none));
+    assert!(old.deferred().opened.get().is_some_and(Option::is_none));
     std::fs::remove_file(&blocker).unwrap();
     state.log(LogLevel::Info, "does not retry failed open".into());
     assert!(!blocker.exists());
@@ -166,7 +183,7 @@ async fn first_open_failure_is_cached_until_binding_reinstallation() {
         true,
         &tracker,
     );
-    state.deferred_logs.owner = replacement.pending;
+    state.deferred_logs.owner = replacement.bound;
     state.capsule_log = replacement.file;
     state.log(LogLevel::Info, "new binding retries".into());
     assert!(
@@ -177,7 +194,7 @@ async fn first_open_failure_is_cached_until_binding_reinstallation() {
 
 #[tokio::test]
 async fn existing_history_keeps_eager_today_and_nonempty_previous_logs() {
-    let (_parent, root, state, tracker) = fixture();
+    let (_parent, root, mut state, tracker) = fixture();
     let uid = state.principal_directory.uid_for(&state.principal).unwrap();
     let relative = Path::new("log/principals")
         .join(uid.to_string())
@@ -200,7 +217,10 @@ async fn existing_history_keeps_eager_today_and_nonempty_previous_logs() {
         true,
         &tracker,
     );
-    assert!(binding.pending.is_none());
+    assert!(matches!(
+        binding.bound.as_deref().unwrap().source,
+        LogSource::Eager(_)
+    ));
     assert!(binding.file.is_some());
     let today = history_path
         .parent()
@@ -212,6 +232,15 @@ async fn existing_history_keeps_eager_today_and_nonempty_previous_logs() {
         std::fs::metadata(history_path).unwrap().modified().unwrap(),
         old_modified
     );
+    state.deferred_logs.owner = binding.bound;
+    state.capsule_log = binding.file;
+    assert!(resolve(&mut state, None).file().is_some());
+    tracker.retire(&state.principal);
+    assert!(resolve(&mut state, None).file().is_none());
+    tracker.resume(&state.principal);
+    assert!(resolve(&mut state, None).file().is_some());
+    state.capsule_log = None;
+    assert!(resolve(&mut state, None).file().is_none());
 }
 
 #[tokio::test]
@@ -219,8 +248,11 @@ async fn pending_target_date_is_not_recomputed_on_first_write() {
     let (_parent, root, mut state, _tracker) = fixture();
     let owner = Arc::get_mut(state.deferred_logs.owner.as_mut().unwrap()).unwrap();
     // A binding installed before UTC rollover retains that installation target.
-    owner.target.set_file_name("2001-02-03.log");
-    let expected = root.home.root().join(&owner.target);
+    let LogSource::Deferred(file) = &mut owner.source else {
+        panic!("expected first-write binding")
+    };
+    file.target.set_file_name("2001-02-03.log");
+    let expected = root.home.root().join(&owner.deferred().target);
     state.log(LogLevel::Info, "after midnight".into());
     assert!(
         std::fs::read_to_string(expected)
@@ -245,7 +277,7 @@ async fn pool_return_drops_old_pending_identity_before_next_principal() {
     let new = Arc::clone(state.deferred_logs.invocation.as_ref().unwrap());
     assert_ne!(old.uid, new.uid);
     state.log(LogLevel::Info, "bob only".into());
-    assert!(!root.home.root().join(&old.target).exists());
+    assert!(!root.home.root().join(&old.deferred().target).exists());
     assert!(contents(&root, &new).contains("bob only"));
 }
 
@@ -274,12 +306,11 @@ async fn already_admitted_matching_guard_can_finish_first_open_after_retirement(
     let resolved = owner
         .resolve(Some(&guard))
         .expect("admitted operation must not re-enter admission");
-    assert!(resolved.file.is_some());
-    assert!(root.home.root().join(&owner.target).exists());
-    assert_eq!(
-        tracker.state.lock().unwrap().active.get(&state.principal),
-        Some(&1)
-    );
+    assert!(resolved.file().is_some());
+    assert!(matches!(&resolved,
+        ResolvedLog::Managed(_, admission::Operation::Borrowed { _borrowed: held }) if std::ptr::eq(*held, &guard)));
+    assert!(root.home.root().join(&owner.deferred().target).exists());
+    assert_eq!(tracker.active(&state.principal), 1);
     drop(resolved);
     drop(guard);
     tracker.wait_for_quiescence(&state.principal).await;
@@ -293,24 +324,14 @@ async fn retired_pending_owner_cannot_borrow_a_different_callers_guard() {
     caller(&mut state, &alice);
     let guard = state.begin_host_operation().unwrap().unwrap();
     tracker.retire(&state.principal);
-    assert!(resolve(&mut state, Some(&guard)).file.is_none());
-    assert!(!root.home.root().join(&owner.target).exists());
+    assert!(resolve(&mut state, Some(&guard)).file().is_none());
+    assert!(!root.home.root().join(&owner.deferred().target).exists());
     tracker.resume(&state.principal);
     let resolved = resolve(&mut state, Some(&guard));
-    assert!(resolved.file.is_some());
-    assert_eq!(
-        tracker.state.lock().unwrap().active.get(&state.principal),
-        Some(&1)
-    );
+    assert!(resolved.file().is_some());
+    assert_eq!(tracker.active(&state.principal), 1);
     drop(resolved);
-    assert!(
-        !tracker
-            .state
-            .lock()
-            .unwrap()
-            .active
-            .contains_key(&state.principal)
-    );
+    assert_eq!(tracker.active(&state.principal), 0);
 }
 
 #[tokio::test]
@@ -341,7 +362,7 @@ async fn pending_binding_never_retargets_a_reused_alias() {
     state.principal = principal.clone();
     state.principal_directory = directory.clone();
     let binding = bind(Some(&root), &directory, &principal, "test", true, &tracker);
-    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), binding.pending);
+    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), binding.bound);
     let old = Arc::clone(state.deferred_logs.owner.as_ref().unwrap());
     identity.delete_user(original.id).await.unwrap();
     identity
@@ -352,7 +373,7 @@ async fn pending_binding_never_retargets_a_reused_alias() {
     assert_ne!(old.uid, new_uid);
     state.log(LogLevel::Info, "cannot retarget".into());
     assert!(
-        old.opened.get().is_none(),
+        old.deferred().opened.get().is_none(),
         "deleted UID is refused before an open attempt"
     );
     assert!(!root.home.log_dir().join("principals").exists());
@@ -402,7 +423,7 @@ async fn first_open_holds_directory_binding_against_direct_identity_unregister()
         true,
         state.principal_invocations.as_ref().unwrap(),
     );
-    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), binding.pending);
+    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), binding.bound);
     let pending = Arc::clone(state.deferred_logs.owner.as_ref().unwrap());
     let (entered_tx, entered_rx) = sync_channel(0);
     let (release_tx, release_rx) = sync_channel(0);
@@ -528,8 +549,6 @@ async fn realized_file_poison_preserves_existing_tracing_fallback_behavior() {
     assert!(file.is_poisoned());
     state.log(LogLevel::Error, "fallback after poison".into());
     assert_eq!(contents(&root, &owner).lines().count(), 1);
-    // ERROR duplication and failed-write/poison routing retain the unchanged
-    // sys::log body and its existing should_emit_to_daemon_log regressions.
 }
 
 #[tokio::test]
@@ -602,31 +621,17 @@ async fn admitted_first_sys_log_open_and_write_drain_before_quiescence() {
             .await;
     });
     observed_rx.await.unwrap();
-    let active = tracker
-        .state
-        .lock()
-        .unwrap()
-        .active
-        .get(&principal)
-        .copied();
+    let active = tracker.active(&principal);
     release_tx.send(()).unwrap();
     writer.join().unwrap();
     resume_tx.send(()).unwrap();
     waiter.await.unwrap();
     assert_eq!(
-        active,
-        Some(1),
+        active, 1,
         "the existing operation must cover first open and write"
     );
     assert!(contents(&root, &owner).contains("admitted first write drains"));
-    assert!(
-        !tracker
-            .state
-            .lock()
-            .unwrap()
-            .active
-            .contains_key(&principal)
-    );
+    assert_eq!(tracker.active(&principal), 0);
 }
 
 #[tokio::test]
@@ -658,9 +663,9 @@ async fn live_uid_rename_keeps_pinned_destination_and_admits_the_current_alias()
         true,
         &tracker,
     );
-    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), binding.pending);
+    state.deferred_logs = DeferredBindings::for_factory(Some(Arc::clone(&root)), binding.bound);
     let pending = Arc::clone(state.deferred_logs.owner.as_ref().unwrap());
-    let target = pending.target.clone();
+    let target = pending.deferred().target.clone();
     identity
         .bind_principal_identity(user.id, current_alias.clone(), [0x22; 32])
         .await
@@ -670,19 +675,17 @@ async fn live_uid_rename_keeps_pinned_destination_and_admits_the_current_alias()
     tracker.retire(&current_alias);
     state.log(LogLevel::Info, "current alias is retired".into());
     assert!(
-        pending.opened.get().is_none(),
+        pending.deferred().opened.get().is_none(),
         "admission rejection must allow a later resumed view to retry"
     );
     assert!(!root.home.log_dir().join("principals").exists());
     tracker.resume(&current_alias);
     state.log(LogLevel::Info, "renamed UID still logs".into());
     let admitted = pending.resolve(None).unwrap();
-    assert_eq!(
-        admitted._owner_operation.as_ref().unwrap().principal,
-        current_alias
-    );
+    assert!(matches!(&admitted,
+        ResolvedLog::Managed(_, admission::Operation::Owned { _owned: guard }) if guard.belongs_to(&tracker, &current_alias)));
     drop(admitted);
-    assert_eq!(pending.target, target);
+    assert_eq!(pending.deferred().target, target);
     assert!(contents(&root, &pending).contains("renamed UID still logs"));
     tracker.retire(&current_alias);
     state.log(
@@ -722,16 +725,42 @@ async fn captured_runtime_uid_is_not_relooked_up_when_alias_is_reused_before_bin
     let binding = super::bind(
         Some(&root),
         &directory,
-        &principal,
         "test",
         true,
         &tracker,
         Some(captured_uid),
     );
-    let pending = binding.pending.unwrap();
+    let pending = binding.bound.unwrap();
     assert_eq!(pending.uid, captured_uid);
     assert!(pending.resolve(None).is_none());
     assert!(!root.home.log_dir().join("principals").exists());
+}
+
+#[tokio::test]
+async fn warm_file_classification_uses_the_selected_arc_and_fences_only_its_binding() {
+    let (_parent, _root, mut state, tracker) = fixture();
+    state.log(LogLevel::Info, "populate the managed slot".into());
+    let managed = state.capsule_log.as_ref().unwrap();
+    let binding = state.deferred_logs.owner.as_ref();
+    {
+        let destination = resolve_file(managed, binding, None);
+        assert!(
+            matches!(destination, ResolvedLog::Managed(ref file, _) if Arc::ptr_eq(file, managed))
+        );
+        assert_eq!(tracker.active(&state.principal), 1);
+    }
+    assert_eq!(tracker.active(&state.principal), 0);
+    tracker.retire(&state.principal);
+    assert!(matches!(
+        resolve_file(managed, binding, None),
+        ResolvedLog::Absent
+    ));
+
+    // An embedder may explicitly supply another Arc even for the same OS file.
+    let injected = Arc::new(Mutex::new(managed.lock().unwrap().try_clone().unwrap()));
+    assert!(matches!(resolve_file(&injected, binding, None),
+        ResolvedLog::Explicit(ref file) if Arc::ptr_eq(file, &injected)));
+    assert_eq!(tracker.active(&state.principal), 0);
 }
 
 #[tokio::test]
@@ -773,5 +802,111 @@ async fn warm_log_cannot_borrow_a_reused_alias_guard() {
         .unwrap();
     let peer_operation = tracker.begin(&previous).unwrap();
     tracker.retire(&current);
-    assert!(resolve(&mut state, Some(&peer_operation)).file.is_none());
+    assert!(resolve(&mut state, Some(&peer_operation)).file().is_none());
+}
+
+#[test]
+fn eager_invocation_logs_follow_the_captured_uid() {
+    let home = tempfile::tempdir().unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            concat!(module_path!(), "::eager_invocation_log_child")
+                .split_once("::")
+                .unwrap()
+                .1,
+        ])
+        .env("ASTRID_TEST_EAGER_LOG_HOME", home.path())
+        .env("ASTRID_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("test result: ok. 1 passed"));
+}
+
+#[tokio::test]
+#[ignore = "run by eager_invocation_logs_follow_the_captured_uid with a private home"]
+async fn eager_invocation_log_child() {
+    let Some(private_home) = std::env::var_os("ASTRID_TEST_EAGER_LOG_HOME") else {
+        return;
+    };
+    assert_eq!(std::env::var_os("ASTRID_HOME"), Some(private_home));
+    let (_parent, _root, mut state, tracker) = fixture();
+    state.deferred_logs = DeferredBindings::default();
+    let original = state.principal.clone();
+    let uid = state.principal_directory.uid_for(&original).unwrap();
+    let renamed = PrincipalId::new("renamed-log-owner").unwrap();
+    state
+        .principal_directory
+        .rename(uid, &original, renamed.clone())
+        .unwrap();
+    let replacement: PrincipalUid = "9".repeat(64).parse().unwrap();
+    assert_ne!(replacement, uid);
+    state
+        .principal_directory
+        .register(original, replacement)
+        .unwrap();
+    let logs = AstridHome::resolve().unwrap().log_dir().join("principals");
+    tracker.retire(&renamed);
+    super::install_invocation(&mut state, uid);
+    assert!(state.invocation_capsule_log.is_none());
+    assert!(!logs.exists());
+    tracker.resume(&renamed);
+    super::install_invocation(&mut state, uid);
+    assert!(state.invocation_capsule_log.is_some());
+    assert!(
+        logs.join(uid.to_string())
+            .join(state.capsule_id.as_str())
+            .is_dir()
+    );
+    let log_dir = logs.join(uid.to_string()).join(state.capsule_id.as_str());
+    let rotated = log_dir.join("2000-01-01.log");
+    let file = File::create(&rotated).unwrap();
+    file.set_modified(
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+    )
+    .unwrap();
+    drop(file);
+    let bind_owner = |captured_uid| {
+        super::bind(
+            None,
+            &state.principal_directory,
+            state.capsule_id.as_str(),
+            true,
+            &tracker,
+            captured_uid,
+        )
+    };
+    assert!(bind_owner(None).file.is_none());
+    assert!(rotated.is_file());
+    tracker.retire(&renamed);
+    assert!(bind_owner(Some(uid)).file.is_none());
+    assert!(rotated.is_file());
+    tracker.resume(&renamed);
+    assert!(bind_owner(Some(uid)).file.is_some());
+    assert!(!rotated.exists());
+    let owner = bind_owner(Some(uid));
+    state.capsule_log = owner.file;
+    state.deferred_logs = DeferredBindings::for_factory(None, owner.bound);
+    state.invocation_capsule_log = None;
+    let path = log_dir.join(format!("{}.log", super::super::today_date_string()));
+    state.log(LogLevel::Info, "admitted before retirement".into());
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(before.contains("admitted before retirement"));
+    tracker.retire(&renamed);
+    state.log(LogLevel::Info, "retired owner".into());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    tracker.resume(&renamed);
+    state.log(LogLevel::Info, "admitted after resume".into());
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("admitted after resume")
+    );
+    assert!(!logs.join(replacement.to_string()).exists());
 }

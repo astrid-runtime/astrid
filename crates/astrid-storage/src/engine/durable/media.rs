@@ -46,11 +46,7 @@ pub(in crate::engine::durable) enum StoreLock {
 /// Native files remain available for legacy import and format tests. Runtime
 /// layout two opens the same engine over [`VolumeFile`], so object and root
 /// authority no longer depends on a host directory namespace.
-#[derive(Debug)]
-pub(in crate::engine::durable) enum File {
-    Native(NativeFile),
-    Volume(VolumeFile),
-}
+pub(in crate::engine::durable) type File = super::frontier::Backing<NativeFile, VolumeFile>;
 
 /// Common random-access durable byte stream used by both legacy host files and
 /// Astrid volume regions.
@@ -111,9 +107,12 @@ impl File {
     pub(in crate::engine::durable) fn sync_data(&self) -> io::Result<()> {
         match self {
             Self::Native(file) => file.sync_data(),
-            // ASTVOL1 durability is one container fsync via AstridVolume::sync.
             Self::Volume(_) => Ok(()),
         }
+    }
+
+    pub(super) fn flush_region(&self) -> io::Result<super::frontier::JournalFlush<VolumeFile>> {
+        self.flush_with(NativeFile::sync_data, Clone::clone)
     }
 
     pub(in crate::engine::durable) fn set_len(&self, length: u64) -> io::Result<()> {
@@ -220,10 +219,8 @@ impl DurableIo for File {
     }
 
     fn durable_sync_repaired_tail(&self) -> io::Result<()> {
-        match self {
-            Self::Native(file) => file.sync_data(),
-            Self::Volume(file) => file.sync_data(),
-        }
+        self.persist_repair(NativeFile::sync_data, |region| region)
+            .map(drop)
     }
 
     fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -281,5 +278,23 @@ impl StoreMetadata {
             Self::Native(metadata) => metadata.len(),
             Self::Volume(metadata) => metadata.len(),
         }
+    }
+}
+
+// Tail repair borrows the selected region and propagates the original I/O error.
+impl super::frontier::JournalContainer for &VolumeFile {
+    type Error = io::Error;
+
+    fn sync_container(&mut self) -> io::Result<()> {
+        self.sync_data()
+    }
+}
+
+impl super::frontier::JournalContainer for VolumeFile {
+    type Error = DurableError;
+
+    fn sync_container(&mut self) -> Result<(), DurableError> {
+        self.sync_data()
+            .map_err(|source| super::io_error("flush volume container", source))
     }
 }

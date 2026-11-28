@@ -36,6 +36,8 @@
 //! more than one principal is present — the aggregate is correct either way,
 //! but a single-user budget is really a whole-instance budget.
 
+mod arithmetic;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -377,11 +379,8 @@ impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
         let mut window = cell.lock();
         Self::roll(&mut window, now);
         let reserved = self.reserved_amount(principal);
-        let total = window
-            .fuel_in_window
-            .checked_add(reserved)
-            .and_then(|total| total.checked_add(amount));
-        if total.is_none_or(|total| total > max_fuel_per_sec) {
+        if !arithmetic::reservation_fits(window.fuel_in_window, reserved, amount, max_fuel_per_sec)
+        {
             return None;
         }
 
@@ -453,14 +452,21 @@ impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
             });
             let mut window = cell.lock();
             Self::roll(&mut window, now);
-            if amount != 0
-                && let Some(counter) = self.reserved.get(principal)
-            {
-                let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    Some(value.saturating_sub(amount))
-                });
+            let reservation = if amount == 0 {
+                None
+            } else {
+                self.reserved.get(principal)
+            };
+            let reserved = reservation
+                .as_ref()
+                .map_or(0, |counter| counter.load(Ordering::Relaxed));
+            let (charged, remaining) =
+                arithmetic::settle_amounts(window.fuel_in_window, reserved, amount, actual_fuel);
+            if let Some(counter) = reservation {
+                // Reservation writers hold this same principal's window lock.
+                counter.store(remaining, Ordering::Relaxed);
             }
-            window.fuel_in_window = window.fuel_in_window.saturating_add(actual_fuel);
+            window.fuel_in_window = charged;
             Arc::clone(&window.available)
         };
         // Wake only this owner's waiters, after releasing the accounting lock.

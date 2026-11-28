@@ -243,9 +243,8 @@ pub(super) fn egress_allowed(allowlist: &[String], host: &str, port: u16) -> boo
 /// (`127.0.0.1:1234`) is permitted rather than airlock-rejected.
 pub(super) fn egress_decision(
     allowlist: &[String],
-    url: &str,
+    parsed: &reqwest::Url,
 ) -> Result<Option<Arc<str>>, ErrorCode> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
     let host = parsed.host_str().ok_or(ErrorCode::InvalidRequest)?;
     if let Some(port) = parsed.port_or_known_default()
         && egress_allowed(allowlist, host, port)
@@ -258,16 +257,6 @@ pub(super) fn egress_decision(
         return Err(ErrorCode::AirlockRejected);
     }
     Ok(None)
-}
-
-/// Parse a URL's host and resolved port for the consent prompt. Returns `None`
-/// (declining consent, fail-closed) if the URL is unparseable or has no host /
-/// known-default port — the same shapes `egress_decision` already rejects.
-fn url_host_port(url: &str) -> Option<(String, u16)> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    let host = parsed.host_str()?.to_string();
-    let port = parsed.port_or_known_default()?;
-    Some((host, port))
 }
 
 impl HostState {
@@ -292,26 +281,36 @@ impl HostState {
     /// requires a pre-bless.
     pub(super) fn egress_decision_with_consent(
         &mut self,
-        url: &str,
-    ) -> Result<Option<Arc<str>>, ErrorCode> {
+        url: &reqwest::Url,
+    ) -> Result<
+        (
+            Option<Arc<str>>,
+            super::super::consent_egress::EgressAuthority,
+        ),
+        ErrorCode,
+    > {
         match egress_decision(&self.local_egress, url) {
             Err(ErrorCode::AirlockRejected) => {
-                let Some((host, port)) = url_host_port(url) else {
+                let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
                     return Err(ErrorCode::AirlockRejected);
                 };
-                if self.consent_local_egress(&host, port) {
+                if let Some(authority) = self.admit_local_egress(host, port) {
                     // Consent granted: re-enter the EXEMPT path. The host is
                     // propagated to `SafeDnsResolver.exempt_host` and
                     // `build_redirect_policy(exempt = true)`, so a
                     // consent-granted endpoint behaves identically to a
                     // pre-blessed one (keeps its private literal, refuses
                     // redirects).
-                    Ok(Some(Arc::from(host.as_str())))
+                    Ok((Some(Arc::from(host)), authority))
                 } else {
                     Err(ErrorCode::AirlockRejected)
                 }
             },
-            other => other,
+            Ok(exempt) => self
+                .admit_egress_caller()
+                .map(|authority| (exempt, authority))
+                .ok_or(ErrorCode::CapabilityDenied),
+            Err(error) => Err(error),
         }
     }
 }

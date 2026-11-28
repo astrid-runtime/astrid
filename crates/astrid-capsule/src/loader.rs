@@ -132,7 +132,8 @@ impl CapsuleLoader {
         capsule_dir: PathBuf,
     ) -> CapsuleResult<Box<dyn Capsule>> {
         let manifest = Arc::new(manifest);
-        let mut composite = CompositeCapsule::new(Arc::clone(&manifest))?;
+        let mut composite =
+            CompositeCapsule::new(Arc::clone(&manifest), self.defer_background_activation)?;
 
         // 1. WASM Component Engine
         if !manifest.components.is_empty() {

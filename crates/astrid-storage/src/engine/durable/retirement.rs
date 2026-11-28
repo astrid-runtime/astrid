@@ -60,9 +60,7 @@ where
         // principal entry. Old readers are fenced by the closed lifecycle;
         // the new owner gets the same authenticated root publications.
         let published_roots = PublishedRoots {
-            entries: arc_swap::ArcSwap::new(
-                self.published_roots.entries.swap(Arc::new(BTreeMap::new())),
-            ),
+            entries: arc_swap::ArcSwapOption::new(self.published_roots.entries.swap(None)),
         };
         self.object_cache.clear();
         drop(arbiter);

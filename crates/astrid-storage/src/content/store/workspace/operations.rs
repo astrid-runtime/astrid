@@ -9,9 +9,10 @@ use crate::content_dag::{
     build_content, open_content, read_opened_content, read_opened_content_range,
 };
 use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
-use crate::storage_model::{ModelError, ObjectId, ObjectRecord, ObjectReference};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord};
 
 use super::super::pending_catalog::retain_final_catalog_records;
+use super::retry::Step;
 
 use super::{
     EngineIdentity, EngineSource, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
@@ -19,7 +20,7 @@ use super::{
     WorkspaceFilesystem, WorkspaceUid, list, list_prefix as catalog_list_prefix, lookup,
     make_branch_record, make_branch_record_for_uid, make_promotion_receipt_for_uid, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, prefix_exists as catalog_prefix_exists,
-    selected_catalog, validate_target_prefix, workspace_receipt_label, workspace_ref_label,
+    selected_catalog, validate_target_prefix,
 };
 
 impl<P: Ord, E> WorkspaceBranchStore<P, E> {
@@ -176,8 +177,11 @@ where
             )?;
             let record_id = self.content.engine.identify_object(&record);
             let mut next = header.as_ref().clone();
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                record_id,
+            );
             let mut records = BTreeMap::new();
             records.insert(record_id, record);
             let transaction =
@@ -668,8 +672,7 @@ where
         {
             return Ok(RenameBatchOutcome::DestinationConflict);
         }
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let branch = self.branch(owner, &header, id)?;
             if let Some(plan) = plan
                 && !self.rename_membership_matches(
@@ -680,7 +683,7 @@ where
                     &replacement_set,
                 )?
             {
-                return Ok(RenameBatchOutcome::Replan);
+                return Ok(Step::Done(RenameBatchOutcome::Replan));
             }
             let mut values = Vec::with_capacity(moves.len());
             for (source, destination) in moves {
@@ -688,7 +691,7 @@ where
                     self.content.load_required_for(owner, object)
                 })?
                 else {
-                    return Ok(RenameBatchOutcome::Replan);
+                    return Ok(Step::Done(RenameBatchOutcome::Replan));
                 };
                 if !sources.contains(destination)
                     && !replacement_set.contains(destination)
@@ -697,7 +700,7 @@ where
                     })?
                     .is_some()
                 {
-                    return Ok(RenameBatchOutcome::DestinationConflict);
+                    return Ok(Step::Done(RenameBatchOutcome::DestinationConflict));
                 }
                 values.push(value);
             }
@@ -717,7 +720,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(RenameBatchOutcome::Replan);
+                    return Ok(Step::Done(RenameBatchOutcome::Replan));
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -736,7 +739,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(RenameBatchOutcome::Replan);
+                    return Ok(Step::Done(RenameBatchOutcome::Replan));
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -753,7 +756,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_some() {
-                    return Ok(RenameBatchOutcome::DestinationConflict);
+                    return Ok(Step::Done(RenameBatchOutcome::DestinationConflict));
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -781,17 +784,22 @@ where
             let mut next = header.as_ref().clone();
             next.preserved_state
                 .retain(|reference| parse_workspace_uid(reference.label().as_bytes()) != Some(id));
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), branch_id));
+            super::reference_transition::push_live(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                branch_id,
+            );
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(RenameBatchOutcome::Committed),
-                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(error.into()),
+                Ok(_) => Ok(Step::Done(RenameBatchOutcome::Committed)),
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
+                    Ok(Step::Conflict)
+                },
+                Err(error) => Err(error.into()),
             }
-        }
+        })
     }
 
     /// Atomically publish a branch's working view as the owner's content view.
@@ -804,19 +812,18 @@ where
         owner: &P,
         id: WorkspaceUid,
     ) -> Result<WorkspaceBranchDescriptor<P>, WorkspaceBranchError> {
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let branches = self.decode_branches(owner, &header)?;
             let Some(branch) = branches.iter().find(|branch| branch.id == id) else {
                 if let Some(receipt) = self.completion_receipt(owner, &header, id)? {
-                    return Ok(WorkspaceBranchDescriptor::new(
+                    return Ok(Step::Done(WorkspaceBranchDescriptor::new(
                         owner.clone(),
                         id,
                         receipt.binding_uid,
                         receipt.target_prefix,
                         receipt.base.map(|root| root.object),
                         receipt.working.map(|root| root.object),
-                    ));
+                    )));
                 }
                 return Err(WorkspaceBranchError::NotFound(id));
             };
@@ -857,35 +864,29 @@ where
             self.enforce_catalog_replacement(owner, &header, branch_quota, merged)?;
             let mut next = header.as_ref().clone();
             next.catalog = merged;
-            next.preserved_state.retain(|reference| {
-                parse_workspace_uid(reference.label().as_bytes()) != Some(id)
-                    && parse_workspace_receipt_uid(reference.label().as_bytes()) != Some(id)
-            });
-            next.preserved_state.push(ObjectReference::owns(
-                workspace_receipt_label(id),
-                receipt_id,
-            ));
+            super::reference_transition::rewrite(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                Some(receipt_id),
+            );
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => {
-                    return Ok(WorkspaceBranchDescriptor::new(
-                        owner.clone(),
-                        id,
-                        branch.binding_uid,
-                        branch.target_prefix.clone(),
-                        base,
-                        branch.working.map(|root| root.object),
-                    ));
-                },
+                Ok(_) => Ok(Step::Done(WorkspaceBranchDescriptor::new(
+                    owner.clone(),
+                    id,
+                    branch.binding_uid,
+                    branch.target_prefix.clone(),
+                    base,
+                    branch.working.map(|root| root.object),
+                ))),
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
-                    // A concurrent KV (or unrelated owner component) update
-                    // is harmless; reload and compare the latest content root.
+                    Ok(Step::Conflict)
                 },
-                Err(error) => return Err(error.into()),
+                Err(error) => Err(error.into()),
             }
-        }
+        })
     }
 
     /// Remove a branch without changing the owner's main content view.
@@ -895,8 +896,7 @@ where
 
     /// Drop a branch and release its immutable DAG on the next owner-root GC.
     pub fn drop(&self, owner: &P, id: WorkspaceUid) -> Result<(), WorkspaceBranchError> {
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let has_branch = self
                 .decode_branches(owner, &header)?
                 .iter()
@@ -907,21 +907,20 @@ where
             // spurious NotFound, while an explicit drop of a promotion
             // receipt also releases that durable completion marker.
             if !has_branch && !has_receipt {
-                return Ok(());
+                return Ok(Step::Done(()));
             }
             let mut next = header.as_ref().clone();
-            next.preserved_state.retain(|reference| {
-                parse_workspace_uid(reference.label().as_bytes()) != Some(id)
-                    && parse_workspace_receipt_uid(reference.label().as_bytes()) != Some(id)
-            });
+            super::reference_transition::rewrite(&mut next.preserved_state, id.as_bytes(), None);
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, BTreeMap::new())?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(()),
-                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(error.into()),
+                Ok(_) => Ok(Step::Done(())),
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
+                    Ok(Step::Conflict)
+                },
+                Err(error) => Err(error.into()),
             }
-        }
+        })
     }
 }

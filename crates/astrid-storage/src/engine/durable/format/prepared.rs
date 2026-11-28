@@ -3,8 +3,7 @@
 use std::io::{IoSlice, Write};
 
 use super::{
-    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, SeekFrom,
-    frame_checksum, frame_header, io, io_error,
+    ArenaLocation, DurableError, DurableIo, FRAME_VERSION, SeekFrom, frame_checksum, io, io_error,
 };
 
 // Deliberately below every supported platform's practical iovec ceiling. A
@@ -12,42 +11,17 @@ use super::{
 // avoids a platform-specific syscall limit without rebuilding one large copy.
 const MAX_IO_SLICES: usize = 64;
 
-/// One physical frame with its header and checksum prepared off-lock.
-pub(in crate::engine::durable) struct PreparedFrame {
-    header: [u8; FRAME_HEADER_LEN_USIZE],
-    payload: Vec<u8>,
-    payload_len: u64,
-    checksum: [u8; 32],
-}
+use super::super::{
+    arena_frame::{self, PreparedFrame},
+    arena_vectors,
+};
 
 impl PreparedFrame {
     pub(in crate::engine::durable) fn new(
         magic: [u8; 8],
         payload: Vec<u8>,
     ) -> Result<Self, DurableError> {
-        let payload_len =
-            u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let checksum = frame_checksum(magic, payload_len, &payload);
-        let header = frame_header(magic, payload_len, checksum);
-        Ok(Self {
-            header,
-            payload,
-            payload_len,
-            checksum,
-        })
-    }
-
-    pub(in crate::engine::durable) fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    pub(in crate::engine::durable) fn retained_bytes(&self) -> usize {
-        self.header.len().saturating_add(self.payload.len())
-    }
-
-    fn encoded_len(&self) -> Result<u64, DurableError> {
-        FRAME_HEADER_LEN
-            .checked_add(self.payload_len)
+        Self::prepare(magic, FRAME_VERSION, payload, frame_checksum)
             .ok_or(DurableError::EncodingOverflow)
     }
 }
@@ -60,63 +34,86 @@ pub(in crate::engine::durable) fn append_prepared_frames<F: DurableIo>(
     let base = file
         .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek prepared durable batch append", source))?;
-    let mut offset = base;
     let mut locations = Vec::new();
     locations
         .try_reserve_exact(frames.len())
         .map_err(|_| DurableError::EncodingOverflow)?;
-    for frame in frames {
-        locations.push(ArenaLocation {
-            offset,
-            payload_len: frame.payload_len,
-            checksum: frame.checksum,
-        });
-        offset = offset
-            .checked_add(frame.encoded_len()?)
-            .ok_or(DurableError::EncodingOverflow)?;
+    arena_frame::append(
+        &mut Vectored(file),
+        frames,
+        base,
+        locations,
+        MAX_IO_SLICES / 2,
+    )
+    .map_err(|error| match error {
+        arena_frame::AppendError::Overflow => DurableError::EncodingOverflow,
+        arena_frame::AppendError::Write(error) => error,
+    })
+}
+
+struct Vectored<'a, F>(&'a mut F);
+
+impl<F: DurableIo> arena_frame::Sink for Vectored<'_, F> {
+    type Error = DurableError;
+
+    fn write_chunk(&mut self, batch: &[PreparedFrame]) -> Result<(), DurableError> {
+        let mut slices = arena_vectors::vectors(batch).ok_or(DurableError::EncodingOverflow)?;
+        write_all_vectored(self.0, &mut slices)
+    }
+}
+
+impl<'a> arena_vectors::Part<'a> for IoSlice<'a> {
+    fn borrow(bytes: &'a [u8]) -> Self {
+        IoSlice::new(bytes)
+    }
+}
+
+struct PendingSlices<'a, 'b, 'c, W: ?Sized> {
+    writer: &'a mut W,
+    remaining: &'b mut [IoSlice<'c>],
+}
+
+impl<W: Write + ?Sized> arena_vectors::Cursor for PendingSlices<'_, '_, '_, W> {
+    type Error = io::Error;
+
+    fn empty(&self) -> bool {
+        self.remaining.is_empty()
     }
 
-    for batch in frames.chunks(MAX_IO_SLICES / 2) {
-        let mut slices = Vec::new();
-        slices
-            .try_reserve_exact(batch.len().saturating_mul(2))
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        for frame in batch {
-            slices.push(IoSlice::new(&frame.header));
-            slices.push(IoSlice::new(&frame.payload));
+    fn write_part(&mut self) -> io::Result<usize> {
+        loop {
+            match self.writer.write_vectored(self.remaining) {
+                Err(source) if source.kind() == io::ErrorKind::Interrupted => {},
+                result => return result,
+            }
         }
-        write_all_vectored(file, &mut slices)?;
     }
-    Ok(locations)
+
+    fn advance(&mut self, written: usize) {
+        IoSlice::advance_slices(&mut self.remaining, written);
+    }
 }
 
 fn write_all_vectored<W: Write + ?Sized>(
     writer: &mut W,
     slices: &mut [IoSlice<'_>],
 ) -> Result<(), DurableError> {
-    let mut remaining = slices;
-    while !remaining.is_empty() {
-        let written = loop {
-            match writer.write_vectored(remaining) {
-                Ok(written) => break written,
-                Err(source) if source.kind() == io::ErrorKind::Interrupted => {},
-                Err(source) => {
-                    return Err(io_error("append prepared durable frame batch", source));
-                },
-            }
-        };
-        if written == 0 {
-            return Err(io_error(
-                "append prepared durable frame batch",
-                io::Error::new(
+    arena_vectors::transmit(&mut PendingSlices {
+        writer,
+        remaining: slices,
+    })
+    .map_err(|error| {
+        io_error(
+            "append prepared durable frame batch",
+            match error {
+                arena_vectors::Error::Io(source) => source,
+                arena_vectors::Error::NoProgress => io::Error::new(
                     io::ErrorKind::WriteZero,
                     "vectored frame append made no progress",
                 ),
-            ));
-        }
-        IoSlice::advance_slices(&mut remaining, written);
-    }
-    Ok(())
+            },
+        )
+    })
 }
 
 #[cfg(test)]

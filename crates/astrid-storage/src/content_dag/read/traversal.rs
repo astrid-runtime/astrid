@@ -1,14 +1,14 @@
 use alloc::{sync::Arc, vec::Vec};
 
-use crate::storage_model::{
-    ObjectClass, ObjectId, ObjectKind, ObjectRecord, ReferenceKind, ReferenceLabel,
-};
+use crate::storage_model::{ObjectClass, ObjectId, ObjectKind, ObjectRecord, ReferenceKind};
 
 use crate::content_dag::{
-    CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentError, FORMAT_VERSION,
+    CHUNK_TREE_FANOUT, ChunkingProfile, ContentError, FORMAT_VERSION,
     boundary::{is_canonical_boundary, is_canonical_final_chunk},
-    decode_file_header,
+    file_wire,
 };
+
+use crate::content_dag::{child_range, chunk_range};
 
 use super::{
     ContentReadError, ContentSource, ContentVerificationDelta, ContentVerificationState,
@@ -482,43 +482,28 @@ fn append_chunk_range<E>(
         base_offset,
         path,
     } = node;
-    validate_chunk(object, &record, shape)?;
+    let chunk = validate_chunk(object, &record, shape)?;
     if let Some(boundaries) = traversal.boundaries.as_mut() {
-        boundaries.observe(
-            object,
-            base_offset,
-            record.canonical_bytes(),
-            &path,
-            shape.profile,
-        )?;
+        boundaries.observe(object, base_offset, chunk.bytes(), &path, shape.profile)?;
     }
-    let chunk_end = base_offset
-        .checked_add(shape.logical_bytes)
-        .ok_or(ContentError::LengthOverflow)?;
-    let start = usize::try_from(
-        traversal
-            .range
-            .start
-            .max(base_offset)
-            .saturating_sub(base_offset),
+    let written = chunk_range::emit(
+        &chunk,
+        base_offset,
+        traversal.range.start,
+        traversal.range.end,
+        traversal.output,
     )
-    .map_err(|_| ContentError::LengthOverflow)?;
-    let end = usize::try_from(
-        traversal
-            .range
-            .end
-            .min(chunk_end)
-            .saturating_sub(base_offset),
-    )
-    .map_err(|_| ContentError::LengthOverflow)?;
-    let bytes = record
-        .canonical_bytes()
-        .get(start..end)
-        .ok_or(ContentError::InvalidObject {
+    .map_err(|error| match error {
+        chunk_range::Error::Overflow => ContentError::LengthOverflow,
+        chunk_range::Error::Outside => ContentError::InvalidObject {
             object,
             detail: "chunk range exceeds payload",
-        })?;
-    traversal.output.append(bytes)?;
+        },
+    })?;
+    #[cfg(test)]
+    measurement::observe(0, written);
+    #[cfg(not(test))]
+    let _ = written;
     Ok(())
 }
 
@@ -542,92 +527,62 @@ fn append_tree_range<S: ContentSource>(
         .into());
     }
     let children = decode_tree(object, &record, shape)?;
-    let mut cursor = 0_u64;
-    let child_count = children.len();
-    let child_count_u16 = u16::try_from(child_count).map_err(|_| ContentError::LengthOverflow)?;
-    let mut selected = Vec::new();
-    for (index, (child, child_length, child_chunk_count)) in children.into_iter().enumerate() {
-        let child_end = cursor
-            .checked_add(child_length)
-            .ok_or(ContentError::LengthOverflow)?;
-        let child_base = base_offset
-            .checked_add(cursor)
-            .ok_or(ContentError::LengthOverflow)?;
-        let child_absolute_end = base_offset
-            .checked_add(child_end)
-            .ok_or(ContentError::LengthOverflow)?;
-        if traversal.range.start < child_absolute_end && traversal.range.end > child_base {
-            let child_index = u16::try_from(index).map_err(|_| ContentError::LengthOverflow)?;
-            let child_path = if traversal.boundaries.is_some() {
-                let mut child_path = path.clone();
-                child_path.push(TreeStep {
-                    tree: object,
-                    child_index,
-                    child_count: child_count_u16,
-                });
-                child_path
-            } else {
-                Vec::new()
-            };
-            selected.push((
-                child,
-                ExpectedShape {
-                    logical_bytes: child_length,
-                    chunk_count: child_chunk_count,
-                    tree_depth: shape.tree_depth.saturating_sub(1),
-                    profile: shape.profile,
-                    ends_file: shape.ends_file && index.saturating_add(1) == child_count,
-                },
-                child_base,
-                child_path,
-            ));
-        }
-        cursor = child_end;
-    }
-    let ids: Vec<_> = selected.iter().map(|(child, _, _, _)| *child).collect();
-    let records = load_many(source, &ids)?;
-    for ((child, child_shape, child_base, child_path), record) in selected.into_iter().zip(records)
-    {
+    let child_count = u16::try_from(children.len()).map_err(|_| ContentError::LengthOverflow)?;
+    let selected = child_range::select(
+        &children,
+        base_offset,
+        traversal.range.start,
+        traversal.range.end,
+    )
+    .ok_or(ContentError::LengthOverflow)?;
+    drop(children);
+    let loaded = child_range::load(&selected, |ids| source.load_shared_content_objects(&ids))
+        .map_err(|error| match error {
+            child_range::LoadError::Source(error) => ContentReadError::Source(error),
+            child_range::LoadError::Length(object) => {
+                ContentReadError::Content(ContentError::InvalidObject {
+                    object,
+                    detail: "content source returned the wrong batch length",
+                })
+            },
+            child_range::LoadError::Missing(object) => {
+                ContentReadError::Content(ContentError::MissingObject(object))
+            },
+        })?;
+    drop(selected);
+    for (visit, record) in loaded {
+        let child_path = if traversal.boundaries.is_some() {
+            let mut child_path = path.clone();
+            child_path.push(TreeStep {
+                tree: object,
+                child_index: u16::try_from(visit.index)
+                    .map_err(|_| ContentError::LengthOverflow)?,
+                child_count,
+            });
+            child_path
+        } else {
+            Vec::new()
+        };
+        let child_shape = ExpectedShape {
+            logical_bytes: visit.length,
+            chunk_count: visit.chunks,
+            tree_depth: shape.tree_depth.saturating_sub(1),
+            profile: shape.profile,
+            ends_file: shape.ends_file && visit.index.saturating_add(1) == usize::from(child_count),
+        };
         append_loaded_range(
             source,
             TraversalNode {
-                object: child,
+                object: visit.object,
                 record,
                 shape: child_shape,
-                base_offset: child_base,
+                base_offset: visit.base,
                 path: child_path,
             },
             traversal,
         )?;
     }
     Ok(())
-}
-
-fn load_many<S: ContentSource>(
-    source: &S,
-    objects: &[ObjectId],
-) -> Result<Vec<Arc<ObjectRecord>>, ContentReadError<S::Error>> {
-    let Some(first) = objects.first().copied() else {
-        return Ok(Vec::new());
-    };
-    let records = source
-        .load_shared_content_objects(objects)
-        .map_err(ContentReadError::Source)?;
-    if records.len() != objects.len() {
-        return Err(ContentError::InvalidObject {
-            object: first,
-            detail: "content source returned the wrong batch length",
-        }
-        .into());
-    }
-    objects
-        .iter()
-        .copied()
-        .zip(records)
-        .map(|(object, record)| {
-            record.ok_or_else(|| ContentReadError::Content(ContentError::MissingObject(object)))
-        })
-        .collect()
 }
 
 fn load_chunk_at_offset<S: ContentSource>(
@@ -641,7 +596,7 @@ fn load_chunk_at_offset<S: ContentSource>(
     let record = load(source, object)?;
     match record.kind() {
         ObjectKind::Chunk => {
-            validate_chunk(object, &record, shape)?;
+            let chunk = validate_chunk(object, &record, shape)?;
             let end = base_offset
                 .checked_add(shape.logical_bytes)
                 .ok_or(ContentError::LengthOverflow)?;
@@ -655,7 +610,7 @@ fn load_chunk_at_offset<S: ContentSource>(
             Ok(LoadedChunk {
                 object,
                 start: base_offset,
-                bytes: record.canonical_bytes().to_vec(),
+                bytes: chunk.bytes().to_vec(),
                 path,
             })
         },
@@ -727,84 +682,34 @@ pub(super) fn decode_file(
     object: ObjectId,
     record: &ObjectRecord,
 ) -> Result<(ChunkingProfile, u64, u64, Option<ObjectId>), ContentError> {
-    if record.kind() != ObjectKind::File
-        || record.format_version() != FORMAT_VERSION
-        || record.class() != ObjectClass::Metadata
-        || record.logical_bytes() != 0
-    {
-        return Err(ContentError::InvalidObject {
-            object,
-            detail: "invalid file object type or accounting",
-        });
-    }
-    let (profile, logical_bytes, chunk_count) =
-        decode_file_header(object, record.canonical_bytes())?;
-    if logical_bytes != 0
-        && (chunk_count == 1) != (logical_bytes <= u64::from(profile.maximum_bytes()))
-    {
-        return Err(ContentError::InvalidObject {
-            object,
-            detail: "file chunk count violates the whole-object threshold",
-        });
-    }
-    let label = ReferenceLabel::new(CONTENT_LABEL);
-    let content = record.reference(&label);
-    match (
-        logical_bytes,
-        chunk_count,
-        content,
-        record.references().len(),
-    ) {
-        (0, 0, None, 0) => Ok((profile, 0, 0, None)),
-        (0, _, _, _) => Err(ContentError::InvalidObject {
-            object,
-            detail: "empty file has chunks or content",
-        }),
-        (_, 0, _, _) => Err(ContentError::InvalidObject {
-            object,
-            detail: "non-empty file has no chunks",
-        }),
-        (_, _, Some(reference), 1) if reference.kind() == ReferenceKind::Owns => Ok((
-            profile,
-            logical_bytes,
-            chunk_count,
-            Some(reference.target()),
-        )),
-        _ => Err(ContentError::InvalidObject {
-            object,
-            detail: "invalid file content reference",
-        }),
-    }
+    file_wire::parse(record, FORMAT_VERSION, ChunkingProfile::fastcdc_v2020)
+        .map_err(|error| error.at(object))
 }
 
 fn validate_chunk(
     object: ObjectId,
     record: &ObjectRecord,
     shape: ExpectedShape,
-) -> Result<(), ContentError> {
-    let actual =
-        u64::try_from(record.canonical_bytes().len()).map_err(|_| ContentError::LengthOverflow)?;
-    if record.format_version() != FORMAT_VERSION
-        || record.class() != ObjectClass::Data
-        || record.logical_bytes() != 0
-        || !record.references().is_empty()
-        || actual != shape.logical_bytes
-        || shape.chunk_count != 1
-        || shape.tree_depth != 0
-    {
-        return Err(ContentError::InvalidObject {
-            object,
-            detail: "invalid chunk object",
-        });
-    }
+) -> Result<chunk_range::Chunk<'_>, ContentError> {
+    let chunk = chunk_range::Chunk::from_record(
+        record,
+        FORMAT_VERSION,
+        shape.logical_bytes,
+        shape.chunk_count,
+        shape.tree_depth,
+    )
+    .ok_or(ContentError::InvalidObject {
+        object,
+        detail: "invalid chunk object",
+    })?;
     validate_profile_bounds(
         object,
-        actual,
+        shape.logical_bytes,
         shape.chunk_count,
         shape.profile,
         shape.ends_file,
     )?;
-    Ok(())
+    Ok(chunk)
 }
 
 fn decode_tree(

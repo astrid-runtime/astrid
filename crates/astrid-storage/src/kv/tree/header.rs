@@ -1,14 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, PrincipalProjectionError};
 use crate::storage_model::{
-    ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
-    ReferenceLabel, RootState,
+    ModelError, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, RootState,
 };
 use parking_lot::Mutex;
 
-use super::delta::{Head, Mutation, Projection, decode_head, mutation_payload_bytes};
+#[cfg(test)]
+use super::delta::Mutation;
+use super::delta::Projection;
 use super::memo::MemoSnapshot;
 use super::node::NodeTotals;
 use super::overlay::OverlayMap;
@@ -75,36 +76,26 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let commit = load_typed(engine, &owner, root.commit, ObjectKind::Commit)?;
-    require_structural(root.commit, &commit)?;
-    let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-    let state = load_typed(engine, &owner, state_id, ObjectKind::PrincipalState)?;
-    require_structural(state_id, &state)?;
-    let (projection, checkpoint) = match state.reference(&ReferenceLabel::new(KV_LABEL)) {
-        None => (Projection::empty(), Some(TreeValidation::EMPTY)),
-        Some(reference) if reference.kind() == ReferenceKind::Owns => {
-            let cached = captured_projection
-                .filter(|projection| projection.head == Some(reference.target()))
-                .or_else(|| {
-                    validation
-                        .projections
-                        .lock()
-                        .get(&owner)
-                        .filter(|projection| projection.head == Some(reference.target()))
-                        .cloned()
-                });
-            if let Some(cached) = cached {
-                (cached, None)
-            } else {
-                let (decoded, checkpoint) =
-                    decode_kv_component::<P, E>(engine, &owner, reference.target(), validation)?;
-                (decoded, Some(checkpoint))
-            }
+    let (graph, (projection, checkpoint)) = super::memo_projection::read_root(
+        &owner,
+        root,
+        |principal, root| read_kv_graph(engine, principal, root),
+        || (Projection::empty(), Some(TreeValidation::EMPTY)),
+        |principal, component| {
+            resolve_projection(
+                engine,
+                principal,
+                component,
+                captured_projection,
+                validation,
+            )
         },
-        Some(_) => {
-            return Err(invalid(state_id, "principal KV component is not owning"));
-        },
-    };
+    )?;
+    let crate::storage_model::header_graph::Graph {
+        commit,
+        state_id,
+        state,
+    } = graph;
     let (preserved_state, other_quota_bytes) = decode_other_components(
         engine,
         &owner,
@@ -167,17 +158,8 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let cached = validation
-        .projections
-        .lock()
-        .get(owner)
-        .filter(|projection| projection.head == Some(head))
-        .cloned();
-    if let Some(cached) = cached {
-        return Ok(cached);
-    }
-    let (decoded, checkpoint) = decode_kv_component(engine, owner, head, validation)?;
-    if let Some(root) = captured_root {
+    let (decoded, checkpoint) = resolve_projection(engine, owner, head, None, validation)?;
+    if let (Some(root), Some(checkpoint)) = (captured_root, checkpoint) {
         validation.publish_if_current(
             engine,
             owner.clone(),
@@ -188,6 +170,22 @@ where
         );
     }
     Ok(decoded)
+}
+
+fn resolve_projection<P: Clone + Ord, E: KvProjectionEngine<P>>(
+    engine: &E,
+    owner: &P,
+    head: ObjectId,
+    captured: Option<Projection>,
+    validation: &KvValidationCache<P>,
+) -> StorageResult<(Projection, Option<TreeValidation>)> {
+    super::memo_projection::resolve(
+        owner,
+        head,
+        captured,
+        |owner, id| super::memo_projection::current(&validation.projections.lock(), owner, id),
+        |owner, id| decode_kv_component(engine, owner, id, validation),
+    )
 }
 
 pub(crate) fn validated_projection_quota<P, E>(
@@ -343,164 +341,158 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let validated_trees = &validation_cache.trees;
-    let mut deltas = Vec::<(ObjectId, u64, u64, Vec<Mutation>, NodeTotals)>::new();
-    let mut cursor = Some(head_id);
-    let mut visited = BTreeSet::new();
-    let (tree, checkpoint_totals) = loop {
-        let object = cursor.ok_or_else(|| invalid(head_id, "KV delta chain has no checkpoint"))?;
-        if !visited.insert(object) {
-            return Err(invalid(object, "KV delta chain contains a cycle"));
-        }
-        let record = load_typed(engine, owner, object, ObjectKind::NamespaceMap)?;
-        match decode_head(object, &record)? {
-            Head::Checkpoint { tree, totals } => break (tree, totals),
-            Head::Delta {
-                previous,
-                depth,
-                delta_bytes,
-                mutations,
-                totals,
-            } => {
-                deltas.push((object, depth, delta_bytes, mutations, totals));
-                cursor = previous;
-                if cursor.is_none() {
-                    break (None, NodeTotals::default());
-                }
-            },
-        }
+    use super::{
+        checkpoint_replay, delta_chain, delta_recovery::CounterError, delta_replay,
+        projection_recovery,
     };
-    let cached = validated_trees
-        .lock()
-        .get(owner)
-        .copied()
-        .filter(|validation| validation.root() == tree);
-    let validation = if let Some(validation) = cached {
-        validation
-    } else {
-        #[cfg(test)]
-        validation_cache.record_tree_validation_for_test();
-        let mut context = TreeContext::<P, E>::new(engine, owner);
-        context.validate_tree(tree)?
-    };
-    if validation.entries != checkpoint_totals.entries
-        || validation.logical_bytes != checkpoint_totals.logical_bytes
-        || validation.quota_bytes != checkpoint_totals.quota_bytes
-    {
-        return Err(invalid(head_id, "KV checkpoint accounting totals disagree"));
-    }
-    let mut context = TreeContext::<P, E>::new(engine, owner);
-    let mut overlay = OverlayMap::default();
-    let mut totals = checkpoint_totals;
-    let mut prior_depth = 0_u64;
-    let mut prior_delta_bytes = 0_u64;
-    for (object, depth, delta_bytes, mutations, declared) in deltas.into_iter().rev() {
-        if depth != prior_depth.saturating_add(1)
-            || delta_bytes
-                != prior_delta_bytes
-                    .checked_add(mutation_payload_bytes(&mutations)?)
-                    .ok_or_else(|| invalid(object, "KV delta byte total overflow"))?
-        {
-            return Err(invalid(object, "KV delta chain counters disagree"));
-        }
-        apply_validated_mutations(
-            object,
-            &mut context,
-            tree,
-            &mut overlay,
-            &mut totals,
-            &mutations,
-        )?;
-        if totals != declared {
-            return Err(invalid(object, "KV delta accounting totals disagree"));
-        }
-        prior_depth = depth;
-        prior_delta_bytes = delta_bytes;
-    }
-    Ok((
-        Projection {
-            head: Some(head_id),
-            tree,
-            overlay,
-            depth: prior_depth,
-            delta_bytes: prior_delta_bytes,
-            totals,
-            boundary: Some(validation.certificate()),
+    projection_recovery::read(
+        owner,
+        head_id,
+        |principal, object| {
+            use super::projection_record::{self, LoadError};
+            projection_record::read_at(
+                principal,
+                object,
+                FORMAT_VERSION,
+                super::ROOT_LABEL,
+                |p, id| load_typed(engine, p, id, ObjectKind::NamespaceMap),
+                |key| super::validation::validate_composite_key(object, key).err(),
+            )
+            .map_err(|error| match error {
+                LoadError::Source(e) => e,
+                LoadError::Record(id, e) => super::delta::projection_error(id, e),
+            })
         },
-        validation,
-    ))
+        |owner, tree| {
+            let cached = validation_cache
+                .trees
+                .lock()
+                .get(owner)
+                .copied()
+                .filter(|validation| validation.root() == tree);
+            let validation = if let Some(validation) = cached {
+                validation
+            } else {
+                #[cfg(test)]
+                validation_cache.record_tree_validation_for_test();
+                let mut context = TreeContext::<P, E>::new(engine, owner);
+                context.validate_tree(tree)?
+            };
+            Ok(projection_recovery::Measured {
+                root: validation.root(),
+                totals: NodeTotals {
+                    entries: validation.entries,
+                    logical_bytes: validation.logical_bytes,
+                    quota_bytes: validation.quota_bytes,
+                },
+                boundary: validation.certificate(),
+                validation,
+            })
+        },
+        |principal| TreeContext::<P, E>::new(engine, principal),
+        (
+            |mut context: TreeContext<'_, P, E>, base, key: &Vec<u8>| {
+                let old = context.get(base, key)?;
+                Ok((context, old))
+            },
+            |context: TreeContext<'_, P, E>, slot: &super::node::ValueSlot| {
+                let bytes = context.value_bytes(slot)?;
+                Ok((context, bytes))
+            },
+        ),
+        mutation_error,
+    )
+    .map_err(|error| match error {
+        projection_recovery::Error::Chain(delta_chain::Error::Cycle(id)) => {
+            invalid(id, "KV delta chain contains a cycle")
+        },
+        projection_recovery::Error::Chain(delta_chain::Error::Source(e))
+        | projection_recovery::Error::Validation(e) => e,
+        projection_recovery::Error::Checkpoint(error) => match error {
+            checkpoint_replay::Error::Root => {
+                invalid(head_id, "KV checkpoint validation root disagrees")
+            },
+            checkpoint_replay::Error::Totals => {
+                invalid(head_id, "KV checkpoint accounting totals disagree")
+            },
+            checkpoint_replay::Error::Replay(error) => match error {
+                delta_replay::Error::Counter(id, CounterError::Disagree) => {
+                    invalid(id, "KV delta chain counters disagree")
+                },
+                delta_replay::Error::Counter(_, CounterError::RowOverflow) => {
+                    super::delta::arithmetic_overflow()
+                },
+                delta_replay::Error::Counter(id, CounterError::ChainOverflow) => {
+                    invalid(id, "KV delta byte total overflow")
+                },
+                delta_replay::Error::Apply(error) => error,
+                delta_replay::Error::Totals(id) => {
+                    invalid(id, "KV delta accounting totals disagree")
+                },
+            },
+        },
+    })
 }
 
+#[cfg(test)]
 fn apply_validated_mutations<P, E>(
     object: ObjectId,
     context: &mut TreeContext<'_, P, E>,
     tree: Option<ObjectId>,
-    overlay: &mut OverlayMap,
-    totals: &mut NodeTotals,
+    overlay: OverlayMap,
+    totals: NodeTotals,
     mutations: &[Mutation],
-) -> StorageResult<()>
+) -> StorageResult<(OverlayMap, NodeTotals)>
 where
     P: Ord,
     E: KvProjectionEngine<P>,
 {
-    for mutation in mutations {
-        let loaded_previous;
-        let previous = if let Some(value) = overlay.get(&mutation.key) {
-            value.as_deref()
-        } else {
-            loaded_previous = context.get(tree, &mutation.key)?;
-            loaded_previous.as_deref()
-        };
-        let replacement = mutation
-            .value
-            .as_ref()
-            .map(|value| context.value_bytes(value))
-            .transpose()?;
-        if previous == replacement.as_deref() {
-            return Err(invalid(object, "KV delta contains a no-op mutation"));
-        }
-        update_totals(totals, &mutation.key, previous, replacement.as_deref())?;
-        overlay.insert(mutation.key.clone(), replacement);
-    }
-    Ok(())
+    let (_, overlay, totals) = overlay
+        .recover(
+            (context, totals),
+            tree,
+            object,
+            mutations,
+            |context, base, key| {
+                let old = context.get(base, key)?;
+                Ok((context, old))
+            },
+            |context, slot| {
+                let data = context.value_bytes(slot)?;
+                Ok((context, data))
+            },
+        )
+        .map_err(|(_, (object, error))| mutation_error(object, error))?;
+    Ok((overlay, totals))
 }
 
-fn update_totals(
-    totals: &mut NodeTotals,
-    key: &[u8],
-    previous: Option<&[u8]>,
-    replacement: Option<&[u8]>,
-) -> StorageResult<()> {
-    let key_bytes = u64::try_from(key.len())
-        .map_err(|_| StorageError::Internal("KV key length overflow".to_owned()))?;
-    let previous_bytes = previous.map_or(0, |value| value.len() as u64);
-    let replacement_bytes = replacement.map_or(0, |value| value.len() as u64);
-    totals.entries = match (previous, replacement) {
-        (None, Some(_)) => totals.entries.checked_add(1),
-        (Some(_), None) => totals.entries.checked_sub(1),
-        _ => Some(totals.entries),
+fn mutation_error(
+    object: ObjectId,
+    error: super::delta_totals::ApplyError<StorageError>,
+) -> StorageError {
+    use super::delta_totals::ApplyError;
+    match error {
+        ApplyError::Load(e) => e,
+        ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
+            invalid(object, "KV delta contains a no-op mutation")
+        },
+        ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
+            replay_accounting_error(e)
+        },
     }
-    .ok_or_else(|| StorageError::Internal("KV entry total overflow".to_owned()))?;
-    totals.logical_bytes = totals
-        .logical_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(|| StorageError::Internal("KV logical total overflow".to_owned()))?;
-    totals.quota_bytes = totals
-        .quota_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| {
-            if previous.is_none() {
-                total.checked_add(key_bytes)
-            } else if replacement.is_none() {
-                total.checked_sub(key_bytes)
-            } else {
-                Some(total)
-            }
-        })
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(|| StorageError::Internal("KV quota total overflow".to_owned()))?;
-    Ok(())
+}
+
+fn replay_accounting_error(error: super::delta_totals::Error) -> StorageError {
+    use super::delta_totals::Error;
+    StorageError::Internal(
+        match error {
+            Error::Key => "KV key length overflow",
+            Error::Entries => "KV entry total overflow",
+            Error::Logical => "KV logical total overflow",
+            Error::Quota => "KV quota total overflow",
+        }
+        .to_owned(),
+    )
 }
 
 pub(super) fn load_typed<P, E>(
@@ -522,28 +514,31 @@ where
     Ok(record)
 }
 
-pub(super) fn require_structural(id: ObjectId, record: &ObjectRecord) -> StorageResult<()> {
-    if !record.canonical_bytes().is_empty()
-        || record.logical_bytes() != 0
-        || record.class() != ObjectClass::Metadata
-    {
-        return Err(invalid(id, "structural KV tree object carries payload"));
-    }
-    Ok(())
-}
-
-pub(super) fn owned_target(
-    id: ObjectId,
-    record: &ObjectRecord,
-    label: &[u8],
-) -> StorageResult<ObjectId> {
-    let reference = record
-        .reference(&ReferenceLabel::new(label))
-        .ok_or_else(|| invalid(id, "required KV tree reference is missing"))?;
-    if reference.kind() != ReferenceKind::Owns {
-        return Err(invalid(id, "required KV tree reference is not owning"));
-    }
-    Ok(reference.target())
+pub(super) fn read_kv_graph<P, E: KvProjectionEngine<P>>(
+    engine: &E,
+    owner: &P,
+    root: RootState,
+) -> StorageResult<(crate::storage_model::header_graph::Graph, Option<ObjectId>)> {
+    use crate::storage_model::header_graph::{self, Error, Invalid, KvError};
+    header_graph::read_kv(owner, root, FORMAT_VERSION, |principal, id| {
+        engine
+            .load_shared_kv_object_for(principal, id)
+            .map_err(|e| map_engine(&e))?
+            .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))
+    })
+    .map_err(|e| match e {
+        KvError::Graph(Error::Read(e)) => e,
+        KvError::Graph(Error::Invalid(id, reason)) => invalid(
+            id,
+            match reason {
+                Invalid::KindOrVersion => "object has the wrong KV tree kind or version",
+                Invalid::Payload => "structural KV tree object carries payload",
+                Invalid::MissingState => "required KV tree reference is missing",
+                Invalid::NonOwningState => "required KV tree reference is not owning",
+            },
+        ),
+        KvError::NonOwning(id) => invalid(id, "principal KV component is not owning"),
+    })
 }
 
 #[cfg(test)]

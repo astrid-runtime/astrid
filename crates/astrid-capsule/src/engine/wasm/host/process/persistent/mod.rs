@@ -35,20 +35,30 @@
 //! # Security model
 //!
 //! The `process-id` is a 256-bit host-minted CSPRNG token (lowercase base32,
-//! see [`ids`]). The registry stores only a keyed BLAKE3 hash of the id,
-//! never the raw token. Possession is necessary but NOT sufficient: every
-//! id-keyed call re-resolves the live `(principal, capsule)` and checks them
-//! against the recorded creator before touching the entry, so a leaked token
-//! is inert across the principal/capsule boundary. Unknown / wrong-owner /
-//! wrong-capsule / reaped / malformed all collapse to `no-such-process` with
-//! no distinguishing oracle.
+//! see [`ids`]). A keyed BLAKE3 digest indexes each entry. The entry retains
+//! the token so its owner can recover it through status and list. Token
+//! lookup requires both the token and the matching creator and capsule.
+//! Possession of another capsule’s token grants no access. Release is idempotent
+//! for an absent entry and refuses a foreign entry.
 
+use super::{process_batch, registry_keys};
+
+mod admission;
+mod cleanup;
 mod config;
 mod entry;
 mod ids;
+mod publication;
+mod reap;
 #[cfg(test)]
 mod registry_tests;
+mod retirement;
 mod ring;
+mod selection;
+#[cfg(unix)]
+mod signal_target;
+pub(super) use admission::admit_and_prepare;
+use selection::Selection;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -166,10 +176,11 @@ impl PersistentProcessRegistry {
     ) -> Result<entry::Resolved, ErrorCode> {
         let key = self.key_of(id);
         let map = self.lock();
-        let entry = map.get(&key).ok_or(ErrorCode::NoSuchProcess)?;
-        if &entry.creator != principal || &*entry.capsule_id != capsule_id {
+        let Selection::Owned(entry) =
+            selection::select(&map, &key, |e| e.owned_by(principal, capsule_id))
+        else {
             return Err(ErrorCode::NoSuchProcess);
-        }
+        };
         if let Ok(mut core) = entry.core.lock() {
             core.last_touch = Instant::now();
         }
@@ -237,24 +248,12 @@ impl PersistentProcessRegistry {
         let injection_guard = p.injection_guard;
         let process_storage_mount = p.process_storage_mount;
 
-        let mut id = mint_id();
-        let mut key = self.key_of(&id);
-        let mut tries = 0;
-        while map.contains_key(&key) {
-            id = mint_id();
-            key = self.key_of(&id);
-            tries += 1;
-            if tries > 8 {
-                // 256-bit space: unreachable in practice. Fail closed.
-                monitor.abort();
-                return Err(ErrorCode::Unknown(
-                    "process-id collision space exhausted".to_string(),
-                ));
-            }
-        }
-        map.insert(
-            key,
-            PersistentEntry {
+        publication::publish(
+            &mut map,
+            monitor,
+            |_| mint_id(),
+            |token| self.key_of(token),
+            |id, monitor| PersistentEntry {
                 id: id.clone(),
                 creator: p.creator,
                 capsule_id: p.capsule_id,
@@ -271,8 +270,11 @@ impl PersistentProcessRegistry {
                 injection_guard,
                 process_storage_mount,
             },
-        );
-        Ok(id)
+        )
+        .map_err(|monitor| {
+            monitor.abort();
+            ErrorCode::Unknown("process-id collision space exhausted".to_string())
+        })
     }
 
     /// Number of LIVE (not-yet-exited) persistent processes a principal owns.
@@ -307,10 +309,11 @@ impl PersistentProcessRegistry {
     ) -> Result<ProcessInfo, ErrorCode> {
         let key = self.key_of(id);
         let map = self.lock();
-        let entry = map.get(&key).ok_or(ErrorCode::NoSuchProcess)?;
-        if &entry.creator != principal || &*entry.capsule_id != capsule_id {
+        let Selection::Owned(entry) =
+            selection::select(&map, &key, |e| e.owned_by(principal, capsule_id))
+        else {
             return Err(ErrorCode::NoSuchProcess);
-        }
+        };
         Ok(entry.info())
     }
 
@@ -324,9 +327,12 @@ impl PersistentProcessRegistry {
         let map = self.lock();
         ids.iter()
             .filter_map(|id| {
-                let entry = map.get(&self.key_of(id))?;
-                (entry.creator == *principal && &*entry.capsule_id == capsule_id)
-                    .then(|| entry.info())
+                match selection::select(&map, &self.key_of(id), |e| {
+                    e.owned_by(principal, capsule_id)
+                }) {
+                    Selection::Owned(entry) => Some(entry.info()),
+                    Selection::Foreign | Selection::Absent => None,
+                }
             })
             .collect()
     }
@@ -341,7 +347,7 @@ impl PersistentProcessRegistry {
     ) -> Vec<ProcessInfo> {
         let map = self.lock();
         map.values()
-            .filter(|e| e.creator == *principal && &*e.capsule_id == capsule_id)
+            .filter(|e| e.owned_by(principal, capsule_id))
             .filter(|e| label_filter.is_none_or(|f| e.label.contains(f)))
             .map(PersistentEntry::info)
             .collect()
@@ -539,20 +545,17 @@ impl PersistentProcessRegistry {
         capsule_id: &str,
     ) -> Result<(), ErrorCode> {
         let key = self.key_of(id);
-        let mut map = self.lock();
-        let Some(entry) = map.get(&key) else {
-            return Ok(());
-        };
-        if entry.creator != *principal || &*entry.capsule_id != capsule_id {
-            return Err(ErrorCode::NoSuchProcess);
-        }
-        if entry.is_live() {
-            return Err(ErrorCode::InvalidInput);
-        }
-        let removed = map.remove(&key);
-        drop(map);
-        if let Some(entry) = removed {
-            reap_entry(entry);
+        let outcome = selection::release(
+            &mut self.lock(),
+            &key,
+            |entry| entry.owned_by(principal, capsule_id),
+            PersistentEntry::is_live,
+        );
+        match outcome {
+            selection::Release::Absent => {},
+            selection::Release::Foreign => return Err(ErrorCode::NoSuchProcess),
+            selection::Release::Live => return Err(ErrorCode::InvalidInput),
+            selection::Release::Removed(entry) => reap_entry(entry),
         }
         Ok(())
     }
@@ -598,38 +601,33 @@ impl PersistentProcessRegistry {
         }
         // Reap (killpg + abort) outside the map lock.
         let n = reaped.len();
-        for entry in reaped {
-            reap_entry(entry);
-        }
+        process_batch::reap_batch(reaped, &mut NativeReaper);
         n
     }
 
     /// Kill + clear every entry (capsule unload / daemon graceful shutdown).
     pub fn shutdown(&self) {
-        let drained: Vec<PersistentEntry> = self.lock().drain().map(|(_, e)| e).collect();
-        for entry in drained {
-            reap_entry(entry);
-        }
+        let drained = cleanup::take_all(&mut self.lock());
+        cleanup::reap_all(drained, &mut NativeReaper);
     }
 
     /// Kill and remove entries owned by one retiring principal only.
     pub fn shutdown_for(&self, principal: &PrincipalId) {
-        let mut removed = Vec::new();
-        {
-            let mut map = self.lock();
-            let keys: Vec<_> = map
-                .iter()
-                .filter_map(|(key, entry)| (entry.creator == *principal).then_some(*key))
-                .collect();
-            for key in keys {
-                if let Some(entry) = map.remove(&key) {
-                    removed.push(entry);
-                }
-            }
-        }
-        for entry in removed {
-            reap_entry(entry);
-        }
+        let removed = retirement::drain_for(&mut self.lock(), |entry| {
+            registry_keys::owned_by(
+                principal.as_str().as_bytes(),
+                entry.creator.as_str().as_bytes(),
+            )
+        });
+        process_batch::reap_batch(removed, &mut NativeReaper);
+    }
+}
+
+struct NativeReaper;
+
+impl process_batch::Reaper<PersistentEntry> for NativeReaper {
+    fn reap(&mut self, entry: PersistentEntry) {
+        reap_entry(entry);
     }
 }
 

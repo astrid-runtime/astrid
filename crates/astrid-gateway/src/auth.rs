@@ -1,6 +1,11 @@
 //! Bearer-token signing, verification, and the principal-extraction
 //! middleware.
 //!
+//! Device registrations use a seven-segment bearer (v4). The first five segments
+//! match v3, followed by the persisted registration UUID and signature. The v4
+//! signature covers a protocol tag and the six dot-separated wire segments.
+//! Refresh preserves the authenticated generation, including its absence on a legacy key.
+//!
 //! ## Wire format (v3)
 //!
 //! ```text
@@ -45,7 +50,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::PrincipalId;
-use astrid_events::ipc::RequestOwnerId;
+use astrid_core::profile::{DeviceKeyId, DeviceRegistrationId};
+use astrid_core::session_token::registration_transcript;
+use astrid_events::ipc::{IpcMessage, MessageOrigin, RequestOwnerId};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -76,6 +83,8 @@ pub struct CallerContext {
     /// attenuation floor. Cryptographically bound: it is part of the signed
     /// message, so a tampered or stripped `key_id` fails verification.
     pub device_key_id: Option<String>,
+    /// Registration signed into the bearer when it was paired.
+    pub registration_id: Option<DeviceRegistrationId>,
     /// Opaque owner of this authenticated bearer session.
     ///
     /// Derived from the verified bearer rather than supplied by an HTTP body,
@@ -83,6 +92,20 @@ pub struct CallerContext {
     /// observe or answer each other's approval prompts. Reusing the same bearer
     /// intentionally means reusing the same authenticated session.
     pub request_owner: RequestOwnerId,
+}
+
+impl CallerContext {
+    /// Bind a gateway-originated publication to this authenticated bearer.
+    /// Downstream capability checks use the device and transport origin, and
+    /// interactive replies use the request owner to reach the issuing client.
+    pub(crate) fn stamp_ipc(&self, mut message: IpcMessage) -> IpcMessage {
+        message.device_key_id.clone_from(&self.device_key_id);
+        message.device_registration_id = self.registration_id.map(Into::into);
+        message
+            .with_principal(self.principal.to_string())
+            .with_request_owner(self.request_owner)
+            .with_origin(MessageOrigin::RemoteGateway)
+    }
 }
 
 /// Stable, non-secret comparison handle for one authenticated bearer.
@@ -131,20 +154,67 @@ pub fn mint_bearer_scoped(
     key_id: &str,
     lifetime_secs: u64,
 ) -> String {
+    mint_device_bearer(signer, principal, key_id, None, lifetime_secs)
+}
+
+/// Mint a bearer for the registration selected by pairing or by a verified refresh.
+pub(crate) fn mint_device_bearer(
+    signer: &SigningKey,
+    principal: &PrincipalId,
+    key_id: &str,
+    registration: Option<DeviceRegistrationId>,
+    lifetime_secs: u64,
+) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let expires = now.saturating_add(lifetime_secs);
     let request_owner = RequestOwnerId::generate();
-    let msg = format!("{principal}:{now}:{expires}:{key_id}:{request_owner}");
-    let sig: Signature = signer.sign(msg.as_bytes());
-
     let p_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(principal.as_str());
     let i_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(now.to_string());
     let e_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expires.to_string());
     let k_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_id);
-    let s_hex = hex::encode(sig.to_bytes());
-    format!("{p_b64}.{i_b64}.{e_b64}.{k_b64}.{request_owner}.{s_hex}")
+    let mut unsigned = format!("{p_b64}.{i_b64}.{e_b64}.{k_b64}.{request_owner}");
+    let transcript = if let Some(id) = registration {
+        let registration = id.to_string();
+        let transcript = registration_transcript(&unsigned, &registration);
+        unsigned.push('.');
+        unsigned.push_str(&registration);
+        transcript
+    } else {
+        format!("{principal}:{now}:{expires}:{key_id}:{request_owner}")
+    };
+    let sig = signer.sign(transcript.as_bytes());
+    format!("{unsigned}.{}", hex::encode(sig.to_bytes()))
+}
+
+fn decode_device(
+    key: Option<&str>,
+    has_owner: bool,
+    registration: Option<&str>,
+) -> Result<(Option<String>, Option<DeviceRegistrationId>), GatewayError> {
+    let key_id = match key {
+        None => None,
+        Some("~") if has_owner => None,
+        Some(encoded) => {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| GatewayError::Unauthorized)?;
+            Some(String::from_utf8(bytes).map_err(|_| GatewayError::Unauthorized)?)
+        },
+    };
+    let generation = if let Some(raw) = registration {
+        DeviceKeyId::new(key_id.as_deref().ok_or(GatewayError::Unauthorized)?)
+            .map_err(|_| GatewayError::Unauthorized)?;
+        let id: DeviceRegistrationId = raw.parse().map_err(|_| GatewayError::Unauthorized)?;
+        if id.to_string() != raw {
+            return Err(GatewayError::Unauthorized);
+        }
+        Some(id)
+    } else {
+        None
+    };
+    Ok((key_id, generation))
 }
 
 /// Parse and verify a bearer token. Returns the [`CallerContext`] on
@@ -158,22 +228,13 @@ pub fn mint_bearer_scoped(
 /// snapshot would be worse than crashing the request handler, so we
 /// fail-stop on the auth path.
 pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, GatewayError> {
-    // `splitn(7, '.')` caps allocation at seven slices regardless of input
-    // length. Without the cap, an attacker sending an Authorization header
-    // packed with dots would coerce `split('.')` into materialising millions
-    // of empty slices — a cheap path to memory / CPU exhaustion against an
-    // unauthenticated route. Seven is one beyond the largest valid arity (6), so
-    // a 7+ segment input still collapses to exactly seven slices (the surplus
-    // dots ride in the final slice) and is then rejected by the arity check
-    // below — a malformed token never allocates unboundedly.
-    let parts: Vec<&str> = raw.splitn(7, '.').collect();
-    // Legacy arities are retained for sessions minted before this release.
-    // Current six-segment bearers carry both the optional key id and the signed
-    // request-owner nonce.
-    let (key_id_seg, owner_seg, sig_seg) = match parts.len() {
-        4 => (None, None, 3),
-        5 => (Some(3usize), None, 4),
-        6 => (Some(3usize), Some(4usize), 5),
+    // One slice beyond the largest wire format bounds allocation and rejects extra fields.
+    let parts: Vec<&str> = raw.splitn(8, '.').collect();
+    let (key_id_seg, owner_seg, registration_seg, sig_seg) = match parts.len() {
+        4 => (None, None, None, 3),
+        5 => (Some(3), None, None, 4),
+        6 => (Some(3), Some(4), None, 5),
+        7 => (Some(3), Some(4), Some(5), 6),
         _ => return Err(GatewayError::Unauthorized),
     };
 
@@ -186,21 +247,11 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     let e_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| GatewayError::Unauthorized)?;
-    // The device key_id segment (5-segment form only). Decoded BEFORE the
-    // signature so the signed message can be reconstructed exactly.
-    let device_key_id = match key_id_seg {
-        Some(idx) if owner_seg.is_some() && parts[idx] == "~" => None,
-        Some(idx) => {
-            let k_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(parts[idx])
-                .map_err(|_| GatewayError::Unauthorized)?;
-            let k = std::str::from_utf8(&k_bytes)
-                .map_err(|_| GatewayError::Unauthorized)?
-                .to_string();
-            Some(k)
-        },
-        None => None,
-    };
+    let (device_key_id, registration_id) = decode_device(
+        key_id_seg.map(|idx| parts[idx]),
+        owner_seg.is_some(),
+        registration_seg.map(|idx| parts[idx]),
+    )?;
     let request_owner = owner_seg
         .map(|idx| parts[idx].parse::<RequestOwnerId>())
         .transpose()
@@ -228,15 +279,16 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     // Reconstruct the signed message for the bearer's generation. Current
     // tokens bind both the optional key id and request-owner nonce. Legacy
     // tokens retain their historical message shape.
-    let msg = match (&request_owner, &device_key_id) {
-        (Some(owner), key_id) => format!(
+    let msg = match (registration_id, &request_owner, &device_key_id) {
+        (Some(_), _, _) => registration_transcript(&parts[..5].join("."), parts[5]),
+        (None, Some(owner), key_id) => format!(
             "{principal_str}:{issued_at_epoch}:{expires_at_epoch}:{}:{owner}",
             key_id.as_deref().unwrap_or("~")
         ),
-        (None, Some(key_id)) => {
+        (None, None, Some(key_id)) => {
             format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}:{key_id}")
         },
-        (None, None) => format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}"),
+        (None, None, None) => format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}"),
     };
     let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
     sig_arr.copy_from_slice(&s_bytes);
@@ -295,6 +347,7 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
         issued_at_epoch,
         expires_at_epoch,
         device_key_id,
+        registration_id,
         request_owner: request_owner.unwrap_or_else(|| request_owner_for_bearer(raw)),
     })
 }
@@ -425,6 +478,41 @@ mod tests {
         assert_eq!(raw.split('.').count(), 6);
         let caller = verify_bearer(&state, &raw).expect("verify");
         assert_eq!(caller.device_key_id, None);
+    }
+
+    #[tokio::test]
+    async fn http_refresh_preserves_the_signed_device_registration() {
+        use tower::ServiceExt;
+        let state = test_state();
+        let principal = PrincipalId::new("paired").unwrap();
+        let key = "0123456789abcdef";
+        let generation: DeviceRegistrationId = uuid::Uuid::new_v4().to_string().parse().unwrap();
+        for registration in [Some(generation), None] {
+            let token =
+                mint_device_bearer(&state.signing.signer, &principal, key, registration, 600);
+            let original = verify_bearer(&state, &token).unwrap();
+            assert_eq!(original.registration_id, registration);
+            let response = crate::routes::build(state.clone())
+                .oneshot(
+                    axum::http::Request::post("/api/auth/refresh")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let refreshed =
+                verify_bearer(&state, reply["session_token"].as_str().unwrap()).unwrap();
+            assert_eq!(refreshed.registration_id, registration);
+            assert_eq!(refreshed.principal, principal);
+            assert_eq!(refreshed.device_key_id.as_deref(), Some(key));
+            assert_ne!(refreshed.request_owner, original.request_owner);
+        }
     }
 
     #[test]

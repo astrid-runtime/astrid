@@ -17,6 +17,9 @@ pub(crate) mod approval_audit;
 mod audit_sink_tests;
 /// Runtime operator-consent for local-egress (transport-origin gated).
 pub(crate) mod consent_egress;
+mod consent_identity;
+mod consent_reply;
+mod egress_reply;
 /// Elicit API (interactive user input collection).
 pub(crate) mod elicit;
 /// File system operations for plugins.

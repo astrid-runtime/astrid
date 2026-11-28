@@ -51,6 +51,7 @@ impl HostState {
             store_meter,
             principal: astrid_core::PrincipalId::default(),
             system_runtime: false,
+            runtime_owner_uid: None,
             capsule_uuid: uuid::Uuid::new_v4(),
             caller_context: None,
             interceptor_active: false,
@@ -83,6 +84,7 @@ impl HostState {
             principal_store: None,
             tmp: None,
             invocation_home: None,
+            invocation_storage_uid: None,
             invocation_workspace: None,
             invocation_tmp: None,
             invocation_secret_store: None,
@@ -135,6 +137,7 @@ impl HostState {
             principal_cancel_tokens: Self::new_principal_cancel_tokens(),
             invocation_cancel_token: None,
             session_token: None,
+            device_sessions: Default::default(),
             interceptor_handles: Vec::new(),
             allowance_store: None,
             // Hooks have no kernel-managed security gate, so no identity store.
@@ -162,10 +165,12 @@ impl HostState {
             share_tcp_listeners: false,
             // No client frame in flight; hooks never forward over publish-as, so
             // neither the ingress principal nor its device id / origin is set.
+            ingress_publication: None,
             ingress_principal: None,
             ingress_device_key_id: None,
             ingress_request_owner: None,
             ingress_origin: None,
+            ingress_socket: None,
         }
     }
 }

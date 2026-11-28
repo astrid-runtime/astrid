@@ -6,6 +6,9 @@
 //! implicit. Mutations publish through the same owner-root compare-and-swap as
 //! content and KV state.
 
+mod path_validation;
+pub(crate) mod replacement;
+
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::sync::{Arc, OnceLock};
@@ -35,19 +38,20 @@ impl FilesystemPath {
     /// on host path normalization for authority.
     pub fn new(value: impl Into<String>) -> Result<Self, FilesystemError> {
         let value = value.into();
-        if value.is_empty() {
-            return Ok(Self::root());
-        }
-        if value.starts_with('/') || value.ends_with('/') || value.as_bytes().contains(&0) {
-            return Err(FilesystemError::InvalidPath(value));
-        }
-        if value
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-        {
+        if !path_validation::is_canonical(value.as_bytes()) {
             return Err(FilesystemError::InvalidPath(value));
         }
         Ok(Self(value))
+    }
+
+    /// Resolve a relative content name below this directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation error as [`Self::new`] for an invalid suffix.
+    pub fn join(&self, raw: &str) -> Result<Self, FilesystemError> {
+        let relative = Self::new(raw)?;
+        Ok(Self(path_validation::join(self.as_str(), relative.0)))
     }
 
     /// Borrow the canonical relative spelling. The root is the empty string.
@@ -57,10 +61,10 @@ impl FilesystemPath {
     }
 
     pub(crate) fn file_name(&self) -> Result<ContentName, FilesystemError> {
-        if self.0.is_empty() {
-            return Err(FilesystemError::IsDirectory(self.clone()));
-        }
-        ContentName::new(self.0.clone()).map_err(|_| FilesystemError::InvalidPath(self.0.clone()))
+        ContentName::from_path(self.as_str()).map_err(|error| match error {
+            crate::ContentNameError::Empty => FilesystemError::IsDirectory(self.clone()),
+            _ => FilesystemError::InvalidPath(self.0.clone()),
+        })
     }
 
     pub(crate) fn directory_marker(&self) -> Result<ContentName, FilesystemError> {
@@ -253,10 +257,7 @@ pub struct OwnerSubtreeFilesystem<P: Ord, E> {
 
 impl<P: Ord, E> OwnerSubtreeFilesystem<P, E> {
     fn path(&self, path: &FilesystemPath) -> Result<FilesystemPath, FilesystemError> {
-        if path.as_str().is_empty() {
-            return Ok(self.prefix.clone());
-        }
-        FilesystemPath::new(format!("{}/{}", self.prefix.as_str(), path.as_str()))
+        self.prefix.join(path.as_str())
     }
 }
 
@@ -530,11 +531,16 @@ where
     ///
     /// Returns a path, parent, conflict, quota, or storage error.
     pub fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
-        self.require_parent(path)?;
-        if self.directory_exists(path)? {
-            return Err(FilesystemError::IsDirectory(path.clone()));
-        }
-        self.content.put(&self.owner, &path.file_name()?, bytes)?;
+        let write = replacement::prepare(
+            &self.owner,
+            path,
+            bytes,
+            |path| self.require_parent(path),
+            |path| self.directory_exists(path),
+            FilesystemPath::file_name,
+            |path| FilesystemError::IsDirectory(path.clone()),
+        )?;
+        write.submit(|owner, name, bytes| self.content.put(owner, &name, bytes))?;
         self.remember_directory(&path.parent());
         Ok(())
     }

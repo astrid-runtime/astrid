@@ -146,20 +146,9 @@ pub(super) fn prepare_sandboxed_command(
     inject_env: &[(String, String)],
     extra_masks: &[std::path::PathBuf],
 ) -> Result<Command, String> {
-    let mut inner_cmd = Command::new(cmd);
-    let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    inner_cmd.args(&str_args);
-    // `cwd` has already been resolved and boundary-checked by the process host.
-    // It normally points into the writable CoW workspace; a capability-gated
-    // `home://` request can instead target the invoking principal's home.
-    inner_cmd.current_dir(&context.cwd);
-    inner_cmd.env_clear();
-    for (key, value) in &context.env {
-        inner_cmd.env(key, value);
-    }
-    for (k, v) in inject_env {
-        inner_cmd.env(k, v);
-    }
+    // The host has confined cwd to the workspace or an authorized home:// or shared:// root.
+    let inner_cmd =
+        super::command::build(cmd, args, context.cwd.as_path(), &context.env, inject_env);
 
     SandboxCommand::wrap_with_process_paths(
         &inner_cmd,
@@ -171,6 +160,29 @@ pub(super) fn prepare_sandboxed_command(
         true,
     )
     .map_err(|e| format!("failed to wrap command in sandbox: {e}"))
+}
+
+// Native adapter for the verified constructor. Its contract relies on std::process::Command.
+impl<'a> super::command::Builder<'a, &'a std::path::Path> for Command {
+    fn new(program: &'a str) -> Self {
+        Command::new(program)
+    }
+
+    fn arguments(&mut self, args: &'a [String]) {
+        self.args(args);
+    }
+
+    fn directory(&mut self, cwd: &'a std::path::Path) {
+        self.current_dir(cwd);
+    }
+
+    fn clear_environment(&mut self) {
+        self.env_clear();
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
 }
 
 /// Wire a freshly-spawned child's stdout / stderr into tokio reader

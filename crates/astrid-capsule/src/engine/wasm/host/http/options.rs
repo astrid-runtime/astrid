@@ -132,8 +132,7 @@ impl ResolvedOptions {
 /// Reject a non-http(s) scheme up front (and enforce `https-only`). reqwest
 /// would surface a generic builder error; the typed `SchemeDenied` is the
 /// contract arm. Returns `Ok(())` for a permitted scheme.
-pub(super) fn check_scheme(url: &str, https_only: bool) -> Result<(), ErrorCode> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
+pub(super) fn check_scheme(parsed: &reqwest::Url, https_only: bool) -> Result<(), ErrorCode> {
     match parsed.scheme() {
         "https" => Ok(()),
         "http" if !https_only => Ok(()),

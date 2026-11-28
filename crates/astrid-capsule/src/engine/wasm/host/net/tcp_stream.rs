@@ -42,7 +42,7 @@ fn write_deadline(stream: &NetStream, data_len: usize) -> Duration {
     let default_ceiling = Duration::from_millis(5000 + (data_len as u64 / 1024));
     match stream {
         NetStream::Tcp(slot) => slot.write_timeout.unwrap_or(default_ceiling),
-        NetStream::Unix(_) => default_ceiling,
+        NetStream::Unix(_) | NetStream::Signed(_) => default_ceiling,
     }
 }
 use super::{
@@ -61,8 +61,16 @@ impl HostTcpStream for HostState {
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
         let tok = self.effective_cancel_token();
+        let authority = match &stream {
+            NetStream::Signed(socket) => Some(socket.authority().clone()),
+            _ => None,
+        };
         let status = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
+                NetStream::Signed(socket) => socket
+                    .io(async |s| read_frame(s).await)
+                    .await
+                    .unwrap_or(Ok(NetReadStatus::Closed)),
                 NetStream::Unix(arc) => {
                     let mut s = arc.lock().await;
                     read_frame(&mut *s).await
@@ -84,10 +92,13 @@ impl HostTcpStream for HostState {
             // Closed terminates the read loop cleanly.
             None => Ok(NetReadStatus::Closed),
         };
-        let binding = self
-            .connection_principals
-            .get(&self_.rep())
-            .map(|entry| entry.clone());
+        let binding = match &authority {
+            Some(socket) => Some(socket.identity.as_ref().clone()),
+            None => self
+                .connection_principals
+                .get(&self_.rep())
+                .map(|entry| entry.clone()),
+        };
         if let Some(identity) = super::ingress_frame::select(
             self.has_uplink_capability,
             matches!(&result, Ok(NetReadStatus::Data(_))),
@@ -108,6 +119,11 @@ impl HostTcpStream for HostState {
                 principal = %identity.principal,
                 "tcp-stream.read stamped LocalSocket origin (uplink-gated)"
             );
+            if let Ok(NetReadStatus::Data(frame)) = &result {
+                self.ingress_publication =
+                    crate::engine::wasm::host_state::IngressPublication::from_frame(frame);
+            }
+            self.ingress_socket = authority;
             self.ingress_principal = Some(identity.principal);
             self.ingress_device_key_id = identity.device_key_id;
             self.ingress_request_owner = Some(identity.request_owner);
@@ -145,6 +161,10 @@ impl HostTcpStream for HostState {
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             let write_fut = async {
                 match stream {
+                    NetStream::Signed(socket) => socket
+                        .io(async |s| write_frame(s, &data).await)
+                        .await
+                        .unwrap_or_else(|| Err(std::io::ErrorKind::ConnectionReset.into())),
                     NetStream::Unix(arc) => {
                         let mut s = arc.lock().await;
                         write_frame(&mut *s, &data).await
@@ -190,6 +210,10 @@ impl HostTcpStream for HostState {
         let max = (max_bytes as usize).min(MAX_BYTES_PER_CALL);
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
+                NetStream::Signed(socket) => socket
+                    .io(async |s| read_bytes_inner(s, max, None).await)
+                    .await
+                    .unwrap_or_else(|| Err("socket closed".into())),
                 NetStream::Unix(arc) => {
                     let mut s = arc.lock().await;
                     read_bytes_inner(&mut *s, max, None).await
@@ -241,6 +265,10 @@ impl HostTcpStream for HostState {
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             let write_fut = async {
                 match stream {
+                    NetStream::Signed(socket) => socket
+                        .io(async |s| write_bytes_inner(s, &data, None).await)
+                        .await
+                        .unwrap_or_else(|| Err("socket closed".into())),
                     NetStream::Unix(arc) => {
                         let mut s = arc.lock().await;
                         write_bytes_inner(&mut *s, &data, None).await
@@ -306,7 +334,7 @@ impl HostTcpStream for HostState {
                 // on cancellation so capsules can distinguish.
                 opt.unwrap_or(Err(ErrorCode::Closed))
             },
-            NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+            NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
         };
         let bytes = result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
         audit_net(self, "astrid:net/host.tcp-stream.peek", bytes, &result);
@@ -330,7 +358,7 @@ impl HostTcpStream for HostState {
                     let sock_ref = socket2::SockRef::from(&*s);
                     sock_ref.shutdown(std_how).map_err(map_io_err)
                 },
-                NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+                NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
             }
         });
         result.unwrap_or(Err(ErrorCode::Closed))
@@ -374,7 +402,7 @@ impl HostTcpStream for HostState {
             NetStream::Tcp(slot) => Ok(slot
                 .read_timeout
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
-            NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+            NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
         }
     }
 
@@ -394,7 +422,7 @@ impl HostTcpStream for HostState {
             NetStream::Tcp(slot) => Ok(slot
                 .write_timeout
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
-            NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+            NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
         }
     }
 
@@ -471,7 +499,10 @@ impl HostTcpStream for HostState {
         })
     }
 
-    fn subscribe_readable(&mut self, _self_: Resource<TcpStream>) -> Resource<DynPollable> {
+    fn subscribe_readable(
+        &mut self,
+        _self_: Resource<TcpStream>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Real pollable wiring (tokio AsyncRead readiness over the
         // NetStream) lands with the stream-half adapter commit.
         // Always-ready sentinel until then; guests poll then call
@@ -479,7 +510,10 @@ impl HostTcpStream for HostState {
         super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
-    fn read_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<InputStream> {
+    fn read_stream(
+        &mut self,
+        _self_: Resource<TcpStream>,
+    ) -> wasmtime::Result<Resource<InputStream>> {
         self.clear_ingress_frame();
         // Real adapter (wasmtime-wasi-io InputStream impl over our
         // NetStream) lands with the stream-half commit. Closed-on-read
@@ -488,7 +522,10 @@ impl HostTcpStream for HostState {
         super::super::stubs::closed_input_stream(&mut self.resource_table)
     }
 
-    fn write_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<OutputStream> {
+    fn write_stream(
+        &mut self,
+        _self_: Resource<TcpStream>,
+    ) -> wasmtime::Result<Resource<OutputStream>> {
         // Same story as read_stream — closed-on-write sentinel.
         super::super::stubs::closed_output_stream(&mut self.resource_table)
     }

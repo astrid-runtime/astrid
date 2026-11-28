@@ -65,6 +65,7 @@ impl WalOrdinal {
     }
 
     /// Advance to the next ordinal without wrapping.
+    #[cfg(test)]
     pub(super) const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(next) => Some(Self(next)),
@@ -140,6 +141,7 @@ impl WalLength {
     }
 
     /// Add two lengths without wrapping.
+    #[cfg(test)]
     pub(super) const fn checked_add(self, other: Self) -> Option<Self> {
         match self.0.checked_add(other.0) {
             Some(value) => Some(Self(value)),
@@ -164,6 +166,7 @@ impl WalCount {
     }
 
     /// Add one record without wrapping.
+    #[cfg(test)]
     pub(super) const fn checked_inc(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(value) => Some(Self(value)),
@@ -226,41 +229,7 @@ impl WalBeginHints {
     }
 }
 
-/// A kind byte in the ASTWAL2 logical record grammar.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WalRecordKind {
-    /// Starts one transaction.
-    Begin,
-    /// Carries one canonical immutable object frame.
-    Object,
-    /// Carries one canonical principal-root transition.
-    Root,
-    /// Commits one transaction after all prior records.
-    Commit,
-}
-
-impl WalRecordKind {
-    /// Return the stable wire tag.
-    pub(super) const fn tag(self) -> u8 {
-        match self {
-            Self::Begin => 1,
-            Self::Object => 2,
-            Self::Root => 3,
-            Self::Commit => 4,
-        }
-    }
-
-    /// Decode a stable wire tag.
-    pub(super) const fn from_tag(tag: u8) -> Option<Self> {
-        match tag {
-            1 => Some(Self::Begin),
-            2 => Some(Self::Object),
-            3 => Some(Self::Root),
-            4 => Some(Self::Commit),
-            _ => None,
-        }
-    }
-}
+pub(crate) use super::record_wire::WalRecordKind;
 
 /// A typed root transition decoded from a canonical root record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,7 +361,9 @@ pub(crate) enum WalTailKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WalTransactionDescriptor {
     pub(super) begin_offset: WalOffset,
-    pub(super) commit: WalCommitDescriptor,
+    pub(super) offset: WalOffset,
+    pub(super) length: WalLength,
+    pub(super) marker: super::commit_wire::CheckedMarker,
 }
 
 /// One streaming scanner event. Object payloads are never retained here.

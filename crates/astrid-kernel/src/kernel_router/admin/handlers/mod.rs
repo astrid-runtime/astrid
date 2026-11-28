@@ -403,13 +403,13 @@ async fn pair_device_dispatch(
                 scope,
             )
             .await;
-            if authorization.is_some() {
+            if let Some(auth) = authorization {
+                let device = astrid_events::ipc::DeviceStamp {
+                    fingerprint: issuer_device_key_id,
+                    registration: auth.device_registration.map(Into::into),
+                };
                 super::request_authorization::record_pair_issue_outcome(
-                    kernel,
-                    caller,
-                    issuer_device_key_id,
-                    request,
-                    &result,
+                    kernel, caller, device, request, &result,
                 )
                 .await;
             }
@@ -458,25 +458,27 @@ async fn agent_set_enabled(
         Ok(p) => p,
         Err(e) => return err_profile(&principal, &e),
     };
-    if profile.enabled == enabled {
-        // No-op but still invalidate cache so the invariant "post-write
-        // reads see current disk state" holds unconditionally.
-        kernel.profile_cache.invalidate(&principal);
-        return success_json(serde_json::json!({
-            "principal": principal.as_str(),
-            "enabled": enabled,
-            "changed": false,
-        }));
-    }
-    profile.enabled = enabled;
-    if let Err(e) = profile.save_to_path(&path) {
-        return err_profile(&principal, &e);
+    let changed = profile.enabled != enabled;
+    if changed {
+        profile.enabled = enabled;
+        if let Err(e) = profile.save_to_path(&path) {
+            return err_profile(&principal, &e);
+        }
     }
     kernel.profile_cache.invalidate(&principal);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if !enabled {
+        crate::storage_mount::retire_requester(
+            kernel,
+            &principal,
+            kernel.principal_directory.uid_for(&principal).ok(),
+        )
+        .await;
+    }
     success_json(serde_json::json!({
         "principal": principal.as_str(),
         "enabled": enabled,
-        "changed": true,
+        "changed": changed,
     }))
 }
 

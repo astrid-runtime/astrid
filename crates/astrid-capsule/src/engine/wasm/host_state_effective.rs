@@ -17,6 +17,62 @@ impl HostState {
             .map(|tracker| tracker.begin(&self.effective_principal()).ok_or(()))
             .transpose()
     }
+    /// Bind an effect to the registration captured by its caller. Register the
+    /// pending lookup before reading the profile so retirement also fences a
+    /// concurrent lookup. The caller holds the session until the effect ends.
+    pub(crate) fn begin_device_operation(
+        &self,
+    ) -> Result<Option<astrid_core::profile::device_sessions::DeviceSession>, ()> {
+        let Some(message) = self.caller_context.as_ref() else {
+            return Ok(None);
+        };
+        self.begin_message_device_operation(message)
+    }
+
+    /// Revalidate a queued message before using its device authority for an effect.
+    pub(crate) fn begin_message_device_operation(
+        &self,
+        message: &astrid_events::ipc::IpcMessage,
+    ) -> Result<Option<astrid_core::profile::device_sessions::DeviceSession>, ()> {
+        let device = message.device_stamp();
+        let Some(raw) = device.fingerprint else {
+            return if device.registration.is_none() {
+                Ok(None)
+            } else {
+                Err(())
+            };
+        };
+        let principal = astrid_core::PrincipalId::new(message.principal.as_deref().ok_or(())?)
+            .map_err(|_| ())?;
+        let key = astrid_core::profile::DeviceKeyId::new(raw.to_owned()).map_err(|_| ())?;
+        self.bind_device_operation(&principal, key, device.registration)
+            .map(Some)
+    }
+
+    /// Bind an effect to the exact registration selected for this principal.
+    pub(crate) fn bind_device_operation(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        key: astrid_core::profile::DeviceKeyId,
+        registration: Option<uuid::Uuid>,
+    ) -> Result<astrid_core::profile::device_sessions::DeviceSession, ()> {
+        use astrid_core::profile::device_sessions::DeviceSessionError;
+        self.device_sessions
+            .bind_current(principal, key, |owner, fingerprint| {
+                let profile = self
+                    .profile_cache
+                    .as_ref()
+                    .ok_or(DeviceSessionError::Unavailable)?
+                    .resolve(owner)
+                    .map_err(|_| DeviceSessionError::Unavailable)?;
+                let record = profile
+                    .active_registration(fingerprint, registration)
+                    .ok_or(DeviceSessionError::Unavailable)?;
+                Ok(record.registration_id)
+            })
+            .map_err(|_| ())
+    }
+
     /// Return the effective KV store for the current invocation.
     ///
     /// Per-principal isolation lives HERE, not in capsule keys. Every real store
@@ -36,7 +92,7 @@ impl HostState {
     pub fn effective_kv(&self) -> &ScopedKvStore {
         #[cfg(debug_assertions)]
         self.debug_assert_invocation_field_set(self.invocation_kv.is_some(), "invocation_kv");
-        self.invocation_kv.as_ref().unwrap_or(&self.kv)
+        crate::engine::wasm::guest_kv::select(self.invocation_kv.as_ref(), &self.kv)
     }
 
     /// The current invocation's capsule KV namespace,
@@ -72,7 +128,10 @@ impl HostState {
     /// for principal-less work.
     #[must_use]
     pub fn effective_home(&self) -> Option<&PrincipalMount> {
-        self.invocation_home.as_ref().or(self.home.as_ref())
+        crate::engine::wasm::mount_selection::effective(
+            self.invocation_home.as_ref(),
+            self.home.as_ref(),
+        )
     }
 
     /// Return the effective tmp mount for the current invocation. Same
@@ -80,7 +139,10 @@ impl HostState {
     /// [`effective_home`](Self::effective_home).
     #[must_use]
     pub fn effective_tmp(&self) -> Option<&PrincipalMount> {
-        self.invocation_tmp.as_ref().or(self.tmp.as_ref())
+        crate::engine::wasm::mount_selection::effective(
+            self.invocation_tmp.as_ref(),
+            self.tmp.as_ref(),
+        )
     }
 
     /// Return the effective authoritative workspace branch for this call.
@@ -89,9 +151,11 @@ impl HostState {
     /// caller; principal runtimes use their load-time branch.
     #[must_use]
     pub fn effective_workspace(&self) -> Option<&PrincipalMount> {
-        self.invocation_workspace
-            .as_ref()
-            .or(self.workspace.as_ref())
+        crate::engine::wasm::mount_selection::workspace(
+            self.workspace_mount_resolver.is_some() && self.invocation_storage_uid.is_some(),
+            self.invocation_workspace.as_ref(),
+            self.workspace.as_ref(),
+        )
     }
 
     /// Return an owned native home root when the effective mount has one.

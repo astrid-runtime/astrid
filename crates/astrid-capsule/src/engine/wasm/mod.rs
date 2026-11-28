@@ -29,7 +29,21 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
         &self,
         principal: &astrid_core::PrincipalId,
     ) -> Result<PrincipalMount, String> {
-        let binding = self.0.bind(principal).await?;
+        Ok(self.mount(self.0.bind(principal).await?))
+    }
+
+    async fn resolve_for(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        uid: astrid_core::PrincipalUid,
+    ) -> Result<PrincipalMount, String> {
+        Ok(self.mount(self.0.bind_for(principal, Some(uid)).await?))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl WorkspaceBranchResolver {
+    fn mount(&self, binding: crate::context::WorkspaceBranchBinding) -> PrincipalMount {
         let handle = astrid_capabilities::DirHandle::new();
         let vfs = storage_vfs::AstridStorageVfs::workspace(
             &self.0.store(),
@@ -37,11 +51,11 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
             binding.branch,
             handle.clone(),
         );
-        Ok(PrincipalMount {
+        PrincipalMount {
             location: PrincipalMountLocation::AstridFilesystem,
             vfs: Arc::new(vfs),
             handle,
-        })
+        }
     }
 }
 
@@ -62,16 +76,24 @@ use compiled::CompiledWasmArtifact;
 pub use compiled::{COMPILED_ENGINE_ABI, CompiledWasmCache};
 #[cfg(test)]
 mod fuel_scheduling_tests;
+mod guest_kv;
+mod guest_uplink;
 pub mod host;
 pub mod host_state;
 #[cfg(test)]
 mod interruption_tests;
 mod invocation_failure;
+mod invocation_owner;
+mod mount_selection;
 mod native_logs;
+mod principal_tracker;
 pub use native_logs::NativeLogRoot;
-pub(crate) use native_logs::eager::open_capsule_log;
 #[cfg(test)]
 use native_logs::eager::open_capsule_log_at;
+pub(crate) use principal_tracker::PrincipalInvocationGuard;
+pub(super) use principal_tracker::PrincipalInvocationTracker;
+#[cfg(test)]
+pub(crate) use principal_tracker::QuiescenceObservationHook;
 #[cfg(test)]
 #[path = "lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
@@ -80,6 +102,10 @@ mod lifecycle_cpu_tests;
 pub mod limits;
 mod pool;
 mod readiness;
+#[cfg(not(target_family = "wasm"))]
+mod storage_file;
+#[cfg(not(target_family = "wasm"))]
+mod storage_handles;
 mod storage_vfs;
 #[cfg(test)]
 mod test_fixtures;
@@ -359,134 +385,6 @@ pub struct WasmEngine {
         Option<Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>>,
 }
 
-#[derive(Default)]
-pub(super) struct PrincipalInvocationTracker {
-    state: std::sync::Mutex<PrincipalInvocationState>,
-    changed: tokio::sync::Notify,
-}
-
-#[derive(Default)]
-struct PrincipalInvocationState {
-    retired: std::collections::HashSet<astrid_core::PrincipalId>,
-    active: std::collections::HashMap<astrid_core::PrincipalId, usize>,
-}
-
-pub(crate) struct PrincipalInvocationGuard {
-    tracker: Arc<PrincipalInvocationTracker>,
-    principal: astrid_core::PrincipalId,
-}
-
-#[cfg(test)]
-pub(crate) struct QuiescenceObservationHook {
-    pub(crate) observed: tokio::sync::oneshot::Sender<()>,
-    pub(crate) resume: tokio::sync::oneshot::Receiver<()>,
-}
-
-impl PrincipalInvocationTracker {
-    pub(super) fn begin(
-        self: &Arc<Self>,
-        principal: &astrid_core::PrincipalId,
-    ) -> Option<PrincipalInvocationGuard> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.retired.contains(principal) {
-            return None;
-        }
-        *state.active.entry(principal.clone()).or_default() += 1;
-        Some(PrincipalInvocationGuard {
-            tracker: Arc::clone(self),
-            principal: principal.clone(),
-        })
-    }
-
-    fn retire(&self, principal: &astrid_core::PrincipalId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retired
-            .insert(principal.clone());
-    }
-
-    fn resume(&self, principal: &astrid_core::PrincipalId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retired
-            .remove(principal);
-    }
-
-    async fn wait_for_quiescence(&self, principal: &astrid_core::PrincipalId) {
-        self.wait_for_quiescence_inner(
-            principal,
-            #[cfg(test)]
-            None,
-        )
-        .await;
-    }
-
-    async fn wait_for_quiescence_inner(
-        &self,
-        principal: &astrid_core::PrincipalId,
-        #[cfg(test)] mut observation_hook: Option<QuiescenceObservationHook>,
-    ) {
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            // notify_waiters does not retain a permit for a future that has
-            // not registered yet. Register before sampling active, otherwise
-            // the final guard can drop between the sample and first poll and
-            // leave retirement asleep after the principal is already drained.
-            notified.as_mut().enable();
-            let active = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .active
-                .get(principal)
-                .copied()
-                .unwrap_or(0);
-            #[cfg(test)]
-            if let Some(hook) = observation_hook.take() {
-                let _ = hook.observed.send(());
-                let _ = hook.resume.await;
-            }
-            if active == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_for_quiescence_with_observation_hook(
-        &self,
-        principal: &astrid_core::PrincipalId,
-        hook: QuiescenceObservationHook,
-    ) {
-        self.wait_for_quiescence_inner(principal, Some(hook)).await;
-    }
-}
-
-impl Drop for PrincipalInvocationGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .tracker
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(active) = state.active.get_mut(&self.principal) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                state.active.remove(&self.principal);
-            }
-        }
-        drop(state);
-        self.tracker.changed.notify_waiters();
-    }
-}
-
 impl WasmEngine {
     /// Use a kernel-shared cache for verified immutable compiled artifacts.
     #[must_use]
@@ -525,7 +423,7 @@ impl WasmEngine {
     /// overlayfs paths alike.
     async fn commit_workspace(
         &self,
-        op: CowOp,
+        op: WorkspaceCommitOp,
         caller: &astrid_core::PrincipalId,
     ) -> CapsuleResult<bool> {
         #[cfg(not(target_family = "wasm"))]
@@ -561,12 +459,8 @@ impl WasmEngine {
                 .binding_for(&caller)
                 .await
                 .map_err(CapsuleError::ExecutionFailed)?;
-            let operation = match op {
-                CowOp::Promote => WorkspaceCommitOp::Promote,
-                CowOp::Rollback => WorkspaceCommitOp::Rollback,
-            };
             return branches
-                .finish(&caller, binding, operation)
+                .finish(&caller, binding, op)
                 .await
                 .map(|()| true)
                 .map_err(CapsuleError::ExecutionFailed);
@@ -620,14 +514,6 @@ impl WasmEngine {
     }
 }
 
-/// Which copy-on-write commit operation to run against a
-/// [`WorkspaceCow`](astrid_vfs::WorkspaceCow) backend.
-#[derive(Clone, Copy)]
-enum CowOp {
-    Promote,
-    Rollback,
-}
-
 /// Reject a hosted portal when the platform could not provide real
 /// copy-on-write isolation. `NoCow` intentionally points at the pristine
 /// directory and is therefore a compatibility result for callers that only
@@ -649,11 +535,11 @@ fn require_isolated_workspace_cow(backend: &dyn astrid_vfs::WorkspaceCow) -> Cap
 /// any guest access is available.
 async fn run_workspace_cow_op(
     backend: Arc<dyn astrid_vfs::WorkspaceCow>,
-    op: CowOp,
+    op: WorkspaceCommitOp,
 ) -> CapsuleResult<bool> {
     let result = tokio::task::spawn_blocking(move || match op {
-        CowOp::Promote => backend.promote(),
-        CowOp::Rollback => backend.rollback(),
+        WorkspaceCommitOp::Promote => backend.promote(),
+        WorkspaceCommitOp::Rollback => backend.rollback(),
     })
     .await
     .map_err(|e| CapsuleError::ExecutionFailed(format!("workspace CoW task panicked: {e}")))?;
@@ -1211,20 +1097,33 @@ pub(crate) struct PrincipalVfsBundle {
 /// Build a home/tmp VFS bundle for `principal`.
 ///
 /// `home://` is always an authoritative AstridFilesystem view.  The mutable
-/// alias is resolved through the kernel-owned directory and only the resulting
-/// immutable UID is passed to the storage provider.  No host directory is
+/// alias labels the view. The storage provider receives the UID captured
+/// during admission for both mounts. No host directory is
 /// created, opened, canonicalized, or consulted for home access.
 pub(crate) fn build_principal_vfs_bundle(
     store: &astrid_storage::RuntimePrincipalStore,
-    directory: &astrid_storage::PrincipalDirectory,
     principal: &astrid_core::PrincipalId,
+    uid: astrid_core::PrincipalUid,
 ) -> PrincipalVfsBundle {
-    let Ok(uid) = directory.uid_for(principal) else {
-        tracing::warn!(%principal, "principal has no durable UID; denying home:// access");
-        return PrincipalVfsBundle::default();
+    let home = build_principal_home(store, principal, uid);
+    // `/tmp` remains an explicitly ephemeral native scratch mount.  It is
+    // intentionally independent from the durable `home://` namespace.
+    let path = store.principal_tmp_dir(uid);
+    let tmp = if astrid_core::platform_fs::ensure_private_directory(&path).is_ok() {
+        mount_dir_sync(&path)
+    } else {
+        None
     };
+    PrincipalVfsBundle { home, tmp }
+}
+
+fn build_principal_home(
+    store: &astrid_storage::RuntimePrincipalStore,
+    principal: &astrid_core::PrincipalId,
+    uid: astrid_core::PrincipalUid,
+) -> Option<PrincipalMount> {
     let handle = astrid_capabilities::DirHandle::new();
-    let home = match storage_vfs::AstridStorageVfs::home(
+    match storage_vfs::AstridStorageVfs::home(
         store,
         astrid_storage::StateOwner::Principal(uid),
         principal,
@@ -1243,25 +1142,7 @@ pub(crate) fn build_principal_vfs_bundle(
             );
             None
         },
-    };
-
-    // `/tmp` remains an explicitly ephemeral native scratch mount.  It is
-    // intentionally independent from the durable `home://` namespace.
-    let tmp = astrid_core::dirs::AstridHome::resolve()
-        .ok()
-        .and_then(|home| {
-            let path = home
-                .run_dir()
-                .join("principals")
-                .join(uid.to_string())
-                .join("tmp");
-            if astrid_core::platform_fs::ensure_private_directory(&path).is_ok() {
-                mount_dir_sync(&path)
-            } else {
-                None
-            }
-        });
-    PrincipalVfsBundle { home, tmp }
+    }
 }
 
 fn mount_dir_sync(root: &std::path::Path) -> Option<PrincipalMount> {
@@ -1322,16 +1203,17 @@ async fn install_principal_overlays(
     // Safe to unwrap: `install_principal_overlays_sync` returned `true` only for
     // a present, parseable principal.
     let p = principal.expect("overlays installed only for a present principal");
-    let Some(store) = state.principal_store.as_ref() else {
+    let (Some(store), Some(uid)) = (state.principal_store.as_ref(), state.invocation_storage_uid)
+    else {
         state.invocation_home = None;
         state.invocation_workspace = None;
         state.invocation_tmp = None;
         return;
     };
-    let bundle = build_principal_vfs_bundle(store, &state.principal_directory, p);
+    let bundle = build_principal_vfs_bundle(store, p, uid);
     state.invocation_home = bundle.home;
     state.invocation_workspace = if let Some(resolver) = state.workspace_mount_resolver.as_ref() {
-        match resolver.resolve(p).await {
+        match resolver.resolve_for(p, uid).await {
             Ok(mount) => Some(mount),
             Err(error) => {
                 tracing::warn!(%p, %error, "failed to resolve Astrid workspace branch; denying workspace access");
@@ -1367,6 +1249,7 @@ fn install_principal_overlays_sync(
     // it only decides which teardown signal this invocation's waits listen to,
     // and a principal-scoped cancel must still be able to unwedge a caller
     // whose data overlays degraded to the neutral floor.
+    state.invocation_storage_uid = None;
     state.install_invocation_cancel_token(principal);
 
     let Some(p) = principal else {
@@ -1378,8 +1261,44 @@ fn install_principal_overlays_sync(
         return false;
     };
 
-    let ns = format!("{}:capsule:{}", p, state.capsule_id);
-    let kv = match astrid_storage::ScopedKvStore::new(state.kv_backend.clone(), &ns) {
+    // Secrets use a separate host-only control namespace. Never build the
+    // SecretStore over the guest's ordinary `{principal}:capsule:*` view:
+    // that would let a capsule enumerate or forge its own control keys.
+    let principal_uid = match state
+        .principal_directory
+        .bound_uid(p, state.runtime_owner_uid)
+    {
+        Ok(uid) => uid,
+        Err(error) => {
+            if state.runtime_owner_uid.is_some() {
+                state.invocation_profile_authorized = false;
+            }
+            tracing::warn!(
+                principal = %p,
+                error = %error,
+                "principal has no immutable UID for secret control scope; failing closed"
+            );
+            state.invocation_kv = None;
+            state.invocation_secret_store = None;
+            state.invocation_capsule_log = None;
+            state.deferred_logs.clear_invocation();
+            return false;
+        },
+    };
+    // A caller may inject independent KV and VFS backends. Only bind
+    // the native tree when KV already refers to that tree.
+    let durable = state
+        .principal_store
+        .as_ref()
+        .filter(|store| Arc::ptr_eq(&state.kv_backend, &store.kv()));
+    let scoped = match durable {
+        Some(store) => store.principal_capsule_kv(p, principal_uid, state.capsule_id.as_str()),
+        None => astrid_storage::ScopedKvStore::new(
+            state.kv_backend.clone(),
+            format!("{p}:capsule:{}", state.capsule_id),
+        ),
+    };
+    let kv = match scoped {
         Ok(kv) => kv,
         Err(e) => {
             // FAIL CLOSED: a construction failure for principal `p` must NEVER
@@ -1398,24 +1317,6 @@ fn install_principal_overlays_sync(
         },
     };
 
-    // Secrets use a separate host-only control namespace. Never build the
-    // SecretStore over the guest's ordinary `{principal}:capsule:*` view:
-    // that would let a capsule enumerate or forge its own control keys.
-    let principal_uid = match state.principal_directory.uid_for(p) {
-        Ok(uid) => uid,
-        Err(error) => {
-            tracing::warn!(
-                principal = %p,
-                error = %error,
-                "principal has no immutable UID for secret control scope; failing closed"
-            );
-            state.invocation_kv = None;
-            state.invocation_secret_store = None;
-            state.invocation_capsule_log = None;
-            state.deferred_logs.clear_invocation();
-            return false;
-        },
-    };
     let secret_scope = match astrid_storage::ScopedKvStore::new(
         state.kv_backend.clone(),
         astrid_storage::env::principal_secret_namespace(principal_uid, state.capsule_id.as_str()),
@@ -1440,7 +1341,8 @@ fn install_principal_overlays_sync(
         state.runtime_handle.clone(),
     ));
     state.invocation_kv = Some(kv);
-    native_logs::install_invocation(state, p, principal_uid);
+    state.invocation_storage_uid = Some(principal_uid);
+    native_logs::install_invocation(state, principal_uid);
     true
 }
 
@@ -1828,13 +1730,24 @@ impl ExecutionEngine for WasmEngine {
             //
             // Detection is automatic (no config flag) via gitoxide work-tree
             // discovery (see `workspace_is_git_managed`).
+            let owner_uid = (!system_runtime)
+                .then(|| ctx.principal_directory.uid_for(&ctx.principal).ok())
+                .flatten();
+            if !invocation_owner::accepts(native_owner_uid, owner_uid) {
+                return Err(CapsuleError::UnsupportedEntryPoint(
+                    "principal runtime owner changed before mount setup".to_owned(),
+                ));
+            }
             #[cfg(not(target_family = "wasm"))]
             let owner_workspace_mount = if let Some(branches) = workspace_branches.as_ref()
                 && !system_runtime
             {
+                let uid = owner_uid.ok_or_else(|| CapsuleError::UnsupportedEntryPoint(
+                    "principal workspace has no registered owner".to_owned(),
+                ))?;
                 Some(
                     WorkspaceBranchResolver(branches.clone())
-                        .resolve(&ctx.principal)
+                        .resolve_for(&ctx.principal, uid)
                         .await
                         .map_err(CapsuleError::UnsupportedEntryPoint)?,
                 )
@@ -2015,6 +1928,7 @@ impl ExecutionEngine for WasmEngine {
             } else {
                 ctx.cli_socket_listener.clone()
             };
+            let device_sessions = ctx.device_sessions.clone();
             let session_tok = if !has_unix_bind {
                 None
             } else {
@@ -2155,7 +2069,7 @@ impl ExecutionEngine for WasmEngine {
             // recv. Explicit system runtimes retain the neutral deny-all
             // fallback and are never aliases for the default human principal.
             let owner_vfs = if !system_runtime {
-                ctx.principal_store.as_ref().map_or_else(
+                ctx.principal_store.as_ref().zip(owner_uid).map_or_else(
                     || {
                         tracing::warn!(
                             principal = %ctx.principal,
@@ -2163,15 +2077,13 @@ impl ExecutionEngine for WasmEngine {
                         );
                         PrincipalVfsBundle::default()
                     },
-                    |store| build_principal_vfs_bundle(store, &ctx.principal_directory, &ctx.principal),
+                    |(store, uid)| build_principal_vfs_bundle(store, &ctx.principal, uid),
                 )
             } else {
                 PrincipalVfsBundle::default()
             };
             let kv_backend = kv.backend();
-            let owner_uid = (!system_runtime)
-                .then(|| ctx.principal_directory.uid_for(&ctx.principal).ok())
-                .flatten();
+
             let owner_secret_namespace = if system_runtime {
                 Some(astrid_storage::env::system_secret_namespace(capsule_id_val.as_str()))
             } else {
@@ -2197,13 +2109,25 @@ impl ExecutionEngine for WasmEngine {
             } else {
                 native_logs::bind(
                     native_log_root.as_ref(), &ctx.principal_directory,
-                    &ctx.principal, capsule_id_val.as_str(), true, &principal_invocations,
+                    capsule_id_val.as_str(), true, &principal_invocations,
                     native_owner_uid.or(owner_uid),
                 )
             };
             let owner_capsule_log = owner_log.file;
-            let owner_pending_log = owner_log.pending;
-            let owner_kv = Some(kv.clone());
+            let owner_log_binding = owner_log.bound;
+            let runtime_owner_uid = self.runtime_id.as_ref().and_then(|id| match id.key().scope() {
+                crate::registry::RuntimeScope::Principal(uid) => Some(uid),
+                crate::registry::RuntimeScope::SystemResident => None,
+            });
+            let durable_kv = ctx.principal_store.as_ref()
+                .filter(|store| Arc::ptr_eq(&kv_backend, &store.kv()));
+            let owner_kv = match (durable_kv, runtime_owner_uid) {
+                (Some(store), Some(uid)) => Some(
+                    store.principal_capsule_kv(&ctx.principal, uid, capsule_id_val.as_str())
+                        .map_err(|error| CapsuleError::ExecutionFailed(format!("bind owner KV: {error}")))?
+                ),
+                _ => Some(kv.clone()),
+            };
 
             // Per-instance `HostState` factory. Shared services clone (Arc or
             // cheap value clones); per-Store fields (`wasi_ctx`,
@@ -2258,7 +2182,7 @@ impl ExecutionEngine for WasmEngine {
             let st_owner_secret_store = owner_secret_store.clone();
             let st_owner_capsule_log = owner_capsule_log.clone();
             let st_native_log_root = native_log_root.clone();
-            let st_owner_pending_log = owner_pending_log.clone();
+            let st_owner_log_binding = owner_log_binding.clone();
             let kv_backend_for_state = kv_backend.clone();
             // Concurrent run-loop workers (Approach B, shared listener). Only a
             // loopback TCP server capsule (run-loop + TCP `net_bind`, no
@@ -2300,6 +2224,7 @@ impl ExecutionEngine for WasmEngine {
                 ),
                 principal: st_principal.clone(),
                 system_runtime: st_system_runtime,
+                runtime_owner_uid,
                 capsule_uuid,
                 caller_context: None,
                 interceptor_active: false,
@@ -2308,7 +2233,7 @@ impl ExecutionEngine for WasmEngine {
                 // no human-principal log fallback.
                 capsule_log: st_owner_capsule_log.clone(),
                 deferred_logs: native_logs::DeferredBindings::for_factory(
-                    st_native_log_root.clone(), st_owner_pending_log.clone(),
+                    st_native_log_root.clone(), st_owner_log_binding.clone(),
                 ),
                 capsule_id: capsule_id_val.clone(),
                 // The CoW merged path (non-git) or the pristine workspace
@@ -2344,6 +2269,7 @@ impl ExecutionEngine for WasmEngine {
                 principal_store: st_principal_store.clone(),
                 tmp: st_owner_tmp.clone(),
                 invocation_home: None,
+                invocation_storage_uid: None,
                 invocation_workspace: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
@@ -2398,6 +2324,7 @@ impl ExecutionEngine for WasmEngine {
                 principal_cancel_tokens: principal_cancel_tokens_for_state.clone(),
                 invocation_cancel_token: None,
                 session_token: session_tok.clone(),
+                device_sessions: device_sessions.clone(),
                 interceptor_handles: Vec::new(),
                 allowance_store: st_allowance_store.clone(),
                 identity_store: st_identity_store.clone(),
@@ -2419,10 +2346,12 @@ impl ExecutionEngine for WasmEngine {
                 // No frame in flight at construction; both the ingress
                 // principal and its authenticating device key_id are set per
                 // framed read.
+                ingress_publication: None,
                 ingress_principal: None,
                 ingress_device_key_id: None,
                 ingress_request_owner: None,
                 ingress_origin: None,
+                ingress_socket: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // a cooperative recv/accept or completed nonzero sleep; the
                 // bound run-loop's epoch callback reads + clears it to
@@ -2683,7 +2612,6 @@ impl ExecutionEngine for WasmEngine {
                     ))
                 })?;
                 let runtime_id = principal_runtime_id.expect("typed principal run has runtime id");
-                let owner_uid = ctx.principal_directory.uid_for(&ctx.principal).ok();
                 let owner_env = match owner_uid {
                     Some(owner_uid) => {
                         load_invocation_env_overlay_from_backend(
@@ -2989,11 +2917,13 @@ impl ExecutionEngine for WasmEngine {
     }
 
     async fn promote_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
-        self.commit_workspace(CowOp::Promote, caller).await
+        self.commit_workspace(WorkspaceCommitOp::Promote, caller)
+            .await
     }
 
     async fn rollback_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
-        self.commit_workspace(CowOp::Rollback, caller).await
+        self.commit_workspace(WorkspaceCommitOp::Rollback, caller)
+            .await
     }
 
     fn request_cancel(&self) {
@@ -3060,9 +2990,17 @@ impl ExecutionEngine for WasmEngine {
         // Invoking principal, derived once: used both for the quota profile
         // below and the per-invocation diagnostic span at the end. Lock-free
         // — `owner_principal` is the immutable load-time `state.principal`.
-        let invoking_principal = caller
+        let Ok(caller_principal) = caller
             .and_then(|msg| msg.principal.as_deref())
-            .and_then(|p| astrid_core::PrincipalId::new(p).ok())
+            .map(astrid_core::PrincipalId::new)
+            .transpose()
+        else {
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: "invalid caller principal stamp".to_owned(),
+            });
+        };
+        let invoking_principal = caller_principal
+            .clone()
             .or_else(|| self.owner_principal.clone())
             .unwrap_or_default();
         if !self.system_runtime
@@ -3265,20 +3203,15 @@ impl ExecutionEngine for WasmEngine {
         // the overlay, that layer will add the field + accessor and
         // consume the resolved `Arc<OverlayVfs>` here.
         if let Some(registry) = self.overlay_registry.as_ref() {
-            let invoking = caller
-                .and_then(|msg| msg.principal.as_deref())
-                .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-                .or_else(|| self.owner_principal.clone())
-                .unwrap_or_default();
-            let resolved = registry.resolve(&invoking).await;
+            let resolved = registry.resolve(&invoking_principal).await;
             if let Err(e) = resolved {
                 tracing::error!(
-                    principal = %invoking,
+                    principal = %invoking_principal,
                     error = %e,
                     "overlay registry resolve failed; denying invocation (issue #668)"
                 );
                 return Err(CapsuleError::WasmError(format!(
-                    "principal '{invoking}' overlay resolve failed: {e}"
+                    "principal '{invoking_principal}' overlay resolve failed: {e}"
                 )));
             }
         }
@@ -3402,27 +3335,34 @@ impl ExecutionEngine for WasmEngine {
                 );
                 state.invocation_profile = invocation_profile.clone();
                 state.invocation_profile_authorized = true;
-                state.invocation_env_overlay =
-                    match state.principal_directory.uid_for(&invoking_principal) {
-                        Ok(principal_uid) => {
-                            load_invocation_env_overlay_from_backend(
-                                state.kv_backend.clone(),
-                                principal_uid,
-                                state.capsule_id.as_str(),
-                            )
-                            .await
-                        },
-                        Err(_) => None,
-                    };
-
                 // Refine the invocation context. Principal runtimes reject peer
                 // callers before checkout; SystemResident runtimes may install
                 // an explicitly authenticated caller overlay.
-                let invocation_principal: Option<astrid_core::PrincipalId> = caller
-                    .and_then(|msg| msg.principal.as_deref())
-                    .and_then(|p| astrid_core::PrincipalId::new(p).ok());
-
-                install_principal_overlays(state, invocation_principal.as_ref()).await;
+                install_principal_overlays(state, caller_principal.as_ref()).await;
+                let env_uid = if caller_principal.is_some() {
+                    state.invocation_storage_uid
+                } else {
+                    state
+                        .principal_directory
+                        .bound_uid(&invoking_principal, state.runtime_owner_uid)
+                        .ok()
+                };
+                if !invocation_owner::accepts(state.runtime_owner_uid, env_uid) {
+                    return Ok(crate::capsule::InterceptResult::Deny {
+                        reason: "interceptor caller no longer owns the runtime".to_owned(),
+                    });
+                }
+                state.invocation_env_overlay = match env_uid {
+                    Some(uid) => {
+                        load_invocation_env_overlay_from_backend(
+                            state.kv_backend.clone(),
+                            uid,
+                            state.capsule_id.as_str(),
+                        )
+                        .await
+                    },
+                    None => None,
+                };
                 state.tool_result = None;
                 tool_audit = crate::engine::wasm::host::tool_audit::ToolCallAudit::arm(
                     state,
@@ -3592,6 +3532,7 @@ pub struct LifecycleConfig {
 #[derive(Clone)]
 pub struct LifecyclePrincipalContext {
     principal: astrid_core::PrincipalId,
+    admitted_uid: Option<astrid_core::PrincipalUid>,
     secret_env: std::collections::HashSet<String>,
     file_secret_root: Option<PathBuf>,
     principal_directory: astrid_storage::PrincipalDirectory,
@@ -3606,6 +3547,7 @@ impl LifecyclePrincipalContext {
     pub fn new(principal: astrid_core::PrincipalId) -> Self {
         Self {
             principal,
+            admitted_uid: None,
             secret_env: std::collections::HashSet::new(),
             file_secret_root: None,
             principal_directory: astrid_storage::PrincipalDirectory::default(),
@@ -3648,8 +3590,22 @@ impl LifecyclePrincipalContext {
         principal_store: astrid_storage::RuntimePrincipalStore,
         principal_directory: astrid_storage::PrincipalDirectory,
     ) -> Self {
+        self.admitted_uid = principal_directory.uid_for(&self.principal).ok();
         self.principal_store = Some(principal_store);
         self.principal_directory = principal_directory;
+        self
+    }
+
+    /// Use the same owner already admitted for the lifecycle environment and secrets.
+    #[must_use]
+    pub fn with_admitted_principal_storage(
+        mut self,
+        store: astrid_storage::RuntimePrincipalStore,
+        uid: astrid_core::PrincipalUid,
+    ) -> Self {
+        self.principal_directory = store.principal_directory();
+        self.principal_store = Some(store);
+        self.admitted_uid = Some(uid);
         self
     }
 }
@@ -3662,6 +3618,7 @@ async fn build_lifecycle_host_state(
 ) -> CapsuleResult<HostState> {
     let LifecyclePrincipalContext {
         principal,
+        admitted_uid,
         secret_env,
         file_secret_root,
         principal_directory,
@@ -3682,9 +3639,37 @@ async fn build_lifecycle_host_state(
     // Lifecycle home access is the same UID-bound logical projection as the
     // steady-state load/recv paths. A legacy native `home_root` is retained
     // in the public config for source compatibility but is never mounted.
-    let home_mount = principal_store
-        .as_ref()
-        .and_then(|store| build_principal_vfs_bundle(store, &principal_directory, &principal).home);
+    let kv_backend = cfg.kv.backend();
+    let mut kv = cfg.kv.clone();
+    let mut home_mount = None;
+    if let Some(store) = &principal_store {
+        let uid = admitted_uid.ok_or_else(|| {
+            CapsuleError::ExecutionFailed("lifecycle principal has no admitted UID".into())
+        })?;
+        if store
+            .principal_directory()
+            .bound_uid(&principal, Some(uid))
+            .is_err()
+        {
+            return Err(CapsuleError::ExecutionFailed(
+                "lifecycle principal owner changed".into(),
+            ));
+        }
+        if Arc::ptr_eq(&kv_backend, &store.kv()) {
+            let bound = store
+                .principal_capsule_kv(&principal, uid, cfg.capsule_id.as_str())
+                .map_err(|error| {
+                    CapsuleError::ExecutionFailed(format!("bind lifecycle KV: {error}"))
+                })?;
+            if bound.namespace() != kv.namespace() {
+                return Err(CapsuleError::ExecutionFailed(
+                    "lifecycle KV namespace mismatch".into(),
+                ));
+            }
+            kv = bound;
+        }
+        home_mount = build_principal_home(store, &principal, uid);
+    }
 
     Ok(HostState {
         wasi_ctx: build_wasi_ctx(),
@@ -3700,6 +3685,7 @@ async fn build_lifecycle_host_state(
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: principal.clone(),
         system_runtime: false,
+        runtime_owner_uid: admitted_uid,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,
@@ -3722,6 +3708,7 @@ async fn build_lifecycle_host_state(
         principal_store,
         tmp: None,
         invocation_home: None,
+        invocation_storage_uid: None,
         invocation_workspace: None,
         invocation_tmp: None,
         invocation_secret_store: None,
@@ -3732,15 +3719,10 @@ async fn build_lifecycle_host_state(
         // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
         profile_cache: None,
         invocation_env_overlay: None,
-        // Lifecycle hooks (install/upgrade) run a ONE-SHOT, single-principal,
-        // NON-shared instance: `cfg.kv` / `cfg.secret_store` are already scoped to
-        // the specific principal the operator is installing for, no other
-        // principal ever touches this throwaway instance, and no per-invocation
-        // overlays are installed. So the load-time `kv` legitimately IS this
-        // principal's real store (not the shared-runtime neutral placeholder).
-        // `kv_backend` mirrors it for API completeness; overlays are never built.
-        kv_backend: cfg.kv.backend(),
-        kv: cfg.kv.clone(),
+        // Host-only control scopes retain the injected backend. Guest operations
+        // use the admitted UID view when backed by the durable principal store.
+        kv_backend,
+        kv,
         event_bus: cfg.event_bus.clone(),
         route_admission_gate: astrid_events::RouteAdmissionGate::default(),
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
@@ -3789,6 +3771,7 @@ async fn build_lifecycle_host_state(
         principal_cancel_tokens: HostState::new_principal_cancel_tokens(),
         invocation_cancel_token: None,
         session_token: None,
+        device_sessions: Default::default(),
         interceptor_handles: Vec::new(),
         allowance_store: None,
         identity_store: None,
@@ -3818,10 +3801,12 @@ async fn build_lifecycle_host_state(
         share_tcp_listeners: false,
         // Lifecycle hooks never forward client frames; no in-flight principal
         // or authenticating device.
+        ingress_publication: None,
         ingress_principal: None,
         ingress_device_key_id: None,
         ingress_request_owner: None,
         ingress_origin: None,
+        ingress_socket: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,
@@ -4131,7 +4116,8 @@ mod lifecycle_context_tests {
         let mut bob_state = build_lifecycle_host_state(
             &cfg,
             LifecyclePhase::Install,
-            LifecyclePrincipalContext::new(bob).with_principal_storage(principal_store, principals),
+            LifecyclePrincipalContext::new(bob)
+                .with_principal_storage(principal_store.clone(), principals.clone()),
             ledger.clone(),
         )
         .await
@@ -4149,6 +4135,53 @@ mod lifecycle_context_tests {
             reopened.get_config("API_KEY".into()).unwrap().as_deref(),
             Some("alice-secret")
         );
+
+        // A separately injected KV stays isolated even when durable home is available.
+        reopened.kv.set("preview", vec![1]).await.unwrap();
+        let durable = principal_store
+            .principal_capsule_kv(&principal, principal_uid, "test")
+            .unwrap();
+        assert_eq!(durable.get("preview").await.unwrap(), None);
+
+        let mut durable_cfg = cfg;
+        durable_cfg.kv = astrid_storage::ScopedKvStore::new(
+            principal_store.kv(),
+            format!("{principal}:capsule:test"),
+        )
+        .unwrap();
+        let admitted = || {
+            LifecyclePrincipalContext::new(principal.clone())
+                .with_admitted_principal_storage(principal_store.clone(), principal_uid)
+        };
+        let running = build_lifecycle_host_state(
+            &durable_cfg,
+            LifecyclePhase::Upgrade,
+            admitted(),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+        running.kv.set("before", vec![1]).await.unwrap();
+        let replacement = astrid_core::PrincipalUid::from_bytes([0x93; 32]);
+        principals
+            .rename(
+                principal_uid,
+                &principal,
+                astrid_core::PrincipalId::new("agent-renamed").unwrap(),
+            )
+            .unwrap();
+        principals.register(principal.clone(), replacement).unwrap();
+        assert!(running.kv.set("after", vec![2]).await.is_err());
+        assert!(
+            build_lifecycle_host_state(&durable_cfg, LifecyclePhase::Upgrade, admitted(), ledger)
+                .await
+                .is_err()
+        );
+        let new_view = principal_store
+            .principal_capsule_kv(&principal, replacement, "test")
+            .unwrap();
+        assert_eq!(new_view.get("before").await.unwrap(), None);
+        assert_eq!(new_view.get("after").await.unwrap(), None);
     }
 }
 

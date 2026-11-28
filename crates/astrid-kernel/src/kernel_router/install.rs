@@ -133,13 +133,12 @@ pub(super) async fn handle_install_capsule(
     // Resolve the immutable UID before any environment or package mutation.
     // A caller may name only a principal already present in the authenticated
     // directory; aliases never become durable package authorities.
-    if let Err(error) = kernel
-        .principal_directory
-        .uid_for(target)
-        .map_err(|error| format!("resolve target principal {target}: {error}"))
-    {
-        return KernelResponse::Error(error);
-    }
+    let admitted_uid = match kernel.principal_directory.uid_for(target) {
+        Ok(uid) => uid,
+        Err(error) => {
+            return KernelResponse::Error(format!("resolve target principal {target}: {error}"));
+        },
+    };
 
     let lifecycle_cpu = match crate::user_resources::execution_throttle(
         &kernel.user_cpu,
@@ -155,6 +154,7 @@ pub(super) async fn handle_install_capsule(
     let env_transaction = match stage_env_values(
         kernel,
         target,
+        admitted_uid,
         &path,
         batch_archive.as_ref().map(|archive| &archive.manifest),
         env,
@@ -168,6 +168,7 @@ pub(super) async fn handle_install_capsule(
     match install_and_activate(
         kernel,
         target,
+        admitted_uid,
         source,
         path,
         batch_archive,
@@ -189,6 +190,7 @@ pub(super) async fn handle_install_capsule(
 async fn install_and_activate(
     kernel: &Arc<crate::Kernel>,
     target: &astrid_core::principal::PrincipalId,
+    admitted_uid: astrid_core::PrincipalUid,
     source: &str,
     path: std::path::PathBuf,
     batch_archive: Option<super::install_batch_archive::BatchArchive>,
@@ -201,6 +203,7 @@ async fn install_and_activate(
     let home = kernel.astrid_home.clone();
     let options = daemon_install_options(
         kernel,
+        admitted_uid,
         source,
         provenance,
         expected_package_generation,
@@ -234,7 +237,9 @@ async fn install_and_activate(
     // must create a new runtime generation even when its bytes/hash are
     // unchanged (configuration and lifecycle state may have changed); merely
     // calling `ensure_principal_loaded` would return early on the old view.
-    if let Err(error) = activate_installed_capsule(kernel, target, &output).await {
+    if let Err(error) =
+        activate_installed_capsule(kernel, target, admitted_uid, &output.capsule_id).await
+    {
         if let Some(transaction) = env_transaction {
             transaction.rollback(kernel).await;
         }
@@ -246,6 +251,7 @@ async fn install_and_activate(
 
 fn daemon_install_options(
     kernel: &Arc<crate::Kernel>,
+    admitted_uid: astrid_core::PrincipalUid,
     source: &str,
     provenance: Option<&CapsuleInstallProvenance>,
     expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
@@ -259,6 +265,7 @@ fn daemon_install_options(
         // elicitation must receive configuration through the request env.
         lifecycle_bus: None,
         storage: kernel.principal_store.clone().map(Arc::new),
+        admitted_uid: Some(admitted_uid),
         provenance_distro: provenance.and_then(|value| value.distro.clone()),
         provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
         expected_package_generation,
@@ -446,7 +453,8 @@ fn validate_install_provenance(
 
 async fn stage_env_values(
     kernel: &Arc<crate::Kernel>,
-    caller: &astrid_core::principal::PrincipalId,
+    target: &astrid_core::principal::PrincipalId,
+    admitted_uid: astrid_core::PrincipalUid,
     source: &std::path::Path,
     batch_manifest: Option<&astrid_capsule::manifest::CapsuleManifest>,
     values: &[CapsuleInstallEnv],
@@ -465,10 +473,6 @@ async fn stage_env_values(
         &loaded_manifest
     };
     let capsule = manifest.package.name.clone();
-    let uid = kernel
-        .principal_directory
-        .uid_for(caller)
-        .map_err(|error| format!("resolve durable principal UID: {error}"))?;
     validate_env_values(manifest, values)?;
 
     // Keep defaults, inherited grants and other installs out through commit/rollback,
@@ -483,6 +487,10 @@ async fn stage_env_values(
     // Keep the lock only for the KV transaction, never capsule activation.
     let _env_guard = kernel.admin_write_lock.lock().await;
 
+    let uid = kernel
+        .principal_directory
+        .bound_uid(target, Some(admitted_uid))
+        .map_err(|error| format!("validate install environment owner: {error}"))?;
     let mut snapshots = Vec::with_capacity(values.len());
     for value in values {
         // Install secrets are the site credential. Every assigned principal
@@ -706,15 +714,12 @@ async fn rollback_env_snapshot_group(
 
 async fn activate_installed_capsule(
     kernel: &Arc<crate::Kernel>,
-    caller: &astrid_core::principal::PrincipalId,
-    output: &InstallOutput,
+    target: &astrid_core::principal::PrincipalId,
+    admitted_uid: astrid_core::PrincipalUid,
+    id: &astrid_capsule_types::CapsuleId,
 ) -> Result<(), String> {
-    let manifest =
-        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml"))
-            .map_err(|error| format!("installed capsule could not be activated: {error}"))?;
-    let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
     kernel
-        .reload_one_capsule(&id, caller)
+        .reload_capsule_for_owner(id, target, Some(admitted_uid))
         .await
         .map_err(|error| format!("capsule installed on disk but live activation failed: {error:#}"))
 }

@@ -35,6 +35,27 @@ fn owner_codec_v1_remains_frozen_without_a_fleet_tag() {
 }
 
 #[test]
+fn owner_codec_v2_preserves_the_durable_domain_and_every_uid_byte() {
+    use super::{FleetUid, StateOwner};
+
+    let uid = std::array::from_fn(|i| u8::try_from(i).unwrap());
+    let codec = StateOwnerCodecV2;
+    assert_eq!(codec.encode(&StateOwner::System), [0]);
+    assert_eq!(codec.decode(&[0]), Some(StateOwner::System));
+    for (tag, owner) in [
+        (1, StateOwner::Principal(PrincipalUid::from_bytes(uid))),
+        (2, StateOwner::Fleet(FleetUid::from_bytes(uid))),
+    ] {
+        let bytes = [[tag].as_slice(), uid.as_slice()].concat();
+        assert_eq!(codec.encode(&owner), bytes);
+        assert_eq!(codec.decode(&bytes), Some(owner));
+        assert_eq!(codec.decode(&bytes[..32]), None);
+    }
+    assert_eq!(codec.decode(&[0; 33]), None);
+    assert_eq!(codec.decode(&[3; 33]), None);
+}
+
+#[test]
 fn new_destination_is_created_with_the_private_directory_contract() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("principal-store");

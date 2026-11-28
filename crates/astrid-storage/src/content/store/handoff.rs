@@ -11,12 +11,9 @@ use crate::content::catalog::{
 };
 use crate::content_dag::ContentError;
 use crate::engine::PrincipalProjectionEngine;
-use crate::storage_model::{ObjectId, ObjectKind, ReferenceKind, ReferenceLabel, RootState};
+use crate::storage_model::{ObjectId, ReferenceKind, ReferenceLabel, RootState};
 
-use super::{
-    PRINCIPAL_GRAPH_VERSION, PrincipalContentStore, STATE_LABEL, invalid, owned_target,
-    require_structural,
-};
+use super::{PrincipalContentStore, invalid};
 
 impl<P, E> PrincipalContentStore<P, E>
 where
@@ -71,21 +68,9 @@ where
         let Some(root) = root else {
             return Ok(None);
         };
-        let commit = self.load_typed(
-            owner,
-            root.commit,
-            ObjectKind::Commit,
-            PRINCIPAL_GRAPH_VERSION,
-        )?;
-        require_structural(root.commit, &commit)?;
-        let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-        let state = self.load_typed(
-            owner,
-            state_id,
-            ObjectKind::PrincipalState,
-            PRINCIPAL_GRAPH_VERSION,
-        )?;
-        require_structural(state_id, &state)?;
+        let super::header_graph::Graph {
+            state_id, state, ..
+        } = self.read_header_graph(owner, root)?;
         let Some(reference) = state.reference(&ReferenceLabel::new(CONTENT_COMPONENT_LABEL)) else {
             return Ok(None);
         };

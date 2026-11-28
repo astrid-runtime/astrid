@@ -41,13 +41,13 @@ fn set_caller(
 /// response topic, echoing the request principal. Mirrors what an uplink/broker
 /// does for the operator.
 fn spawn_responder(bus: astrid_events::EventBus, decision: &'static str) {
-    respond_after(bus, decision, || {});
+    respond_after(bus, decision, |_| {});
 }
 
 fn respond_after(
     bus: astrid_events::EventBus,
     decision: &'static str,
-    before_reply: impl FnOnce() + Send + 'static,
+    before_reply: impl FnOnce(&mut IpcMessage) + Send + 'static,
 ) {
     let mut req_rx = bus.subscribe_topic("astrid.v1.approval");
     tokio::spawn(async move {
@@ -58,7 +58,6 @@ fn respond_after(
             let IpcPayload::ApprovalRequired { request_id, .. } = &message.payload else {
                 continue;
             };
-            before_reply();
             let response_topic = Topic::approval_response(request_id);
             let payload = IpcPayload::ApprovalResponse {
                 request_id: request_id.clone(),
@@ -72,6 +71,7 @@ fn respond_after(
             if let Some(owner) = message.request_owner {
                 response = response.with_request_owner(owner);
             }
+            before_reply(&mut response);
             bus.publish(AstridEvent::Ipc {
                 message: response,
                 metadata: astrid_events::EventMetadata::default(),
@@ -116,19 +116,14 @@ fn publish_consent_reply(
 
 #[test]
 fn classify_decision_maps_approve_variants() {
-    assert!(matches!(classify_decision("approve"), Decision::Once));
-    assert!(matches!(
-        classify_decision("approve_session"),
-        Decision::Session
-    ));
-    assert!(matches!(
-        classify_decision("approve_always"),
-        Decision::Always
-    ));
+    use super::super::consent_reply::classify;
+    assert!(matches!(classify(b"approve"), Decision::Once));
+    assert!(matches!(classify(b"approve_session"), Decision::Session));
+    assert!(matches!(classify(b"approve_always"), Decision::Always));
     // Everything else is a deny (fail-closed).
-    assert!(matches!(classify_decision("deny"), Decision::Deny));
-    assert!(matches!(classify_decision("garbage"), Decision::Deny));
-    assert!(matches!(classify_decision(""), Decision::Deny));
+    assert!(matches!(classify(b"deny"), Decision::Deny));
+    assert!(matches!(classify(b"garbage"), Decision::Deny));
+    assert!(matches!(classify(b""), Decision::Deny));
 }
 
 #[test]
@@ -769,7 +764,7 @@ async fn changed_profile_cancels_a_pending_egress_approval() {
     set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
 
     let target = principal.clone();
-    respond_after(state.event_bus.clone(), "approve_always", move || {
+    respond_after(state.event_bus.clone(), "approve_always", move |_| {
         std::fs::remove_file(&path).unwrap();
         cache.invalidate(&target);
     });
@@ -783,6 +778,130 @@ async fn changed_profile_cancels_a_pending_egress_approval() {
         "127.0.0.1",
         1234
     ));
+}
+
+#[test]
+fn durable_egress_writes_only_the_selected_profile_endpoint() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    for invalidate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+        for principal in [&alice, &bob] {
+            PrincipalProfile::default().save(&home, principal).unwrap();
+        }
+        let cache = PrincipalProfileCache::with_home(home.clone());
+        let store = AllowanceStore::new();
+        let snapshot = cache.resolve(&alice).unwrap();
+        if invalidate {
+            cache.invalidate(&alice);
+        }
+        let authority = super::super::consent_reply::admit(Ok(()), || Ok(()), || Ok(())).unwrap();
+        let mut writer = GrantWriter {
+            devices: [Default::default(); 2],
+            store: &store,
+            profile: Some((&cache, snapshot)),
+        };
+        let target = LocalTarget {
+            principal: &alice,
+            capsule: "chat",
+            host: "127.0.0.1",
+            port: 1234,
+        };
+        let result = super::super::egress_reply::apply(
+            &authority,
+            b"approve_always",
+            true,
+            target,
+            &mut writer,
+        );
+        assert_eq!(result.is_ok(), !invalidate);
+        assert_eq!(store.count(), 0);
+        let fresh = PrincipalProfileCache::with_home(home);
+        let a = fresh.resolve(&alice).unwrap();
+        let b = fresh.resolve(&bob).unwrap();
+        assert_eq!(
+            has_persisted_grant(&a, "chat", "127.0.0.1", 1234),
+            !invalidate
+        );
+        assert!(!has_persisted_grant(&a, "chat", "127.0.0.2", 1234));
+        assert!(!has_persisted_grant(&a, "chat", "127.0.0.1", 1235));
+        assert!(!has_persisted_grant(&a, "other", "127.0.0.1", 1234));
+        assert!(!has_persisted_grant(&b, "chat", "127.0.0.1", 1234));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_rechecks_both_device_registrations_after_the_prompt() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    for decision in ["approve", "approve_session", "approve_always"] {
+        for (replace_caller, replace_responder, stale_reply) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = AstridHome::from_path(dir.path());
+            let principal = PrincipalId::new("alice").unwrap();
+            let caller = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+            let responder = DeviceKey::new("b".repeat(64), DeviceScope::Full, None, 0);
+            let mut profile = PrincipalProfile::default();
+            profile.auth.methods.push(AuthMethod::Keypair);
+            profile.add_device(caller.clone());
+            profile.add_device(responder.clone());
+            profile.save(&home, &principal).unwrap();
+            let mut state = minimal_host_state(tokio::runtime::Handle::current());
+            let store = Arc::new(AllowanceStore::new());
+            state.allowance_store = Some(store.clone());
+            state.profile_cache = Some(Arc::new(PrincipalProfileCache::with_home(home.clone())));
+            set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+            let context = state.caller_context.as_mut().unwrap();
+            context.device_key_id = Some(caller.key_id.clone());
+            context.device_registration_id = caller.registration_id.map(Into::into);
+            let path = home.profile_path(&principal);
+            respond_after(state.event_bus.clone(), decision, move |reply| {
+                reply.device_key_id = Some(responder.key_id.clone());
+                reply.device_registration_id = if stale_reply {
+                    Some(uuid::Uuid::new_v4())
+                } else {
+                    responder.registration_id.map(Into::into)
+                };
+                if replace_caller || replace_responder {
+                    let retired = if replace_caller { &caller } else { &responder };
+                    let live = if replace_caller { &responder } else { &caller };
+                    profile.auth.public_keys.clear();
+                    profile.add_device(live.clone());
+                    profile.add_device(DeviceKey::new(
+                        retired.pubkey.clone(),
+                        DeviceScope::Full,
+                        None,
+                        0,
+                    ));
+                    profile.save_to_path(&path).unwrap();
+                }
+            });
+            let accepted =
+                tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
+            let valid = !replace_caller && !replace_responder && !stale_reply;
+            assert_eq!(accepted, valid);
+            assert_eq!(
+                store.count(),
+                usize::from(valid && decision == "approve_session")
+            );
+            let disk = PrincipalProfile::load_required(&home, &principal).unwrap();
+            assert_eq!(
+                has_persisted_grant(&disk, "test", "127.0.0.1", 1234),
+                valid && decision == "approve_always"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -803,7 +922,7 @@ async fn changed_profile_cancels_a_pending_session_egress_approval() {
     set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
 
     let target = principal.clone();
-    respond_after(state.event_bus.clone(), "approve_session", move || {
+    respond_after(state.event_bus.clone(), "approve_session", move |_| {
         std::fs::remove_file(&path).unwrap();
         cache.invalidate(&target);
     });

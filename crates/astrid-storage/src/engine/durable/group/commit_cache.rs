@@ -2,25 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::storage_model::{ObjectIdentity, RootState};
-
-use super::super::format::{decode_object_frame, frame_checksum};
+use super::super::format::{frame_checksum, published_record};
 use super::super::{
-    ARENA_MAGIC, ArenaLocation, DurableEngine, LIFECYCLE_USABLE, PersistentObjectIdentity,
-    PrincipalCodec, ensure_usable,
+    ARENA_MAGIC, DurableEngine, LIFECYCLE_USABLE, PersistentObjectIdentity, PrincipalCodec,
+    ensure_usable,
 };
 
-/// Created only after the batch's durable frontier and root publication.
-/// The payload is moved from `Prepared`, never copied or kept decoded there.
-pub(super) struct PublishedCommitPayload {
-    pub(super) root: RootState,
-    pub(super) arena_generation: u64,
-    pub(super) location: ArenaLocation,
-    pub(super) payload: Arc<[u8]>,
-}
+pub(super) use super::super::read_admission::PublishedCommitPayload;
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -51,17 +41,12 @@ where
         {
             return;
         }
-        if length != commit.location.payload_len
-            || frame_checksum(ARENA_MAGIC, length, &commit.payload) != commit.location.checksum
-        {
-            return;
-        }
-        let Ok((id, record)) = decode_object_frame(&commit.payload, self.identity.scheme()) else {
+        let Some(candidate) = commit.prepare(
+            |len, bytes| frame_checksum(ARENA_MAGIC, len, bytes),
+            |bytes, id| published_record(bytes, id, &self.identity),
+        ) else {
             return;
         };
-        if id != commit.root.commit || self.identity.identify(&record) != id {
-            return;
-        }
         // Match ordinary read admission's writer -> cache order. The original
         // publication writer/fence is already released; never wait for a writer
         // or enter recovery here. A miss after any skipped admission uses the authoritative path.
@@ -70,12 +55,15 @@ where
         };
         if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_USABLE
             || ensure_usable(&inner).is_err()
-            || inner.arena_generation != commit.arena_generation
-            || inner.roots_by_principal.get(principal) != Some(&commit.root)
-            || inner.index.get(&id) != Some(&commit.location)
         {
             return;
         }
-        let _ = self.object_cache.insert(principal, id, record);
+        let _ = candidate.warm(
+            principal,
+            inner.arena_generation,
+            &inner.roots_by_principal,
+            &inner.index,
+            |owner, key, loaded| self.object_cache.insert(owner, key, loaded),
+        );
     }
 }

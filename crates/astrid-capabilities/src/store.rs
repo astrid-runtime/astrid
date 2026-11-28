@@ -6,11 +6,17 @@
 //! `SurrealKV` constructor for compatibility during the migration window.
 
 use astrid_core::principal::PrincipalId;
+use astrid_core::principal::retirement;
 use astrid_core::{Permission, TokenId};
 use astrid_storage::{KvStore, SurrealKvStore};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+
+mod authority;
+mod marker_batch;
+mod marker_key;
+use authority::{Admission, Marker, TokenStatus};
 
 use crate::error::{CapabilityError, CapabilityResult};
 use crate::token::CapabilityToken;
@@ -26,7 +32,9 @@ const NS_TOKENS: &str = "caps:tokens";
 /// though the primary layout is principal-prefixed. Kept in sync with
 /// [`NS_TOKENS`] by `add`/`revoke`/`cleanup_expired`.
 const NS_TOKEN_INDEX: &str = "caps:token_index";
+#[cfg(test)]
 const NS_REVOKED: &str = "caps:revoked";
+#[cfg(test)]
 const NS_USED: &str = "caps:used";
 
 /// Build the persistent-token key for a given principal and token id.
@@ -40,8 +48,12 @@ fn token_key_prefix(principal: &PrincipalId) -> String {
     format!("{principal}/")
 }
 
+fn marker_text(encoded: &[u8; 36]) -> CapabilityResult<&str> {
+    std::str::from_utf8(encoded).map_err(|error| CapabilityError::StorageError(error.to_string()))
+}
+
 /// Tombstone value for presence-only KV entries (revoked/used markers).
-const PRESENCE_MARKER: &[u8] = &[1];
+const PRESENCE_MARKER: &[u8] = &authority::PRESENCE_MARKER;
 
 /// Capability store with both session and persistent storage.
 ///
@@ -64,15 +76,9 @@ pub struct CapabilityStore {
     session_tokens: RwLock<HashMap<PrincipalId, HashMap<TokenId, CapabilityToken>>>,
     /// Persistent tokens (`KvStore` backed).
     persistent_store: Option<Arc<dyn KvStore>>,
-    /// Revoked token IDs (quick lookup). Global — cross-principal.
-    revoked: RwLock<std::collections::HashSet<TokenId>>,
-    /// Used single-use token IDs (replay protection). Global — cross-principal.
-    ///
-    /// This is a `tokio::sync::RwLock` (unlike the other fields) because
-    /// [`mark_used`](Self::mark_used) must hold the write guard **across the
-    /// persistent KV write** to close the check-then-persist TOCTOU replay
-    /// window — a `std` guard cannot legally live across an `.await`.
-    used_tokens: tokio::sync::RwLock<std::collections::HashSet<TokenId>>,
+    /// Orders token admission, revocation and consumption in this daemon.
+    /// The write guard spans the authority-changing durable operation.
+    authority: tokio::sync::RwLock<HashMap<TokenId, TokenStatus>>,
 }
 
 impl CapabilityStore {
@@ -83,8 +89,7 @@ impl CapabilityStore {
             retiring_principals: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             session_tokens: RwLock::new(HashMap::new()),
             persistent_store: None,
-            revoked: RwLock::new(std::collections::HashSet::new()),
-            used_tokens: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            authority: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -102,19 +107,7 @@ impl CapabilityStore {
             SurrealKvStore::open(path).map_err(|e| CapabilityError::StorageError(e.to_string()))?;
         let kv: Arc<dyn KvStore> = Arc::new(store);
 
-        let mut cap_store = Self {
-            retiring_principals: tokio::sync::RwLock::new(std::collections::HashSet::new()),
-            session_tokens: RwLock::new(HashMap::new()),
-            persistent_store: Some(kv),
-            revoked: RwLock::new(std::collections::HashSet::new()),
-            used_tokens: tokio::sync::RwLock::new(std::collections::HashSet::new()),
-        };
-
-        // Load revoked and used tokens
-        cap_store.load_revoked().await?;
-        cap_store.load_used_tokens().await?;
-
-        Ok(cap_store)
+        Self::with_kv_store(kv).await
     }
 
     /// Create a store backed by an existing `KvStore` (for shared stores).
@@ -123,66 +116,54 @@ impl CapabilityStore {
     ///
     /// Returns an error if loading existing revoked/used tokens fails.
     pub async fn with_kv_store(store: Arc<dyn KvStore>) -> CapabilityResult<Self> {
-        let mut cap_store = Self {
-            retiring_principals: tokio::sync::RwLock::new(std::collections::HashSet::new()),
-            session_tokens: RwLock::new(HashMap::new()),
+        let mut recorded: HashMap<TokenId, Vec<Marker>> = HashMap::new();
+        for marker in Marker::recovery_order() {
+            let namespace = marker.namespace();
+            let keys = store
+                .list_keys(namespace)
+                .await
+                .map_err(|error| CapabilityError::StorageError(error.to_string()))?;
+            marker_batch::group(&mut recorded, &keys, marker, |key| {
+                marker_key::decode_compatible(key.as_bytes(), |bytes| {
+                    let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+                    uuid::Uuid::parse_str(text)
+                        .map(uuid::Uuid::into_bytes)
+                        .map_err(|error| error.to_string())
+                })
+                .map(uuid::Uuid::from_bytes)
+                .map(TokenId::from_uuid)
+                .map_err(|error| {
+                    CapabilityError::StorageError(format!(
+                        "invalid token marker in {namespace}: {error}"
+                    ))
+                })
+            })?;
+        }
+        // Each token's live authority is replayed from the markers the store
+        // reports for it, as `TokenStatus::recover_markers` verifies. A token
+        // can have multiple spellings in legacy storage. Replay tolerates duplicates.
+        let authority = authority::recover_authority(recorded);
+        Ok(Self {
             persistent_store: Some(store),
-            revoked: RwLock::new(std::collections::HashSet::new()),
-            used_tokens: tokio::sync::RwLock::new(std::collections::HashSet::new()),
-        };
-
-        cap_store.load_revoked().await?;
-        cap_store.load_used_tokens().await?;
-
-        Ok(cap_store)
+            authority: tokio::sync::RwLock::new(authority),
+            ..Self::in_memory()
+        })
     }
 
-    /// Load revoked token IDs from persistent storage.
-    async fn load_revoked(&mut self) -> CapabilityResult<()> {
-        let Some(store) = &self.persistent_store else {
-            return Ok(());
-        };
-
-        let keys = store
-            .list_keys(NS_REVOKED)
-            .await
-            .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
-
-        let mut revoked = self
-            .revoked
-            .write()
-            .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
-
-        for key in keys {
-            if let Ok(uuid) = uuid::Uuid::parse_str(&key) {
-                revoked.insert(TokenId::from_uuid(uuid));
-            }
+    fn ensure_admission(
+        status: TokenStatus,
+        id: &TokenId,
+        single_use: bool,
+    ) -> CapabilityResult<()> {
+        match status.admit(single_use) {
+            Admission::Revoked => Err(CapabilityError::TokenRevoked {
+                token_id: id.to_string(),
+            }),
+            Admission::AlreadyUsed => Err(CapabilityError::TokenAlreadyUsed {
+                token_id: id.to_string(),
+            }),
+            Admission::Allowed => Ok(()),
         }
-
-        Ok(())
-    }
-
-    /// Load used single-use token IDs from persistent storage.
-    async fn load_used_tokens(&mut self) -> CapabilityResult<()> {
-        let Some(store) = &self.persistent_store else {
-            return Ok(());
-        };
-
-        let keys = store
-            .list_keys(NS_USED)
-            .await
-            .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
-
-        // `&mut self` — exclusive access, no need to take the async lock.
-        let used = self.used_tokens.get_mut();
-
-        for key in keys {
-            if let Ok(uuid) = uuid::Uuid::parse_str(&key) {
-                used.insert(TokenId::from_uuid(uuid));
-            }
-        }
-
-        Ok(())
     }
 
     /// Add a capability token.
@@ -196,7 +177,7 @@ impl CapabilityStore {
     /// Returns an error if the token is invalid or storage fails.
     pub async fn add(&self, token: CapabilityToken) -> CapabilityResult<()> {
         let retirement = self.retiring_principals.read().await;
-        if retirement.contains(&token.principal) {
+        if retirement::fenced(&retirement, &token.principal) {
             return Err(CapabilityError::StorageError(format!(
                 "principal {} is retiring",
                 token.principal
@@ -270,19 +251,16 @@ impl CapabilityStore {
     /// to v2 signing), or a storage error if reading fails.
     pub async fn get(&self, token_id: &TokenId) -> CapabilityResult<Option<CapabilityToken>> {
         let retirement = self.retiring_principals.read().await;
-        // Check if revoked
-        {
-            let revoked = self
-                .revoked
-                .read()
-                .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
-            if revoked.contains(token_id) {
-                return Err(CapabilityError::TokenRevoked {
-                    token_id: token_id.to_string(),
-                });
-            }
-        }
+        let authority = self.authority.read().await;
+        Self::ensure_admission(authority::status(&authority, token_id), token_id, false)?;
+        self.lookup(token_id, &retirement).await
+    }
 
+    async fn lookup(
+        &self,
+        token_id: &TokenId,
+        retirement: &std::collections::HashSet<PrincipalId>,
+    ) -> CapabilityResult<Option<CapabilityToken>> {
         // Check session tokens first (scan across principals — token id is unique).
         {
             let tokens = self
@@ -291,7 +269,7 @@ impl CapabilityStore {
                 .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
             for principal_map in tokens.values() {
                 if let Some(token) = principal_map.get(token_id) {
-                    if retirement.contains(&token.principal) {
+                    if retirement::fenced(retirement, &token.principal) {
                         return Ok(None);
                     }
                     return Ok(Some(token.clone()));
@@ -306,7 +284,7 @@ impl CapabilityStore {
         if let Some(store) = &self.persistent_store
             && let Some(token) = Self::read_persistent_token_any_principal(store, token_id).await?
         {
-            if retirement.contains(&token.principal) {
+            if retirement::fenced(retirement, &token.principal) {
                 return Ok(None);
             }
             return Ok(Some(token));
@@ -353,6 +331,9 @@ impl CapabilityStore {
                 let token: CapabilityToken = serde_json::from_slice(&bytes)
                     .map_err(|e| CapabilityError::SerializationError(e.to_string()))?;
                 token.validate()?;
+                if token.id != *token_id || token.principal != principal {
+                    return Err(CapabilityError::InvalidSignature);
+                }
                 return Ok(Some(token));
             }
             // Index pointed at a missing primary entry — stale index row.
@@ -377,20 +358,21 @@ impl CapabilityStore {
             let token: CapabilityToken = serde_json::from_slice(&bytes)
                 .map_err(|e| CapabilityError::SerializationError(e.to_string()))?;
             token.validate()?;
+            if token.id != *token_id {
+                return Err(CapabilityError::InvalidSignature);
+            }
             return Ok(Some(token));
         }
 
         Ok(None)
     }
 
-    /// Check if a single-use token has already been consumed.
-    ///
-    /// Returns `true` only if the token is single-use and already consumed.
-    async fn is_consumed_single_use(&self, token: &CapabilityToken) -> bool {
-        if !token.is_single_use() {
-            return false;
-        }
-        self.used_tokens.read().await.contains(&token.id)
+    async fn is_available(&self, token: &CapabilityToken) -> bool {
+        let authority = self.authority.read().await;
+        matches!(
+            authority::status(&authority, &token.id).admit(token.is_single_use()),
+            Admission::Allowed
+        )
     }
 
     /// Check if `principal` holds a capability for `(resource, permission)`.
@@ -423,7 +405,7 @@ impl CapabilityStore {
         permission: Permission,
     ) -> Option<CapabilityToken> {
         let retirement = self.retiring_principals.read().await;
-        if retirement.contains(principal) {
+        if retirement::fenced(&retirement, principal) {
             return None;
         }
         // Check session tokens (this principal's inner map only). Matching
@@ -448,7 +430,7 @@ impl CapabilityStore {
             Err(_) => Vec::new(),
         };
         for token in session_candidates {
-            if !self.is_consumed_single_use(&token).await {
+            if self.is_available(&token).await {
                 return Some(token);
             }
         }
@@ -485,15 +467,7 @@ impl CapabilityStore {
                     if token.principal != *principal {
                         continue;
                     }
-                    // Revocation is global.
-                    if let Ok(revoked) = self.revoked.read()
-                        && revoked.contains(&token.id)
-                    {
-                        continue;
-                    }
-                    if token.grants(resource, permission)
-                        && !self.is_consumed_single_use(&token).await
-                    {
+                    if token.grants(resource, permission) && self.is_available(&token).await {
                         return Some(token);
                     }
                 }
@@ -510,7 +484,15 @@ impl CapabilityStore {
     /// the subsequent purge observes every earlier add and every later add is
     /// rejected.
     pub async fn begin_principal_retirement(&self, principal: PrincipalId) {
-        self.retiring_principals.write().await.insert(principal);
+        retirement::fence(&mut *self.retiring_principals.write().await, principal);
+    }
+
+    /// Restore a retirement fence during startup, while the store is exclusively owned.
+    pub fn restore_principal_retirement(
+        &mut self,
+        principal: PrincipalId,
+    ) -> retirement::RecoveredCapabilityFence<PrincipalId> {
+        retirement::restore_capability(self.retiring_principals.get_mut(), principal)
     }
 
     /// Return whether new authority for `principal` is currently fenced.
@@ -519,37 +501,49 @@ impl CapabilityStore {
     /// loading, so an on-disk profile retained temporarily for reclamation
     /// policy cannot make a retiring principal live again.
     pub async fn is_principal_retiring(&self, principal: &PrincipalId) -> bool {
-        self.retiring_principals.read().await.contains(principal)
+        retirement::fenced(&*self.retiring_principals.read().await, principal)
     }
 
     /// Release an in-process retirement fence after durable reclamation.
     pub async fn finish_principal_retirement(&self, principal: &PrincipalId) {
-        self.retiring_principals.write().await.remove(principal);
+        retirement::release(&mut *self.retiring_principals.write().await, principal);
     }
 
     /// Revoke a token (global — all principals).
     ///
     /// Revocation is a property of the token's identity, not the caller.
     /// Once revoked, a token stays revoked for every principal that might
-    /// hold it — the mark is written to the global revoked set and the
-    /// persistent token bytes are deleted from every known principal
-    /// namespace.
+    /// hold it. The marker is authoritative even when cleanup of the token
+    /// payload or index is incomplete.
     ///
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
     pub async fn revoke(&self, token_id: &TokenId) -> CapabilityResult<()> {
-        // Persist revocation first so KV is the ground truth. If the daemon
-        // crashes after this point, `load_revoked()` will still see it on
-        // restart.
+        // Close live admission before the durable write. If the future is
+        // canceled or storage reports an error, retain the in-memory fence.
+        // Only a successful durable write provides the restart guarantee.
+        {
+            let mut authority = self.authority.write().await;
+            if let Some(store) = &self.persistent_store {
+                authority::submit_revocation(
+                    &mut authority,
+                    token_id,
+                    |id| *id.0.as_bytes(),
+                    |namespace, encoded, value| async move {
+                        store
+                            .set(namespace, marker_text(&encoded)?, value.to_vec())
+                            .await
+                            .map_err(|error| CapabilityError::StorageError(error.to_string()))
+                    },
+                )
+                .await?;
+            } else {
+                authority::fence_revocation(&mut authority, token_id);
+            }
+        }
         if let Some(store) = &self.persistent_store {
             let token_id_str = token_id.0.to_string();
-
-            store
-                .set(NS_REVOKED, &token_id_str, PRESENCE_MARKER.to_vec())
-                .await
-                .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
-
             // Look up the principal via the secondary index (O(1)) and
             // delete the single primary entry.
             if let Ok(Some(principal_bytes)) = store.get(NS_TOKEN_INDEX, &token_id_str).await
@@ -566,15 +560,6 @@ impl CapabilityStore {
             // Legacy sweep: a v1 token still at the flat `caps:tokens/{id}`
             // key from before the Layer 4 migration.
             let _ = store.delete(NS_TOKENS, &token_id_str).await;
-        }
-
-        // Update in-memory state (rebuilt from KV on restart regardless).
-        {
-            let mut revoked = self
-                .revoked
-                .write()
-                .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
-            revoked.insert(token_id.clone());
         }
 
         {
@@ -691,43 +676,51 @@ impl CapabilityStore {
 
     /// Mark a single-use token as used.
     ///
-    /// This should be called after successfully using a single-use token
-    /// to prevent replay attacks.
+    /// Admission records consumption before allowing an operation to use
+    /// the grant. Use [`Self::use_token`] to validate and consume together.
     ///
     /// # Errors
     ///
-    /// Returns an error if the token was already used or storage fails.
+    /// Returns an error if the token was revoked, already used, or storage fails.
     pub async fn mark_used(&self, token_id: &TokenId) -> CapabilityResult<()> {
-        // Hold a single write lock across check, persist, and insert to
-        // prevent TOCTOU races where two concurrent callers both pass
-        // the "already used?" check before either inserts.
-        let mut used = self.used_tokens.write().await;
+        let mut authority = self.authority.write().await;
+        self.consume(&mut authority, token_id).await
+    }
 
-        if used.contains(token_id) {
+    async fn consume(
+        &self,
+        authority: &mut HashMap<TokenId, TokenStatus>,
+        token_id: &TokenId,
+    ) -> CapabilityResult<()> {
+        let status = authority::status(authority, token_id);
+        Self::ensure_admission(status, token_id, true)?;
+
+        // A canceled or ambiguous write can have committed. Requiring
+        // durable absence atomically prevents a retry from winning twice.
+        let consumption = authority::Consumption::new(token_id);
+        let won = if let Some(store) = &self.persistent_store {
+            let (namespace, id) = consumption.address();
+            let encoded = marker_key::encode(id.0.as_bytes());
+            let key = marker_text(&encoded)?;
+            store
+                .compare_and_swap(namespace, key, None, PRESENCE_MARKER.to_vec())
+                .await
+                .map_err(|error| CapabilityError::StorageError(error.to_string()))?
+        } else {
+            true
+        };
+        let admitted = consumption.finish(authority, won);
+        if !admitted {
             return Err(CapabilityError::TokenAlreadyUsed {
                 token_id: token_id.to_string(),
             });
         }
-
-        // Persist first so KV is the ground truth. If the daemon crashes
-        // after this point, `load_used_tokens()` will still see it on
-        // restart. The write guard is a `tokio::sync` guard precisely so it
-        // can be held across this await — dropping it before the persist
-        // would reopen the TOCTOU replay window.
-        if let Some(store) = &self.persistent_store {
-            store
-                .set(NS_USED, &token_id.0.to_string(), PRESENCE_MARKER.to_vec())
-                .await
-                .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
-        }
-
-        used.insert(token_id.clone());
         Ok(())
     }
 
     /// Check if a single-use token has been used.
     pub async fn is_used(&self, token_id: &TokenId) -> bool {
-        self.used_tokens.read().await.contains(token_id)
+        authority::status(&*self.authority.read().await, token_id).is_used()
     }
 
     /// Validate and optionally consume a token.
@@ -739,21 +732,39 @@ impl CapabilityStore {
     ///
     /// Returns an error if the token is invalid, expired, revoked, or already used.
     pub async fn use_token(&self, token_id: &TokenId) -> CapabilityResult<CapabilityToken> {
-        let token = self
-            .get(token_id)
-            .await?
-            .ok_or_else(|| CapabilityError::TokenNotFound {
-                token_id: token_id.to_string(),
-            })?;
+        self.use_checked(token_id, |_| Ok(())).await
+    }
 
-        // Validate the token
-        token.validate()?;
-
-        // For single-use tokens, mark as used
-        if token.is_single_use() {
-            self.mark_used(token_id).await?;
+    pub(crate) async fn use_checked(
+        &self,
+        token_id: &TokenId,
+        check: impl FnOnce(&CapabilityToken) -> CapabilityResult<()> + Send,
+    ) -> CapabilityResult<CapabilityToken> {
+        let retirement = self.retiring_principals.read().await;
+        {
+            let authority = self.authority.read().await;
+            Self::ensure_admission(authority::status(&authority, token_id), token_id, false)?;
         }
+        let token = self.lookup(token_id, &retirement).await?.ok_or_else(|| {
+            CapabilityError::TokenNotFound {
+                token_id: token_id.to_string(),
+            }
+        })?;
+        if token.id != *token_id {
+            return Err(CapabilityError::InvalidSignature);
+        }
+        token.validate()?;
+        check(&token)?;
 
+        if token.is_single_use() {
+            let mut authority = self.authority.write().await;
+            token.check_admission_expiry()?;
+            self.consume(&mut authority, token_id).await?;
+        } else {
+            let authority = self.authority.read().await;
+            token.check_admission_expiry()?;
+            Self::ensure_admission(authority::status(&authority, token_id), token_id, false)?;
+        }
         Ok(token)
     }
 
@@ -764,6 +775,7 @@ impl CapabilityStore {
     /// Returns an error if storage operations fail.
     pub async fn list_tokens(&self) -> CapabilityResult<Vec<CapabilityToken>> {
         let mut tokens = Vec::new();
+        let authority = self.authority.read().await;
 
         // Session tokens
         {
@@ -773,7 +785,8 @@ impl CapabilityStore {
                 .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
             for principal_map in session.values() {
                 for token in principal_map.values() {
-                    if !token.is_expired() {
+                    if !token.is_expired() && !authority::status(&authority, &token.id).is_revoked()
+                    {
                         tokens.push(token.clone());
                     }
                 }
@@ -782,14 +795,6 @@ impl CapabilityStore {
 
         // Persistent tokens — iterate every `{principal}/{token_id}` key.
         if let Some(store) = &self.persistent_store {
-            // Snapshot the revoked set — a `std` read guard cannot be
-            // held across the KV awaits below.
-            let revoked = self
-                .revoked
-                .read()
-                .map_err(|e| CapabilityError::StorageError(e.to_string()))?
-                .clone();
-
             let keys = store
                 .list_keys(NS_TOKENS)
                 .await
@@ -800,7 +805,7 @@ impl CapabilityStore {
                 };
                 if let Some(bytes) = data
                     && let Ok(token) = serde_json::from_slice::<CapabilityToken>(&bytes)
-                    && !revoked.contains(&token.id)
+                    && !authority::status(&authority, &token.id).is_revoked()
                     && !token.is_expired()
                 {
                     tokens.push(token);
@@ -856,8 +861,15 @@ impl std::fmt::Debug for CapabilityStore {
         let (session_principals, session_count) = self.session_tokens.read().map_or((0, 0), |t| {
             (t.len(), t.values().map(HashMap::len).sum::<usize>())
         });
-        let revoked_count = self.revoked.read().map_or(0, |r| r.len());
-        let used_count = self.used_tokens.try_read().map_or(0, |u| u.len());
+        let (revoked_count, used_count) = self.authority.try_read().map_or((0, 0), |authority| {
+            (
+                authority
+                    .values()
+                    .filter(|status| status.is_revoked())
+                    .count(),
+                authority.values().filter(|status| status.is_used()).count(),
+            )
+        });
         let retiring_count = self
             .retiring_principals
             .try_read()

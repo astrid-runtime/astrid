@@ -26,6 +26,17 @@ impl PrincipalProfile {
                 self.profile_version, CURRENT_PROFILE_VERSION
             )));
         }
+        if self.profile_version < super::DEVICE_REGISTRATION_PROFILE_VERSION
+            && self
+                .auth
+                .public_keys
+                .iter()
+                .any(|key| key.registration_id.is_some())
+        {
+            return Err(ProfileError::Invalid(
+                "device registration IDs require profile_version 2 or later".into(),
+            ));
+        }
         self.quotas.validate()?;
         self.auth.validate()?;
         self.typed_fields()?;
@@ -379,6 +390,22 @@ mod tests {
     }
 
     #[test]
+    fn version_one_cannot_persist_a_versioned_registration() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut profile = PrincipalProfile {
+            profile_version: 1,
+            ..Default::default()
+        };
+        profile
+            .auth
+            .public_keys
+            .push(DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 1));
+        assert!(
+            matches!(profile.validate(), Err(ProfileError::Invalid(reason)) if reason.contains("profile_version"))
+        );
+    }
+
+    #[test]
     fn rejects_device_key_with_bad_pubkey_len() {
         use super::super::{DeviceKey, DeviceScope};
         let mut p = PrincipalProfile::default();
@@ -390,6 +417,7 @@ mod tests {
             scope: DeviceScope::Full,
             label: None,
             created_at: 0,
+            registration_id: None,
         }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
@@ -404,6 +432,7 @@ mod tests {
             scope: DeviceScope::Full,
             label: None,
             created_at: 0,
+            registration_id: None,
         }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
@@ -440,6 +469,7 @@ mod tests {
             scope: DeviceScope::Full,
             label: None,
             created_at: 0,
+            registration_id: None,
         }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }

@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::engine::wasm::host_state::HostState;
+use crate::engine::wasm::mount_selection::{LogicalRoot, VfsTarget};
 
 /// URI scheme prefix for the principal's home directory.
 pub(super) const HOME_SCHEME: &str = "home://";
@@ -16,7 +17,8 @@ pub(super) const HOME_SCHEME: &str = "home://";
 /// URI scheme prefix for the daemon's current working directory.
 pub(super) const CWD_SCHEME: &str = "cwd://";
 /// Logical scheme used for the path-free canonical Astrid workspace.
-pub(super) const WORKSPACE_SCHEME: &str = "workspace://";
+#[cfg(test)]
+const WORKSPACE_SCHEME: &str = "workspace://";
 
 /// Path prefix that maps to the principal's tmp directory.
 pub(super) const TMP_PREFIX: &str = "/tmp/";
@@ -39,7 +41,28 @@ fn make_relative(requested: &str) -> &Path {
 /// Result of resolving a path to a physical absolute location on disk.
 pub(super) struct ResolvedPhysical {
     pub(super) physical: PathBuf,
-    pub(super) canonical_root: PathBuf,
+    pub(super) relative: PathBuf,
+}
+
+impl super::physical::PhysicalPath<&std::ffi::OsStr> for PathBuf {
+    fn append(&mut self, name: &std::ffi::OsStr) {
+        self.push(name);
+    }
+
+    fn relative(&self, root: &Self) -> Option<Self> {
+        self.strip_prefix(root).ok().map(Path::to_path_buf)
+    }
+}
+
+impl ResolvedPhysical {
+    fn into_target(self, target: VfsTarget) -> ResolvedPath {
+        ResolvedPath {
+            gate_path: self.physical.to_string_lossy().into_owned(),
+            physical: Some(self.physical),
+            relative: self.relative,
+            target,
+        }
+    }
 }
 
 /// Compute the true physical absolute path for the security gate by
@@ -54,7 +77,7 @@ pub(super) fn resolve_physical_absolute(
     let joined = canonical_root.join(make_relative(requested));
     let mut existing = joined.as_path();
     let mut missing = Vec::new();
-    let mut physical = loop {
+    let ancestor = loop {
         match std::fs::symlink_metadata(existing) {
             Ok(_) => {
                 break existing.canonicalize().map_err(|error| {
@@ -78,27 +101,14 @@ pub(super) fn resolve_physical_absolute(
             Err(error) => return Err(format!("cannot inspect {}: {error}", existing.display())),
         }
     };
-    for name in missing.into_iter().rev() {
-        physical.push(name);
-    }
-    if !physical.starts_with(&canonical_root) {
-        return Err(format!(
-            "path escapes root boundary: {requested} resolves to {}",
-            physical.display()
-        ));
-    }
-    Ok(ResolvedPhysical {
-        physical,
-        canonical_root,
-    })
-}
-
-/// Which VFS target a resolved path points at.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum VfsTarget {
-    Workspace,
-    Home,
-    Tmp,
+    super::physical::confine(&canonical_root, ancestor, missing)
+        .map(|(physical, relative)| ResolvedPhysical { physical, relative })
+        .map_err(|physical| {
+            format!(
+                "path escapes root boundary: {requested} resolves to {}",
+                physical.display()
+            )
+        })
 }
 
 /// Phase-1 resolution: physical path for the security gate + VFS-relative
@@ -116,9 +126,27 @@ pub(super) struct ResolvedPath {
 /// Phase-2 resolution: the VFS instance and capability handle to use
 /// for the actual filesystem operation.
 pub(super) struct ResolvedVfsPath {
+    access: super::FsAccess,
+    _operation: Option<crate::engine::wasm::PrincipalInvocationGuard>,
     pub(super) relative: PathBuf,
     pub(super) vfs: Arc<dyn astrid_vfs::Vfs>,
     pub(super) handle: astrid_capabilities::DirHandle,
+}
+
+impl ResolvedVfsPath {
+    pub(super) async fn open(&self) -> astrid_vfs::VfsResult<astrid_capabilities::FileHandle> {
+        let path = self.relative.to_string_lossy();
+        self.access
+            .open(&self.handle, path.as_ref(), |dir, path, write, truncate| {
+                self.vfs.open(dir, path, write, truncate)
+            })
+            .ok_or_else(|| {
+                astrid_vfs::VfsError::PermissionDenied(
+                    "file open requires read or write admission".into(),
+                )
+            })?
+            .await
+    }
 }
 
 /// Phase 1: resolve a raw guest path to a physical path and determine
@@ -136,17 +164,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             return resolve_logical_workspace(stripped);
         }
         let resolved = resolve_physical_absolute(&state.workspace_root, stripped)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved cwd path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Workspace,
-        })
+        Ok(resolved.into_target(VfsTarget::Workspace))
     } else if let Some(stripped) = raw_path.strip_prefix(HOME_SCHEME) {
         let home = state
             .effective_home()
@@ -157,34 +175,14 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
         ) {
             let path = astrid_storage::FilesystemPath::new(stripped.to_owned())
                 .map_err(|error| error.to_string())?;
-            let gate_path = if path.as_str().is_empty() {
-                HOME_SCHEME.to_owned()
-            } else {
-                format!("{HOME_SCHEME}{}", path.as_str())
-            };
-            return Ok(ResolvedPath {
-                gate_path,
-                physical: None,
-                relative: PathBuf::from(path.as_str()),
-                target: VfsTarget::Home,
-            });
+            return Ok(logical_path(LogicalRoot::Home, &path));
         }
         let crate::engine::wasm::host_state::PrincipalMountLocation::Native(root) = &home.location
         else {
             return Err("home:// storage mount did not resolve logically".to_owned());
         };
         let resolved = resolve_physical_absolute(root, stripped)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved home path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Home,
-        })
+        Ok(resolved.into_target(VfsTarget::Home))
     } else if raw_path.starts_with(TMP_PREFIX) || raw_path == "/tmp" {
         let tmp_mount = state
             .effective_tmp()
@@ -199,17 +197,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             return Err("/tmp mount is not a native scratch directory".to_owned());
         };
         let resolved = resolve_physical_absolute(root, stripped)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved /tmp path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Tmp,
-        })
+        Ok(resolved.into_target(VfsTarget::Tmp))
     } else {
         if state.effective_workspace().is_some_and(|mount| {
             matches!(
@@ -220,17 +208,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             return resolve_logical_workspace(raw_path);
         }
         let resolved = resolve_physical_absolute(&state.workspace_root, raw_path)?;
-        let relative = resolved
-            .physical
-            .strip_prefix(&resolved.canonical_root)
-            .map_err(|_| "resolved path escaped canonical root".to_string())?
-            .to_path_buf();
-        Ok(ResolvedPath {
-            gate_path: resolved.physical.to_string_lossy().into_owned(),
-            physical: Some(resolved.physical),
-            relative,
-            target: VfsTarget::Workspace,
-        })
+        Ok(resolved.into_target(VfsTarget::Workspace))
     }
 }
 
@@ -244,54 +222,154 @@ fn resolve_logical_workspace(raw_path: &str) -> Result<ResolvedPath, String> {
         .collect::<Vec<_>>()
         .join("/");
     let path = astrid_storage::FilesystemPath::new(relative).map_err(|error| error.to_string())?;
-    let gate_path = if path.as_str().is_empty() {
-        WORKSPACE_SCHEME.to_owned()
-    } else {
-        format!("{WORKSPACE_SCHEME}{}", path.as_str())
-    };
-    Ok(ResolvedPath {
+    Ok(logical_path(LogicalRoot::Workspace, &path))
+}
+
+fn logical_path(root: LogicalRoot, path: &astrid_storage::FilesystemPath) -> ResolvedPath {
+    let (gate_path, relative, target) = root.bind_path(path.as_str());
+    ResolvedPath {
         gate_path,
         physical: None,
-        relative: PathBuf::from(path.as_str()),
-        target: VfsTarget::Workspace,
-    })
+        relative: PathBuf::from(relative),
+        target,
+    }
 }
 
 /// Phase 2: pick the VFS instance + capability handle for `resolved`.
-pub(super) fn resolve_vfs(
+pub(super) fn admit_vfs(
     state: &HostState,
     resolved: &ResolvedPath,
-) -> Result<ResolvedVfsPath, String> {
-    let (vfs, handle) = match resolved.target {
-        VfsTarget::Home => {
-            let m = state
-                .effective_home()
-                .ok_or_else(|| "home:// VFS is not mounted".to_string())?;
-            (m.vfs.clone(), m.handle.clone())
+    access: super::FsAccess,
+) -> Result<ResolvedVfsPath, super::ErrorCode> {
+    let mounts = (
+        state.effective_workspace(),
+        state.effective_home(),
+        state.effective_tmp(),
+    );
+    let ((guard, access), mount, relative) = resolved.target.admitted(
+        resolved.gate_path.as_str(),
+        &resolved.relative,
+        mounts,
+        super::ErrorCode::CapabilityDenied,
+        |path| {
+            access.authorize(path, |policy, path| match policy {
+                super::access::Policy::Read => super::gate_read_path(state, path),
+                super::access::Policy::Write => {
+                    super::gate_write_path(state, path, super::WriteKind::Write)
+                },
+                super::access::Policy::Delete => {
+                    super::gate_write_path(state, path, super::WriteKind::Delete)
+                },
+            })
         },
-        VfsTarget::Tmp => {
-            let m = state
-                .effective_tmp()
-                .ok_or_else(|| "/tmp VFS is not mounted".to_string())?;
-            (m.vfs.clone(), m.handle.clone())
-        },
-        VfsTarget::Workspace => {
-            let mount = state
-                .effective_workspace()
-                .ok_or_else(|| "workspace VFS is not mounted".to_owned())?;
-            (mount.vfs.clone(), mount.handle.clone())
-        },
-    };
+    )?;
     Ok(ResolvedVfsPath {
-        relative: resolved.relative.clone(),
-        vfs,
-        handle,
+        access,
+        _operation: guard,
+        relative: relative.clone(),
+        vfs: mount.vfs.clone(),
+        handle: mount.handle.clone(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_reads_use_the_selected_mount_and_its_registered_handle() {
+        use crate::engine::wasm::bindings::astrid::fs::host::Host;
+        use crate::engine::wasm::host_state::{PrincipalMount, PrincipalMountLocation};
+        use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mount = |name: &str| {
+            let root = directory.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("marker"), name).unwrap();
+            let handle = astrid_capabilities::DirHandle::new();
+            PrincipalMount {
+                vfs: Arc::new(
+                    astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &root).unwrap(),
+                ),
+                location: PrincipalMountLocation::Native(root),
+                handle,
+            }
+        };
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.workspace = Some(mount("workspace"));
+        state.home = Some(mount("home"));
+        state.tmp = Some(mount("tmp"));
+        state.invocation_workspace = Some(mount("caller-workspace"));
+        state.invocation_home = Some(mount("caller-home"));
+        state.invocation_tmp = Some(mount("caller-tmp"));
+        for prefix in ["caller-", ""] {
+            state.workspace_root = directory.path().join(format!("{prefix}workspace"));
+            for (path, target) in [
+                ("cwd://marker", "workspace"),
+                ("marker", "workspace"),
+                ("home://marker", "home"),
+                ("/tmp/marker", "tmp"),
+            ] {
+                assert_eq!(
+                    state.read_file(path.to_owned()).unwrap(),
+                    format!("{prefix}{target}").as_bytes()
+                );
+            }
+            state.invocation_workspace = None;
+            state.invocation_home = None;
+            state.invocation_tmp = None;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manifest_file_access_controls_native_creation_and_replacement() {
+        use crate::engine::wasm::{
+            bindings::astrid::fs::host::{ErrorCode, Host},
+            host_state::{PrincipalMount, PrincipalMountLocation},
+            test_fixtures::minimal_host_state,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().canonicalize().unwrap();
+        std::fs::write(dir.join("input"), b"preserved").unwrap();
+        let mut manifest: crate::manifest::CapsuleManifest =
+            toml::from_str("[package]\nname = 'file-access'\nversion = '0.1.0'").unwrap();
+        manifest.capabilities.fs_read = vec!["cwd://input".into()];
+        manifest.capabilities.fs_write = vec!["cwd://output".into()];
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let handle = astrid_capabilities::DirHandle::new();
+        state.workspace_root = dir.clone();
+        state.workspace = Some(PrincipalMount {
+            location: PrincipalMountLocation::Native(dir.clone()),
+            vfs: Arc::new(astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &dir).unwrap()),
+            handle,
+        });
+        state.security = Some(Arc::new(crate::security::ManifestSecurityGate::new(
+            manifest,
+            dir.clone(),
+            None,
+        )));
+        assert_eq!(state.read_file("input".into()).unwrap(), b"preserved");
+        assert!(matches!(
+            state.write_file("input".into(), b"blocked".to_vec()),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+        assert_eq!(std::fs::read(dir.join("input")).unwrap(), b"preserved");
+        assert!(matches!(
+            state.write_file("other".into(), vec![1]),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+        assert!(!dir.join("other").exists());
+        state
+            .write_file("output".into(), b"created".to_vec())
+            .unwrap();
+        state.write_file("output".into(), b"new".to_vec()).unwrap();
+        assert_eq!(std::fs::read(dir.join("output")).unwrap(), b"new");
+        assert!(matches!(
+            state.read_file("output".into()),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+    }
 
     #[test]
     fn physical_paths_require_a_resolved_root_and_allow_new_children() {
@@ -300,6 +378,7 @@ mod tests {
         assert!(resolve_physical_absolute(&absent, "child").is_err());
         for spelling in ["absent/child", "absent/./child", "./absent/child"] {
             let result = resolve_physical_absolute(root.path(), spelling).unwrap();
+            assert_eq!(result.relative, Path::new("absent/child"));
             assert_eq!(
                 result.physical,
                 root.path().canonicalize().unwrap().join("absent/child")
@@ -317,6 +396,7 @@ mod tests {
         std::os::unix::fs::symlink("child", root.path().join("inside")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
         let resolved = resolve_physical_absolute(root.path(), "inside/new").unwrap();
+        assert_eq!(resolved.relative, Path::new("child/new"));
         assert_eq!(
             resolved.physical,
             root.path().canonicalize().unwrap().join("child/new")

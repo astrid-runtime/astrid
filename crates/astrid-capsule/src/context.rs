@@ -161,6 +161,15 @@ impl Drop for ProcessStorageMount {
 pub trait ProcessStorageMountBroker: Send + Sync {
     /// Mount the authenticated principal's process view.
     async fn mount(&self, principal: &PrincipalId) -> Result<ProcessStorageMount, String>;
+
+    /// Mount storage for the immutable owner selected at guest admission.
+    async fn mount_for(
+        &self,
+        _principal: &PrincipalId,
+        _uid: astrid_core::PrincipalUid,
+    ) -> Result<ProcessStorageMount, String> {
+        Err("process storage broker does not support UID-bound projections".to_owned())
+    }
 }
 
 /// One immutable principal binding to the canonical workspace attachment.
@@ -180,15 +189,13 @@ pub struct WorkspaceBranchBinding {
     pub branch: astrid_core::WorkspaceUid,
 }
 
-/// Operation applied to one authenticated workspace branch.
 #[cfg(not(target_family = "wasm"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkspaceCommitOp {
-    /// Publish the branch's selected attachment into the owner catalog.
-    Promote,
-    /// Discard the branch's selected attachment.
-    Rollback,
-}
+mod workspace_commit;
+#[cfg(not(target_family = "wasm"))]
+pub use workspace_commit::WorkspaceCommitOp;
+
+#[cfg(not(target_family = "wasm"))]
+mod workspace_commit_native;
 
 /// Kernel-owned workspace branch service shared by every capsule engine.
 ///
@@ -272,10 +279,31 @@ impl WorkspaceBranchService {
     /// selected `workspace/default` attachment and never expose the complete
     /// owner catalog.
     pub async fn bind(&self, principal: &PrincipalId) -> Result<WorkspaceBranchBinding, String> {
+        self.bind_for(principal, None).await
+    }
+
+    /// Bind the workspace belonging to an already-admitted principal UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the alias has changed owners or the workspace cannot be opened.
+    pub async fn bind_for_uid(
+        &self,
+        principal: &PrincipalId,
+        uid: astrid_core::PrincipalUid,
+    ) -> Result<WorkspaceBranchBinding, String> {
+        self.bind_for(principal, Some(uid)).await
+    }
+
+    pub(crate) async fn bind_for(
+        &self,
+        principal: &PrincipalId,
+        expected: Option<astrid_core::PrincipalUid>,
+    ) -> Result<WorkspaceBranchBinding, String> {
         let _bind_guard = self.bind_lock.lock().await;
         let uid = self
             .directory
-            .uid_for(principal)
+            .bound_uid(principal, expected)
             .map_err(|error| format!("resolve principal workspace identity: {error}"))?;
         let owner = self.owner_for(uid).await?;
         let existing = self
@@ -430,9 +458,8 @@ impl WorkspaceBranchService {
             .branches
             .binding(&binding.owner, binding.branch)
             .map_err(|error| format!("read durable workspace binding: {error}"))?;
-        if durable.lifecycle() != astrid_storage::WorkspaceBindingLifecycle::Live
-            || durable.binding_uid() != Some(uid)
-            || durable.target_prefix() != Some(&prefix)
+        if !workspace_commit_native::attachment(&durable)
+            .matches(*uid.as_bytes(), prefix.as_str().as_bytes())
         {
             return Err("durable workspace binding no longer matches this principal".to_owned());
         }
@@ -461,40 +488,39 @@ impl WorkspaceBranchService {
         if current_owner != binding.owner {
             return Err("principal workspace ownership changed; refusing branch commit".to_owned());
         }
-        let stored = self
-            .bindings
-            .lock()
-            .map_err(|_| "workspace branch binding lock poisoned".to_owned())?
-            .get(&binding.uid)
-            .copied()
-            .ok_or_else(|| "no workspace branch is bound to this principal".to_owned())?;
-        if stored != binding {
-            return Err("workspace branch binding does not match the kernel lease".to_owned());
-        }
+        let binding = {
+            let leases = self
+                .bindings
+                .lock()
+                .map_err(|_| "workspace branch binding lock poisoned".to_owned())?;
+            workspace_commit::lease(&leases, &binding.uid, &binding).map_err(
+                |error| match error {
+                    workspace_commit::LeaseError::Missing => {
+                        "no workspace branch is bound to this principal".to_owned()
+                    },
+                    workspace_commit::LeaseError::Mismatch => {
+                        "workspace branch binding does not match the kernel lease".to_owned()
+                    },
+                },
+            )?
+        };
         let prefix = astrid_storage::ContentName::new(Self::ATTACHMENT_PREFIX)
             .map_err(|error| format!("invalid workspace attachment prefix: {error}"))?;
         let durable = self
             .branches
             .binding(&binding.owner, binding.branch)
             .map_err(|error| format!("read durable workspace binding: {error}"))?;
-        if durable.lifecycle() != astrid_storage::WorkspaceBindingLifecycle::Live
-            || durable.binding_uid() != Some(binding.uid)
-            || durable.target_prefix() != Some(&prefix)
-        {
-            return Err("durable workspace binding no longer matches this principal".to_owned());
-        }
-        match operation {
-            WorkspaceCommitOp::Promote => self
-                .branches
-                .promote(&binding.owner, binding.branch)
-                .map(|_| ())
-                .map_err(|error| format!("promote workspace branch: {error}"))?,
-            WorkspaceCommitOp::Rollback => {
-                self.branches
-                    .rollback(&binding.owner, binding.branch)
-                    .map_err(|error| format!("rollback workspace branch: {error}"))?
-            },
-        }
+        let mut writer = self;
+        workspace_commit::finish(
+            workspace_commit_native::attachment(&durable),
+            *binding.uid.as_bytes(),
+            prefix.as_str().as_bytes(),
+            operation,
+            binding.owner,
+            binding.branch,
+            &mut writer,
+        )
+        .ok_or_else(|| "durable workspace binding no longer matches this principal".to_owned())??;
         self.bindings
             .lock()
             .map_err(|_| "workspace branch binding lock poisoned".to_owned())?
@@ -705,6 +731,8 @@ pub struct CapsuleContext {
     /// Session token for authenticating CLI socket connections. Only set for
     /// capsules with `net_bind` capability (the CLI proxy capsule).
     pub session_token: Option<Arc<SessionToken>>,
+    /// Registry shared with the kernel that retires signed local sessions.
+    pub device_sessions: astrid_core::profile::device_sessions::DeviceSessions,
     /// Shared allowance store for capsule-level approval requests.
     pub allowance_store: Option<Arc<astrid_approval::AllowanceStore>>,
     /// Shared identity store for resolving platform users to `AstridUserId`.
@@ -784,6 +812,7 @@ impl CapsuleContext {
             cli_socket_listener,
             capsule_registry: None,
             session_token: None,
+            device_sessions: Default::default(),
             allowance_store: None,
             identity_store: None,
             schema_catalog: Arc::new(SchemaCatalog::new()),
@@ -851,6 +880,16 @@ impl CapsuleContext {
     #[must_use]
     pub fn with_session_token(mut self, token: Arc<SessionToken>) -> Self {
         self.session_token = Some(token);
+        self
+    }
+
+    /// Share the boot registry with the local signed-socket handshake.
+    #[must_use]
+    pub fn with_device_sessions(
+        mut self,
+        sessions: astrid_core::profile::device_sessions::DeviceSessions,
+    ) -> Self {
+        self.device_sessions = sessions;
         self
     }
 

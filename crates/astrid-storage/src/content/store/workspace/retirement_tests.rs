@@ -22,7 +22,7 @@ fn retirement_preserves_an_extension_label_matching_the_bare_branch_uid() {
         )
         .unwrap();
     let header = branches.content.header(&owner).unwrap();
-    let label = super::workspace_ref_label(branch.id());
+    let label = ReferenceLabel::new(branch.id().to_string().into_bytes());
     let target = header
         .preserved_state
         .iter()

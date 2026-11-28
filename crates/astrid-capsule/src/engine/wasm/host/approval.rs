@@ -5,6 +5,7 @@
 //! then the shared [`AllowanceStore`] (instant path), then publishes an
 //! [`ApprovalRequired`] IPC event and blocks until the frontend responds.
 
+use super::consent_reply::{self, Decision, Destination, Writer};
 use crate::audit_sink::HostApprovalScope;
 use crate::engine::wasm::bindings::astrid::approval::host::{
     self as approval, ApprovalDecision, ApprovalRequest, ApprovalResponse, ErrorCode,
@@ -134,38 +135,131 @@ fn approval_location(state: &HostState) -> CommandApprovalLocation {
     }
 }
 
-/// An Always response is truthful only after its profile write succeeds.
-/// Failed persistence is an error, not a silently downgraded approval.
-fn persist_always(
-    state: &HostState,
-    principal: &PrincipalId,
-    action: &str,
-) -> Result<(), ErrorCode> {
-    let cache = state
+fn grant_destination(state: &HostState) -> Result<Destination<&str>, ErrorCode> {
+    state
         .profile_cache
         .as_ref()
         .ok_or(ErrorCode::StoreUnavailable)?;
-    let persisted = match approval_location(state) {
-        CommandApprovalLocation::AstridWorkspace => {
-            cache.persist_astrid_command_always(principal, action)
-        },
+    match approval_location(state) {
+        CommandApprovalLocation::AstridWorkspace => Ok(Destination::AstridWorkspace),
         CommandApprovalLocation::Hosted => {
-            let workspace = hosted_workspace_identity(state)?;
-            cache.persist_command_always(principal, action, Some(workspace))
+            Ok(Destination::Hosted(hosted_workspace_identity(state)?))
         },
-    };
-    persisted.map_err(|error| {
-        tracing::warn!(%error, "Cannot persist Always approval");
-        ErrorCode::StoreUnavailable
-    })
+    }
+}
+
+struct CommandGrants<'a> {
+    state: &'a HostState,
+    responder: &'a IpcMessage,
+}
+
+impl<'a> CommandGrants<'a> {
+    fn devices(
+        &self,
+        owner: &PrincipalId,
+    ) -> Result<[astrid_events::ipc::DeviceStamp<'a>; 2], ErrorCode> {
+        let mut devices = [Default::default(); 2];
+        for (slot, message) in devices
+            .iter_mut()
+            .zip([self.state.caller_context.as_ref(), Some(self.responder)])
+        {
+            if let Some(message) = message {
+                let stamp = message.device_stamp();
+                if stamp.fingerprint.is_some()
+                    && message.principal.as_deref() != Some(owner.as_str())
+                {
+                    return Err(ErrorCode::StoreUnavailable);
+                }
+                *slot = stamp;
+            }
+        }
+        Ok(devices)
+    }
+
+    fn session(
+        &self,
+        outcome: Decision,
+        owner: &PrincipalId,
+        install: impl FnOnce(),
+    ) -> Result<(), ErrorCode> {
+        use consent_reply::SessionRoute;
+        let caller = self
+            .state
+            .caller_context
+            .as_ref()
+            .map(IpcMessage::device_stamp)
+            .unwrap_or_default();
+        let responder = self.responder.device_stamp();
+        match consent_reply::session_route(
+            outcome,
+            (caller.fingerprint, caller.registration),
+            (responder.fingerprint, responder.registration),
+        ) {
+            SessionRoute::Skip => Ok(()),
+            SessionRoute::Unstamped => {
+                install();
+                Ok(())
+            },
+            SessionRoute::CheckProfile => self
+                .state
+                .profile_cache
+                .as_ref()
+                .ok_or(ErrorCode::StoreUnavailable)?
+                .with_session_devices(owner, self.devices(owner)?, None, install)
+                .map_err(|_| ErrorCode::StoreUnavailable),
+        }
+    }
+
+    fn write(
+        &self,
+        owner: &PrincipalId,
+        family: &str,
+        path: Option<&str>,
+        location: CommandApprovalLocation,
+    ) -> Result<(), ErrorCode> {
+        let cache = self
+            .state
+            .profile_cache
+            .as_ref()
+            .ok_or(ErrorCode::StoreUnavailable)?;
+        let devices = self.devices(owner)?;
+        cache
+            .persist_command_at(owner, family, path, location, devices)
+            .map_err(|error| {
+                tracing::warn!(%error, "Cannot persist Always approval");
+                ErrorCode::StoreUnavailable
+            })
+    }
+}
+
+impl Writer<&PrincipalId, &str, &str> for CommandGrants<'_> {
+    type Error = ErrorCode;
+
+    fn hosted(&mut self, owner: &PrincipalId, family: &str, path: &str) -> Result<(), ErrorCode> {
+        self.write(owner, family, Some(path), CommandApprovalLocation::Hosted)
+    }
+    fn workspace(&mut self, owner: &PrincipalId, family: &str) -> Result<(), ErrorCode> {
+        self.write(
+            owner,
+            family,
+            None,
+            CommandApprovalLocation::AstridWorkspace,
+        )
+    }
 }
 
 /// Sanitize a guest-supplied display field in place.
 ///
 /// Trims whitespace, strips control characters, and enforces a character-count
 /// length cap. Logs a warning (with plugin ID and field name) when control
-/// characters were stripped or the string was truncated.
-fn sanitize_guest_field(s: &mut String, max_len: usize, field_name: &str, capsule_id: &str) {
+/// characters were stripped or the string was truncated. Returns whether the
+/// display text still equals the complete guest-supplied value.
+fn sanitize_guest_field(
+    s: &mut String,
+    max_len: usize,
+    field_name: &str,
+    capsule_id: &str,
+) -> bool {
     let trimmed = s.trim();
     let sanitized: String = trimmed
         .chars()
@@ -186,7 +280,9 @@ fn sanitize_guest_field(s: &mut String, max_len: usize, field_name: &str, capsul
         );
     }
 
+    let unchanged = *s == sanitized;
     *s = sanitized;
+    unchanged
 }
 
 /// Characters that do not contribute a command family.
@@ -323,19 +419,6 @@ fn create_allowance_from_decision(
     }
 }
 
-/// Map the JSON-string decision in `IpcPayload::ApprovalResponse` to the
-/// typed [`ApprovalDecision`] returned to the WASM guest.
-fn decision_from_str(decision: &str) -> ApprovalDecision {
-    match decision {
-        "approve" => ApprovalDecision::Approved,
-        "approve_session" => ApprovalDecision::ApprovedSession,
-        "approve_always" => ApprovalDecision::ApprovedAlways,
-        // Anything else — including explicit denies, unknown strings, or
-        // empty — is treated as a deny.
-        _ => ApprovalDecision::Denied,
-    }
-}
-
 fn event_principal(event: &AstridEvent) -> Option<&str> {
     match event {
         AstridEvent::Ipc { message, .. } => message.principal.as_deref(),
@@ -355,8 +438,12 @@ fn response_identity_matches(
     expected_owner: astrid_events::ipc::RequestOwnerId,
     event: &AstridEvent,
 ) -> bool {
-    event_principal(event) == Some(expected_principal)
-        && event_request_owner(event) == Some(expected_owner)
+    super::consent_identity::matches(
+        expected_principal.as_bytes(),
+        expected_owner.as_u128(),
+        event_principal(event).map(str::as_bytes),
+        event_request_owner(event).map(astrid_events::ipc::RequestOwnerId::as_u128),
+    )
 }
 
 async fn await_matching_approval_response(
@@ -406,9 +493,9 @@ impl approval::Host for HostState {
         &mut self,
         mut request: ApprovalRequest,
     ) -> Result<ApprovalResponse, ErrorCode> {
-        if !self.invocation_authority_active() {
-            return Err(ErrorCode::StoreUnavailable);
-        }
+        let request_principal = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::StoreUnavailable)?;
         let allowance_store = self.allowance_store.clone();
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -429,7 +516,7 @@ impl approval::Host for HostState {
         if request.action.is_empty() {
             return Err(ErrorCode::InvalidInput);
         }
-        sanitize_guest_field(
+        let exact_resource = sanitize_guest_field(
             &mut request.target_resource,
             MAX_RESOURCE_LEN,
             "resource",
@@ -444,7 +531,11 @@ impl approval::Host for HostState {
             &request.target_resource,
         );
 
-        if check_persisted_allowance(self, &principal, &request.target_resource)? {
+        let request_device = self
+            .begin_device_operation()
+            .map_err(|()| ErrorCode::StoreUnavailable)?;
+        if exact_resource && check_persisted_allowance(self, &principal, &request.target_resource)?
+        {
             audit.granted(HostApprovalScope::Always, "remembered_consent");
             return Ok(ApprovalResponse {
                 decision: ApprovalDecision::Allowance,
@@ -452,7 +543,8 @@ impl approval::Host for HostState {
         }
 
         // Fast path: check existing allowances.
-        if let Some(ref store) = allowance_store
+        if exact_resource
+            && let Some(ref store) = allowance_store
             && check_allowance(store, &principal, &request.target_resource, ws_path)
         {
             tracing::debug!(
@@ -486,6 +578,7 @@ impl approval::Host for HostState {
                 decision: ApprovalDecision::Denied,
             });
         };
+        let destination = grant_destination(self);
         let request_id = Uuid::new_v4().to_string();
         let response_topic = Topic::approval_response(&request_id);
         // Durable before the prompt is published.
@@ -524,6 +617,8 @@ impl approval::Host for HostState {
             "Approval request details"
         );
 
+        // Retirement can finish while the operator is deciding.
+        drop((request_device, request_principal));
         // Block until response, timeout, or cancellation.
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
@@ -550,14 +645,58 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
-                            if decision == "approve_always"
-                                && let Err(error) =
-                                    persist_always(self, &principal, &request.action)
-                            {
-                                audit.denied("user", "approve_always could not be persisted");
-                                return Err(error);
-                            }
-                            let typed = decision_from_str(decision);
+                            let authority = consent_reply::admit(
+                                self.begin_host_operation(),
+                                || self.begin_device_operation(),
+                                || self.begin_message_device_operation(message),
+                            )
+                            .ok_or_else(|| {
+                                audit.denied(
+                                    "authority_unavailable",
+                                    "could not re-admit the approval reply",
+                                );
+                                ErrorCode::StoreUnavailable
+                            })?;
+                            let mut grants = CommandGrants {
+                                state: self,
+                                responder: message,
+                            };
+                            let outcome = authority
+                                .apply(
+                                    decision.as_bytes(),
+                                    &principal,
+                                    request.action.as_str(),
+                                    destination,
+                                    &mut grants,
+                                )
+                                .inspect_err(|_| {
+                                    audit.denied("user", "approve_always could not be persisted");
+                                })?;
+                            grants
+                                .session(outcome, &principal, || {
+                                    if let Some(ref store) = allowance_store {
+                                        create_allowance_from_decision(
+                                            store,
+                                            &principal,
+                                            &request.action,
+                                            decision,
+                                            Some(workspace_root.clone()),
+                                            &capsule_id,
+                                        );
+                                    }
+                                })
+                                .inspect_err(|_| {
+                                    audit.denied(
+                                        "authority_unavailable",
+                                        "could not establish current session approval authority",
+                                    )
+                                })?;
+                            let typed = match outcome {
+                                Decision::Once => ApprovalDecision::Approved,
+                                Decision::Session => ApprovalDecision::ApprovedSession,
+                                Decision::Always => ApprovalDecision::ApprovedAlways,
+                                Decision::Deny => ApprovalDecision::Denied,
+                            };
                             match typed {
                                 ApprovalDecision::Approved => {
                                     audit.granted(HostApprovalScope::Once, "user");
@@ -570,29 +709,6 @@ impl approval::Host for HostState {
                                 },
                                 _ => audit.denied("user", "denied by user"),
                             }
-                            let approved = matches!(
-                                typed,
-                                ApprovalDecision::Approved
-                                    | ApprovalDecision::ApprovedSession
-                                    | ApprovalDecision::ApprovedAlways
-                            );
-
-                            // Persistent choices were saved above; keep temporary
-                            // allowances in the session store only.
-                            if approved
-                                && decision != "approve_always"
-                                && let Some(ref store) = allowance_store
-                            {
-                                create_allowance_from_decision(
-                                    store,
-                                    &principal,
-                                    &request.action,
-                                    decision,
-                                    Some(workspace_root.clone()),
-                                    &capsule_id,
-                                );
-                            }
-
                             tracing::info!(
                                 plugin = %capsule_id,
                                 action = %request.action,
@@ -642,3 +758,7 @@ mod hosted_identity_tests;
 #[cfg(test)]
 #[path = "approval_audit_tests.rs"]
 mod audit_tests;
+
+#[cfg(test)]
+#[path = "approval_device_tests.rs"]
+mod device_tests;

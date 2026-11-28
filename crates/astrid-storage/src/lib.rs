@@ -37,6 +37,7 @@ extern crate alloc;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod test_directory;
 
+mod byte_order;
 /// Durable owner-scoped installed capsule package registry.
 pub mod capsule_registry;
 pub mod content;
@@ -62,8 +63,10 @@ mod resident_cache;
 /// Kernel-owned resident-memory authorities used by native storage.
 pub mod resources;
 pub mod secret;
+mod storage_fields;
 /// Portable executable model for principal state.
 pub mod storage_model;
+mod storage_words;
 pub mod volume;
 
 pub use capsule_registry::{
@@ -102,7 +105,7 @@ pub use kv::{
 };
 pub use ownership::{
     FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore, PrincipalDeletionGuard,
-    UnownedPrincipalDeferral, UnownedPrincipalReconciliation,
+    RetirementSink, UnownedPrincipalDeferral, UnownedPrincipalReconciliation,
 };
 pub use principal_directory::PrincipalDirectory;
 #[cfg(feature = "keychain")]

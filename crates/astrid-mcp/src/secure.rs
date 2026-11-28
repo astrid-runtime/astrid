@@ -70,7 +70,7 @@ impl SecureMcpClient {
 
     /// Check authorization for a tool call.
     ///
-    /// This is a read-only validation - no audit entry is written. The audit
+    /// No audit entry is written here. The audit
     /// record is created inside [`call_tool`] when the tool is actually invoked,
     /// so every audit entry carries the real args hash.
     ///
@@ -99,27 +99,11 @@ impl SecureMcpClient {
             .await;
 
         if let Some(found_token) = result.token() {
-            // Consume single-use tokens to prevent replay.
-            // `use_token` validates + marks used atomically.
-            match self.capabilities.use_token(&found_token.id).await {
+            match validator
+                .authorize_by_id(principal, &resource, Permission::Invoke, &found_token.id)
+                .await
+            {
                 Ok(token) => {
-                    // Re-verify issuer on the token returned by use_token.
-                    // `use_token` checks expiry and signature but not issuer
-                    // trust. This explicit check closes the TOCTOU window and
-                    // ensures the security property does not rely on calling
-                    // convention.
-                    let trusted_key = self.audit.runtime_public_key();
-                    if token.issuer != trusted_key {
-                        warn!(
-                            server = server,
-                            tool = tool,
-                            "Token issuer is not the trusted runtime key"
-                        );
-                        return Err(McpError::AuthorizationFailed {
-                            reason: "token issuer is not the trusted runtime key".into(),
-                        });
-                    }
-
                     let proof = AuthorizationProof::Capability {
                         token_id: token.id.clone(),
                         token_hash: token.content_hash(),
@@ -139,7 +123,8 @@ impl SecureMcpClient {
                 Err(
                     CapabilityError::TokenAlreadyUsed { .. }
                     | CapabilityError::TokenExpired { .. }
-                    | CapabilityError::TokenRevoked { .. },
+                    | CapabilityError::TokenRevoked { .. }
+                    | CapabilityError::TokenNotFound { .. },
                 ) => {
                     debug!(
                         server = server,
@@ -161,10 +146,10 @@ impl SecureMcpClient {
         })
     }
 
-    /// Call a tool with authorization check.
+    /// Invoke a tool after the caller has admitted the operation.
     ///
-    /// Returns an error if not authorized. Use `check_authorization` first
-    /// to determine if approval is needed.
+    /// The supplied proof is audit metadata. Callers enforcing capability
+    /// tokens should use [`Self::call_tool_if_authorized`].
     ///
     /// # Errors
     ///

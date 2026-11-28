@@ -18,8 +18,8 @@
 //!   process spawn default to empty → fail-closed).
 //! - Malformed TOML, failed validation, or a future `profile_version` → hard
 //!   error. The operator must correct the file.
-//! - Unknown keys are ignored so upgrade and rollback across binaries do not
-//!   brick a home. `profile_version` is the breaking-change gate.
+//! - A profile carrying device registration IDs requires a version-2 reader.
+//!   Existing version-1 profiles upgrade when a new device is registered.
 //! - Save is atomic on Unix (write to `.tmp` with `0o600`, then `rename`).
 //!
 //! # Defaults
@@ -39,12 +39,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod device;
+mod device_admission;
+pub(crate) mod device_challenge;
+mod device_registration;
+pub mod device_sessions;
 mod field;
 mod io_impl;
 mod validation;
 
 pub use device::{
-    DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope,
+    DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceKeyId, DevicePubkey, DeviceRegistrationId, DeviceScope,
     device_key_id_fingerprint,
 };
 pub use field::{
@@ -56,7 +60,8 @@ pub use field::{
 /// Profiles on disk with a version greater than this constant are rejected
 /// by [`PrincipalProfile::validate`] — a forward-dated profile would otherwise
 /// be silently truncated to whatever fields this binary understands.
-pub const CURRENT_PROFILE_VERSION: u32 = 1;
+pub const CURRENT_PROFILE_VERSION: u32 = DEVICE_REGISTRATION_PROFILE_VERSION;
+const DEVICE_REGISTRATION_PROFILE_VERSION: u32 = 2;
 
 /// Default per-principal memory ceiling in bytes (64 `MiB`).
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -152,7 +157,7 @@ pub struct PrincipalProfile {
     /// Schema version. Bumped on breaking field changes.
     ///
     /// Values above [`CURRENT_PROFILE_VERSION`] are rejected at load time.
-    #[serde(default = "current_profile_version")]
+    #[serde(default = "legacy_profile_version")]
     pub profile_version: u32,
 
     /// Master enable switch. When `false`, the kernel will refuse every
@@ -441,8 +446,8 @@ pub struct Quotas {
 
 // ── serde default helpers ────────────────────────────────────────────────
 
-fn current_profile_version() -> u32 {
-    CURRENT_PROFILE_VERSION
+fn legacy_profile_version() -> u32 {
+    1
 }
 
 fn default_true() -> bool {
@@ -501,23 +506,54 @@ impl PrincipalProfile {
     /// Registered signing keys usable under this profile's current policy.
     #[must_use]
     pub fn active_keypair_keys(&self) -> Option<&[DeviceKey]> {
-        (self.enabled && self.auth.methods.contains(&AuthMethod::Keypair))
-            .then_some(self.auth.public_keys.as_slice())
+        device_admission::enabled_keys(
+            self.enabled,
+            self.auth.methods.contains(&AuthMethod::Keypair),
+            &self.auth.public_keys,
+        )
     }
 
     /// Resolve a transport's device stamp under the current keypair policy.
     /// Ambiguous fingerprints confer no device authority.
     #[must_use]
     pub fn active_device<S: AsRef<str>>(&self, id: &DeviceKeyId<S>) -> Option<&DeviceKey> {
-        let mut matches = self
-            .active_keypair_keys()?
-            .iter()
-            .filter(|key| key.key_id == id.as_str());
-        let device = matches.next()?;
-        if matches.next().is_some() {
-            return None;
+        device_registration::resolve_unique(self.active_keypair_keys()?, id.as_str(), |key| {
+            key.key_id.as_str()
+        })
+    }
+
+    /// Resolve a captured device registration against the current profile.
+    /// An unversioned capture only matches an unversioned live record.
+    #[must_use]
+    pub fn active_registration<S: AsRef<str>>(
+        &self,
+        id: &DeviceKeyId<S>,
+        generation: Option<uuid::Uuid>,
+    ) -> Option<&DeviceKey> {
+        device_registration::active(
+            self.enabled,
+            self.auth.methods.contains(&AuthMethod::Keypair),
+            &self.auth.public_keys,
+            id.as_str(),
+            generation.map(|g| g.as_u128()),
+            |record| record.key_id.as_str(),
+            |record| {
+                record
+                    .registration_id
+                    .map(|g| uuid::Uuid::from(g).as_u128())
+            },
+        )
+    }
+
+    /// Append a device and declare the profile format required to retain its
+    /// registration identity on disk.
+    pub fn add_device(&mut self, device: DeviceKey) {
+        if device.registration_id.is_some() {
+            self.profile_version = self
+                .profile_version
+                .max(DEVICE_REGISTRATION_PROFILE_VERSION);
         }
-        Some(device)
+        self.auth.public_keys.push(device);
     }
 
     /// Borrow the process-global default profile.
@@ -551,6 +587,33 @@ impl Default for Quotas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_requires_active_policy_unique_fingerprint_and_exact_generation() {
+        let mut profile = PrincipalProfile::default();
+        let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+        let key = DeviceKeyId::new(device.key_id.clone()).unwrap();
+        let generation = device.registration_id.map(Into::into);
+        assert!(generation.is_some());
+        profile.add_device(device.clone());
+        assert!(profile.active_registration(&key, generation).is_none());
+
+        profile.auth.methods.push(AuthMethod::Keypair);
+        assert_eq!(profile.active_registration(&key, generation), Some(&device));
+        assert!(profile.active_registration(&key, None).is_none());
+        profile.enabled = false;
+        assert!(profile.active_registration(&key, generation).is_none());
+        profile.enabled = true;
+
+        let mut legacy = device.clone();
+        legacy.registration_id = None;
+        profile.add_device(legacy.clone());
+        assert!(profile.active_registration(&key, generation).is_none());
+        assert!(profile.active_registration(&key, None).is_none());
+        profile.auth.public_keys.remove(0);
+        assert_eq!(profile.active_registration(&key, None), Some(&legacy));
+        assert!(profile.active_registration(&key, generation).is_none());
+    }
 
     #[test]
     fn default_is_permissive_but_fail_closed_egress() {
@@ -636,7 +699,7 @@ mod tests {
     #[test]
     fn roundtrip_populated() {
         let p = PrincipalProfile {
-            profile_version: 1,
+            profile_version: CURRENT_PROFILE_VERSION,
             enabled: false,
             groups: vec!["admins".into(), "ops_team".into()],
             grants: vec!["capsule:install".into()],

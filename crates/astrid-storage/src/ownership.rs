@@ -19,6 +19,12 @@ use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 
 mod deletion;
 mod derived;
+mod graph_read;
+mod pending;
+mod recovery;
+mod reservation_validation;
+use crate::principal_directory::recovery_aliases;
+pub use recovery::RetirementSink;
 mod provision;
 mod resources;
 mod shared_snapshot;
@@ -83,13 +89,7 @@ pub struct OwnershipSnapshot {
     local_user_binding_initialized: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PrincipalDeletionReservation {
-    alias: Option<PrincipalId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    fleet: Option<FleetUid>,
-}
+type PrincipalDeletionReservation = pending::Reservation<PrincipalId, FleetUid>;
 
 impl Default for OwnershipSnapshot {
     fn default() -> Self {
@@ -129,6 +129,14 @@ impl OwnershipSnapshot {
     #[must_use]
     pub fn principal_is_retiring(&self, uid: PrincipalUid) -> bool {
         self.principal_deletions.contains_key(&uid)
+    }
+
+    pub(crate) fn replay_retirements<S: RetirementSink<PrincipalId>>(
+        &self,
+        directory: &std::collections::HashMap<PrincipalUid, PrincipalId>,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
+        recovery::replay(&self.principal_deletions, directory, sink)
     }
 
     /// Iterate over users in stable UID order.
@@ -205,6 +213,7 @@ impl OwnershipSnapshot {
     }
 
     fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
+        use reservation_validation::Error;
         self.validate_accountable_users()?;
         self.validate_user_bindings(principals)?;
         if self.format_version != GRAPH_FORMAT_VERSION {
@@ -262,28 +271,21 @@ impl OwnershipSnapshot {
             }
         }
         self.validate_principal_owners(principals)?;
-        let mut deletion_aliases = BTreeMap::new();
-        for (principal_uid, reservation) in &self.principal_deletions {
-            if let Some(fleet) = reservation.fleet
-                && !self.fleets.contains_key(&fleet)
-            {
-                return Err(OwnershipError::FleetNotFound(fleet));
-            }
-            if self.principal_ownership.contains_key(principal_uid) {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} is both owned and reserved for deletion"
-                )));
-            }
-            if let Some(alias) = &reservation.alias
-                && let Some(existing_uid) =
-                    deletion_aliases.insert(alias.as_str().to_owned(), *principal_uid)
-            {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal deletion alias {alias} is reserved by both {existing_uid} and {principal_uid}"
-                )));
-            }
-        }
-        Ok(())
+        reservation_validation::validate(
+            &self.principal_deletions,
+            &self.principal_ownership,
+            &self.fleets,
+            PrincipalId::as_str,
+        )
+        .map_err(|error| match error {
+            Error::Fleet(fleet) => OwnershipError::FleetNotFound(fleet),
+            Error::Owned(uid) => OwnershipError::CorruptGraph(format!(
+                "principal {uid} is both owned and reserved for deletion"
+            )),
+            Error::Alias(alias, existing, uid) => OwnershipError::CorruptGraph(format!(
+                "principal deletion alias {alias} is reserved by both {existing} and {uid}"
+            )),
+        })
     }
 }
 
@@ -364,8 +366,12 @@ impl OwnershipStore {
     ///
     /// Fails closed on storage errors, malformed bytes, or broken invariants.
     pub async fn load(&self) -> Result<OwnershipSnapshot, OwnershipError> {
-        let raw = self.storage.get(GRAPH_KEY).await?;
-        self.decode(raw.as_deref())
+        self.decode_read(
+            self.storage
+                .get(GRAPH_KEY)
+                .await
+                .map_err(OwnershipError::from),
+        )
     }
 
     /// Register one durable human identity, idempotently.
@@ -661,15 +667,22 @@ impl OwnershipStore {
     }
 
     fn decode(&self, raw: Option<&[u8]>) -> Result<OwnershipSnapshot, OwnershipError> {
-        let graph = raw.map_or_else(
-            || Ok(OwnershipSnapshot::default()),
+        self.decode_read(Ok(raw))
+    }
+
+    fn decode_read<B: AsRef<[u8]>>(
+        &self,
+        read: Result<Option<B>, OwnershipError>,
+    ) -> Result<OwnershipSnapshot, OwnershipError> {
+        graph_read::admit(
+            read,
+            OwnershipSnapshot::default,
             |bytes| {
-                serde_json::from_slice(bytes)
+                serde_json::from_slice(bytes.as_ref())
                     .map_err(|error| OwnershipError::Serialization(error.to_string()))
             },
-        )?;
-        graph.validate(&self.principals)?;
-        Ok(graph)
+            |graph| graph.validate(&self.principals),
+        )
     }
 
     fn require_manager(fleet: &FleetRecord, actor: UserUid) -> Result<(), OwnershipError> {

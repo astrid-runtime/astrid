@@ -19,12 +19,17 @@ use crate::capabilities::{AstridClientHandler, ServerNotice};
 use crate::config::{RestartPolicy, ServerConfig, ServersConfig, Transport};
 use crate::error::{McpError, McpResult};
 use crate::process_transport::OwnedProcessTransport;
+mod command;
+mod stdio_policy;
 use crate::server_process::{
     build_unsandboxed_command, mcp_client_lifecycle, today_date_string, wrap_process_tree,
 };
 use crate::types::{ServerInfo, ToolDefinition};
 
 use tokio::sync::mpsc;
+
+mod peer_selection;
+pub(crate) mod tool_call;
 
 /// Type alias for a running MCP client service.
 type McpService = RunningService<RoleClient, AstridClientHandler>;
@@ -328,11 +333,7 @@ impl ServerManager {
             McpError::ConfigError(format!("No command specified for stdio server {name}"))
         })?;
 
-        let mut cmd = if config.trusted {
-            build_unsandboxed_command(name, command, config)
-        } else {
-            self.build_sandboxed_command(name, command, config)?
-        };
+        let mut cmd = self.prepare_stdio_command(name, command, config)?;
 
         // Redirect capsule stderr to a per-capsule daily log file if configured.
         if let Some(ref log_dir) = self.capsule_log_dir {
@@ -426,6 +427,7 @@ impl ServerManager {
         name: &str,
         command: &str,
         config: &ServerConfig,
+        allow_network: bool,
     ) -> McpResult<tokio::process::Command> {
         use astrid_workspace::ProcessSandboxConfig;
 
@@ -458,7 +460,7 @@ impl ServerManager {
 
         // Build sandbox config
         let mut sandbox_config = ProcessSandboxConfig::new(&writable_root)
-            .with_network(config.allow_network)
+            .with_network(allow_network)
             .with_protected_runtime_home(astrid_home);
         if let Some(policy) = self.sandbox_policy_override {
             sandbox_config = sandbox_config.with_policy(policy);
@@ -542,21 +544,9 @@ impl ServerManager {
                 .map_err(|e| McpError::ServerStartFailed {
                     name: name.to_string(),
                     reason: e.to_string(),
-                })?;
+                });
 
-        // Build the command
-        let mut cmd = if let Some(prefix) = sandbox_prefix {
-            let mut cmd = tokio::process::Command::from(prefix.into_command());
-            cmd.arg(&resolved_command);
-            cmd.args(&config.args);
-            cmd
-        } else {
-            // Reached only when the operator explicitly opted into
-            // `Off`, which is intentionally silent.
-            let mut cmd = tokio::process::Command::new(&resolved_command);
-            cmd.args(&config.args);
-            cmd
-        };
+        let mut cmd = command::assemble_child(sandbox_prefix, &resolved_command, &config.args)?;
 
         // Environment scrubbing: clear inherited env, re-add safe vars.
         cmd.env_clear();
@@ -593,7 +583,7 @@ impl ServerManager {
         info!(
             server = name,
             writable_root = %writable_root.display(),
-            allow_network = config.allow_network,
+            allow_network,
             "Spawning sandboxed MCP server"
         );
 
@@ -647,15 +637,29 @@ impl ServerManager {
     /// Returns an error if the server is not running or not connected.
     pub async fn get_peer(&self, name: &str) -> McpResult<Peer<RoleClient>> {
         let running = self.running.read().await;
-        let server = running
-            .get(name)
-            .ok_or_else(|| McpError::ServerNotRunning {
-                name: name.to_string(),
-            })?;
+        peer_selection::select(&running, name, RunningServer::peer)
+            .map_err(|error| Self::lookup_error(name, &error))
+    }
 
-        server.peer().ok_or_else(|| {
-            McpError::ConnectionFailed(format!("Server {name} is registered but not connected"))
-        })
+    pub(crate) async fn bind_call<'a>(
+        &self,
+        name: &str,
+        call: tool_call::ToolCall<'a, serde_json::Value>,
+    ) -> McpResult<tool_call::RoutedCall<'a, Peer<RoleClient>, serde_json::Value>> {
+        let running = self.running.read().await;
+        tool_call::bind(&running, name, call, RunningServer::peer)
+            .map_err(|error| Self::lookup_error(name, &error))
+    }
+
+    fn lookup_error(name: &str, error: &peer_selection::LookupError) -> McpError {
+        match error {
+            peer_selection::LookupError::Missing => McpError::ServerNotRunning {
+                name: name.to_owned(),
+            },
+            peer_selection::LookupError::Disconnected => {
+                McpError::ConnectionFailed(format!("Server {name} is registered but not connected"))
+            },
+        }
     }
 
     /// Stop a server.

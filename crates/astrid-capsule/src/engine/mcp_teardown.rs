@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+#[path = "mcp_cleanup.rs"]
+mod cleanup;
+use cleanup::Phase;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,9 +31,7 @@ impl DisconnectOps for SecureMcpClient {
 
 struct TeardownState {
     ops: Arc<dyn DisconnectOps>,
-    server_id: Mutex<Option<String>>,
-    started: AtomicBool,
-    done: AtomicBool,
+    phase: Mutex<Phase>,
     completed: Notify,
 }
 
@@ -53,77 +53,69 @@ impl McpTeardown {
         Self {
             state: Arc::new(TeardownState {
                 ops,
-                server_id: Mutex::new(None),
-                started: AtomicBool::new(false),
-                done: AtomicBool::new(false),
+                phase: Mutex::new(Phase::Open(None)),
                 completed: Notify::new(),
             }),
         }
     }
 
     pub(super) fn register(&self, server_id: String) -> bool {
-        let mut owned_id = self
-            .state
-            .server_id
+        self.state
+            .phase
             .lock()
-            .expect("MCP server id lock poisoned");
-        if self.state.started.load(Ordering::Acquire) {
-            return false;
-        }
-        *owned_id = Some(server_id);
-        true
+            .expect("MCP teardown lock poisoned")
+            .register(server_id)
     }
 
     pub(super) fn server_id(&self) -> Option<String> {
         self.state
-            .server_id
+            .phase
             .lock()
-            .expect("MCP server id lock poisoned")
-            .clone()
+            .expect("MCP teardown lock poisoned")
+            .target()
     }
 
     pub(super) fn start(&self) {
-        if self
+        let Some(work) = self
             .state
-            .started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+            .phase
+            .lock()
+            .expect("MCP teardown lock poisoned")
+            .begin()
+        else {
             return;
-        }
-
+        };
         let state = Arc::clone(&self.state);
         astrid_runtime::spawn(async move {
-            let Some(server_id) = state
-                .server_id
-                .lock()
-                .expect("MCP server id lock poisoned")
-                .clone()
-            else {
-                finish(&state, None);
-                return;
-            };
-
-            let mut retry_delay = Duration::from_millis(25);
-            loop {
-                match state.ops.disconnect(&server_id).await {
-                    Ok(()) => break,
-                    Err(_error) if !state.ops.is_running(&server_id).await => break,
-                    Err(error) => {
-                        warn!(
-                            server = %server_id,
-                            %error,
-                            "MCP teardown failed while server is still present; retrying"
-                        );
-                        tokio::time::sleep(retry_delay).await;
-                        retry_delay = retry_delay
-                            .checked_mul(2)
-                            .unwrap_or(Duration::from_secs(1))
-                            .min(Duration::from_secs(1));
-                    },
+            if let Some(server_id) = work.target() {
+                let mut retry_delay = Duration::from_millis(25);
+                loop {
+                    match state.ops.disconnect(server_id).await {
+                        Ok(()) => break,
+                        Err(_error) if !state.ops.is_running(server_id).await => break,
+                        Err(error) => {
+                            warn!(
+                                server = %server_id,
+                                %error,
+                                "MCP teardown failed while server is still present; retrying"
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = retry_delay
+                                .checked_mul(2)
+                                .unwrap_or(Duration::from_secs(1))
+                                .min(Duration::from_secs(1));
+                        },
+                    }
                 }
             }
-            finish(&state, Some(&server_id));
+            if state
+                .phase
+                .lock()
+                .expect("MCP teardown lock poisoned")
+                .finish(work)
+            {
+                state.completed.notify_waiters();
+            }
         });
     }
 
@@ -131,7 +123,10 @@ impl McpTeardown {
         self.start();
         loop {
             let completed = self.state.completed.notified();
-            if self.state.done.load(Ordering::Acquire) {
+            if matches!(
+                *self.state.phase.lock().expect("MCP teardown lock poisoned"),
+                Phase::Done
+            ) {
                 return;
             }
             completed.await;
@@ -139,20 +134,10 @@ impl McpTeardown {
     }
 }
 
-fn finish(state: &TeardownState, server_id: Option<&str>) {
-    let mut owned_id = state.server_id.lock().expect("MCP server id lock poisoned");
-    if server_id.is_none() || owned_id.as_deref() == server_id {
-        *owned_id = None;
-    }
-    drop(owned_id);
-    state.done.store(true, Ordering::Release);
-    state.completed.notify_waiters();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FailingOnceDisconnect {
         attempts: AtomicUsize,
@@ -163,7 +148,8 @@ mod tests {
 
     #[async_trait]
     impl DisconnectOps for FailingOnceDisconnect {
-        async fn disconnect(&self, _server_id: &str) -> Result<(), String> {
+        async fn disconnect(&self, server_id: &str) -> Result<(), String> {
+            assert_eq!(server_id, "capsule:test");
             if self.attempts.fetch_add(1, Ordering::AcqRel) == 0 {
                 self.first_attempt.notify_one();
                 self.release_first.notified().await;
@@ -174,9 +160,28 @@ mod tests {
             }
         }
 
-        async fn is_running(&self, _server_id: &str) -> bool {
+        async fn is_running(&self, server_id: &str) -> bool {
+            assert_eq!(server_id, "capsule:test");
             self.running.load(Ordering::Acquire)
         }
+    }
+
+    #[tokio::test]
+    async fn retirement_before_registration_completes_without_disconnect() {
+        let ops = Arc::new(FailingOnceDisconnect {
+            attempts: AtomicUsize::new(0),
+            first_attempt: Notify::new(),
+            release_first: Notify::new(),
+            running: AtomicBool::new(false),
+        });
+        let teardown = McpTeardown::with_ops(ops.clone());
+        let ((), ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(teardown.wait(), teardown.wait())
+        })
+        .await
+        .expect("both waiters should observe empty retirement");
+        assert!(!teardown.register("late-server".to_string()));
+        assert_eq!(ops.attempts.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -193,6 +198,9 @@ mod tests {
         teardown.start();
 
         ops.first_attempt.notified().await;
+        assert!(!teardown.register("other-server".to_string()));
+        assert_eq!(teardown.server_id().as_deref(), Some("capsule:test"));
+        teardown.start();
         drop(teardown);
         ops.release_first.notify_one();
 
@@ -202,5 +210,6 @@ mod tests {
         assert_eq!(ops.attempts.load(Ordering::Acquire), 2);
         assert!(!ops.running.load(Ordering::Acquire));
         assert_eq!(waiter.server_id(), None);
+        assert!(!waiter.register("late-server".to_string()));
     }
 }

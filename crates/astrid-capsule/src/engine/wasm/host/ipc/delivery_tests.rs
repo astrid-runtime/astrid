@@ -105,3 +105,27 @@ async fn publish_captures_metadata_before_typed_payload_conversion() {
         Err(ErrorCode::InvalidInput)
     ));
 }
+
+#[tokio::test]
+async fn retired_publisher_cannot_commit_before_cancellation_is_observed() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let tracker = Arc::new(crate::engine::wasm::PrincipalInvocationTracker::default());
+    state.principal_invocations = Some(Arc::clone(&tracker));
+    let principal = state.effective_principal();
+    let topic = "verification.test.publish";
+    state.ipc_publish_patterns = vec![topic.into()];
+
+    // Retirement closes tracker admission before the engine cancels its token.
+    tracker.retire(&principal);
+    assert!(state.invocation_authority_active());
+    assert!(matches!(
+        IpcHost::publish(&mut state, topic.into(), "{}".into()).await,
+        Err(ErrorCode::CapabilityDenied)
+    ));
+
+    // A fresh invocation can publish once the engine explicitly resumes it.
+    tracker.resume(&principal);
+    IpcHost::publish(&mut state, topic.into(), "{}".into())
+        .await
+        .expect("resumed principal can publish");
+}

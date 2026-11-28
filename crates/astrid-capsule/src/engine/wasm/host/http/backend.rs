@@ -65,27 +65,24 @@ pub(super) fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, ErrorCode
     Ok(headers)
 }
 
+pub(super) fn parse_request_url(input: &str) -> Result<reqwest::Url, ErrorCode> {
+    reqwest::Url::parse(input).map_err(|_| ErrorCode::InvalidRequest)
+}
+
 async fn check_http_security(
-    security: &Option<Arc<dyn crate::security::CapsuleSecurityGate>>,
-    capsule_id: String,
-    url: &str,
-    method: &str,
-    io_semaphore: &Arc<tokio::sync::Semaphore>,
+    security: Option<&dyn crate::security::CapsuleSecurityGate>,
+    capsule_id: &str,
+    url: &reqwest::Url,
+    method: &reqwest::Method,
+    io_semaphore: &tokio::sync::Semaphore,
 ) -> Result<(), ErrorCode> {
     if let Some(gate) = security {
-        let url_obj = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
-        let _ = url_obj.host_str().ok_or(ErrorCode::InvalidRequest)?;
-
-        let full_url = url.to_string();
-        let m = method.to_string();
-        let gate = gate.clone();
-        let check = util::bounded_await(io_semaphore, async move {
-            gate.check_http_request(&capsule_id, &m, &full_url).await
-        })
-        .await;
-        if check.is_err() {
-            return Err(ErrorCode::CapabilityDenied);
-        }
+        util::bounded_await(
+            io_semaphore,
+            gate.check_http_request(capsule_id, method.as_str(), url.as_str()),
+        )
+        .await
+        .map_err(|_| ErrorCode::CapabilityDenied)?;
     }
     Ok(())
 }
@@ -93,10 +90,8 @@ async fn check_http_security(
 /// A live HTTP streaming response pinned to the principal that opened it.
 #[derive(Debug, Clone)]
 pub struct ActiveHttpStream {
-    pub response: Arc<tokio::sync::Mutex<reqwest::Response>>,
+    lifetime: super::stream_lifetime::StreamLifetime,
     pub creator: astrid_core::principal::PrincipalId,
-    pub status: u16,
-    pub headers: Vec<KeyValuePair>,
     /// Per-chunk read timeout. Caller-overridable via
     /// `timeout-config.between-bytes-ms`; defaults to the host
     /// [`HttpLimits::stream_read_timeout`](crate::engine::wasm::limits::HttpLimits::stream_read_timeout).
@@ -108,25 +103,12 @@ pub struct ActiveHttpStream {
 }
 
 impl ActiveHttpStream {
-    /// Build a quota-counting placeholder stream WITHOUT any network. The
-    /// streaming concurrency quota in [`HostState::http_stream_backend`] only
-    /// counts `active_http_streams` entries — it never reads the `response` — so
-    /// tests can pre-populate the map to the cap and assert the next open is
-    /// rejected with `Quota` immediately, instead of opening real streams (which
-    /// would block on the streaming header deadline waiting for a responder).
-    /// The `response` is a synthetic empty-body `200` made from an
-    /// `http::Response`, never an over-the-wire one.
+    /// Closed placeholder for tests that fill the per-capsule stream quota.
     #[cfg(test)]
     pub(crate) fn dummy_for_test(creator: &astrid_core::principal::PrincipalId) -> Self {
-        let http_resp = http::Response::builder()
-            .status(200)
-            .body(reqwest::Body::from(Vec::<u8>::new()))
-            .expect("build synthetic http::Response");
         Self {
-            response: Arc::new(tokio::sync::Mutex::new(reqwest::Response::from(http_resp))),
+            lifetime: super::stream_lifetime::StreamLifetime::closed(),
             creator: creator.clone(),
-            status: 200,
-            headers: Vec::new(),
             read_timeout: Duration::from_secs(120),
             audit: Arc::default(),
         }
@@ -154,6 +136,7 @@ pub(super) fn header_deadline(opts: &ResolvedOptions, floor: Duration) -> Durati
 /// exemption is host-only and a `30x` to a different port/host would escape
 /// the port-scoped allowlist.
 struct WireResponse {
+    authority: super::super::consent_egress::EgressAuthority,
     response: reqwest::Response,
     /// Best-effort bytes-on-wire before decompression (content-length header).
     content_length: Option<u64>,
@@ -229,33 +212,31 @@ impl HostState {
     /// returned [`WireResponse`] carries the open exchange.
     async fn send_one_hop(
         &mut self,
-        url: &str,
+        parsed: &reqwest::Url,
         method: &reqwest::Method,
         headers: &HeaderMap,
         body: Option<&[u8]>,
         opts: &ResolvedOptions,
         redirect_hop: u32,
     ) -> Result<WireResponse, ErrorCode> {
-        if let Err(error) = check_scheme(url, opts.https_only) {
+        if let Err(error) = check_scheme(parsed, opts.https_only) {
             // A refused scheme is a refused request: record it like the other
             // refusals whenever the URL parses at all.
-            if let Ok(parsed) = reqwest::Url::parse(url)
-                && let Some(precommit) =
-                    self.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
+            if let Some(precommit) =
+                self.http_precommit(parsed, method, headers, body, redirect_hop, &[])
             {
                 precommit.deny("scheme denied");
             }
             return Err(error);
         }
 
-        let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
         let host = parsed.host_str().ok_or(ErrorCode::InvalidRequest)?;
         let port = parsed
             .port_or_known_default()
             .ok_or(ErrorCode::InvalidRequest)?;
         let deny = |state: &Self, reason: &str| {
             if let Some(precommit) =
-                state.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
+                state.http_precommit(parsed, method, headers, body, redirect_hop, &[])
             {
                 precommit.deny(reason);
             }
@@ -265,23 +246,30 @@ impl HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let security = self.security.clone();
         let io_semaphore = self.io_semaphore.clone();
-        if let Err(error) =
-            check_http_security(&security, capsule_id, url, method.as_str(), &io_semaphore).await
+        if let Err(error) = check_http_security(
+            self.security.as_deref(),
+            self.capsule_id.as_str(),
+            parsed,
+            method,
+            &io_semaphore,
+        )
+        .await
         {
             deny(self, "security gate denied");
             return Err(error);
         }
 
-        let exempt_host = match self.egress_decision_with_consent(url) {
-            Ok(exempt_host) => exempt_host,
-            Err(error) => {
-                deny(self, &error_text(&error));
-                return Err(error);
-            },
-        };
+        let (hop, (exempt_host, authority)) =
+            match super::hop::admit(method, parsed, |_, target| {
+                self.egress_decision_with_consent(target)
+            }) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    deny(self, &error_text(&error));
+                    return Err(error);
+                },
+            };
         let exempt = exempt_host.is_some();
 
         // Host-side credential injection: `{{secret:NAME}}` placeholders in
@@ -311,8 +299,8 @@ impl HostState {
             reqwest::redirect::Policy::none(),
         )?;
 
-        let mut request_builder = client
-            .request(method.clone(), url)
+        let mut request_builder = hop
+            .request(|method, target| client.request(method.clone(), target.clone()))
             .headers(injected.headers);
         if let Some(b) = body {
             request_builder = request_builder.body(b.to_vec());
@@ -320,14 +308,8 @@ impl HostState {
 
         // Pre-commit: the request entry is durable before anything leaves
         // the host (DNS resolution included).
-        let precommit = self.http_precommit(
-            &parsed,
-            method,
-            headers,
-            body,
-            redirect_hop,
-            &injected.names,
-        );
+        let precommit =
+            self.http_precommit(parsed, method, headers, body, redirect_hop, &injected.names);
         let mut exchange = match precommit {
             Some(precommit) => precommit.commit().await,
             None => HttpExchange::default(),
@@ -340,13 +322,18 @@ impl HostState {
         // hangs before sending headers would block this future forever
         // (executor starvation).
         let header_deadline = header_deadline(opts, self.http_limits.header_deadline_floor);
-        let sent = util::bounded_await(&io_semaphore, async move {
+        let cancel = self.effective_cancel_token();
+        let send = util::bounded_await_cancellable(&io_semaphore, &cancel, async move {
             match tokio::time::timeout(header_deadline, request_builder.send()).await {
                 Ok(result) => result.map_err(|e| airlock_or(&tripped, &dns_failed, &e)),
                 Err(_elapsed) => Err(ErrorCode::Timeout),
             }
-        })
-        .await;
+        });
+        let sent = authority
+            .while_live(send)
+            .await
+            .flatten()
+            .unwrap_or(Err(ErrorCode::Closed));
         let response = match sent {
             Ok(response) => response,
             Err(error) => {
@@ -360,6 +347,7 @@ impl HostState {
 
         let content_length = response.content_length();
         Ok(WireResponse {
+            authority,
             response,
             content_length,
             exempt,
@@ -399,8 +387,7 @@ impl HostState {
     ) -> Result<(WireResponse, u32, reqwest::Url), ErrorCode> {
         let mut method = map_method(&request.method)?;
         let mut headers = build_headers(&request.headers)?;
-        let mut current_url =
-            reqwest::Url::parse(&request.url).map_err(|_| ErrorCode::InvalidRequest)?;
+        let mut current_url = parse_request_url(&request.url)?;
         // The body is forwarded across redirect hops that preserve the method
         // (307/308). On 301/302/303 the method is downgraded to GET and the
         // body dropped — the RFC 7231 behaviour reqwest's default policy
@@ -411,7 +398,7 @@ impl HostState {
         loop {
             let mut wire = self
                 .send_one_hop(
-                    current_url.as_str(),
+                    &current_url,
                     &method,
                     &headers,
                     body.as_deref(),
@@ -500,6 +487,7 @@ impl HostState {
         redirect_count: u32,
     ) -> Result<HttpResponseData, ErrorCode> {
         let WireResponse {
+            authority,
             response,
             content_length,
             exempt: _,
@@ -529,40 +517,44 @@ impl HostState {
         } else {
             None
         };
-        // The loop hands back the bytes read so far even on failure, so the
-        // completion commits to exactly what the host received.
-        let (body, read_error) = util::bounded_await(&io_semaphore, async move {
+        // Keep the accepted prefix outside the cancellable future so a failed
+        // completion can still commit to the bytes already appended.
+        let cancel = self.effective_cancel_token();
+        let mut body = Vec::new();
+        let read = util::bounded_await_cancellable(&io_semaphore, &cancel, async {
             let mut response = response;
-            let mut bytes = Vec::new();
             loop {
                 let chunk = match response.chunk().await {
                     Ok(Some(chunk)) => chunk,
-                    Ok(None) => return (bytes, None),
-                    Err(e) => return (bytes, Some(map_reqwest_err(&e))),
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(map_reqwest_err(&e)),
                 };
                 // `chunk()` yields decoded bytes when auto-decompress is on.
                 // Enforce the decompressed ceiling first (bomb defence), then
                 // the response cap. Both are hard limits.
                 if let Some(cap) = max_decompressed
-                    && bytes.len() as u64 + chunk.len() as u64 > cap
+                    && body.len() as u64 + chunk.len() as u64 > cap
                 {
-                    return (bytes, Some(ErrorCode::DecompressionBomb));
+                    return Err(ErrorCode::DecompressionBomb);
                 }
-                if bytes.len() as u64 + chunk.len() as u64 > max_response {
-                    return (bytes, Some(ErrorCode::BodyTooLarge));
+                if body.len() as u64 + chunk.len() as u64 > max_response {
+                    return Err(ErrorCode::BodyTooLarge);
                 }
-                bytes.extend_from_slice(&chunk);
+                body.extend_from_slice(&chunk);
             }
-        })
-        .await;
+        });
+        let read_result = authority.while_live(read).await;
         exchange.begin_body();
         exchange.digest(&body);
-        if let Some(error) = read_error {
-            exchange
-                .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
-                .await;
-            return Err(error);
-        }
+        let body = match super::body::finish(body, read_result, ErrorCode::Closed) {
+            Ok(body) => body,
+            Err(error) => {
+                exchange
+                    .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                    .await;
+                return Err(error);
+            },
+        };
 
         if let Some(integrity) = &opts.integrity
             && let Err(error) = verify_integrity(integrity, &body)
@@ -612,7 +604,7 @@ impl HostState {
         // length is the per-capsule count. A separate, SMALLER per-principal
         // limit would be needed for true per-principal isolation (one principal
         // not starving others within the capsule) — out of scope here.
-        if self.active_http_streams.len() >= max_streams {
+        if !super::slots::room(&self.active_http_streams, max_streams) {
             return Err(ErrorCode::Quota);
         }
 
@@ -633,6 +625,14 @@ impl HostState {
         if !opts.total_explicit {
             stream_opts.total_timeout = None;
         }
+        let owner_uid = self
+            .principal_directory
+            .bound_uid(
+                &principal,
+                self.invocation_storage_uid.or(self.runtime_owner_uid),
+            )
+            .map_err(|_| ErrorCode::CapabilityDenied)?;
+        let owner_cancel = self.principal_cancel_token_for(&principal);
         let read_timeout = opts
             .between_bytes_timeout
             .unwrap_or(self.http_limits.stream_read_timeout);
@@ -645,26 +645,29 @@ impl HostState {
         let response = wire.response;
         let mut exchange = wire.exchange;
         exchange.begin_body();
-        let status = response.status().as_u16();
-        let mut resp_headers = Vec::new();
-        for (k, v) in response.headers() {
-            if let Ok(v_str) = v.to_str() {
-                resp_headers.push(KeyValuePair {
-                    key: k.as_str().to_string(),
-                    value: v_str.to_string(),
-                });
-            }
-        }
-
+        let audit = Arc::new(std::sync::Mutex::new(exchange));
         let active = ActiveHttpStream {
-            response: Arc::new(tokio::sync::Mutex::new(response)),
-            creator: principal,
-            status,
-            headers: resp_headers,
+            lifetime: super::stream_lifetime::StreamLifetime::start(
+                self,
+                owner_uid,
+                owner_cancel,
+                response,
+                wire.authority,
+                audit.clone(),
+            ),
+            creator: principal.clone(),
             read_timeout,
-            audit: Arc::new(std::sync::Mutex::new(exchange)),
+            audit,
         };
-        register_stream(self, active)
+        let directory = self.principal_directory.clone();
+        directory
+            .with_bound_input(&principal, owner_uid, active, |active| {
+                if !active.lifetime.live_now() || !self.invocation_authority_active() {
+                    return Err(ErrorCode::Closed);
+                }
+                register_stream(self, active)
+            })
+            .map_err(|_| ErrorCode::Closed)?
     }
 }
 
@@ -726,10 +729,25 @@ pub(super) fn register_stream(
         .resource_table
         .push(HttpStreamSlot)
         .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
-    state
-        .active_http_streams
-        .insert(u64::from(slot.rep()), active);
-    Ok(Resource::new_own(slot.rep()))
+    match super::slots::publish(
+        &mut state.active_http_streams,
+        state.http_limits.max_concurrent_streams,
+        slot.rep(),
+        active,
+    ) {
+        Ok(rep) => Ok(Resource::new_own(rep)),
+        Err(refusal) => {
+            // The just-allocated marker has no children and has not escaped.
+            state
+                .resource_table
+                .delete(slot)
+                .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+            Err(match refusal {
+                super::slots::Refusal::Full => ErrorCode::Quota,
+                super::slots::Refusal::Occupied => ErrorCode::Closed,
+            })
+        },
+    }
 }
 
 fn live_stream(state: &HostState, rep: u32) -> Option<&ActiveHttpStream> {
@@ -741,12 +759,26 @@ fn live_stream(state: &HostState, rep: u32) -> Option<&ActiveHttpStream> {
 }
 
 pub(super) fn stream_status(state: &mut HostState, rep: u32) -> u16 {
-    live_stream(state, rep).map(|s| s.status).unwrap_or(0)
+    let Some(reader) = state.admit_egress_caller() else {
+        return 0;
+    };
+    live_stream(state, rep)
+        .and_then(|s| {
+            s.lifetime
+                .access(state, &s.creator, &reader, |open| open.status)
+        })
+        .unwrap_or(0)
 }
 
 pub(super) fn stream_headers(state: &mut HostState, rep: u32) -> Vec<KeyValuePair> {
+    let Some(reader) = state.admit_egress_caller() else {
+        return Vec::new();
+    };
     live_stream(state, rep)
-        .map(|s| s.headers.clone())
+        .and_then(|s| {
+            s.lifetime
+                .access(state, &s.creator, &reader, |open| open.headers.clone())
+        })
         .unwrap_or_default()
 }
 
@@ -755,38 +787,61 @@ pub(super) async fn stream_read_chunk(
     rep: u32,
 ) -> Result<Vec<u8>, ErrorCode> {
     let stream = live_stream(state, rep).ok_or(ErrorCode::Closed)?;
-    let response_arc = stream.response.clone();
+    let reader = state.admit_egress_caller().ok_or(ErrorCode::Closed)?;
+    let open = stream
+        .lifetime
+        .access(state, &stream.creator, &reader, |open| open)
+        .ok_or(ErrorCode::Closed)?;
     let audit = Arc::clone(&stream.audit);
     let read_timeout = stream.read_timeout;
     let cancel = state.effective_cancel_token();
     let sem = state.io_semaphore.clone();
     let started = Instant::now();
-    let result = util::bounded_await_cancellable(&sem, &cancel, async {
-        let mut resp = response_arc.lock().await;
-        tokio::time::timeout(read_timeout, resp.chunk()).await
-    })
-    .await;
+    let read = util::bounded_await_cancellable(&sem, &cancel, open.read(read_timeout));
+    let result = reader
+        .while_live(open.while_live(Box::pin(read)))
+        .await
+        .ok_or(ErrorCode::Closed)?;
     // The audit exchange hashes each delivered chunk and is completed at end
     // of body or on a read error. A per-chunk timeout leaves it open: the
     // guest may read again.
+    let Some(result) = result else {
+        complete_stream(&audit, false, HostAuditOutcome::Failed("authority retired")).await;
+        return Err(ErrorCode::Closed);
+    };
     let bytes_result: Result<Vec<u8>, ErrorCode> = match result {
         None => {
             complete_stream(&audit, false, HostAuditOutcome::Failed("cancelled")).await;
             Ok(Vec::new())
         },
-        Some(Err(_)) => Err(ErrorCode::Timeout),
-        Some(Ok(Err(e))) => {
-            let error = map_reqwest_err(&e);
-            complete_stream(&audit, false, HostAuditOutcome::Failed(&error_text(&error))).await;
-            Err(error)
-        },
-        Some(Ok(Ok(Some(bytes)))) => {
-            with_exchange(&audit, |exchange| exchange.digest(&bytes));
-            Ok(bytes.to_vec())
-        },
-        Some(Ok(Ok(None))) => {
-            complete_stream(&audit, true, HostAuditOutcome::Allowed).await;
-            Ok(Vec::new())
+        Some(observation) => {
+            let publication = stream
+                .lifetime
+                .access_with(
+                    state,
+                    &stream.creator,
+                    &reader,
+                    observation,
+                    |(selected, observation)| {
+                        selected
+                            .outcome_of(observation)
+                            .map(|outcome| prepare_read(&audit, outcome))
+                    },
+                )
+                .flatten();
+            match publication {
+                Some((result, record)) => {
+                    if let Some(record) = record {
+                        record.commit().await;
+                    }
+                    result
+                },
+                None => {
+                    complete_stream(&audit, false, HostAuditOutcome::Failed("authority retired"))
+                        .await;
+                    Err(ErrorCode::Closed)
+                },
+            }
         },
     };
     let bytes = bytes_result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
@@ -816,6 +871,32 @@ pub(super) async fn stream_read_chunk(
     bytes_result
 }
 
+fn prepare_read(
+    audit: &std::sync::Mutex<HttpExchange>,
+    outcome: super::stream_lifetime::WireRead,
+) -> (Result<Vec<u8>, ErrorCode>, Option<super::audit::Completion>) {
+    super::body::read_outcome(
+        outcome.ok(),
+        ErrorCode::Timeout,
+        |received| {
+            super::body::stream_result(
+                received,
+                |bytes| {
+                    with_exchange(audit, |exchange| exchange.digest(&bytes));
+                    bytes.to_vec()
+                },
+                || take_stream_completion(audit, true, HostAuditOutcome::Allowed),
+            )
+        },
+        |error| {
+            let error = map_reqwest_err(&error);
+            let record =
+                take_stream_completion(audit, false, HostAuditOutcome::Failed(&error_text(&error)));
+            (error, record)
+        },
+    )
+}
+
 /// Run `f` on a stream's audit exchange (skipped if the lock is poisoned).
 fn with_exchange(audit: &std::sync::Mutex<HttpExchange>, f: impl FnOnce(&mut HttpExchange)) {
     if let Ok(mut exchange) = audit.lock() {
@@ -828,8 +909,21 @@ fn with_exchange(audit: &std::sync::Mutex<HttpExchange>, f: impl FnOnce(&mut Htt
 /// terminator), so the completion is successful but marked incomplete.
 fn close_stream_exchange(stream: &ActiveHttpStream) {
     with_exchange(&stream.audit, |exchange| {
-        exchange.finish_detached(false, HostAuditOutcome::Allowed);
+        let outcome = if stream.lifetime.live_now() {
+            HostAuditOutcome::Allowed
+        } else {
+            HostAuditOutcome::Failed("authority retired")
+        };
+        exchange.finish_detached(false, outcome);
     });
+}
+
+fn take_stream_completion(
+    audit: &std::sync::Mutex<HttpExchange>,
+    complete: bool,
+    outcome: HostAuditOutcome<'_>,
+) -> Option<super::audit::Completion> {
+    audit.lock().ok()?.take_completion(complete, outcome)
 }
 
 /// Complete a stream's audit exchange and wait until the record is durable.
@@ -839,38 +933,31 @@ async fn complete_stream(
     complete: bool,
     outcome: HostAuditOutcome<'_>,
 ) {
-    let completion = audit
-        .lock()
-        .ok()
-        .and_then(|mut exchange| exchange.take_completion(complete, outcome));
-    if let Some(completion) = completion {
+    if let Some(completion) = take_stream_completion(audit, complete, outcome) {
         completion.commit().await;
     }
 }
 
 pub(super) fn stream_close(state: &mut HostState, rep: u32) -> Result<(), ErrorCode> {
-    release_response(state, rep);
+    if let Some(stream) = super::slots::release(&mut state.active_http_streams, rep) {
+        close_stream_exchange(&stream);
+    }
     Ok(())
 }
 
-fn release_response(state: &mut HostState, rep: u32) {
-    if let Some(stream) = state.active_http_streams.remove(&u64::from(rep)) {
-        close_stream_exchange(&stream);
-    }
-}
-
 pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
-    // Wasmtime deletes the underlying entry before downcasting its value.
-    if state
-        .resource_table
-        .get::<HttpStreamSlot>(&Resource::new_borrow(rep))
-        .is_ok()
-        && state
-            .resource_table
-            .delete::<HttpStreamSlot>(Resource::new_own(rep))
+    let table = &mut state.resource_table;
+    let stream = super::slots::drop_owned(&mut state.active_http_streams, rep, |slot| {
+        // Wasmtime deletes the underlying entry before downcasting its value.
+        table
+            .get::<HttpStreamSlot>(&Resource::new_borrow(slot))
             .is_ok()
-    {
-        release_response(state, rep);
+            && table
+                .delete::<HttpStreamSlot>(Resource::new_own(slot))
+                .is_ok()
+    });
+    if let Some(stream) = stream {
+        close_stream_exchange(&stream);
     }
 }
 

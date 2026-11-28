@@ -2,8 +2,8 @@
 use std::fmt;
 
 use super::{
-    DurableError, DurableIo, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, RecoveryLimits, io_error,
-    read_exact_at, validate_positioned_header, validate_positioned_payload,
+    DurableError, DurableIo, RecoveryLimits, io_error, positional_error, positional_read,
+    validate_positioned_header, validate_positioned_payload,
 };
 
 /// Only the validating reader in this module can construct this proof.
@@ -23,9 +23,6 @@ impl fmt::Debug for ValidatedFrame {
 }
 
 impl ValidatedFrame {
-    pub(super) fn payload(&self) -> &[u8] {
-        &self.payload
-    }
     pub(super) const fn checksum(&self) -> [u8; 32] {
         self.checksum
     }
@@ -42,22 +39,20 @@ pub(in crate::engine::durable) fn read_frame_at<F: DurableIo>(
     offset: u64,
     limits: RecoveryLimits,
 ) -> Result<ValidatedFrame, DurableError> {
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    read_exact_at(file, &mut header, offset)
-        .map_err(|source| io_error("read indexed durable frame header", source))?;
-    let decoded = validate_positioned_header(file_name, magic, offset, &header, limits)?;
-    let payload_usize =
-        usize::try_from(decoded.payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(payload_usize)
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    payload.resize(payload_usize, 0);
-    let payload_offset = offset
-        .checked_add(FRAME_HEADER_LEN)
-        .ok_or(DurableError::EncodingOverflow)?;
-    read_exact_at(file, &mut payload, payload_offset)
-        .map_err(|source| io_error("read indexed durable frame payload", source))?;
-    let checksum = validate_positioned_payload(file_name, magic, offset, decoded, &payload)?;
+    use positional_read::FrameError;
+    let (payload, checksum) = positional_read::frame(
+        file,
+        offset,
+        |header| validate_positioned_header(file_name, magic, offset, header, limits),
+        |decoded, payload| validate_positioned_payload(file_name, magic, offset, decoded, payload),
+    )
+    .map_err(|error| match error {
+        FrameError::Header(e) => io_error("read indexed durable frame header", positional_error(e)),
+        FrameError::Payload(e) => {
+            io_error("read indexed durable frame payload", positional_error(e))
+        },
+        FrameError::Invalid(e) => e,
+        FrameError::Capacity => DurableError::EncodingOverflow,
+    })?;
     Ok(ValidatedFrame { payload, checksum })
 }

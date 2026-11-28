@@ -31,6 +31,27 @@ pub trait PrivateElicitResponder: Send + Sync {
         value: Option<String>,
         values: Option<Vec<String>>,
     ) -> Result<(), PrivateElicitRejection>;
+
+    /// Deliver an answer from the registration authenticated on this connection.
+    ///
+    /// # Errors
+    /// Implementations using only fingerprint authentication support unversioned devices.
+    fn reply_for_registration(
+        &self,
+        principal: &PrincipalId,
+        device: astrid_events::ipc::DeviceStamp<'_>,
+        request_id: Uuid,
+        value: Option<String>,
+        values: Option<Vec<String>>,
+    ) -> Result<(), PrivateElicitRejection> {
+        let key = device
+            .fingerprint
+            .ok_or(PrivateElicitRejection::Forbidden)?;
+        if device.registration.is_some() {
+            return Err(PrivateElicitRejection::Forbidden);
+        }
+        self.reply(principal, key, request_id, value, values)
+    }
 }
 
 /// Deliberately closed error vocabulary: neither log nor echo secret input.
@@ -100,13 +121,13 @@ pub(super) fn respond(
                 };
                 let result = if payload_too_large(&payload) {
                     Err(PrivateElicitRejection::Invalid)
-                } else if let Some(device) = identity.device_key_id.as_deref() {
+                } else if identity.device_key_id.is_some() {
                     match payload {
                         IpcPayload::ElicitResponse { value, values, .. } => {
                             handler.map_or(Err(PrivateElicitRejection::Unavailable), |handler| {
-                                handler.reply(
+                                handler.reply_for_registration(
                                     &identity.principal,
-                                    device,
+                                    identity.device_stamp(),
                                     request_id,
                                     value,
                                     values,

@@ -2,17 +2,41 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord, RootState};
 
+use super::closure_load::CommitError;
+use super::journal_history::{self, Rejection};
+use super::journal_snapshot::{self, SnapshotError};
+use super::journal_transition::{self, DecodeError};
+use super::root_wire::TailError;
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
-    preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
+    PrincipalCodec, ROOT_FILE, RecoveryLimits, corrupt, preload_indexed_closures,
+    recovery_closure_error,
 };
 
-const SNAPSHOT_SENTINEL: u64 = u64::MAX;
-const SNAPSHOT_RECORD: u8 = 1;
-const CURRENT_DIGEST_BYTES: u32 = 32;
+use super::{journal_apply, journal_payload};
+use journal_snapshot::{CompleteError, EndError, HeaderError, RowError};
+impl From<IdentityScheme> for super::root_wire::Scheme {
+    fn from(scheme: IdentityScheme) -> Self {
+        Self {
+            algorithm: scheme.algorithm().to_le_bytes(),
+            construction: scheme.construction().to_le_bytes(),
+        }
+    }
+}
+
+impl From<RootState> for super::root_wire::Root {
+    fn from(root: RootState) -> Self {
+        journal_history::to_wire(root)
+    }
+}
+
+impl From<super::root_wire::Root> for RootState {
+    fn from(root: super::root_wire::Root) -> Self {
+        journal_history::from_wire(root)
+    }
+}
 
 pub(super) fn recover_root_history<P, C, R>(
     roots: &mut R,
@@ -25,13 +49,26 @@ where
     C: PrincipalCodec<P>,
     R: DurableIo,
 {
-    let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
-    scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
-        let record = decode_root_journal_record(payload, scheme)
-            .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
-        apply_root_journal_record(&mut recovered, codec, scheme, offset, payload, record)
-    })?;
-    Ok(recovered)
+    let mut recovered = super::journal_visitor::RootHistory::new(
+        scheme.into(),
+        |key: &[u8]| codec.decode(key),
+        |p: &P| codec.encode(p),
+    );
+    super::format::scan_recovery_file(
+        roots,
+        limits,
+        super::format::RecoveryFile::Roots,
+        &mut recovered,
+        |offset, payload, error| match error {
+            journal_apply::VisitError::Decode(cursor, error) => corrupt(
+                ROOT_FILE,
+                offset,
+                decode_error(payload, cursor, scheme, error),
+            ),
+            journal_apply::VisitError::Apply(error) => apply_error(offset, error),
+        },
+    )?;
+    Ok(recovered.finish())
 }
 
 pub(super) fn recover_roots<P, I, C, R>(
@@ -49,25 +86,24 @@ where
     R: DurableIo,
 {
     let recovered = recover_root_history(roots, codec, identity.scheme(), limits)?;
-    validate_recovered_roots(recovered, arena, index, identity, limits)
+    validate_recovered_roots(&recovered, arena, index, identity, limits)
 }
 
 fn validate_recovered_roots<P, I>(
-    recovered: BTreeMap<P, (RootState, u64)>,
+    recovered: &BTreeMap<P, (RootState, u64)>,
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>
 where
-    P: Ord,
+    P: Clone + Ord,
     I: PersistentObjectIdentity,
 {
-    let mut validated = BTreeSet::new();
     let preload = preload_indexed_closures(
         arena,
         index,
-        recovered.values().map(|(root, _)| root.commit),
+        super::journal_closure::commits(recovered),
         identity,
         limits,
     )
@@ -75,150 +111,93 @@ where
         let root_offset = recovered.values().next().map_or(0, |(_, offset)| *offset);
         recovery_closure_error(error, root_offset)
     })?;
-    let empty_index = BTreeMap::new();
-    for (root, offset) in recovered.values().copied() {
-        let records = materialize_closure(
-            &mut super::ClosureObjects::<_, P> {
-                arena,
-                index: &empty_index,
-                incoming: &preload,
-                pending: None,
-                identity,
-                limits,
-            },
-            root.commit,
-        )
-        .map_err(|error| recovery_closure_error(error, offset))?;
-        validate_commit_closure(&records, root.commit).map_err(|source| {
-            DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source,
-            }
-        })?;
-        validated.extend(records.into_iter().map(|(id, _)| id));
-    }
-    Ok((
-        recovered
-            .into_iter()
-            .map(|(principal, (root, _))| (principal, root))
-            .collect(),
-        validated,
-    ))
+    let validated = validate_preloaded(recovered, &preload)?;
+    let candidate = recovered
+        .iter()
+        .map(|(owner, (root, _))| (owner.clone(), *root))
+        .collect();
+    let roots = super::journal_closure::project(recovered, candidate)
+        .ok_or(DurableError::InvalidRootProjection)?;
+    Ok((roots, validated))
 }
 
-fn apply_root_journal_record<P, C>(
-    recovered: &mut BTreeMap<P, (RootState, u64)>,
-    codec: &C,
-    scheme: IdentityScheme,
-    offset: u64,
-    payload: &[u8],
-    record: DecodedRootJournalRecord,
-) -> Result<(), DurableError>
-where
-    P: Ord,
-    C: PrincipalCodec<P>,
-{
-    match record {
-        DecodedRootJournalRecord::Transition(record) => {
-            let canonical = encode_root_record(
-                scheme,
-                &record.principal,
-                record.expected,
-                record.replacement,
-            )?;
-            if canonical != payload {
-                return Err(corrupt(
-                    ROOT_FILE,
-                    offset,
-                    "root-journal frame is not canonical",
-                ));
-            }
-            apply_transition(recovered, codec, offset, &record)
+pub(super) fn validate_preloaded<P: Ord>(
+    recovered: &BTreeMap<P, (RootState, u64)>,
+    preload: &BTreeMap<ObjectId, ObjectRecord>,
+) -> Result<BTreeSet<ObjectId>, DurableError> {
+    use super::closure_walk::Failure;
+    use super::journal_closure;
+    journal_closure::validate(recovered, preload).map_err(|failure| match failure {
+        journal_closure::Failure::Walk(at, failure) => {
+            let source = match failure {
+                Failure::Cycle(id) => ModelError::ObjectCycle(id),
+                Failure::Root(id) | Failure::Source(_, id) => ModelError::MissingObject(id),
+            };
+            recovery_closure_error(source.into(), at)
         },
-        DecodedRootJournalRecord::Snapshot(entries) => {
-            if offset != 0 || !recovered.is_empty() {
-                return Err(corrupt(
-                    ROOT_FILE,
-                    offset,
-                    "root snapshot must be the first journal frame",
-                ));
-            }
-            if encode_root_snapshot(scheme, &entries)? != payload {
-                return Err(corrupt(
-                    ROOT_FILE,
-                    offset,
-                    "root snapshot frame is not canonical",
-                ));
-            }
-            for (principal_bytes, root) in entries {
-                let principal = decode_principal(codec, &principal_bytes, offset)?;
-                if recovered.insert(principal, (root, offset)).is_some() {
-                    return Err(corrupt(
-                        ROOT_FILE,
-                        offset,
-                        "root snapshot decodes duplicate principals",
-                    ));
-                }
-            }
-            Ok(())
-        },
-    }
-}
-
-fn apply_transition<P, C>(
-    recovered: &mut BTreeMap<P, (RootState, u64)>,
-    codec: &C,
-    offset: u64,
-    record: &DecodedRootRecord,
-) -> Result<(), DurableError>
-where
-    P: Ord,
-    C: PrincipalCodec<P>,
-{
-    let principal = decode_principal(codec, &record.principal, offset)?;
-    let actual = recovered.get(&principal).map(|(root, _)| *root);
-    if actual != record.expected {
-        return Err(DurableError::RecoveryModel {
+        journal_closure::Failure::Commit(offset, commit, kind) => DurableError::RecoveryModel {
             file: ROOT_FILE,
             offset,
-            source: ModelError::RootConflict {
-                expected: record.expected,
-                actual,
+            source: match kind {
+                CommitError::WrongKind(actual) => ModelError::RootNotCommit {
+                    object: commit,
+                    actual,
+                },
+                CommitError::Missing => ModelError::MissingObject(commit),
             },
-        });
-    }
-    let generation = match actual {
-        Some(root) => root.generation.checked_next(),
-        None => Some(RootGeneration::INITIAL),
-    }
-    .ok_or(DurableError::RecoveryModel {
-        file: ROOT_FILE,
-        offset,
-        source: ModelError::ArithmeticOverflow,
-    })?;
-    if record.replacement.generation != generation {
-        return Err(corrupt(
-            ROOT_FILE,
-            offset,
-            "replacement generation does not match journal history",
-        ));
-    }
-    recovered.insert(principal, (record.replacement, offset));
-    Ok(())
+        },
+    })
 }
 
-fn decode_principal<P, C>(codec: &C, bytes: &[u8], offset: u64) -> Result<P, DurableError>
-where
-    C: PrincipalCodec<P>,
-{
-    let principal = codec
-        .decode(bytes)
-        .ok_or(DurableError::InvalidPrincipal { offset })?;
-    if codec.encode(&principal) != bytes {
-        return Err(DurableError::InvalidPrincipal { offset });
+fn apply_error(offset: u64, error: journal_apply::Error) -> DurableError {
+    use journal_transition::Error;
+    match error {
+        journal_apply::Error::Transition(expected, error) => match error {
+            Error::Length => DurableError::EncodingOverflow,
+            Error::Noncanonical => {
+                corrupt(ROOT_FILE, offset, "root-journal frame is not canonical")
+            },
+            Error::Principal => DurableError::InvalidPrincipal { offset },
+            Error::History(Rejection::Conflict(actual)) => DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset,
+                source: ModelError::RootConflict { expected, actual },
+            },
+            Error::History(Rejection::Overflow) => DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset,
+                source: ModelError::ArithmeticOverflow,
+            },
+            Error::History(Rejection::Generation) => corrupt(
+                ROOT_FILE,
+                offset,
+                "replacement generation does not match journal history",
+            ),
+        },
+        journal_apply::Error::Snapshot(error) => match error {
+            SnapshotError::Position => corrupt(
+                ROOT_FILE,
+                offset,
+                "root snapshot must be the first journal frame",
+            ),
+            SnapshotError::Noncanonical => {
+                corrupt(ROOT_FILE, offset, "root snapshot frame is not canonical")
+            },
+            SnapshotError::Duplicate => corrupt(
+                ROOT_FILE,
+                offset,
+                "root snapshot decodes duplicate principals",
+            ),
+            SnapshotError::Codec(journal_apply::CodecError::Order) => corrupt(
+                ROOT_FILE,
+                0,
+                "root snapshot principals are not strictly ordered",
+            ),
+            SnapshotError::Codec(journal_apply::CodecError::Principal) => {
+                DurableError::InvalidPrincipal { offset }
+            },
+        },
     }
-    Ok(principal)
 }
 
 pub(super) fn encode_root_record(
@@ -227,127 +206,74 @@ pub(super) fn encode_root_record(
     expected: Option<RootState>,
     replacement: RootState,
 ) -> Result<Vec<u8>, DurableError> {
-    let principal_len =
-        u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    if principal_len == SNAPSHOT_SENTINEL {
-        return Err(DurableError::EncodingOverflow);
-    }
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&principal_len.to_le_bytes());
-    bytes.extend_from_slice(principal);
-    match expected {
-        None => bytes.push(0),
-        Some(root) => {
-            bytes.push(1);
-            encode_root_state(&mut bytes, scheme, root);
-        },
-    }
-    encode_root_state(&mut bytes, scheme, replacement);
-    Ok(bytes)
+    journal_transition::encode(principal, scheme.into(), expected, replacement)
+        .ok_or(DurableError::EncodingOverflow)
 }
 
 pub(super) fn encode_root_snapshot(
     scheme: IdentityScheme,
     roots: &[(Vec<u8>, RootState)],
 ) -> Result<Vec<u8>, DurableError> {
-    if roots
-        .windows(2)
-        .any(|pair| pair[0].0.as_slice() >= pair[1].0.as_slice())
-    {
-        return Err(corrupt(
+    journal_snapshot::encode_ordered(roots, scheme.into()).ok_or_else(|| {
+        corrupt(
             ROOT_FILE,
             0,
             "root snapshot principals are not strictly ordered",
-        ));
-    }
-    let count = u64::try_from(roots.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&SNAPSHOT_SENTINEL.to_le_bytes());
-    bytes.push(SNAPSHOT_RECORD);
-    bytes.extend_from_slice(&count.to_le_bytes());
-    for (principal, root) in roots {
-        let principal_len =
-            u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        bytes.extend_from_slice(&principal_len.to_le_bytes());
-        bytes.extend_from_slice(principal);
-        encode_root_state(&mut bytes, scheme, *root);
-    }
-    Ok(bytes)
+        )
+    })
 }
 
-fn encode_root_state(bytes: &mut Vec<u8>, scheme: IdentityScheme, root: RootState) {
-    bytes.extend_from_slice(&root.generation.get().to_le_bytes());
-    encode_identity(bytes, scheme, root.commit);
-}
-
-fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
-    bytes.extend_from_slice(&scheme.algorithm().to_le_bytes());
-    bytes.extend_from_slice(&scheme.construction().to_le_bytes());
-    bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
-    bytes.extend_from_slice(id.as_bytes());
-}
-
-enum DecodedRootJournalRecord {
-    Transition(DecodedRootRecord),
-    Snapshot(Vec<(Vec<u8>, RootState)>),
-}
-
-struct DecodedRootRecord {
-    principal: Vec<u8>,
-    expected: Option<RootState>,
-    replacement: RootState,
-}
-
+#[cfg(test)]
 fn decode_root_journal_record(
     bytes: &[u8],
     scheme: IdentityScheme,
-) -> Result<DecodedRootJournalRecord, &'static str> {
-    let mut reader = RootReader::new(bytes);
-    let prefix = reader.u64()?;
-    if prefix == SNAPSHOT_SENTINEL {
-        if reader.u8()? != SNAPSHOT_RECORD {
-            return Err("unknown root-journal extension record");
-        }
-        let count = reader.usize_len()?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(count)
-            .map_err(|_| "root snapshot allocation failed")?;
-        for _ in 0..count {
-            let principal_len = reader.usize_len()?;
-            let principal = reader.take(principal_len)?.to_vec();
-            let root = reader.root_state(scheme)?;
-            entries.push((principal, root));
-        }
-        if entries
-            .windows(2)
-            .any(|pair| pair[0].0.as_slice() >= pair[1].0.as_slice())
-        {
-            return Err("root snapshot principals are not strictly ordered");
-        }
-        if reader.remaining() != 0 {
-            return Err("trailing root snapshot bytes");
-        }
-        return Ok(DecodedRootJournalRecord::Snapshot(entries));
-    }
+) -> Result<journal_payload::Record, &'static str> {
+    let mut cursor = 0;
+    journal_payload::decode(bytes, &mut cursor, scheme.into())
+        .map_err(|error| decode_error(bytes, cursor, scheme, error))
+}
 
-    let principal_len =
-        usize::try_from(prefix).map_err(|_| "principal length is not process-addressable")?;
-    let principal = reader.take(principal_len)?.to_vec();
-    let expected = match reader.u8()? {
-        0 => None,
-        1 => Some(reader.root_state(scheme)?),
-        _ => return Err("invalid expected-root tag"),
+fn decode_error(
+    bytes: &[u8],
+    cursor: usize,
+    scheme: IdentityScheme,
+    error: journal_payload::Error,
+) -> &'static str {
+    let mut reader = RootReader {
+        bytes,
+        offset: cursor,
     };
-    let replacement = reader.root_state(scheme)?;
-    if reader.remaining() != 0 {
-        return Err("trailing root-journal bytes");
+    match error {
+        journal_payload::Error::Header(error) => match error {
+            HeaderError::Read(e) => read_error(e),
+            HeaderError::UnknownRecord => "unknown root-journal extension record",
+            HeaderError::Length => "length is not process-addressable",
+        },
+        journal_payload::Error::Snapshot(error) => match error {
+            CompleteError::Capacity => "root snapshot allocation failed",
+            CompleteError::Row(RowError::Read(e)) => read_error(e),
+            CompleteError::Row(RowError::Length) => "length is not process-addressable",
+            CompleteError::Row(RowError::Root(e)) => reader.root_error(e, scheme),
+            CompleteError::End(EndError::Order) => {
+                "root snapshot principals are not strictly ordered"
+            },
+            CompleteError::End(EndError::Trailing) => "trailing root snapshot bytes",
+        },
+        journal_payload::Error::Transition(error) => match error {
+            DecodeError::Length => "principal length is not process-addressable",
+            DecodeError::Principal(e) | DecodeError::Tail(TailError::Read(e)) => read_error(e),
+            DecodeError::Tail(TailError::Root(e)) => reader.root_error(e, scheme),
+            DecodeError::Tail(TailError::ExpectedTag) => "invalid expected-root tag",
+            DecodeError::Tail(TailError::Trailing) => "trailing root-journal bytes",
+        },
     }
-    Ok(DecodedRootJournalRecord::Transition(DecodedRootRecord {
-        principal,
-        expected,
-        replacement,
-    }))
+}
+
+fn read_error(error: super::root_wire::ReadError) -> &'static str {
+    match error {
+        super::root_wire::ReadError::Overflow(_) => "frame length overflow",
+        super::root_wire::ReadError::Truncated => "truncated frame payload",
+    }
 }
 
 struct RootReader<'a> {
@@ -356,81 +282,45 @@ struct RootReader<'a> {
 }
 
 impl<'a> RootReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.offset)
-    }
-
     fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or("frame length overflow")?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or("truncated frame payload")?;
-        self.offset = end;
-        Ok(value)
+        super::root_wire::take(self.bytes, &mut self.offset, len).map_err(read_error)
     }
 
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        self.take(1)?.first().copied().ok_or("truncated u8 field")
-    }
-
-    fn u16(&mut self) -> Result<u16, &'static str> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?
-                .try_into()
-                .map_err(|_| "truncated u16 field")?,
-        ))
-    }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| "truncated u32 field")?,
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| "truncated u64 field")?,
-        ))
-    }
-
-    fn usize_len(&mut self) -> Result<usize, &'static str> {
-        usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
-    }
-
-    fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
-        let algorithm = self.u16()?;
-        let construction = self.u16()?;
-        let digest_len =
-            usize::try_from(self.u32()?).map_err(|_| "identity digest length overflow")?;
-        if algorithm == 0 || construction == 0 || digest_len == 0 {
-            return Err("identity tag fields must be non-zero");
+    fn root_error(
+        &mut self,
+        error: super::root_wire::RootError,
+        scheme: IdentityScheme,
+    ) -> &'static str {
+        let (algorithm, construction, size) = match error {
+            super::root_wire::RootError::Read(e) => return read_error(e),
+            super::root_wire::RootError::Scheme {
+                algorithm,
+                construction,
+                size,
+            } => (
+                u16::from_le_bytes(algorithm),
+                u16::from_le_bytes(construction),
+                u32::from_le_bytes(size),
+            ),
+        };
+        let Ok(len) = usize::try_from(size) else {
+            return "identity digest length overflow";
+        };
+        if algorithm == 0 || construction == 0 || len == 0 {
+            return "identity tag fields must be non-zero";
         }
-        let digest = self.take(digest_len)?;
+        // Journal diagnostics distinguish an incomplete digest from an
+        // unsupported identity. Preserve the existing error precedence.
+        if let Err(error) = self.take(len) {
+            return error;
+        }
         if algorithm != scheme.algorithm() || construction != scheme.construction() {
-            return Err("unsupported identity algorithm or construction version");
+            return "unsupported identity algorithm or construction version";
         }
-        digest
-            .try_into()
-            .map(ObjectId::new)
-            .map_err(|_| "identity digest length does not match the supported scheme")
-    }
-
-    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, &'static str> {
-        Ok(RootState {
-            generation: RootGeneration::new(self.u64()?),
-            commit: self.identity(scheme)?,
-        })
+        "identity digest length does not match the supported scheme"
     }
 }
+
+#[cfg(test)]
+#[path = "root_journal_decode_tests.rs"]
+mod decode_tests;

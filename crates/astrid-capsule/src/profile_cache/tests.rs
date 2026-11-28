@@ -301,7 +301,13 @@ fn replaced_profile_cannot_inherit_a_pending_egress_approval() {
     assert_eq!(replacement, captured);
     assert!(
         cache
-            .persist_egress_for_profile(&principal, "react", "127.0.0.1:443", Some(&captured))
+            .persist_egress_for_profile(
+                &principal,
+                "react",
+                "127.0.0.1:443",
+                Some(&captured),
+                [Default::default(); 2]
+            )
             .is_err()
     );
     let current = PrincipalProfile::load_required(&cache.astrid_home, &principal).unwrap();
@@ -664,4 +670,94 @@ fn unwinding_last_profile_loader_removes_its_identity() {
     });
     assert!(result.is_err());
     assert!(cache.state.read().unwrap().loads.is_empty());
+}
+
+#[test]
+fn revocation_and_consent_updates_survive_a_fresh_profile_cache() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
+    use std::sync::Barrier;
+
+    let (dir, cache) = fixture();
+    let alice = principal("alice");
+    let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let key = DeviceKeyId::new(device.key_id.clone()).unwrap();
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.auth.public_keys.push(device);
+    profile.save(&cache.astrid_home, &alice).unwrap();
+    assert_eq!(cache.resolve(&alice).unwrap().auth.public_keys.len(), 1);
+
+    let start = Barrier::new(3);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            start.wait();
+            assert_eq!(
+                cache.remove_paired_device(&alice, &key).unwrap(),
+                DeviceRemoval::Removed(key.clone())
+            );
+        });
+        scope.spawn(|| {
+            start.wait();
+            cache
+                .persist_command_always(&alice, "git push", Some("/work"))
+                .unwrap();
+        });
+        start.wait();
+        cache
+            .persist_egress(&alice, "react", "127.0.0.1:1234")
+            .unwrap();
+    });
+
+    let fresh = PrincipalProfileCache::with_home(AstridHome::from_path(dir.path()));
+    for profile in [
+        cache.resolve(&alice).unwrap(),
+        fresh.resolve(&alice).unwrap(),
+    ] {
+        assert!(profile.auth.public_keys.is_empty());
+        assert!(!profile.auth.methods.contains(&AuthMethod::Keypair));
+        assert_eq!(profile.approvals.command_always.len(), 1);
+        assert_eq!(profile.approvals.command_always[0].command, "git push");
+        assert_eq!(profile.network.capsule_egress["react"], ["127.0.0.1:1234"]);
+    }
+}
+
+#[test]
+fn session_install_excludes_the_device_removal_writer_through_the_callback() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
+
+    let (_dir, cache) = fixture();
+    let alice = principal("alice");
+    let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let stamp = DeviceStamp {
+        fingerprint: Some(&device.key_id),
+        registration: device.registration_id.map(Into::into),
+    };
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(device.clone());
+    profile.save(&cache.astrid_home, &alice).unwrap();
+
+    cache
+        .with_session_devices(&alice, [stamp; 2], None, || {
+            assert!(matches!(
+                cache.state.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+        })
+        .unwrap();
+    assert!(cache.state.try_write().is_ok());
+    let snapshot = cache.resolve(&alice).unwrap();
+    let stale = DeviceStamp {
+        registration: Some(uuid::Uuid::new_v4()),
+        ..stamp
+    };
+    for devices in [[stale, stamp], [stamp, stale]] {
+        assert!(
+            cache
+                .with_session_devices(&alice, devices, Some(&snapshot), || panic!(
+                    "installed a stale grant"
+                ))
+                .is_err()
+        );
+    }
 }

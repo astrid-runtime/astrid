@@ -3,15 +3,14 @@
 use super::{
     AstridMcpServer, CallFlow, CallToolRequestParams, CallToolResponse, CallToolResult,
     ConsentProtocol, ConsentResolution, ContentBlock, GrantStep, McpError, RequestContext,
-    ResolvedConsent, RoleServer, TOOL_CALL_TOPIC, ToolInvocation, Value,
-    call_tool_result_from_reply, consent_denied_result, elicit, grant_denied_result, ingress,
-    new_req_id, next_grant_step,
+    ResolvedConsent, RoleServer, ToolInvocation, Value, call_tool_result_from_reply,
+    consent_denied_result, elicit, grant_denied_result, ingress, new_req_id, next_grant_step,
 };
 
 impl AstridMcpServer {
     pub(super) async fn resume_mrtr(
         &self,
-        invocation: &ToolInvocation,
+        invocation: &ToolInvocation<'_>,
         request: &CallToolRequestParams,
         protocol: ConsentProtocol,
     ) -> Result<CallFlow<usize>, McpError> {
@@ -31,21 +30,25 @@ impl AstridMcpServer {
             ));
         }
 
+        let (name, arguments) = invocation.consent_context();
         let ResolvedConsent {
             decision,
             redemption,
         } = self.mrtr.resolve(
             &self.principal,
-            &invocation.name,
-            &invocation.arguments,
+            name,
+            arguments,
             state,
             request.input_responses.as_ref(),
         )?;
         match decision {
             ConsentResolution::Ingress(approved) => {
-                let granted = !approved || self.record_ingress_accept().await?;
-                redemption.commit();
-                if approved && granted {
+                let outcome = if approved {
+                    self.record_ingress_accept().await
+                } else {
+                    Ok(false)
+                };
+                if redemption.finish(outcome)? {
                     Ok(CallFlow::Continue(0))
                 } else {
                     Ok(CallFlow::Complete(consent_denied_result()))
@@ -56,19 +59,18 @@ impl AstridMcpServer {
                 approved,
                 grants_resolved,
             } => {
-                let granted = self.forward_grant_decision(&request, approved).await?;
-                redemption.commit();
-                if granted {
+                let outcome = self.forward_grant_decision(&request, approved).await;
+                if redemption.finish(outcome)? {
                     Ok(CallFlow::Continue(grants_resolved.saturating_add(1)))
                 } else {
                     Ok(CallFlow::Complete(grant_denied_result()))
                 }
             },
             ConsentResolution::Approval { request, choice } => {
-                let reply = self
+                let outcome = self
                     .forward_approval_decision(&request, choice.verb())
-                    .await?;
-                redemption.commit();
+                    .await;
+                let reply = redemption.finish(outcome)?;
                 Ok(CallFlow::Complete(
                     call_tool_result_from_reply(&reply).into(),
                 ))
@@ -76,16 +78,22 @@ impl AstridMcpServer {
         }
     }
 
-    pub(super) async fn invoke_tool(&self, invocation: &ToolInvocation) -> Result<Value, McpError> {
+    pub(super) async fn invoke_tool(
+        &self,
+        invocation: &ToolInvocation<'_>,
+    ) -> Result<Value, McpError> {
         let req_id = new_req_id();
-        self.round_trip(TOOL_CALL_TOPIC, &req_id, invocation.body(&req_id))
+        invocation
+            .publish(&req_id, super::tool_call_body, |topic, id, body| {
+                self.round_trip(topic, id, body)
+            })
             .await
     }
 
     pub(super) async fn handle_ingress(
         &self,
         reply: Value,
-        invocation: &ToolInvocation,
+        invocation: &ToolInvocation<'_>,
         context: &RequestContext<RoleServer>,
         protocol: ConsentProtocol,
     ) -> Result<CallFlow<Value>, McpError> {
@@ -96,12 +104,15 @@ impl AstridMcpServer {
         match protocol {
             ConsentProtocol::Modern {
                 supports_form: true,
-            } => Ok(CallFlow::Complete(self.mrtr.ingress_required(
-                &self.principal,
-                &invocation.name,
-                &invocation.arguments,
-                request.prompt(),
-            )?)),
+            } => {
+                let (name, arguments) = invocation.consent_context();
+                Ok(CallFlow::Complete(self.mrtr.ingress_required(
+                    &self.principal,
+                    name,
+                    arguments,
+                    request.prompt(),
+                )?))
+            },
             ConsentProtocol::Modern {
                 supports_form: false,
             } => Ok(CallFlow::Complete(consent_denied_result())),
@@ -118,7 +129,7 @@ impl AstridMcpServer {
     pub(super) async fn handle_grants(
         &self,
         mut reply: Value,
-        invocation: &ToolInvocation,
+        invocation: &ToolInvocation<'_>,
         context: &RequestContext<RoleServer>,
         protocol: ConsentProtocol,
         mut grants_resolved: usize,
@@ -138,10 +149,11 @@ impl AstridMcpServer {
                     supports_form: true,
                 } => {
                     let prompt = grant.prompt();
+                    let (name, arguments) = invocation.consent_context();
                     return Ok(CallFlow::Complete(self.mrtr.grant_required(
                         &self.principal,
-                        &invocation.name,
-                        &invocation.arguments,
+                        name,
+                        arguments,
                         grant,
                         grants_resolved,
                         prompt,
@@ -167,7 +179,7 @@ impl AstridMcpServer {
     pub(super) async fn finish_approval(
         &self,
         reply: Value,
-        invocation: &ToolInvocation,
+        invocation: &ToolInvocation<'_>,
         context: &RequestContext<RoleServer>,
         protocol: ConsentProtocol,
     ) -> Result<CallToolResponse, McpError> {
@@ -179,13 +191,9 @@ impl AstridMcpServer {
                 supports_form: true,
             } => {
                 let prompt = approval.prompt();
-                self.mrtr.approval_required(
-                    &self.principal,
-                    &invocation.name,
-                    &invocation.arguments,
-                    approval,
-                    prompt,
-                )
+                let (name, arguments) = invocation.consent_context();
+                self.mrtr
+                    .approval_required(&self.principal, name, arguments, approval, prompt)
             },
             ConsentProtocol::Modern {
                 supports_form: false,

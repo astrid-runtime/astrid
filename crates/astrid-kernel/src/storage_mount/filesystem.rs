@@ -241,18 +241,21 @@ where
 /// Callback paths remain relative to the subtree root; the caller cannot
 /// escape it by selecting a different prefix in an operation.
 pub(super) struct PrefixedFilesystem<F> {
-    pub(super) inner: F,
-    pub(super) prefix: String,
+    inner: F,
+    prefix: FilesystemPath,
 }
 
 impl<F> PrefixedFilesystem<F> {
+    pub(super) fn principal_home(inner: F) -> Self {
+        Self {
+            inner,
+            prefix: FilesystemPath::new(super::Subtree::PrincipalHome.prefix())
+                .expect("canonical principal home prefix"),
+        }
+    }
+
     fn path(&self, path: &FilesystemPath) -> Result<FilesystemPath, FilesystemError> {
-        let full = if path.as_str().is_empty() {
-            self.prefix.clone()
-        } else {
-            format!("{}/{}", self.prefix, path.as_str())
-        };
-        FilesystemPath::new(full)
+        self.prefix.join(path.as_str())
     }
 }
 

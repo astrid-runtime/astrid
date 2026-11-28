@@ -20,7 +20,7 @@
 
 use crate::storage_model::{
     GcReport, InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectRecord, PinId,
-    PrincipalUsage, RootState, World,
+    PrincipalUsage, RootState, World, staged_closure,
 };
 use parking_lot::RwLock;
 
@@ -35,6 +35,8 @@ mod kv;
 mod muninn;
 mod projection;
 mod refinery;
+mod root_declaration;
+pub(crate) mod transaction_records;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
@@ -47,7 +49,6 @@ pub use durable::{
     RecoveryRetryPolicy, TransactionWalPolicy, VerifiedCompactionPlan,
     deterministic_compaction_proof,
 };
-pub(crate) use identity::IdentityProof;
 pub use identity::KvIdentitySession;
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, ReadyKvRoot,
@@ -88,11 +89,7 @@ pub use refinery::{
 /// engine-bound and are discarded by cloning or untrusted reconstruction.
 #[derive(Debug)]
 pub struct RootTransaction<P> {
-    principal: P,
-    expected: Option<RootState>,
-    commit: ObjectId,
-    records: Vec<(ObjectId, ObjectRecord)>,
-    identity_proof: IdentityProof,
+    declaration: root_declaration::Declaration<P, std::sync::Arc<()>>,
     kv_checkpoint_publication: Option<crate::kv::KvCheckpointPublication>,
 }
 
@@ -106,69 +103,68 @@ impl<P> RootTransaction<P> {
         records: Vec<(ObjectId, ObjectRecord)>,
     ) -> Self {
         Self {
-            principal,
-            expected,
-            commit,
-            records,
-            identity_proof: IdentityProof::Untrusted,
+            declaration: root_declaration::Declaration::untrusted(
+                principal, expected, commit, records,
+            ),
             kv_checkpoint_publication: None,
         }
     }
 
+    pub(crate) fn checkpoint_target(&self) -> root_declaration::CheckpointTarget<P>
+    where
+        P: Clone,
+    {
+        self.declaration.checkpoint_target()
+    }
+
     pub(crate) fn with_kv_checkpoint_publication(
         mut self,
-        publication: impl FnOnce() -> crate::kv::KvCheckpointPublication,
+        publication: impl FnOnce(&P, ObjectId) -> crate::kv::KvCheckpointPublication,
     ) -> Self {
-        if matches!(self.identity_proof, IdentityProof::Engine(_)) {
-            self.kv_checkpoint_publication = Some(publication());
-        }
+        self.declaration
+            .attach_checkpoint(&mut self.kv_checkpoint_publication, publication);
         self
     }
 
     /// Borrow the target principal.
     #[must_use]
     pub const fn principal(&self) -> &P {
-        &self.principal
+        &self.declaration.update().principal
     }
 
     /// Return the exact root expected by the caller.
     #[must_use]
     pub const fn expected(&self) -> Option<RootState> {
-        self.expected
+        self.declaration.update().expected
     }
 
     /// Return the immutable commit that becomes current on success.
     #[must_use]
     pub const fn commit(&self) -> ObjectId {
-        self.commit
+        self.declaration.update().commit
     }
 
     /// Borrow the transaction's declared immutable records.
     #[must_use]
     pub fn records(&self) -> &[(ObjectId, ObjectRecord)] {
-        &self.records
+        &self.declaration.update().records
     }
 }
 
 impl<P: Clone> Clone for RootTransaction<P> {
     fn clone(&self) -> Self {
-        Self {
-            principal: self.principal.clone(),
-            expected: self.expected,
-            commit: self.commit,
-            records: self.records.clone(),
-            identity_proof: IdentityProof::Untrusted,
-            kv_checkpoint_publication: None,
-        }
+        Self::new(
+            self.declaration.update().principal.clone(),
+            self.declaration.update().expected,
+            self.declaration.update().commit,
+            self.declaration.update().records.clone(),
+        )
     }
 }
 
 impl<P: PartialEq> PartialEq for RootTransaction<P> {
     fn eq(&self, other: &Self) -> bool {
-        self.principal == other.principal
-            && self.expected == other.expected
-            && self.commit == other.commit
-            && self.records == other.records
+        self.declaration.update() == other.declaration.update()
     }
 }
 
@@ -385,7 +381,9 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         records: &[(ObjectId, ObjectRecord)],
         root: ObjectId,
     ) -> Result<u64, ModelError> {
-        self.verify_identities(records)?;
+        transaction_records::check_transaction(records, |record| self.identify(record)).map_err(
+            |(declared, computed)| ModelError::ObjectIdentityMismatch { declared, computed },
+        )?;
         self.world.write().import_closure(records, root)
     }
 
@@ -403,25 +401,27 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
     /// root-conflict failures also admit no transaction record.
     pub fn commit(&self, transaction: RootTransaction<P>) -> Result<CommitOutcome, ModelError> {
         let RootTransaction {
-            principal,
-            expected,
-            commit,
-            records,
-            identity_proof,
-            kv_checkpoint_publication,
+            declaration,
+            mut kv_checkpoint_publication,
         } = transaction;
-        let same_engine = identity_proof.matches(&self.preparation_authority);
-        if !same_engine {
-            self.verify_identities(&records)?;
-        }
+        let (
+            crate::engine::root_declaration::Update {
+                principal,
+                expected,
+                commit,
+                records,
+            },
+            admitted_checkpoint,
+        ) = declaration.admit_records(
+            &self.preparation_authority,
+            |record| self.identify(record),
+            &mut kv_checkpoint_publication,
+        )?;
         let world = self.world.upgradable_read();
         let (world, root, objects_inserted) =
             World::commit_closure_owned(world, principal, expected, commit, records)?;
-        let retired_projection = if same_engine {
-            kv_checkpoint_publication.and_then(|publication| publication.try_publish(root))
-        } else {
-            None
-        };
+        let retired_projection =
+            admitted_checkpoint.and_then(|publication| publication.try_publish(root));
         drop(world);
         drop(retired_projection);
         Ok(CommitOutcome {
@@ -444,19 +444,6 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         self.world
             .write()
             .compare_and_swap_root(principal, expected, commit)
-    }
-
-    fn verify_identities(&self, records: &[(ObjectId, ObjectRecord)]) -> Result<(), ModelError> {
-        for (declared, record) in records {
-            let computed = self.identify(record);
-            if computed != *declared {
-                return Err(ModelError::ObjectIdentityMismatch {
-                    declared: *declared,
-                    computed,
-                });
-            }
-        }
-        Ok(())
     }
 }
 

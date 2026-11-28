@@ -15,7 +15,7 @@ use crate::storage_model::{
     ObjectFormatVersion, ObjectId, ObjectRecord, ObjectReference, ReferenceKind,
 };
 
-use super::{root_from_record, validate_catalog};
+use super::{component_labels, root_from_record, validate_catalog};
 
 mod codec;
 mod filesystem;
@@ -23,13 +23,18 @@ mod helpers;
 mod lifecycle;
 mod model;
 mod operations;
+mod reference_transition;
 mod rename_guards;
 mod retirement;
+mod retry;
+mod retry_native;
 
 #[cfg(test)]
 mod rename_tests;
 #[cfg(test)]
 mod retirement_tests;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod retry_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -41,8 +46,7 @@ pub use model::{
     WorkspaceBranchError, WorkspaceBranchStore,
 };
 
-const BRANCH_REF_PREFIX_BYTES: &[u8] = b"workspace/";
-const BRANCH_RECEIPT_PREFIX_BYTES: &[u8] = b"workspace-promoted/";
+use reference_transition::{BRANCH_RECEIPT_PREFIX_BYTES, BRANCH_REF_PREFIX_BYTES};
 const BRANCH_BASE_LABEL: &[u8] = b"base";
 const BRANCH_WORKING_LABEL: &[u8] = b"working";
 const BRANCH_MAGIC: &[u8] = b"astrid-workspace-branch-v1\0";
@@ -69,7 +73,7 @@ use codec::{
 use helpers::{
     BranchState, hydrate_root, is_workspace_receipt_label, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, qualify_name, selected_catalog,
-    selected_name, validate_target_prefix, workspace_receipt_label, workspace_ref_label,
+    selected_name, validate_target_prefix,
 };
 
 pub(crate) fn is_workspace_branch_label(label: &[u8]) -> bool {

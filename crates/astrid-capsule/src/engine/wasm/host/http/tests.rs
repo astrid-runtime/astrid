@@ -7,9 +7,16 @@ use std::str::FromStr;
 
 use super::ErrorCode;
 use super::ssrf::{
-    egress_allowed, egress_decision, filter_safe_addrs, is_safe_ip, literal_ip,
-    redirect_target_blocked,
+    egress_allowed, filter_safe_addrs, is_safe_ip, literal_ip, redirect_target_blocked,
 };
+
+fn egress_decision(
+    allow: &[String],
+    input: &str,
+) -> Result<Option<std::sync::Arc<str>>, ErrorCode> {
+    let url = super::backend::parse_request_url(input)?;
+    super::ssrf::egress_decision(allow, &url)
+}
 
 fn ip(s: &str) -> IpAddr {
     IpAddr::from_str(s).unwrap()
@@ -333,9 +340,11 @@ async fn consent_grant_yields_exempt_host() {
 
     // Granted local-operator endpoint → exempt host returned (re-enters exempt
     // path).
-    let decision = state.egress_decision_with_consent("http://127.0.0.1:1234/v1/models");
+    let decision = state.egress_decision_with_consent(
+        &reqwest::Url::parse("http://127.0.0.1:1234/v1/models").unwrap(),
+    );
     assert_eq!(
-        decision.unwrap().as_deref(),
+        decision.unwrap().0.as_deref(),
         Some("127.0.0.1"),
         "a consent-granted endpoint must return the exempt host"
     );
@@ -347,7 +356,9 @@ async fn consent_grant_yields_exempt_host() {
             .with_principal("alice")
             .with_origin(MessageOrigin::RemoteGateway),
     );
-    let decision = state.egress_decision_with_consent("http://127.0.0.1:1234/v1/models");
+    let decision = state.egress_decision_with_consent(
+        &reqwest::Url::parse("http://127.0.0.1:1234/v1/models").unwrap(),
+    );
     assert!(
         matches!(decision, Err(ErrorCode::AirlockRejected)),
         "a remote-origin request to the same endpoint must stay airlock-rejected"
@@ -459,7 +470,7 @@ mod e2e {
         Some((addr, handle))
     }
 
-    fn get_request(url: String) -> HttpRequestData {
+    pub(super) fn get_request(url: String) -> HttpRequestData {
         HttpRequestData {
             url,
             method: HttpMethod::Get,
@@ -468,7 +479,7 @@ mod e2e {
         }
     }
 
-    fn follow_opts() -> RequestOptions {
+    pub(super) fn follow_opts() -> RequestOptions {
         RequestOptions {
             timeouts: None,
             redirect: Some(RedirectPolicy::Follow),
@@ -570,7 +581,7 @@ mod e2e {
         let limits = state.http_limits;
         let err = state
             .http_stream_backend(
-                get_request("https://denied.example.invalid/v1/stream".to_string()),
+                get_request("HTTPS://DENIED.EXAMPLE.invalid/v1/stream".to_string()),
                 super::super::options::ResolvedOptions::from_options(follow_opts(), &limits),
             )
             .await
@@ -687,6 +698,10 @@ mod v11 {
     /// any non-http(s) scheme is denied unconditionally.
     #[test]
     fn scheme_enforcement() {
+        let check_scheme = |input: &str, https_only| {
+            let parsed = super::super::backend::parse_request_url(input)?;
+            check_scheme(&parsed, https_only)
+        };
         // https always allowed.
         assert!(check_scheme("https://api.example.com/x", true).is_ok());
         assert!(check_scheme("https://api.example.com/x", false).is_ok());
@@ -926,3 +941,6 @@ fn v11_error_maps_to_v10_arm_set() {
         V10::Unknown(_)
     ));
 }
+
+#[path = "tests/approved_hop.rs"]
+mod approved_hop;

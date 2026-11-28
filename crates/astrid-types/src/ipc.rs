@@ -21,6 +21,12 @@ pub mod request_failure;
 pub struct RequestOwnerId(Uuid);
 
 impl RequestOwnerId {
+    /// The complete UUID value for comparing host-stamped routing metadata.
+    #[must_use]
+    pub const fn as_u128(self) -> u128 {
+        self.0.as_u128()
+    }
+
     /// Mint a fresh request owner for an authenticated connection.
     #[must_use]
     pub fn generate() -> Self {
@@ -100,6 +106,42 @@ pub enum MessageOrigin {
     System,
 }
 
+/// Device authority captured at ingress and inherited through IPC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceStamp<'a> {
+    /// Stable key fingerprint, if this caller was device-authenticated.
+    pub fingerprint: Option<&'a str>,
+    /// Generation of that key's registration at authentication.
+    pub registration: Option<Uuid>,
+}
+
+/// Device authority retained by an asynchronous consumer of an IPC envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedDeviceStamp {
+    fingerprint: Option<String>,
+    registration: Option<Uuid>,
+}
+
+impl From<DeviceStamp<'_>> for OwnedDeviceStamp {
+    fn from(stamp: DeviceStamp<'_>) -> Self {
+        Self {
+            fingerprint: stamp.fingerprint.map(str::to_owned),
+            registration: stamp.registration,
+        }
+    }
+}
+
+impl OwnedDeviceStamp {
+    /// Borrow the original fingerprint and registration together.
+    #[must_use]
+    pub fn as_stamp(&self) -> DeviceStamp<'_> {
+        DeviceStamp {
+            fingerprint: self.fingerprint.as_deref(),
+            registration: self.registration,
+        }
+    }
+}
+
 /// A cross-boundary message sent over the event bus between WASM guests and the host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcMessage {
@@ -154,6 +196,11 @@ pub struct IpcMessage {
     /// `DeviceKey` happens at the kernel boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_key_id: Option<String>,
+    /// Persisted registration that authenticated this device, captured at ingress.
+    /// Legacy device registrations have no generation. Host publishers inherit
+    /// the original value when forwarding work or creating a response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_registration_id: Option<Uuid>,
 
     /// Exact authenticated connection that owns this request, if any.
     ///
@@ -203,6 +250,15 @@ fn default_unix_epoch() -> DateTime<Utc> {
 }
 
 impl IpcMessage {
+    /// Borrow the device authority carried by this envelope.
+    #[must_use]
+    pub fn device_stamp(&self) -> DeviceStamp<'_> {
+        DeviceStamp {
+            fingerprint: self.device_key_id.as_deref(),
+            registration: self.device_registration_id,
+        }
+    }
+
     /// Create a new IPC message stamped with the current wall-clock
     /// time. Only available when the `clock` feature is enabled
     /// (kernel-side); capsule code constructs `IpcMessage` from
@@ -220,6 +276,7 @@ impl IpcMessage {
             seq: 0,
             principal: None,
             device_key_id: None,
+            device_registration_id: None,
             request_owner: None,
             origin: MessageOrigin::System,
         }

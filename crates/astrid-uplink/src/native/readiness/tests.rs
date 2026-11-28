@@ -13,6 +13,7 @@ fn identity() -> AuthenticatedIdentity {
     AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: Some("verified-key".into()),
+        registration: Some(Uuid::new_v4().to_string().parse().unwrap()),
         request_owner: RequestOwnerId::generate(),
     }
 }
@@ -38,7 +39,7 @@ async fn assert_cold_request_gated(topic: &'static str) {
     let identity = identity();
     let receiver = registry.subscribe(
         "alice".into(),
-        identity.device_key_id.clone(),
+        identity.device_stamp(),
         identity.request_owner,
     );
     let mut deliveries = bus.subscribe_topic(topic);
@@ -81,6 +82,10 @@ async fn assert_cold_request_gated(topic: &'static str) {
     };
     assert_eq!(message.principal.as_deref(), Some("alice"));
     assert_eq!(message.device_key_id, identity.device_key_id);
+    assert_eq!(
+        message.device_registration_id,
+        identity.registration.map(Into::into)
+    );
 }
 
 #[tokio::test]
@@ -90,7 +95,7 @@ async fn unavailable_provider_refuses_without_publishing() {
     let identity = identity();
     let receiver = registry.subscribe(
         "alice".into(),
-        identity.device_key_id.clone(),
+        identity.device_stamp(),
         identity.request_owner,
     );
     let mut deliveries = bus.subscribe_topic("cli.v1.command.run.fixture");
@@ -148,7 +153,7 @@ async fn cancellation_drops_pending_readiness_without_publishing_the_prompt() {
     let identity = identity();
     let receiver = registry.subscribe(
         "alice".into(),
-        identity.device_key_id.clone(),
+        identity.device_stamp(),
         identity.request_owner,
     );
     let mut deliveries = bus.subscribe_topic(routing::CHAT_REQUEST_TOPIC);
@@ -217,7 +222,7 @@ async fn pending_input_validates_ingress_payload_once_before_readiness() {
     let identity = identity();
     let receiver = registry.subscribe(
         "alice".into(),
-        identity.device_key_id.clone(),
+        identity.device_stamp(),
         identity.request_owner,
     );
     let mut deliveries = bus.subscribe_topic("cli.v1.command.run.fixture");
@@ -252,7 +257,7 @@ async fn oversize_ingress_is_refused_before_readiness_or_publication() {
     let identity = identity();
     let receiver = registry.subscribe(
         "alice".into(),
-        identity.device_key_id.clone(),
+        identity.device_stamp(),
         identity.request_owner,
     );
     let mut deliveries = bus.subscribe_topic("cli.v1.command.run.fixture");
@@ -284,7 +289,7 @@ async fn malformed_topic_is_refused_before_readiness_without_serialization() {
     let identity = identity();
     let receiver = registry.subscribe(
         "alice".into(),
-        identity.device_key_id.clone(),
+        identity.device_stamp(),
         identity.request_owner,
     );
     let probe = CapsuleTopicProbe::new(|_| panic!("readiness must not run for malformed topic"));
@@ -316,7 +321,7 @@ async fn raw_process_inbound_wrapper_still_refuses_oversize() {
     let identity = identity();
     let receiver = registry.subscribe(
         "alice".into(),
-        identity.device_key_id.clone(),
+        identity.device_stamp(),
         identity.request_owner,
     );
     let oversized = "x".repeat(MAX_PAYLOAD_BYTES + 1);

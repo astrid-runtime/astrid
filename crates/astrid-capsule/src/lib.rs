@@ -34,6 +34,7 @@ pub mod principal_class;
 pub mod profile_cache;
 pub mod readiness;
 pub mod registry;
+mod registry_keys;
 pub mod schema_catalog;
 pub mod security;
 pub mod tool_discovery;
@@ -80,7 +81,14 @@ pub mod test_support {
         expected_token: &SessionToken,
         home: &astrid_core::dirs::AstridHome,
     ) -> Result<Option<(PrincipalId, String)>, String> {
-        crate::engine::wasm::host::net::handshake::validate_handshake(stream, expected_token, home)
-            .await
+        let sessions = astrid_core::profile::device_sessions::DeviceSessions::default();
+        let authenticated = crate::engine::wasm::host::net::handshake::validate_handshake(
+            stream,
+            expected_token,
+            home,
+            &sessions,
+        )
+        .await?;
+        Ok(authenticated.map(|(principal, device, _session)| (principal, device)))
     }
 }

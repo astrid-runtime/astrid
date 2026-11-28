@@ -114,7 +114,7 @@ async fn production_assignment_audits_the_final_result_once() {
             &kernel,
             Topic::from_raw("astrid.v1.admin.quota.assign_user"),
             caller.clone(),
-            None,
+            astrid_events::ipc::DeviceStamp::default(),
             AdminKernelRequest {
                 request_id: Some("assign-audit".into()),
                 kind: request(requested),

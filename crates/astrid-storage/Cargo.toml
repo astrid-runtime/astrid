@@ -42,6 +42,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+vstd = { workspace = true }
 
 [dev-dependencies]
 astrid-core = { workspace = true, features = ["test-support"] }

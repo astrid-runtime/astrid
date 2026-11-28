@@ -27,6 +27,11 @@ use super::form_elicitation::form_params;
 use super::grant::{GrantForm, GrantRequest};
 use super::ingress::IngressForm;
 
+#[path = "mrtr_context.rs"]
+mod context;
+#[path = "mrtr_redemption.rs"]
+mod redemption;
+
 const INPUT_KEY: &str = "astrid-consent";
 const STATE_TTL: Duration = Duration::from_mins(5);
 
@@ -62,23 +67,22 @@ pub(super) struct ResolvedConsent {
 
 pub(super) struct RedemptionLease {
     redeemed: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
-    digest: [u8; 32],
-    committed: bool,
+    claim: redemption::Claim,
 }
 
 impl RedemptionLease {
-    pub(super) fn commit(mut self) {
-        self.committed = true;
+    pub(super) fn finish<T, E>(mut self, outcome: Result<T, E>) -> Result<T, E> {
+        self.claim.finish(outcome)
     }
 }
 
 impl Drop for RedemptionLease {
     fn drop(&mut self) {
-        if self.committed {
+        if self.claim.committed() {
             return;
         }
         if let Ok(mut redeemed) = self.redeemed.lock() {
-            redeemed.remove(&self.digest);
+            self.claim.on_drop(&mut redeemed);
         }
     }
 }
@@ -203,11 +207,16 @@ impl MrtrBridge {
         responses: Option<&InputResponses>,
     ) -> Result<ResolvedConsent, McpError> {
         let associated_data = associated_data(principal, tool, arguments);
-        let pending: PendingConsent = self
-            .codec
-            .open_json_with(state, &associated_data)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let redemption = self.redeem_once(state)?;
+        let (pending, redemption) = context::open_and_redeem(
+            state,
+            &associated_data,
+            |token, binding| {
+                self.codec
+                    .open_json_with(token, binding)
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))
+            },
+            |token| self.redeem_once(token),
+        )?;
         let response = responses.and_then(|values| values.get(INPUT_KEY));
 
         let decision = match pending {
@@ -245,16 +254,12 @@ impl MrtrBridge {
         let expiry = now
             .checked_add(STATE_TTL)
             .ok_or_else(|| McpError::internal_error("MRTR replay-fence deadline overflow", None))?;
-        if redeemed.insert(digest, expiry).is_some() {
-            return Err(McpError::invalid_params(
-                "requestState has already been redeemed",
-                None,
-            ));
-        }
+        let claim = redemption::reserve(&mut redeemed, digest, expiry).ok_or_else(|| {
+            McpError::invalid_params("requestState has already been redeemed", None)
+        })?;
         Ok(RedemptionLease {
             redeemed: Arc::clone(&self.redeemed),
-            digest,
-            committed: false,
+            claim,
         })
     }
 }
@@ -284,14 +289,21 @@ where
     }
 }
 
+impl context::Digest for blake3::Hasher {
+    fn absorb(&mut self, chunk: &[u8]) {
+        self.update(chunk);
+    }
+}
+
 fn associated_data(principal: &PrincipalId, tool: &str, arguments: &Value) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"astrid/mcp/mrtr/v1\0");
-    hasher.update(principal.to_string().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(tool.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(&serde_json::to_vec(arguments).unwrap_or_default());
+    let encoded = serde_json::to_vec(arguments).unwrap_or_default();
+    context::absorb_context(
+        &mut hasher,
+        principal.as_str().as_bytes(),
+        tool.as_bytes(),
+        &encoded,
+    );
     hasher.finalize().as_bytes().to_vec()
 }
 
@@ -319,6 +331,18 @@ mod tests {
             INPUT_KEY.to_owned(),
             json!({ "action": "accept", "content": content }),
         )])
+    }
+
+    #[test]
+    fn associated_data_preserves_v1_bytes_with_embedded_nuls() {
+        let principal = PrincipalId::new("alice").unwrap();
+        let arguments = json!({"key": "a\0b"});
+        let expected =
+            blake3::hash(b"astrid/mcp/mrtr/v1\0alice\0tool\0name\0{\"key\":\"a\\u0000b\"}");
+        assert_eq!(
+            associated_data(&principal, "tool\0name", &arguments),
+            expected.as_bytes()
+        );
     }
 
     #[test]
@@ -362,7 +386,7 @@ mod tests {
             resolved.decision,
             ConsentResolution::Ingress(true)
         ));
-        resolved.redemption.commit();
+        resolved.redemption.finish(Ok::<_, ()>(())).unwrap();
         assert!(
             bridge
                 .resolve(&alice, "fs.read", &arguments, &state, Some(&responses))
@@ -391,7 +415,14 @@ mod tests {
         let completed = bridge
             .resolve(&alice, "fs.read", &arguments, &state, Some(&responses))
             .expect("dropping an uncommitted lease must permit a safe retry");
-        completed.redemption.commit();
+        assert_eq!(
+            completed.redemption.finish(Err::<(), _>("lost reply")),
+            Err("lost reply")
+        );
+        let retried = bridge
+            .resolve(&alice, "fs.read", &arguments, &state, Some(&responses))
+            .expect("transport failure must release the local claim");
+        assert_eq!(retried.redemption.finish(Ok::<_, ()>(false)), Ok(false));
 
         assert!(
             bridge
@@ -399,6 +430,41 @@ mod tests {
                 .is_err(),
             "a completed broker mutation must consume requestState"
         );
+    }
+
+    #[test]
+    fn concurrent_redemptions_issue_one_lease_until_cancellation() {
+        let bridge = MrtrBridge::new().unwrap();
+        let principal = PrincipalId::new("alice").unwrap();
+        let arguments = json!({"path": "report"});
+        let state = state_from(
+            bridge
+                .ingress_required(&principal, "fs.read", &arguments, "Allow?".into())
+                .unwrap(),
+        );
+        let responses = accepted(&json!({"allow": true}));
+        let resolve =
+            || bridge.resolve(&principal, "fs.read", &arguments, &state, Some(&responses));
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let workers = [(); 2].map(|()| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    resolve()
+                })
+            });
+            workers.map(|worker| worker.join().unwrap())
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        let error = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+        assert!(error.message.contains("already been redeemed"));
+        drop(results);
+        resolve()
+            .unwrap()
+            .redemption
+            .finish(Ok::<_, ()>(()))
+            .unwrap();
+        assert!(resolve().is_err());
     }
 
     #[test]

@@ -78,6 +78,31 @@ impl DeviceScope {
     }
 }
 
+/// Identity of one persisted device registration. A new pairing of the same
+/// public key receives an independent ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeviceRegistrationId(uuid::Uuid);
+
+impl From<DeviceRegistrationId> for uuid::Uuid {
+    fn from(id: DeviceRegistrationId) -> Self {
+        id.0
+    }
+}
+
+impl std::fmt::Display for DeviceRegistrationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for DeviceRegistrationId {
+    type Err = uuid::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::parse_str(value).map(Self)
+    }
+}
+
 /// A public key registered to a principal, with the capability scope the
 /// device pairing was granted.
 ///
@@ -103,6 +128,9 @@ pub struct DeviceKey {
     /// Unix epoch seconds when the device was paired. `0` for migrated legacy
     /// keys that predate pairing-time recording.
     pub created_at: i64,
+    /// Absent on records created before registration IDs were persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<DeviceRegistrationId>,
 }
 
 /// Length, in hex characters, of a [`DeviceKey::key_id`] fingerprint
@@ -120,6 +148,26 @@ const ED25519_PUBKEY_HEX_LEN: usize = 64;
 /// bearer handle from the raw ed25519 public key it was derived from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceKeyId<S = String>(S);
+
+impl super::AuthConfig {
+    /// Remove the unique registration matching a validated fingerprint.
+    /// Missing or ambiguous fingerprints leave the configuration unchanged.
+    /// Removing the last key also disables the keypair method.
+    #[must_use]
+    pub fn remove_device<S: AsRef<str>>(&mut self, key: &DeviceKeyId<S>) -> Option<DeviceKeyId> {
+        let removed = super::device_registration::remove_unique(
+            &mut self.public_keys,
+            key.as_str(),
+            |device| device.key_id.as_str(),
+        )?;
+        if self.public_keys.is_empty() {
+            self.methods
+                .retain(|method| *method != super::AuthMethod::Keypair);
+        }
+        // The removed record's fingerprint equals the validated selector.
+        Some(DeviceKeyId(removed.key_id))
+    }
+}
 
 impl<S: AsRef<str>> DeviceKeyId<S> {
     /// Create a validated device key handle.
@@ -429,8 +477,41 @@ fn validate_device_key_id(id: &str) -> Result<(), String> {
 }
 
 impl DeviceKey {
+    /// Identify the registered device that signed this principal's exact challenge.
+    /// The caller supplies the candidates admitted by the active profile and
+    /// the signature verifier for their canonical public keys.
+    ///
+    /// # Errors
+    /// Fails if no admitted device verifies the signature.
+    pub fn identify_signer<'a, S>(
+        keys: &'a [Self],
+        principal: &crate::PrincipalId,
+        nonce_hex: &str,
+        signature: &S,
+        verify: impl Fn(&S, &str, &[u8]) -> bool,
+    ) -> Result<&'a Self, String> {
+        let message =
+            crate::session_token::principal_auth_challenge_message(principal.as_str(), nonce_hex);
+        let device = super::device_challenge::signed_device(
+            keys,
+            signature,
+            message.as_bytes(),
+            |record| record.typed_pubkey().ok().map(|key| key.0),
+            verify,
+        );
+        match device {
+            Some(record) => Ok(record),
+            None if keys.is_empty() => Err(format!(
+                "principal {principal} has no registered ed25519 key"
+            )),
+            None => Err(format!(
+                "signature did not verify against any registered key for {principal}"
+            )),
+        }
+    }
+
     /// Build a [`DeviceKey`] from a canonical lowercase-hex pubkey and a
-    /// scope, deriving the deterministic `key_id` and defaulting label/time.
+    /// scope, deriving the stable key fingerprint and minting a new registration ID.
     ///
     /// The caller is responsible for having already validated `pubkey_hex`
     /// (e.g. via the redeem/issue paths); the fingerprint is computed over
@@ -447,6 +528,7 @@ impl DeviceKey {
         Self {
             key_id,
             pubkey: pubkey.into_inner(),
+            registration_id: Some(DeviceRegistrationId(uuid::Uuid::new_v4())),
             scope,
             label,
             created_at,
@@ -513,6 +595,8 @@ struct DeviceKeyData {
     label: Option<String>,
     #[serde(default)]
     created_at: i64,
+    #[serde(default)]
+    registration_id: Option<DeviceRegistrationId>,
 }
 
 /// serde default helper: a missing `scope` on a full `DeviceKey` struct means
@@ -546,7 +630,14 @@ impl<'de> Deserialize<'de> for DeviceKey {
                 // string is a hard error — never a silently-dropped or
                 // partially-trusted key.
                 let hex = normalise_pubkey_hex(&s).map_err(D::Error::custom)?;
-                Ok(DeviceKey::new(hex, DeviceScope::Full, None, 0))
+                Ok(DeviceKey {
+                    key_id: device_key_id_fingerprint(&hex),
+                    pubkey: hex,
+                    scope: DeviceScope::Full,
+                    label: None,
+                    created_at: 0,
+                    registration_id: None,
+                })
             },
             DeviceKeyRepr::Full(d) => {
                 // Full struct form. The canonical source of `key_id` is ALWAYS
@@ -566,6 +657,7 @@ impl<'de> Deserialize<'de> for DeviceKey {
                     scope: d.scope,
                     label: d.label,
                     created_at: d.created_at,
+                    registration_id: d.registration_id,
                 })
             },
         }
@@ -612,6 +704,19 @@ mod tests {
             DeviceScope::Full => panic!("use-only must be Scoped, got DeviceScope::Full"),
         }
         assert_eq!(DeviceScope::preset("nonexistent"), None);
+    }
+
+    #[test]
+    fn ambiguous_device_removal_preserves_records_and_authentication_methods() {
+        let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+        let id = DeviceKeyId::new(device.key_id.clone()).unwrap();
+        let mut config = crate::profile::AuthConfig {
+            methods: vec![crate::profile::AuthMethod::Keypair],
+            public_keys: vec![device.clone(), device.clone()],
+        };
+        assert!(config.remove_device(&id).is_none());
+        assert_eq!(config.public_keys, [device.clone(), device]);
+        assert_eq!(config.methods, [crate::profile::AuthMethod::Keypair]);
     }
 
     #[test]
@@ -696,6 +801,32 @@ mod tests {
         assert_eq!(json["scope"]["type"], "full");
         assert_eq!(json["label"], "laptop");
         assert_eq!(json["created_at"], 42);
+    }
+
+    #[test]
+    fn repeated_pairing_gets_a_new_identity_at_the_same_timestamp() {
+        let pair = || DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 42);
+        let first = pair();
+        let second = pair();
+        assert_eq!(first.key_id, second.key_id);
+        assert!(first.registration_id.is_some());
+        assert_ne!(first.registration_id, second.registration_id);
+        let saved = toml::to_string(&first).unwrap();
+        assert_eq!(toml::from_str::<DeviceKey>(&saved).unwrap(), first);
+    }
+
+    #[test]
+    fn loading_either_legacy_form_preserves_its_unversioned_identity() {
+        let hex = "a".repeat(64);
+        let bare = serde_json::json!(format!("ed25519:{hex}"));
+        let structured = serde_json::json!({"pubkey": hex});
+        for original in [bare, structured] {
+            let device: DeviceKey = serde_json::from_value(original).unwrap();
+            assert_eq!(device.registration_id, None);
+            let saved = serde_json::to_value(&device).unwrap();
+            assert!(saved.get("registration_id").is_none());
+            assert_eq!(serde_json::from_value::<DeviceKey>(saved).unwrap(), device);
+        }
     }
 
     #[test]

@@ -1,12 +1,15 @@
 //! Bounds-checked primitives shared by durable frame decoders.
 
-use super::{IdentityScheme, ObjectId};
+#[cfg(test)]
+use super::IdentityScheme;
 
+#[cfg(test)]
 pub(super) struct SliceReader<'a> {
     bytes: &'a [u8],
     pub(super) offset: usize,
 }
 
+#[cfg(test)]
 impl<'a> SliceReader<'a> {
     pub(super) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
@@ -16,66 +19,53 @@ impl<'a> SliceReader<'a> {
         self.bytes.len().saturating_sub(self.offset)
     }
 
-    pub(super) fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or("frame length overflow")?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or("truncated frame payload")?;
-        self.offset = end;
-        Ok(value)
+    pub(super) fn references(
+        &mut self,
+        scheme: IdentityScheme,
+        count: usize,
+    ) -> Result<Vec<super::ObjectReference>, &'static str> {
+        super::verified_record::reference_list(self.bytes, &mut self.offset, scheme.into(), count)
+            .map_err(super::verified_record::BodyError::detail)
     }
+}
 
-    pub(super) fn u8(&mut self) -> Result<u8, &'static str> {
-        self.take(1)?.first().copied().ok_or("truncated u8 field")
-    }
-
-    pub(super) fn u16(&mut self) -> Result<u16, &'static str> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?
-                .try_into()
-                .map_err(|_| "truncated u16 field")?,
-        ))
-    }
-
-    pub(super) fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| "truncated u32 field")?,
-        ))
-    }
-
-    pub(super) fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| "truncated u64 field")?,
-        ))
-    }
-
-    pub(super) fn usize_len(&mut self) -> Result<usize, &'static str> {
-        usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
-    }
-
-    pub(super) fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
-        let algorithm = self.u16()?;
-        let construction = self.u16()?;
-        let digest_len =
-            usize::try_from(self.u32()?).map_err(|_| "identity digest length overflow")?;
-        if algorithm == 0 || construction == 0 || digest_len == 0 {
-            return Err("identity tag fields must be non-zero");
+impl super::verified_record::TagError {
+    pub(super) fn detail(self) -> &'static str {
+        use super::root_wire::ReadError;
+        match self {
+            Self::Read(ReadError::Overflow(_)) => "frame length overflow",
+            Self::Read(ReadError::Truncated) => "truncated frame payload",
+            Self::LengthOverflow => "identity digest length overflow",
+            Self::Zero => "identity tag fields must be non-zero",
+            Self::Scheme => "unsupported identity algorithm or construction version",
+            Self::DigestLength => "identity digest length does not match the supported scheme",
         }
-        let digest = self.take(digest_len)?;
-        if algorithm != scheme.algorithm() || construction != scheme.construction() {
-            return Err("unsupported identity algorithm or construction version");
+    }
+}
+
+impl super::verified_record::BodyError {
+    pub(super) fn detail(self) -> &'static str {
+        use super::root_wire::ReadError;
+        use super::verified_record::{HeaderError, PayloadError, ReferenceError};
+        match self {
+            Self::Header(HeaderError::Read(e))
+            | Self::Payload(PayloadError::Read(e))
+            | Self::Reference(ReferenceError::Read(e)) => match e {
+                ReadError::Overflow(_) => "frame length overflow",
+                ReadError::Truncated => "truncated frame payload",
+            },
+            Self::Header(HeaderError::Kind) => "unknown object-kind code",
+            Self::Header(HeaderError::Version) => "object-format version must be non-zero",
+            Self::Header(HeaderError::Class) => "unknown object-class code",
+            Self::Reference(ReferenceError::Length) | Self::Payload(PayloadError::Length) => {
+                "length is not process-addressable"
+            },
+            Self::Reference(ReferenceError::Target(e)) => e.detail(),
+            Self::Reference(ReferenceError::Kind) => "unknown reference-kind code",
+            Self::Capacity => "reference count exceeds frame capacity",
+            Self::Allocation => "reference allocation failed",
+            Self::Trailing => "trailing object-frame bytes",
+            Self::Order => "non-canonical object references",
         }
-        digest
-            .try_into()
-            .map(ObjectId::new)
-            .map_err(|_| "identity digest length does not match the supported scheme")
     }
 }

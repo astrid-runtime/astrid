@@ -1,13 +1,13 @@
 //! Shared publication gate for staged routed subscriptions.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 
-#[repr(u8)]
-enum AdmissionState {
-    Staged,
-    Published,
-    Retired,
+mod state;
+
+impl std::fmt::Debug for state::GateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.observe().fmt(f)
+    }
 }
 
 /// Admission gate shared by every routed subscription owned by one runtime.
@@ -18,7 +18,7 @@ enum AdmissionState {
 /// backlog (closed routes reject events during matching and enqueue).
 #[derive(Clone, Debug)]
 pub struct RouteAdmissionGate {
-    state: Arc<AtomicU8>,
+    state: Arc<state::GateState>,
     commit: Arc<parking_lot::Mutex<()>>,
     retired: Arc<tokio::sync::Notify>,
 }
@@ -34,7 +34,7 @@ impl RouteAdmissionGate {
     #[must_use]
     pub fn published() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(AdmissionState::Published as u8)),
+            state: Arc::new(state::GateState::new(true)),
             commit: Arc::new(parking_lot::Mutex::new(())),
             retired: Arc::new(tokio::sync::Notify::new()),
         }
@@ -44,7 +44,7 @@ impl RouteAdmissionGate {
     #[must_use]
     pub fn staged() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(AdmissionState::Staged as u8)),
+            state: Arc::new(state::GateState::new(false)),
             commit: Arc::new(parking_lot::Mutex::new(())),
             retired: Arc::new(tokio::sync::Notify::new()),
         }
@@ -53,24 +53,25 @@ impl RouteAdmissionGate {
     /// Atomically admit future matching events on every route sharing this gate.
     pub fn publish(&self) {
         let _guard = self.commit.lock();
-        if self.state.load(Ordering::Acquire) != AdmissionState::Retired as u8 {
-            self.state
-                .store(AdmissionState::Published as u8, Ordering::Release);
-        }
+        self.state.publish();
     }
 
     /// Atomically reject all future events for a retiring runtime.
     pub fn retire(&self) {
         let _guard = self.commit.lock();
-        self.state
-            .store(AdmissionState::Retired as u8, Ordering::Release);
+        self.state.retire();
         self.retired.notify_waiters();
     }
 
     /// Whether this runtime's routes currently admit external events.
     #[must_use]
     pub fn is_published(&self) -> bool {
-        self.state.load(Ordering::Acquire) == AdmissionState::Published as u8
+        state::admits(self.state.observe())
+    }
+
+    /// Linearize delivery after extracting the payload from its private queue.
+    pub(super) fn release<T>(&self, pending: T) -> Option<T> {
+        state::release(self.state.observe(), pending)
     }
 
     /// Wait for permanent retirement, including retirement before registration.
@@ -81,7 +82,7 @@ impl RouteAdmissionGate {
             let notified = self.retired.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.state.load(Ordering::Acquire) == AdmissionState::Retired as u8 {
+            if self.state.observe() == state::RETIRED {
                 return;
             }
             notified.await;
@@ -93,8 +94,7 @@ impl RouteAdmissionGate {
     #[must_use]
     pub fn commit_guard(&self) -> Option<RouteCommitGuard> {
         let guard = self.commit.lock_arc();
-        self.is_published()
-            .then_some(RouteCommitGuard { _guard: guard })
+        state::release(self.state.observe(), RouteCommitGuard { _guard: guard })
     }
 }
 
@@ -130,6 +130,30 @@ mod tests {
         gate.publish();
         assert!(!gate.is_published(), "a retired generation cannot reopen");
         gate.wait_until_retired().await;
+    }
+
+    #[test]
+    fn retirement_is_terminal_across_clones_while_a_new_generation_can_publish() {
+        let old = RouteAdmissionGate::staged();
+        let publisher = old.clone();
+        let retiree = old.clone();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                publisher.publish();
+            });
+            start.wait();
+            retiree.retire();
+        });
+
+        // Exercise a late publication through a clone regardless of which thread won.
+        publisher.publish();
+        let replacement = RouteAdmissionGate::staged();
+        replacement.publish();
+        assert!(replacement.commit_guard().is_some());
+        assert!(old.commit_guard().is_none());
+        assert!(publisher.release(17).is_none());
     }
 
     #[test]
