@@ -230,6 +230,24 @@ fn overflow_priority(object:ObjectId) {
     assert(verdict == Err(batch::AuditError::Overflow));
 }
 
+proof fn header_equal(h:crate::delta_header::Header,read:crate::delta_header::Header)
+    requires h.wire() == read.wire(),
+    ensures h == read,
+{
+    vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+    assert(read.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(read.depth));
+    assert(h.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(h.depth));
+    assert(read.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(read.delta_bytes));
+    assert(h.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(h.delta_bytes));
+    assert(read.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(read.entries));
+    assert(h.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(h.entries));
+    assert(read.wire().subrange(24,32) =~= vstd::bytes::spec_u64_to_le_bytes(read.quota_bytes));
+    assert(h.wire().subrange(24,32) =~= vstd::bytes::spec_u64_to_le_bytes(h.quota_bytes));
+    assert(read.wire().subrange(32,36) =~= storage_words::word32(read.count));
+    assert(h.wire().subrange(32,36) =~= storage_words::word32(h.count));
+    storage_words::unique_word32(h.count,read.count);
+}
+
 /// The same fixed header is used by the KV delta record writer and the replay reader.
 fn header_roundtrip(h:crate::delta_header::Header,tail:&[u8]) {
     use crate::delta_header::Header;
@@ -242,17 +260,7 @@ fn header_roundtrip(h:crate::delta_header::Header,tail:&[u8]) {
         assert(bytes@.subrange(1,37) =~= h.wire());
         assert(result.is_ok());
         let (read,start) = result->Ok_0;
-        assert(read.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(read.depth));
-        assert(h.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(h.depth));
-        assert(read.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(read.delta_bytes));
-        assert(h.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(h.delta_bytes));
-        assert(read.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(read.entries));
-        assert(h.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(h.entries));
-        assert(read.wire().subrange(24,32) =~= vstd::bytes::spec_u64_to_le_bytes(read.quota_bytes));
-        assert(h.wire().subrange(24,32) =~= vstd::bytes::spec_u64_to_le_bytes(h.quota_bytes));
-        assert(read.wire().subrange(32,36) =~= storage_words::word32(read.count));
-        assert(h.wire().subrange(32,36) =~= storage_words::word32(h.count));
-        storage_words::unique_word32(h.count,read.count);
+        header_equal(h,read);
         assert(read == h && start == 37);
         assert(bytes@.skip(start as int) =~= tail@);
     }
@@ -263,5 +271,113 @@ fn short_header(bytes:&[u8])
 {
     let result = crate::delta_header::Header::read(bytes);
     assert(result == Err(storage_fields::ReadError::Truncated));
+}
+
+fn predecessor_roundtrip(previous:Option<ObjectId>,spill:ObjectId,kind:ReferenceKind) {
+    use crate::delta_header::{self as header,EdgeError};
+    let mut refs = header::predecessor_edges(previous);
+    let row = Mutation {key:vec![110u8,0,97],value:Some(ValueSlot::Spilled {object:spill,length:2048})};
+    let mut bytes = Vec::new();
+    let append = row.append(0,&mut bytes,&mut refs);
+    assert(append.is_ok());
+    let recovered = header::predecessor(&refs);
+    proof {
+        reveal_with_fuel(reference_lookup::selected,3);
+        assert(delta::label_bytes(0)[0] == 118 && header::PREVIOUS@[0] == 112);
+        let a = delta::label_bytes(0);
+        let b = header::PREVIOUS@;
+        assert forall|j:int| 0 <= j < a.len() && j < b.len() && a.take(j) == b.take(j)
+            implies !(#[trigger] a[j] < #[trigger] b[j]) by {
+            if j > 0 { assert(a.take(j)[0] == a[0] && b.take(j)[0] == b[0]); }
+        }
+        assert(!ObjectRecord::label_before(a,b));
+        assert(recovered == Ok(previous));
+    }
+    let edge = ObjectReference::new(header::predecessor_label(),spill,kind);
+    let labelled = vec![edge];
+    let actual = header::predecessor(&labelled);
+    assert(actual == if kind is Owns {Ok(Some(spill))} else {Err(EdgeError::NonOwning)});
+}
+
+fn reconcile_charge(object:ObjectId,prior:u64,declared:u64,depth:u64,length:u64) {
+    use crate::delta_recovery::{counters,CounterError};
+    let rows = vec![Mutation {key:vec![110u8,0,97],value:Some(ValueSlot::Spilled {object,length})}];
+    let measured = crate::delta_batch::measure(&rows);
+    let outcome = counters(7,prior,depth,declared,&rows);
+    proof {
+        reveal_with_fuel(crate::delta_batch::usage,2);
+        let size = 3nat + length as nat;
+        assert(measured == if size > u64::MAX {None} else {Some((size as u64,1usize))});
+        assert(outcome == if depth != 8 {Err(CounterError::Disagree)}
+            else if size > u64::MAX {Err(CounterError::RowOverflow)}
+            else if prior as nat + size > u64::MAX {Err(CounterError::ChainOverflow)}
+            else if prior as nat + size != declared {Err(CounterError::Disagree)}
+            else {Ok(())});
+    }
+}
+
+fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64,deny:bool) {
+    use crate::{delta_batch as batch,delta_header as header,delta_recovery as recovery};
+    let h = header::Header {depth:1,delta_bytes:3,entries,quota_bytes:quota,count:1};
+    let mut bytes = vec![1u8];
+    h.append(&mut bytes);
+    let mut refs = header::predecessor_edges(previous);
+    let row = Mutation {key:vec![110u8,0,97],value:None};
+    let ok = row.append(0,&mut bytes,&mut refs);
+    assert(ok.is_ok());
+    let ghost wire = bytes@;
+    let ghost links = refs@;
+    let record = ObjectRecord::from_fields(crate::ObjectKind::NamespaceMap,crate::ObjectFormatVersion::new(4).unwrap(),
+        bytes,refs,logical,crate::ObjectClass::Metadata).unwrap();
+    let validate = |_k:&[u8]| -> (e:Option<u8>) ensures e == if deny {Some(7u8)} else {None} {
+        if deny {Some(7u8)} else {None}
+    };
+    let got = recovery::decode(&record,validate);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(wire.subrange(1,37) =~= h.wire());
+        assert(wire.subrange(37,41) =~= storage_words::word32(3));
+        key::encoded_length(wire,37,3);
+        assert(wire.subrange(41,44) =~= row.key@);
+        assert(wire[44] == 0 && wire.len() == 45);
+        if got is Ok {
+            let r = got->Ok_0;
+            let (b,l,p) = choose|b:&[u8],l:&[ObjectReference],p:Seq<usize>| #[trigger] recovery::admitted(&record,validate,r,b,l,p);
+            let recorded = header::Header {depth:r.depth,delta_bytes:r.delta_bytes,entries:r.totals.entries,
+                quota_bytes:r.totals.quota_bytes,count:r.rows.len() as u32};
+            header_equal(h,recorded);
+            assert(delta::decoded(b,37,p[1],l,0,validate,Ok(r.rows@[0])));
+            assert(!deny && r.previous == previous && r.rows.len() == 1 && r.rows@[0].key@ == row.key@ && r.rows@[0].value.is_none());
+            assert(r.totals.logical_bytes == logical && r.totals.entries == entries && r.totals.quota_bytes == quota);
+        } else {
+            let e = got->Err_0;
+            assert(!(e is Truncated));
+            let (hh,b,l) = choose|hh:header::Header,b:&[u8],l:&[ObjectReference]| b@ == wire && l@ == links &&
+                #[trigger] recovery::refused(b,l,validate,hh,e);
+            header_equal(h,hh);
+            match e {
+                recovery::Error::Batch(be) => {
+                    let (rs,p,end) = choose|rs:Seq<Mutation>,p:Seq<usize>,end:usize| #[trigger] batch::stopped(b,l,37,1,validate,rs,p,end,be);
+                    if rs.len() == 1 {
+                        assert(delta::decoded(b,37,p[1],l,0,validate,Ok(rs[0])));
+                        assert(end == 45);
+                    } else if be is Row {
+                        let stop = choose|stop:usize| #[trigger] delta::decoded(b,end as int,stop,l,0,validate,Err(be->Row_0));
+                        assert(end == 37 && deny && be->Row_0 == delta::DecodeError::InvalidKey(7u8));
+                    }
+                    assert(deny && be == batch::Error::Row(delta::DecodeError::InvalidKey(7u8)));
+                },
+                recovery::Error::Audit(ae) => {
+                    let (rs,p) = choose|rs:Seq<Mutation>,p:Seq<usize>| rs.len()==1 &&
+                        #[trigger] batch::layout(b,l,37,45,rs,p,validate) && recovery::audit_refusal(rs,3,previous.is_some(),l.len() as nat,ae);
+                    assert(delta::decoded(b,37,p[1],l,0,validate,Ok(rs[0])));
+                    assert(rs[0].key@ == row.key@ && rs[0].value.is_none());
+                    reveal_with_fuel(batch::usage,2);
+                    assert(false);
+                },
+                _ => assert(false),
+            }
+        }
+    }
 }
 }

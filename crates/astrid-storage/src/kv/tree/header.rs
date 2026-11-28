@@ -8,7 +8,7 @@ use crate::storage_model::{
 };
 use parking_lot::Mutex;
 
-use super::delta::{Head, Mutation, Projection, decode_head, mutation_payload_bytes};
+use super::delta::{Head, Mutation, Projection, decode_head};
 use super::memo::MemoSnapshot;
 use super::node::NodeTotals;
 use super::overlay::OverlayMap;
@@ -395,14 +395,19 @@ where
     let mut prior_depth = 0_u64;
     let mut prior_delta_bytes = 0_u64;
     for (object, depth, delta_bytes, mutations, declared) in deltas.into_iter().rev() {
-        if depth != prior_depth.saturating_add(1)
-            || delta_bytes
-                != prior_delta_bytes
-                    .checked_add(mutation_payload_bytes(&mutations)?)
-                    .ok_or_else(|| invalid(object, "KV delta byte total overflow"))?
-        {
-            return Err(invalid(object, "KV delta chain counters disagree"));
-        }
+        use super::delta_recovery::{self, CounterError};
+        delta_recovery::counters(
+            prior_depth,
+            prior_delta_bytes,
+            depth,
+            delta_bytes,
+            &mutations,
+        )
+        .map_err(|error| match error {
+            CounterError::Disagree => invalid(object, "KV delta chain counters disagree"),
+            CounterError::RowOverflow => super::delta::arithmetic_overflow(),
+            CounterError::ChainOverflow => invalid(object, "KV delta byte total overflow"),
+        })?;
         apply_validated_mutations(
             object,
             &mut context,

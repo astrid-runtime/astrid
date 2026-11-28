@@ -18,7 +18,6 @@ const DELTA: u8 = 1;
 #[cfg(test)]
 use super::delta_mutation::{DELETE, INLINE, SPILLED};
 use super::delta_mutation::{DecodeError, EdgeError, ReadError, WriteError};
-const PREVIOUS_LABEL: &[u8] = b"previous";
 
 pub(super) use super::delta_mutation::Mutation;
 
@@ -112,13 +111,7 @@ pub(super) fn delta_record(
         count,
     }
     .append(&mut canonical);
-    let mut references = Vec::new();
-    if let Some(previous) = previous {
-        references.push(ObjectReference::owns(
-            PREVIOUS_LABEL.to_vec().into(),
-            previous,
-        ));
-    }
+    let mut references = super::delta_header::predecessor_edges(previous);
     for (index, mutation) in mutations.iter().enumerate() {
         mutation
             .append(index, &mut canonical, &mut references)
@@ -179,56 +172,31 @@ fn decode_checkpoint(
 }
 
 fn decode_delta(id: ObjectId, record: &ObjectRecord) -> StorageResult<Head> {
-    let bytes = record.canonical_bytes();
-    let (header, offset) = super::delta_header::Header::read(bytes)
-        .map_err(|_| invalid(id, "truncated KV projection head"))?;
-    let depth = header.depth;
-    let delta_bytes = header.delta_bytes;
-    let totals = NodeTotals {
-        entries: header.entries,
-        logical_bytes: record.logical_bytes(),
-        quota_bytes: header.quota_bytes,
-    };
-    let count = usize::try_from(header.count)
-        .map_err(|_| invalid(id, "KV projection count is too large"))?;
-    if depth == 0 || count == 0 {
-        return Err(invalid(id, "empty KV delta head"));
-    }
-    let previous = record
-        .reference(&ReferenceLabel::new(PREVIOUS_LABEL))
-        .map(|reference| {
-            if reference.kind() != ReferenceKind::Owns {
-                return Err(invalid(id, "KV delta predecessor is not owning"));
-            }
-            Ok(reference.target())
-        })
-        .transpose()?;
-    let mutations = super::delta_batch::read(bytes, record.references(), offset, count, |key| {
-        validate_composite_key(id, key).err()
-    })
-    .map_err(|error| match error {
-        super::delta_batch::Error::Row(error) => decode_error(id, error),
-        super::delta_batch::Error::Trailing => invalid(id, "trailing KV projection head bytes"),
-    })?;
-    super::delta_batch::audit(
-        &mutations,
-        delta_bytes,
-        previous.is_some(),
-        record.references().len(),
-    )
-    .map_err(|error| match error {
-        super::delta_batch::AuditError::NonCanonical => {
-            invalid(id, "non-canonical KV delta operations")
-        },
-        super::delta_batch::AuditError::Overflow => arithmetic_overflow(),
-        super::delta_batch::AuditError::References => invalid(id, "unexpected KV delta reference"),
-    })?;
+    use super::delta_recovery::{self, Error};
+    let head = delta_recovery::decode(record, |key| validate_composite_key(id, key).err())
+        .map_err(|error| match error {
+            Error::Truncated => invalid(id, "truncated KV projection head"),
+            Error::Count => invalid(id, "KV projection count is too large"),
+            Error::Empty => invalid(id, "empty KV delta head"),
+            Error::NonOwning => invalid(id, "KV delta predecessor is not owning"),
+            Error::Batch(super::delta_batch::Error::Row(error)) => decode_error(id, error),
+            Error::Batch(super::delta_batch::Error::Trailing) => {
+                invalid(id, "trailing KV projection head bytes")
+            },
+            Error::Audit(super::delta_batch::AuditError::NonCanonical) => {
+                invalid(id, "non-canonical KV delta operations")
+            },
+            Error::Audit(super::delta_batch::AuditError::Overflow) => arithmetic_overflow(),
+            Error::Audit(super::delta_batch::AuditError::References) => {
+                invalid(id, "unexpected KV delta reference")
+            },
+        })?;
     Ok(Head::Delta {
-        previous,
-        depth,
-        delta_bytes,
-        mutations,
-        totals,
+        previous: head.previous,
+        depth: head.depth,
+        delta_bytes: head.delta_bytes,
+        mutations: head.rows,
+        totals: head.totals,
     })
 }
 
@@ -270,7 +238,7 @@ fn field_error(id: ObjectId, error: crate::storage_fields::ReadError) -> Storage
     }
 }
 
-fn arithmetic_overflow() -> StorageError {
+pub(super) fn arithmetic_overflow() -> StorageError {
     StorageError::Internal("persistent KV projection arithmetic overflow".to_owned())
 }
 

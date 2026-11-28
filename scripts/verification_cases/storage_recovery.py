@@ -135,6 +135,23 @@ def consumer_defects():
             f"delta header loses {label}", header,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
         )
+    recovery = Path("crates/astrid-storage/src/kv/tree/delta_recovery.rs")
+    for label, path, clause, weaker in [
+        ("predecessor output", header, "out == match reference_lookup::selected", "true || out == match reference_lookup::selected"),
+        ("predecessor encoding", header, "refs@[0].fields() == (PREVIOUS@,id,super::ReferenceKind::Owns)", "true"),
+        ("logical bytes", recovery, "r.totals.logical_bytes == stored.4", "true"),
+        ("physical row layout", recovery, "&&& batch::layout(bytes,refs,37,bytes.len(),r.rows@,path,validate)", "&&& true"),
+        ("predecessor identity", recovery, "r.previous == Some(edge.fields().1)", "r.previous.is_some()"),
+        ("rejection evidence", recovery, "!(e is Truncated) ==> exists|h:", "!(e is Truncated) ==> true || exists|h:"),
+        ("current charge overflow", recovery, "out == if depth != next_depth", "charge > u64::MAX || out == if depth != next_depth"),
+        ("cumulative charge overflow", recovery, "out == if depth != next_depth", "prior_bytes as nat + charge > u64::MAX || out == if depth != next_depth"),
+        ("predecessor contribution", recovery, "out == if depth != next_depth", "prior_bytes as nat + charge != bytes || out == if depth != next_depth"),
+        ("prior depth", recovery, "out == if depth != next_depth", "depth != next_depth || out == if depth != next_depth"),
+    ]:
+        yield (
+            f"delta recovery loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),
