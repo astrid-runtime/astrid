@@ -207,6 +207,29 @@ fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published
         })
 }
 
+fn fill_point<C>(owner:u64,namespace:&[u8],logical:&[u8],
+    observation:Result<(Option<crate::RootState>,Option<Vec<u8>>),u64>,cache:C)
+    -> (out:Result<Option<Vec<u8>>,u64>)
+    where C:FnOnce(&u64,Vec<u8>,Option<crate::RootState>,&Option<Vec<u8>>),
+    requires forall|k:Vec<u8>| #[trigger] k@ == namespace@ + seq![0u8] + logical@ ==>
+        (observation matches Ok((root,v)) ==> cache.requires((&owner,k,root,&v))),
+    ensures match observation {
+        Err(e) => out == Err(e),
+        Ok((root,value)) => out == Ok(value) && exists|k:Vec<u8>| k@ == namespace@ + seq![0u8] + logical@ &&
+            #[trigger] cache.ensures((&owner,k,root,&value),()),
+    },
+{
+    let address = crate::encoding::composite(namespace,logical);
+    let read = crate::hot_lookup::PointRead::load(owner,address,
+        |p:u64,k:&Vec<u8>| -> (r:Result<(Option<crate::RootState>,Option<Vec<u8>>),u64>)
+            requires p == owner && k@ == namespace@ + seq![0u8] + logical@,
+            ensures r == observation,
+            {observation})?;
+    let value = read.retain(cache);
+    assert(cache.ensures((&owner,address,observation.unwrap().0,&value),()));
+    Ok(value)
+}
+
 fn load_visits<R,E,F>(plan:&[child_range::Visit],read:F, table:Ghost<spec_fn(ObjectId)->Option<R>>,
     error:Ghost<E>) -> (out:Result<Vec<(child_range::Visit,R)>,child_range::LoadError<E>>)
     where F:FnOnce(Vec<ObjectId>)->Result<Vec<Option<R>>,E>,

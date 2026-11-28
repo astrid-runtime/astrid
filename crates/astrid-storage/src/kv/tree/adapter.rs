@@ -55,18 +55,19 @@ where
         }
         let blocking = self.blocking_store();
         let cache = self.hot_cache.clone();
-        let cache_owner = owner.clone();
-        let cache_key = composite.clone();
         run_blocking(move || {
-            let (read_root, value) = blocking.read(owner, |context, header| {
-                context
-                    .projected_get(header, &composite)
-                    .map(|value| (header.root, value))
+            let read = super::hot_lookup::PointRead::load(owner, composite, |owner, key| {
+                blocking.read(owner, |context, header| {
+                    context
+                        .projected_get(header, key)
+                        .map(|value| (header.root, value))
+                })
             })?;
-            if let Some(cache) = cache {
-                cache.insert(&cache_owner, read_root, cache_key, value.as_deref());
-            }
-            Ok(value)
+            Ok(read.retain(|owner, key, root, value| {
+                if let Some(cache) = cache {
+                    cache.insert(owner, root, key, value.as_deref());
+                }
+            }))
         })
         .await
     }

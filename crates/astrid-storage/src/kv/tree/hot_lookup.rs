@@ -68,4 +68,46 @@ pub(super) fn lookup<P:Ord,S,V,F>(owners:&BTreeMap<P,S>,owner:&P,requested:Optio
     let selected = owners.get(owner)?;
     snapshot(selected,requested,key)
 }
+
+/// One successful point read, held until its optional cache fill.
+pub(super) struct PointRead<P> {
+    owner:P,
+    key:Vec<u8>,
+    root:Option<RootState>,
+    value:Option<Vec<u8>>,
+}
+
+impl<P:Clone> PointRead<P> {
+    pub(super) closed spec fn binding(&self) -> (P,Vec<u8>,Option<RootState>,Option<Vec<u8>>) {
+        (self.owner,self.key,self.root,self.value)
+    }
+
+    pub(super) fn load<E,L>(owner:P,key:Vec<u8>,read:L) -> (out:Result<Self,E>)
+        where L:FnOnce(P,&Vec<u8>)->Result<(Option<RootState>,Option<Vec<u8>>),E>,
+        requires vstd::pervasive::obeys_clone_eq::<P>(),read.requires((owner,&key)),
+        ensures match out {
+            Ok(row) => row.binding().0 == owner && row.binding().1 == key &&
+                read.ensures((owner,&key),Ok((row.binding().2,row.binding().3))),
+            Err(e) => read.ensures((owner,&key),Err(e)),
+        },
+    {
+        proof { reveal(vstd::pervasive::obeys_clone_eq); }
+        let read_owner = P::clone(&owner);
+        assert(vstd::pervasive::cloned(owner,read_owner));
+        assert(read_owner == owner);
+        let (root,value) = read(read_owner,&key)?;
+        Ok(Self {owner,key,root,value})
+    }
+
+    /// Return the observed value after offering it to the cache, including negative entries.
+    pub(super) fn retain<C>(self,cache:C) -> (out:Option<Vec<u8>>)
+        where C:FnOnce(&P,Vec<u8>,Option<RootState>,&Option<Vec<u8>>),
+        requires cache.requires((&self.binding().0,self.binding().1,self.binding().2,&self.binding().3)),
+        ensures out == self.binding().3,
+            cache.ensures((&self.binding().0,self.binding().1,self.binding().2,&out),()),
+    {
+        cache(&self.owner,self.key,self.root,&self.value);
+        self.value
+    }
+}
 }

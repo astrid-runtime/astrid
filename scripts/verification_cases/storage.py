@@ -844,6 +844,23 @@ def hot_point_consumers():
         )
 
 
+def point_fill_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/hot_lookup.rs")
+    for label, clause, weaker in [
+        ("read owner", "row.binding().0 == owner &&", ""),
+        ("read key", "row.binding().1 == key &&", ""),
+        ("observed root and value", "read.ensures((owner,&key),Ok((row.binding().2,row.binding().3)))", "true"),
+        ("read error", "Err(e) => read.ensures((owner,&key),Err(e))", "Err(e) => true"),
+        ("returned value", "ensures out == self.binding().3,", "ensures true,"),
+        ("admission arguments", "cache.ensures((&self.binding().0,self.binding().1,self.binding().2,&out),())", "true"),
+    ]:
+        yield (
+            f"point fill loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_batch_slots.rs"),
+        )
+
+
 def resident_cache_consumers():
     path = Path("crates/astrid-storage/src/engine/durable_cache/resident.rs")
     for label, clause, weaker in [
@@ -882,3 +899,4 @@ def checkpoint_decode_consumers():
     yield from publication_cache_consumers()
     yield from resident_cache_consumers()
     yield from hot_point_consumers()
+    yield from point_fill_consumers()
