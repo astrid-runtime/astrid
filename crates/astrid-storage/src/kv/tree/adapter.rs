@@ -262,22 +262,13 @@ where
         let blocking = self.blocking_store();
         run_blocking(move || {
             blocking.mutate(&owner, |context, header| {
-                let current = context.projected_get(header, &composite)?;
-                if current.as_deref() != expected.as_deref() {
-                    return Ok((false, Vec::new(), false));
-                }
-                if current.as_deref() == Some(new.as_slice()) {
-                    return Ok((true, Vec::new(), false));
-                }
-                Ok((
-                    true,
-                    vec![Replacement::observed(
-                        composite.clone(),
-                        current,
-                        Some(new.clone()),
-                    )],
-                    true,
-                ))
+                Replacement::compare_at(
+                    header,
+                    &composite,
+                    expected.as_deref(),
+                    &new,
+                    |header, key| context.projected_get(header, key),
+                )
             })
         })
         .await

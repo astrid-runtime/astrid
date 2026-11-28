@@ -25,51 +25,9 @@ mod checkpoint;
 mod range;
 pub(super) mod value;
 
-// A comparison and its mutation share one immutable header per CAS attempt.
-// Carry only its length and equality result through accounting, releasing
-// each old payload immediately; key-only operations keep deferred reads.
-pub(super) struct Replacement {
-    key: Vec<u8>,
-    previous: PreviousValue,
-    value: Option<Vec<u8>>,
-}
-
-enum PreviousValue {
-    Unread,
-    Loaded {
-        previous_len: Option<usize>,
-        unchanged: bool,
-    },
-}
-
-impl Replacement {
-    #[cfg(any(test, all(feature = "legacy-surrealkv", not(target_family = "wasm"))))]
-    pub(super) fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
-        Self {
-            key,
-            previous: PreviousValue::Unread,
-            value,
-        }
-    }
-
-    pub(super) fn observed(
-        key: Vec<u8>,
-        previous: Option<Vec<u8>>,
-        value: Option<Vec<u8>>,
-    ) -> Self {
-        let previous_len = previous.as_ref().map(Vec::len);
-        let unchanged = previous == value;
-        drop(previous);
-        Self {
-            key,
-            previous: PreviousValue::Loaded {
-                previous_len,
-                unchanged,
-            },
-            value,
-        }
-    }
-}
+mod replacement;
+use replacement::PreviousValue;
+pub(super) use replacement::Replacement;
 
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,

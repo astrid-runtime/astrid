@@ -45,6 +45,19 @@ def defects():
             f"production replay {name}", replay,
             lambda s, a=original, b=changed: replace_once(s, a, b), location,
         )
+    cas = Path("crates/astrid-storage/src/kv/tree/context/replacement.rs")
+    for name, original, changed in [
+        ("comparison result", "out.0 == (prior == expected)", "true"),
+        ("change decision", "out.2 == (prior == expected && prior != Some(new))", "true"),
+        ("replacement count", "out.1.len() == if out.2 {1int} else {0int}", "true"),
+        ("replacement address and bytes", "out.2 ==> out.1@[0].fields()", "false ==> out.1@[0].fields()"),
+        ("read failure", "Err(e) => read.ensures((header,key),Err(e))", "Err(e) => true"),
+        ("read provenance", "#[trigger] read.ensures((header,key),Ok(old)) &&", "true &&"),
+    ]:
+        yield (
+            f"ownership graph CAS loses {name}", cas,
+            lambda s, a=original, b=changed: replace_once(s, a, b), consumer,
+        )
     cursor = Path("crates/astrid-storage/src/ownership/pending.rs")
     for name, original, changed in [
         ("candidate identity", "final(rows)@ == old(rows)@.insert(uid,match before", "final(rows)@.contains_key(uid) || final(rows)@ == old(rows)@.insert(uid,match before"),

@@ -83,6 +83,38 @@ fn reserve_then_recover(rows:&mut BTreeMap<u64,Reservation>,uid:u64,requested:u6
     }
 }
 
+// Exercise the real KV adapter's read/compare/stage step with an immutable
+// header observation. A matching empty value differs from an absent entry.
+fn graph_compare(namespace:&[u8],key:&[u8],header:u64,observed_at:u64,prior:Option<Vec<u8>>,
+    expected:Option<&[u8]>,candidate:&[u8]) {
+    use crate::kv_replacement::{bytes,Replacement};
+    let address = crate::encoding::composite(namespace,key);
+    let ghost image = bytes(prior);
+    let ghost location = namespace@ + seq![0u8] + key@;
+    let read = |h:&u64,k:&[u8]| -> (r:Result<Option<Vec<u8>>,u64>)
+        requires k@ == location,
+        ensures match r {Ok(v) => *h == observed_at && k@ == location && bytes(v) == image,
+            Err(e) => *h != observed_at && e == *h},
+    {
+        if *h == observed_at { Ok(prior) } else { Err(*h) }
+    };
+    let result = Replacement::compare_at(&header,&address,expected,candidate,read);
+    match result {
+        Ok((accepted,rows,changed)) => {
+            assert(header == observed_at);
+            let ghost compare = match expected {Some(v) => Some(v@),None => None};
+            assert(accepted == (image == compare));
+            assert(changed == (accepted && image != Some(candidate@)));
+            assert(rows.len() == if changed {1int} else {0int});
+            if changed {
+                assert(rows@[0].fields() == (location,Some(candidate@),
+                    Some((match image {Some(old) => Some(old.len() as usize),None => None},false))));
+            }
+        },
+        Err(e) => {assert(e == header && observed_at != header);},
+    }
+}
+
 // Both observations describe the same final state of one invocation.
 fn recover_renamed(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64>,
     stores: &mut Stores, uid: u64, retained: u64, live: u64)
