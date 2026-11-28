@@ -54,6 +54,7 @@ mod checkpoint_walk;
 mod context;
 mod delta;
 use crate::storage_model::reference_lookup;
+mod delta_batch;
 mod delta_mutation;
 mod handoff;
 mod header;

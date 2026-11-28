@@ -35,12 +35,6 @@ impl NodeTotals {
     }
 }
 
-impl ValueSlot {
-    pub(super) fn length(&self) -> StorageResult<u64> {
-        super::checkpoint_leaf_summary::length(self).ok_or_else(arithmetic_overflow)
-    }
-}
-
 pub(super) type LeafEntry = super::checkpoint_leaf::Entry<ValueSlot>;
 
 impl LeafEntry {

@@ -172,38 +172,40 @@ pub(super) open spec fn validated<E,F:FnOnce(&[u8])->Option<E>>(validate:F,key:S
     exists|field:&[u8]| field@ == key && #[trigger] validate.ensures((field,),decision)
 }
 
+pub(super) open spec fn decoded<E,F:FnOnce(&[u8])->Option<E>>(bytes:&[u8],start:int,finish:usize,
+    refs:&[ObjectReference],index:usize,validate:F,out:Result<Mutation,DecodeError<E>>) -> bool {
+    let key_end = start + 4 + super::checkpoint_key_field::length(bytes@,start);
+    let has_key = start+4 <= bytes.len() && key_end <= bytes.len();
+    let key = if has_key {bytes@.subrange(start+4,key_end)} else {Seq::empty()};
+    let length = super::checkpoint_value::value_length(bytes@,key_end+1);
+    let label = if index <= u32::MAX {label_bytes(index as u32)} else {Seq::empty()};
+    let edge = super::reference_lookup::selected(refs@,label,0,refs.len() as int);
+    match out {
+        Err(DecodeError::Key(_)) => !has_key,
+        Err(DecodeError::InvalidKey(e)) => has_key && validated(validate,key,Some(e)),
+        Err(DecodeError::Operation(_)) => has_key && validated(validate,key,None) && !valid(bytes@,key_end),
+        Err(DecodeError::Edge(_)) => has_key && validated(validate,key,None) && valid(bytes@,key_end) && bytes@[key_end] == SPILLED &&
+            (index > u32::MAX || edge.is_none() || edge.unwrap().fields().2 != super::ReferenceKind::Owns),
+        Ok(row) => {
+            &&& has_key && row.key@ == key && valid(bytes@,key_end)
+            &&& validated(validate,key,None)
+            &&& match row.value {
+                None => bytes@[key_end] == DELETE && finish as int == key_end+1,
+                Some(ValueSlot::Inline(data)) => bytes@[key_end] == INLINE && finish as int == key_end+9+length &&
+                    data@ == bytes@.subrange(key_end+9,finish as int),
+                Some(ValueSlot::Spilled {object,length:n}) => bytes@[key_end] == SPILLED && finish as int == key_end+9 &&
+                    n == length && index <= u32::MAX && (edge matches Some(r) && r.fields() == (label,object,super::ReferenceKind::Owns)),
+            }
+        },
+    }
+}
+
 impl Mutation {
     /// Recover one complete mutation, preserving validation and error order.
     pub(super) fn decode<E,F:FnOnce(&[u8])->Option<E>>(bytes:&[u8],cursor:&mut usize,
         refs:&[ObjectReference],index:usize,validate:F) -> (out:Result<Self,DecodeError<E>>)
         requires forall|k:&[u8]| #[trigger] validate.requires((k,)),
-        ensures ({
-            let start = *old(cursor) as int;
-            let key_end = start + 4 + super::checkpoint_key_field::length(bytes@,start);
-            let has_key = start+4 <= bytes.len() && key_end <= bytes.len();
-            let key = if has_key {bytes@.subrange(start+4,key_end)} else {Seq::empty()};
-            let length = super::checkpoint_value::value_length(bytes@,key_end+1);
-            let label = if index <= u32::MAX {label_bytes(index as u32)} else {Seq::empty()};
-            let edge = super::reference_lookup::selected(refs@,label,0,refs.len() as int);
-            match out {
-                Err(DecodeError::Key(_)) => !has_key,
-                Err(DecodeError::InvalidKey(e)) => has_key && validated(validate,key,Some(e)),
-                Err(DecodeError::Operation(_)) => has_key && validated(validate,key,None) && !valid(bytes@,key_end),
-                Err(DecodeError::Edge(_)) => has_key && validated(validate,key,None) && valid(bytes@,key_end) && bytes@[key_end] == SPILLED &&
-                    (index > u32::MAX || edge.is_none() || edge.unwrap().fields().2 != super::ReferenceKind::Owns),
-                Ok(row) => {
-                    &&& has_key && row.key@ == key && valid(bytes@,key_end)
-                    &&& validated(validate,key,None)
-                    &&& match row.value {
-                        None => bytes@[key_end] == DELETE && *final(cursor) as int == key_end+1,
-                        Some(ValueSlot::Inline(data)) => bytes@[key_end] == INLINE && *final(cursor) as int == key_end+9+length &&
-                            data@ == bytes@.subrange(key_end+9,*final(cursor) as int),
-                        Some(ValueSlot::Spilled {object,length:n}) => bytes@[key_end] == SPILLED && *final(cursor) as int == key_end+9 &&
-                            n == length && index <= u32::MAX && (edge matches Some(r) && r.fields() == (label,object,super::ReferenceKind::Owns)),
-                    }
-                },
-            }
-        }),
+        ensures decoded(bytes,*old(cursor) as int,*final(cursor),refs,index,validate,out),
     {
         let ghost start = *cursor as int;
         let k = match super::checkpoint_key_field::read(bytes,cursor) {

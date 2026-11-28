@@ -101,12 +101,26 @@ def consumer_defects():
         ("validation before operation", "validated(validate,key,None) && !valid(bytes@,key_end)", "!valid(bytes@,key_end)"),
         ("validation before edge", "validated(validate,key,None) && valid(bytes@,key_end) && bytes@", "valid(bytes@,key_end) && bytes@"),
         ("accepted key", "&&& validated(validate,key,None)", "&&& true"),
-        ("assembled inline data", "data@ == bytes@.subrange(key_end+9,*final(cursor) as int)", "true"),
+        ("assembled inline data", "data@ == bytes@.subrange(key_end+9,finish as int)", "true"),
         ("assembled spill identity", "r.fields() == (label,object,super::ReferenceKind::Owns)", "r.fields().0 == label"),
         ("assembled spill length", "n == length && index <= u32::MAX", "index <= u32::MAX"),
     ]:
         yield (
             f"delta decoder loses {label}", delta,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
+        )
+    batch = Path("crates/astrid-storage/src/kv/tree/delta_batch.rs")
+    for label, clause, weaker in [
+        ("declared count", "rows.len() == count && exists|path", "exists|path"),
+        ("contiguous extent", "rows.len() == count && exists|path", "rows.len() == count && true || exists|path"),
+        ("failure position", "Err(e) => exists|rows:Seq<Mutation>", "Err(e) => true || exists|rows:Seq<Mutation>"),
+        ("strict order", "out == if !ordered(rows@)", "!ordered(rows@) || out == if !ordered(rows@)"),
+        ("charge limit", "out == if !ordered(rows@)", "n > delta_bytes || out == if !ordered(rows@)"),
+        ("charge overflow", "out == if !ordered(rows@)", "n > u64::MAX || out == if !ordered(rows@)"),
+        ("reference count", "out == if !ordered(rows@)", "expected != edges || out == if !ordered(rows@)"),
+    ]:
+        yield (
+            f"delta batch loses {label}", batch,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
         )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")

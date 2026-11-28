@@ -4,7 +4,9 @@ use crate::storage_model::{
     ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel,
 };
 
-use super::node::{NodeTotals, ValueSlot};
+use super::node::NodeTotals;
+#[cfg(test)]
+use super::node::ValueSlot;
 use super::overlay::OverlayMap;
 use super::validation::validate_composite_key;
 use super::{FORMAT_VERSION, ROOT_LABEL};
@@ -89,7 +91,7 @@ pub(super) fn delta_record(
     mutations: &[Mutation],
     totals: NodeTotals,
 ) -> StorageResult<ObjectRecord> {
-    if mutations.is_empty() || mutations.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+    if mutations.is_empty() || !super::delta_batch::keys_ordered(mutations) {
         return Err(serialization("KV delta keys are not strictly ordered"));
     }
     let depth = previous_depth
@@ -198,35 +200,30 @@ fn decode_delta(
             Ok(reference.target())
         })
         .transpose()?;
-    let mut mutations = Vec::with_capacity(count);
-    for index in 0..count {
-        let row = Mutation::decode(
-            cursor.bytes,
-            &mut cursor.offset,
-            record.references(),
-            index,
-            |key| validate_composite_key(id, key).err(),
-        )
-        .map_err(|error| decode_error(id, error))?;
-        mutations.push(row);
-    }
-    cursor.done()?;
-    if mutations.windows(2).any(|pair| pair[0].key >= pair[1].key)
-        || mutation_payload_bytes(&mutations)? > delta_bytes
-    {
-        return Err(invalid(id, "non-canonical KV delta operations"));
-    }
-    let expected_references = usize::from(previous.is_some())
-        .checked_add(
-            mutations
-                .iter()
-                .filter(|mutation| matches!(mutation.value, Some(ValueSlot::Spilled { .. })))
-                .count(),
-        )
-        .ok_or_else(arithmetic_overflow)?;
-    if record.references().len() != expected_references {
-        return Err(invalid(id, "unexpected KV delta reference"));
-    }
+    let mutations = super::delta_batch::read(
+        cursor.bytes,
+        record.references(),
+        cursor.offset,
+        count,
+        |key| validate_composite_key(id, key).err(),
+    )
+    .map_err(|error| match error {
+        super::delta_batch::Error::Row(error) => decode_error(id, error),
+        super::delta_batch::Error::Trailing => invalid(id, "trailing KV projection head bytes"),
+    })?;
+    super::delta_batch::audit(
+        &mutations,
+        delta_bytes,
+        previous.is_some(),
+        record.references().len(),
+    )
+    .map_err(|error| match error {
+        super::delta_batch::AuditError::NonCanonical => {
+            invalid(id, "non-canonical KV delta operations")
+        },
+        super::delta_batch::AuditError::Overflow => arithmetic_overflow(),
+        super::delta_batch::AuditError::References => invalid(id, "unexpected KV delta reference"),
+    })?;
     Ok(Head::Delta {
         previous,
         depth,
@@ -237,19 +234,9 @@ fn decode_delta(
 }
 
 pub(super) fn mutation_payload_bytes(mutations: &[Mutation]) -> StorageResult<u64> {
-    mutations.iter().try_fold(0_u64, |total, mutation| {
-        let key = u64::try_from(mutation.key.len()).map_err(|_| arithmetic_overflow())?;
-        let value = mutation
-            .value
-            .as_ref()
-            .map(ValueSlot::length)
-            .transpose()?
-            .unwrap_or(0);
-        total
-            .checked_add(key)
-            .and_then(|total| total.checked_add(value))
-            .ok_or_else(arithmetic_overflow)
-    })
+    super::delta_batch::measure(mutations)
+        .map(|(bytes, _)| bytes)
+        .ok_or_else(arithmetic_overflow)
 }
 
 fn decode_error(id: ObjectId, error: DecodeError<StorageError>) -> StorageError {
