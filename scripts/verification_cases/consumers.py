@@ -540,7 +540,7 @@ def consumer_defects():
             lambda s, a=original, b=changed: replace_once(s, a, b), target,
         )
     def pending_before_incoming(source):
-        incoming = """    if let Some(record) = layers.incoming.get(&id) {
+        incoming = """    if let Some(record) = incoming(&id,layers.incoming) {
         return Ok(from_incoming(record));
     }
 """

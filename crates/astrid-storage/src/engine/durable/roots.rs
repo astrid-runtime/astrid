@@ -98,13 +98,19 @@ where
     let validated = super::recovered_closure::check_all(
         &recovered,
         |commit, at| {
-            super::validation::materialize_with(commit, |id| {
-                preload
-                    .get(&id)
-                    .cloned()
-                    .ok_or_else(|| DurableError::from(ModelError::MissingObject(id)))
+            use super::closure_walk::Failure;
+            super::closure_load::materialize(
+                &preload,
+                commit,
+                crate::storage_model::ObjectRecord::clone,
+            )
+            .map_err(|failure| {
+                let source = match failure {
+                    Failure::Cycle(id) => ModelError::ObjectCycle(id),
+                    Failure::Root(id) | Failure::Source(_, id) => ModelError::MissingObject(id),
+                };
+                recovery_closure_error(source.into(), at)
             })
-            .map_err(|error| recovery_closure_error(error, at))
         },
         |records, commit, at| {
             validate_commit_closure(records, commit).map_err(|source| DurableError::RecoveryModel {

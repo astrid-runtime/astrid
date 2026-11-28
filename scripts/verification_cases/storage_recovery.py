@@ -6,6 +6,20 @@ from .common import replace_once
 
 
 def consumer_defects():
+    materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
+    for label, clause, weaker in [
+        ("row order", "&&& in_id_order(row_ids(rows@))", "&&& true"),
+        ("root membership", "&&& walk::closed(root,Set::empty(),graph,ids)", "&&& true"),
+        ("minimality", "==> ids.subset_of(nodes)", "==> true"),
+        ("acyclicity", "rank.dom() == ids && #[trigger] walk::ranked(graph,Set::empty(),rank)", "rank.dom() == ids"),
+        ("record contents", "(#[trigger] rows@[i]).1.contents() == table@[rows@[i].0].contents()\n", "true\n"),
+        ("missing identity", "id == e && !table@.contains_key(id)", "!table@.contains_key(id)"),
+        ("cycle evidence", "=> walk::reaches(Preload(table).edges(),Set::empty(),id,id) &&", "=> true &&"),
+    ]:
+        yield (
+            f"recovery materializer loses {label}", materializer,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_closure_model.rs"),
+        )
     append = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     readback = Path("verification/hosted_arena_append.rs")
     closure = Path("crates/astrid-storage/src/engine/durable/recovered_closure.rs")

@@ -1,9 +1,62 @@
 //! Independently consume the production graph traversal and edge scheduler.
 use crate::closure_walk::{self as walk, Edge, Failure, Source, Work};
 use std::collections::{BTreeMap,BTreeSet};
-use vstd::{prelude::*,std_specs::btree::{btree_map_inv,btree_set_inv}};
+use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},prelude::*,std_specs::btree::{btree_map_inv,btree_set_inv}};
 
 verus! {
+/// With no WAL overlay and an empty index, recovery selects exactly the same records and errors as the layered loader.
+fn preload_equivalence<K:Ord+Copy,V,F:Fn(&V)->V>(table:&BTreeMap<K,V>,id:K,copy:F) -> (out:Result<V,K>)
+    requires btree_map_inv(table),obeys_cmp::<K>(),obeys_cmp_concrete_eq::<K>(),
+        forall|v:&V| #[trigger] copy.requires((v,)),
+        forall|v:&V,r:V| #[trigger] copy.ensures((v,),r) ==> r == *v,
+    ensures out == if table@.contains_key(id) {Ok(table@[id])} else {Err(id)},
+{
+    use crate::closure_load::{self,Layers};
+    let empty = BTreeMap::<K,u64>::new();
+    let layered = closure_load::load(id,&Layers {incoming:table,pending:None::<&BTreeMap<K,V>>,index:&empty},
+        |v:&V| -> (r:V) ensures r == *v, {copy(v)},
+        |v:&V| -> (r:V) ensures r == *v, {copy(v)},
+        |k:K,_:&u64| -> (r:Result<V,K>) ensures r == Err(k), {Err(k)},
+        |k:K| -> (r:K) ensures r == k, {k});
+    let result = closure_load::preloaded(id,table,|v:&V| -> (r:V) ensures r == *v, {copy(v)},
+        |k:K| -> (r:K) ensures r == k, {k});
+    assert(result == layered);
+    result
+}
+
+/// A root's owning child must be returned with its preloaded contents. An
+/// unrelated row outside any closed superset cannot appear in the result.
+fn recovered_child<F:Fn(&crate::ObjectRecord)->crate::ObjectRecord>(
+    table:&BTreeMap<crate::ObjectId,crate::ObjectRecord>,root:crate::ObjectId,
+    child:crate::ObjectId,scope:Ghost<Set<crate::ObjectId>>,copy:F)
+    requires crate::closure_load::Preload(table).valid(),
+        table@.contains_key(root),walk::children(table@[root].contents().3).contains(child),
+        walk::closed(root,Set::empty(),crate::closure_load::Preload(table).edges(),scope@),
+        forall|v:&crate::ObjectRecord| #[trigger] copy.requires((v,)),
+        forall|v:&crate::ObjectRecord,r:crate::ObjectRecord| #[trigger] copy.ensures((v,),r) ==> r.contents() == v.contents(),
+{
+    use crate::closure_load::{self,Preload,row_ids};
+    match closure_load::materialize(table,root,copy) {
+        Ok(rows) => {
+            let ghost ids = row_ids(rows@).to_set();
+            let ghost graph = Preload(table).edges();
+            assert(graph[root].contains(child));
+            assert(ids.contains(root) && ids.contains(child));
+            assert(closure_load::in_id_order(row_ids(rows@)));
+            assert(ids.subset_of(scope@));
+            assert(exists|rank:Map<crate::ObjectId,nat>| rank.dom() == ids && #[trigger] walk::ranked(graph,Set::empty(),rank));
+            assert forall|i:int| 0 <= i < rows.len() implies
+                (#[trigger] rows@[i]).1.contents() == table@[rows@[i].0].contents() by {};
+        },
+        Err(Failure::Source(id,e)) => {
+            assert(!table@.contains_key(id) && e == id && scope@.contains(id));
+        },
+        Err(Failure::Cycle(id)) => {
+            assert(walk::reaches(Preload(table).edges(),Set::empty(),id,id) && scope@.contains(id));
+        },
+        Err(Failure::Root(_)) => {assert(false);},
+    }
+}
 
 /// Equal duplicate declarations are admitted. A rejected name actually
 /// appears twice with different records in the supplied batch.
