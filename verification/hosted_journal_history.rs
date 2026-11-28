@@ -426,11 +426,62 @@ proof fn extend_wave(start:Map<crate::ObjectId,crate::ObjectRecord>,seen:Set<cra
     }
 }
 
+/// Reordering complete rows preserves distinct frontier IDs, including when
+/// two different IDs name the same physical offset.
+proof fn permute_frontier(input:Seq<ReadRow>,output:Seq<ReadRow>)
+    requires input.to_multiset() == output.to_multiset(), input.map(|_,r:ReadRow|r.0).no_duplicates(),
+    ensures output.map(|_,r:ReadRow|r.0).no_duplicates(),
+        crate::journal_preload::selected(output) == crate::journal_preload::selected(input),
+{
+    let old = input.map(|_,r:ReadRow|r.0);
+    let new = output.map(|_,r:ReadRow|r.0);
+    assert(input.no_duplicates()) by {
+        assert forall|i:int,j:int| 0 <= i < input.len() && 0 <= j < input.len() && i!=j implies
+            #[trigger] input[i] != #[trigger] input[j] by {assert(old[i] != old[j]);}
+    }
+    input.lemma_multiset_has_no_duplicates();
+    output.lemma_multiset_has_no_duplicates_conv();
+    input.to_multiset_ensures();
+    output.to_multiset_ensures();
+    assert forall|i:int| 0 <= i < output.len() implies input.contains(#[trigger] output[i]) by {
+        assert(output.contains(output[i]));
+        assert(output.to_multiset().count(output[i])>0);
+    }
+    assert forall|i:int,j:int| 0 <= i < output.len() && 0 <= j < output.len() && i!=j implies
+        #[trigger] new[i] != #[trigger] new[j] by {
+        let a = choose|a:int| 0 <= a < input.len() && input[a]==output[i];
+        let b = choose|b:int| 0 <= b < input.len() && input[b]==output[j];
+        assert(output[i]!=output[j] && a!=b);
+        assert(old[a]!=old[b]);
+    }
+    old.to_set_ensures();
+    new.to_set_ensures();
+    assert forall|k:crate::ObjectId| new.to_set().contains(k) == old.to_set().contains(k) by {
+        if new.contains(k) {
+            let i = choose|i:int| 0 <= i < new.len() && new[i]==k;
+            assert(output[i].0==k && input.contains(output[i]));
+            let a = choose|a:int| 0 <= a < input.len() && input[a]==output[i];
+            assert(old[a]==k);
+            assert(old[a]==k && old.contains(k));
+        } else if old.contains(k) {
+            let a = choose|a:int| 0 <= a < old.len() && old[a]==k;
+            assert(input.contains(input[a]) && input.to_multiset().count(input[a])>0);
+            assert(output.contains(input[a]));
+            let i = choose|i:int| 0 <= i < output.len() && output[i]==input[a];
+            assert(input[a].0==k && output[i].0==k);
+            assert(new[i]==k);
+            assert(new.contains(k));
+        }
+    }
+    assert(old.to_set() =~= new.to_set());
+}
+
 /// Model-independent reader witness. Each success uses the real accept
 /// operation on a fresh row. Errors discard the partial private table.
 fn read_wave<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::ObjectRecord>>(
     initial:PreloadTable,rows:&[ReadRow],decode:D) -> (out:Result<(PreloadTable,PendingIds),()>)
-    requires btree_map_inv(&initial),obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
+    requires initial@.dom().disjoint(crate::journal_preload::selected(rows@)),
+        rows@.map(|_,row:ReadRow|row.0).no_duplicates(),btree_map_inv(&initial),obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
         forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
     ensures out matches Ok((t,n)) ==> btree_map_inv(&t) && vstd::std_specs::btree::btree_set_inv(&n) &&
         crate::journal_preload::wave(initial@,crate::journal_preload::selected(rows@),t@,n@),
@@ -448,11 +499,25 @@ fn read_wave<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::ObjectRec
         invariant n <= rows.len(), btree_map_inv(&table), vstd::std_specs::btree::btree_set_inv(&next),
             obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
             forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
+            rows@.map(|_,row:ReadRow|row.0).no_duplicates(),initial@.dom().disjoint(selected(rows@)),
             wave(initial@,selected(rows@.take(n as int)),table@,next@),
         decreases rows.len()-n,
     {
         let (id,loc) = rows[n];
-        if table.contains_key(&id) {return Err(());}
+        proof {
+            let ids = rows@.map(|_,row:ReadRow|row.0);
+            let prior = rows@.take(n as int).map(|_,row:ReadRow|row.0);
+            ids.to_set_ensures();
+            prior.to_set_ensures();
+            assert(ids[n as int] == id && ids.contains(id));
+            assert(!prior.contains(id)) by {
+                if prior.contains(id) {
+                    let j = choose|j:int| 0 <= j < prior.len() && prior[j]==id;
+                    assert(ids[j]==id && j<n);
+                }
+            }
+            assert(!table@.contains_key(id));
+        }
         let Some(r) = decode(id,loc) else {return Err(());};
         proof { extend_wave(initial@,selected(rows@.take(n as int)),table@,next@,id,r); }
         accept(&mut table,&mut next,id,r);
@@ -480,10 +545,14 @@ fn preload_closure<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::Obj
 {
     use crate::journal_preload::{preload,closed_on,selected,wave,outgoing,Error};
     let read = |t:PreloadTable,r:&[ReadRow]| -> (out:Result<(PreloadTable,PendingIds),()>)
-        requires btree_map_inv(&t),
+        requires btree_map_inv(&t), t@.dom().disjoint(selected(r@)),r@.map(|_,row:ReadRow|row.0).no_duplicates(),
         ensures out matches Ok((u,n)) ==> btree_map_inv(&u) && vstd::std_specs::btree::btree_set_inv(&n) &&
             wave(t@,selected(r@),u@,n@),
-    { read_wave(t,r,decode) };
+    {
+        let ordered = crate::indexed_frame::ordered(r);
+        proof { permute_frontier(r@,ordered@); }
+        read_wave(t,&ordered,decode)
+    };
     match preload(index,roots,read) {
         Ok(table) => {
             assert(table@.dom().union(Set::empty()) =~= table@.dom());
@@ -494,7 +563,13 @@ fn preload_closure<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::Obj
             assert forall|scope:Set<crate::ObjectId>| roots@.subset_of(scope) && #[trigger] closed_on(table@,scope)
                 implies table@.dom().subset_of(scope) by {};
         },
-        Err(Error::Missing(id)) => {assert(!index@.contains_key(id));},
+        Err(Error::Missing(id)) => { proof {
+            assert(!index@.contains_key(id));
+            assert(exists|t:Map<crate::ObjectId,crate::ObjectRecord>,f:Set<crate::ObjectId>|
+                #[trigger] crate::journal_preload::pending_failure(roots@,index@,t,f) &&
+                f.contains(id) && !t.contains_key(id) && (roots@.contains(id) ||
+                    exists|parent:crate::ObjectId| t.contains_key(parent) && #[trigger] outgoing(t,parent).contains(id)));
+        }},
         Err(Error::Read(e)) => {
             assert(crate::journal_preload::read_failure(roots@,index@,read,e));
             assert(exists|t:PreloadTable,r:&[ReadRow]| r.len()>0 &&

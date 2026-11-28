@@ -118,11 +118,20 @@ def consumer_defects():
         )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
+        ("request uniqueness", "rows@.map(|_,row:(ObjectId,ArenaLocation)| row.0).no_duplicates() &&", "true &&"),
+        ("missing identity", "Err(Error::Missing(k)) => missing_failure(roots@,index@,k)", "Err(Error::Missing(k)) => !index@.contains_key(k)"),
+    ]:
+        yield (
+            f"frontier refinement loses {label}", preload,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs") if label == "request uniqueness" else Path("verification/hosted_journal_history.rs"),
+        )
+    for label, clause, weaker in [
         ("indexed domain", "btree_map_inv(&t) && t@.dom().subset_of(index@.dom()) &&", "btree_map_inv(&t) &&"),
         ("root coverage", "covered(roots@,t@,Set::empty()) && reachable_only(roots@,t@,Set::empty())", "closed_on(t@,t@.dom()) && reachable_only(roots@,t@,Set::empty())"),
         ("owning coverage", "covered(roots@,t@,Set::empty()) && reachable_only(roots@,t@,Set::empty())", "roots@.subset_of(t@.dom()) && reachable_only(roots@,t@,Set::empty())"),
         ("least closure", "reachable_only(roots@,t@,Set::empty()),", "true,"),
-        ("missing index entry", "Err(Error::Missing(k)) => !index@.contains_key(k)", "Err(Error::Missing(k)) => true"),
+        ("missing index entry", "!index.contains_key(k) && exists|t:Map", "true && exists|t:Map"),
         ("batch read error", "Err(Error::Read(e)) => read_failure(roots@,index@,read,e)", "Err(Error::Read(e)) => true"),
     ]:
         yield (

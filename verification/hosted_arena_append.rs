@@ -557,6 +557,7 @@ fn preload_wave(frontier:&std::collections::BTreeSet<crate::ObjectId>,
         Ok(rows) => {
             let ghost ids = rows@.map(|_,row:(crate::ObjectId,frame::ArenaLocation)| row.0);
             proof {
+                assert(ids.no_duplicates());
                 ids.to_set_ensures();
                 assert(ids.to_set() =~= frontier@.difference(loaded@.dom()));
                 if rows.len() == 0 {

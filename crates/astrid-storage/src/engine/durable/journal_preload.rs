@@ -22,6 +22,7 @@ pub(super) fn requests(frontier: &BTreeSet<ObjectId>, loaded: &BTreeMap<ObjectId
     ensures match out {
         Ok(rows) => rows@.map(|_, row:(ObjectId,ArenaLocation)| row.0).to_set() ==
             frontier@.difference(loaded@.dom()) &&
+            rows@.map(|_,row:(ObjectId,ArenaLocation)| row.0).no_duplicates() &&
             forall|i:int| 0 <= i < rows.len() ==> index@.contains_key(#[trigger] rows@[i].0) &&
                 index@[rows@[i].0] == rows@[i].1,
         Err(id) => frontier@.contains(id) && !loaded@.contains_key(id) && !index@.contains_key(id),
@@ -32,7 +33,9 @@ pub(super) fn requests(frontier: &BTreeSet<ObjectId>, loaded: &BTreeMap<ObjectId
     let ghost mut left = frontier@.len() as int;
     loop
         invariant
-            left == iter.remaining().len(),
+            left == iter.remaining().len(), iter.remaining().no_duplicates(),
+            requested@.map(|_,row:(ObjectId,ArenaLocation)| row.0).no_duplicates(),
+            iter.remaining().unref().to_set().disjoint(requested@.map(|_,row:(ObjectId,ArenaLocation)| row.0).to_set()),
             btree_map_inv(loaded), btree_map_inv(index), obeys_cmp::<ObjectId>(), obeys_cmp_concrete_eq::<ObjectId>(),
             iter.remaining().unref().to_set().subset_of(frontier@),
             requested@.map(|_,row:(ObjectId,ArenaLocation)| row.0).to_set().union(
@@ -57,6 +60,31 @@ pub(super) fn requests(frontier: &BTreeSet<ObjectId>, loaded: &BTreeMap<ObjectId
         }
         proof { vstd::seq_lib::seq_to_set_distributes_over_add(seq![id],iter.remaining().unref()); }
         assert(remaining.unref().to_set() =~= iter.remaining().unref().to_set().insert(id));
+        proof {
+            let rest = iter.remaining();
+            assert forall|j:int| 0 <= j < rest.len() implies #[trigger] rest[j] != &id by {
+                assert(remaining[0] == &id && remaining[j+1] == rest[j]);
+            }
+            rest.unref().to_set_ensures();
+            assert(!rest.unref().contains(id)) by {
+                if rest.unref().contains(id) {
+                    let j = choose|j:int| 0 <= j < rest.len() && rest.unref()[j] == id;
+                    assert(*rest[j] == id);
+                }
+            }
+            assert forall|a:int,b:int| 0 <= a < b < rest.len() implies #[trigger] rest[a] != #[trigger] rest[b] by {
+                assert(remaining[a+1] == rest[a] && remaining[b+1] == rest[b]);
+            }
+            let previous = prefix.map(|_,row:(ObjectId,ArenaLocation)| row.0);
+            assert(remaining.unref().to_set().contains(id));
+            assert(!previous.to_set().contains(id));
+            previous.to_set_ensures();
+            assert(previous.push(id).no_duplicates()) by {
+                assert forall|a:int,b:int| 0 <= a < b < previous.len()+1 implies #[trigger] previous.push(id)[a] != #[trigger] previous.push(id)[b] by {
+                    if b == previous.len() {assert(previous.contains(previous[a]));}
+                }
+            }
+        }
         if !loaded.contains_key(&id) {
             let Some(&location) = index.get(&id) else { return Err(id); };
             requested.push((id,location));
@@ -169,6 +197,15 @@ pub(super) open spec fn pending_failure(roots:Set<ObjectId>,index:Map<ObjectId,A
     t.dom().subset_of(index.dom()) && covered(roots,t,frontier) && reachable_only(roots,t,frontier)
 }
 
+pub(super) open spec fn discovered(roots:Set<ObjectId>,t:Map<ObjectId,ObjectRecord>,k:ObjectId) -> bool {
+    roots.contains(k) || exists|parent:ObjectId| t.contains_key(parent) && #[trigger] outgoing(t,parent).contains(k)
+}
+
+pub(super) open spec fn missing_failure(roots:Set<ObjectId>,index:Map<ObjectId,ArenaLocation>,k:ObjectId) -> bool {
+    !index.contains_key(k) && exists|t:Map<ObjectId,ObjectRecord>,f:Set<ObjectId>|
+        #[trigger] pending_failure(roots,index,t,f) && f.contains(k) && !t.contains_key(k) && discovered(roots,t,k)
+}
+
 pub(super) open spec fn read_failure<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
     roots:Set<ObjectId>,index:Map<ObjectId,ArenaLocation>,read:V,e:E) -> bool {
     exists|t:Table,r:&[Row],f:Set<ObjectId>| #[trigger] pending_failure(roots,index,t@,f) && r.len()>0 &&
@@ -182,13 +219,14 @@ pub(super) open spec fn read_failure<E,V:Fn(Table,&[Row])->Result<(Table,Frontie
 pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
     index:&BTreeMap<ObjectId,ArenaLocation>,roots:Frontier,read:V) -> (out:Result<Table,Error<E>>)
     requires btree_map_inv(index), btree_set_inv(&roots), obeys_cmp::<ObjectId>(), obeys_cmp_concrete_eq::<ObjectId>(),
-        forall|t:Table,r:&[Row]| btree_map_inv(&t) && t@.dom().disjoint(selected(r@)) ==> #[trigger] read.requires((t,r)),
+        forall|t:Table,r:&[Row]| btree_map_inv(&t) && t@.dom().disjoint(selected(r@)) &&
+                r@.map(|_,row:Row| row.0).no_duplicates() ==> #[trigger] read.requires((t,r)),
         forall|t:Table,r:&[Row],u:Table,n:Frontier| #[trigger] read.ensures((t,r),Ok((u,n))) ==>
             btree_map_inv(&u) && btree_set_inv(&n) && wave(t@,selected(r@),u@,n@),
     ensures match out {
         Ok(t) => btree_map_inv(&t) && t@.dom().subset_of(index@.dom()) &&
             covered(roots@,t@,Set::empty()) && reachable_only(roots@,t@,Set::empty()),
-        Err(Error::Missing(k)) => !index@.contains_key(k),
+        Err(Error::Missing(k)) => missing_failure(roots@,index@,k),
         Err(Error::Read(e)) => read_failure(roots@,index@,read,e),
     },
 {
@@ -197,8 +235,10 @@ pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
     loop
         invariant btree_map_inv(index),btree_map_inv(&table),btree_set_inv(&pending),
             obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+            forall|k:ObjectId| pending@.contains(k) ==> #[trigger] discovered(roots@,table@,k),
             table@.dom().subset_of(index@.dom()),covered(roots@,table@,pending@),reachable_only(roots@,table@,pending@),
-            forall|t:Table,r:&[Row]| btree_map_inv(&t) && t@.dom().disjoint(selected(r@)) ==> #[trigger] read.requires((t,r)),
+            forall|t:Table,r:&[Row]| btree_map_inv(&t) && t@.dom().disjoint(selected(r@)) &&
+                r@.map(|_,row:Row| row.0).no_duplicates() ==> #[trigger] read.requires((t,r)),
             forall|t:Table,r:&[Row],u:Table,n:Frontier| #[trigger] read.ensures((t,r),Ok((u,n))) ==>
                 btree_map_inv(&u) && btree_set_inv(&n) && wave(t@,selected(r@),u@,n@),
         decreases index@.dom().len() as int - table@.dom().len(),
@@ -206,7 +246,15 @@ pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
         let ghost frontier = pending@;
         let rows = {
             let current = pending;
-            match requests(&current,&table,index) {Ok(r)=>r,Err(k)=>return Err(Error::Missing(k))}
+            match requests(&current,&table,index) {
+                Ok(r)=>r,
+                Err(k)=>{
+                    assert(discovered(roots@,table@,k));
+                    assert(pending_failure(roots@,index@,table@,frontier));
+                    assert(missing_failure(roots@,index@,k));
+                    return Err(Error::Missing(k));
+                },
+            }
         };
         let ghost keys = selected(rows@);
         let ghost earlier = table@;
@@ -246,6 +294,10 @@ pub(super) fn preload<E,V:Fn(Table,&[Row])->Result<(Table,Frontier),E>>(
             }
             assert(wave(earlier,keys,table@,pending@));
             advance(roots@,earlier,frontier,table@,pending@);
+            assert forall|k:ObjectId| pending@.contains(k) implies #[trigger] discovered(roots@,table@,k) by {
+                let id = choose|id:ObjectId| keys.contains(id) && #[trigger] outgoing(table@,id).contains(k);
+                assert(table@.contains_key(id));
+            }
             assert(ids[0] == rows@[0].0 && ids.contains(rows@[0].0));
             assert(keys.contains(rows@[0].0));
             earlier.dom().lemma_subset_not_in_lt(table@.dom(),rows@[0].0);
