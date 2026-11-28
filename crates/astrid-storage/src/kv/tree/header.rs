@@ -456,13 +456,18 @@ where
         use super::delta_totals::ApplyError;
         overlay
             .apply(totals, mutation, |key, slot, needs_checkpoint| {
-                let prior = if needs_checkpoint {
-                    context.get(tree, key)?
-                } else {
-                    None
-                };
-                let replacement = slot.as_ref().map(|v| context.value_bytes(v)).transpose()?;
-                Ok((prior, replacement))
+                super::replay_values::resolve(
+                    &mut *context,
+                    tree,
+                    key,
+                    slot.as_ref(),
+                    needs_checkpoint,
+                    |context, base, address| {
+                        let prior = context.get(base, address)?;
+                        Ok((context, prior))
+                    },
+                    |context, value| context.value_bytes(value),
+                )
             })
             .map_err(|error| match error {
                 ApplyError::Load(e) => e,

@@ -353,6 +353,8 @@ mod delta_totals;
 mod spill_record;
 #[path = "../crates/astrid-storage/src/kv/tree/projection_record.rs"]
 mod projection_record;
+#[path = "../crates/astrid-storage/src/kv/tree/replay_values.rs"]
+mod replay_values;
 mod hosted_projection_record;
 mod hosted_spill_record;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_batch.rs"]
@@ -364,6 +366,7 @@ mod hosted_delta_replay;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_header.rs"]
 mod delta_header;
 mod hosted_delta_mutation;
+mod hosted_replay_values;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_entries.rs"]
 mod checkpoint_entries;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_leaf_summary.rs"]

@@ -209,6 +209,19 @@ def consumer_defects():
             f"delta chain loses {label}", chain,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_chain.rs"),
         )
+    values = Path("crates/astrid-storage/src/kv/tree/replay_values.rs")
+    for label, clause, weaker in [
+        ("prior bytes", "pair.0 == prior && replacement", "replacement"),
+        ("deletion", "None => out == Ok(None)", "None => true"),
+        ("value resolution", "Ok(Some(bytes)) => value.ensures((context,v),Ok(bytes))", "Ok(Some(bytes)) => true"),
+        ("value failure", "Err(e) => value.ensures((context,v),Err(e))", "Err(e) => true"),
+        ("lookup failure", "out matches Err(e) && lookup.ensures((context,tree,key),Err(e))", "out is Err"),
+        ("overlay hit", "else {after_prior(context,None,slot,value,out)}", "else {true}"),
+    ]:
+        yield (
+            f"replay value resolution loses {label}", values,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_replay_values.rs"),
+        )
     fold = Path("crates/astrid-storage/src/kv/tree/delta_replay.rs")
     for label, clause, weaker in [
         ("success history", "out matches Ok(c) ==> replayed(initial,base,tree,input@,0,apply,c)", "out matches Ok(c) ==> true"),

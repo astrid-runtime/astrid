@@ -80,6 +80,7 @@ mod overlay;
 mod performance_tests;
 mod projection_record;
 mod publication;
+mod replay_values;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod retirement_tests;
 mod spill_record;
