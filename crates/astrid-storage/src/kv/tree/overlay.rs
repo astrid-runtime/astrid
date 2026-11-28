@@ -10,7 +10,7 @@ pub(super) struct OverlayMap {
     root: Option<Arc<Node>>,
 }
 
-use super::{checkpoint_value, delta_mutation, key_projection};
+use super::{checkpoint_totals, checkpoint_value, delta_mutation, delta_totals, key_projection};
 use crate::kv::encoding;
 mod range;
 mod traversal;
@@ -24,6 +24,14 @@ impl OverlayMap {
 
     pub(super) fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
         update::put(&mut self.root, key, value);
+    }
+
+    pub(super) fn replay(
+        &mut self,
+        change: delta_totals::Prepared,
+        totals: &mut checkpoint_totals::NodeTotals,
+    ) {
+        update::replay(&mut self.root, change, totals);
     }
 
     pub(super) fn stage<E>(

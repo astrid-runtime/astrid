@@ -308,7 +308,13 @@ where
                     "KV mutation batch contains a no-op".to_owned(),
                 ));
             }
-            update_totals(&mut totals, &key, previous_len, replacement.as_deref())?;
+            totals = super::delta_totals::update(
+                totals,
+                key.len(),
+                previous_len,
+                replacement.as_ref().map(Vec::len),
+            )
+            .map_err(|_| arithmetic_overflow())?;
             mutations.push(current.stage(key, replacement, |data| {
                 super::delta_mutation::encode(data, |bytes, length| {
                     self.spill_value(bytes.into(), length)
@@ -571,43 +577,6 @@ where
         }
         self.records.retain(|object, _| reachable.contains(object));
     }
-}
-
-fn update_totals(
-    totals: &mut NodeTotals,
-    key: &[u8],
-    previous: Option<usize>,
-    replacement: Option<&[u8]>,
-) -> StorageResult<()> {
-    let key_bytes = u64::try_from(key.len()).map_err(|_| arithmetic_overflow())?;
-    let previous_bytes = previous.map_or(0, |length| length as u64);
-    let replacement_bytes = replacement.map_or(0, |value| value.len() as u64);
-    totals.entries = match (previous, replacement) {
-        (None, Some(_)) => totals.entries.checked_add(1),
-        (Some(_), None) => totals.entries.checked_sub(1),
-        _ => Some(totals.entries),
-    }
-    .ok_or_else(arithmetic_overflow)?;
-    totals.logical_bytes = totals
-        .logical_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(arithmetic_overflow)?;
-    totals.quota_bytes = totals
-        .quota_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| {
-            if previous.is_none() {
-                total.checked_add(key_bytes)
-            } else if replacement.is_none() {
-                total.checked_sub(key_bytes)
-            } else {
-                Some(total)
-            }
-        })
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(arithmetic_overflow)?;
-    Ok(())
 }
 
 pub(super) fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {

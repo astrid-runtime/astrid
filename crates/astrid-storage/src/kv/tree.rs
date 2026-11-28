@@ -58,6 +58,7 @@ mod delta_batch;
 mod delta_header;
 mod delta_mutation;
 mod delta_recovery;
+mod delta_totals;
 mod handoff;
 mod header;
 mod hot_cache;

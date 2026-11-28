@@ -152,6 +152,22 @@ def consumer_defects():
             f"delta recovery loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
         )
+    totals = Path("crates/astrid-storage/src/kv/tree/delta_totals.rs")
+    overlay = Path("crates/astrid-storage/src/kv/tree/overlay/update.rs")
+    for label, path, clause, weaker in [
+        ("accounting exactness", totals, "out == changed(old,key as nat", "true || out == changed(old,key as nat"),
+        ("unchanged refusal", totals, "out == Err(ReplayError::Unchanged)", "true"),
+        ("accounting rejection", totals, "Err(e) => out == Err(ReplayError::Accounting(e))", "Err(e) => true"),
+        ("resolved key", totals, "p.key@ == key@ && p.value == value", "p.value == value"),
+        ("resolved value", totals, "p.value == value && p.totals == t", "p.totals == t"),
+        ("prepared totals", totals, "&& p.totals == t", ""),
+        ("installed totals", overlay, "ensures *final(totals) == change.totals", "ensures true"),
+        ("unrelated overlay keys", overlay, "Some(change.value)} else {lookup_spec(*old(root),q)}", "Some(change.value)} else {lookup_spec(*final(root),q)}"),
+    ]:
+        yield (
+            f"replay application loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

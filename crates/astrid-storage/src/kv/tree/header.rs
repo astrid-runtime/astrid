@@ -461,51 +461,31 @@ where
             .as_ref()
             .map(|value| context.value_bytes(value))
             .transpose()?;
-        if previous == replacement.as_deref() {
-            return Err(invalid(object, "KV delta contains a no-op mutation"));
-        }
-        update_totals(totals, &mutation.key, previous, replacement.as_deref())?;
-        overlay.insert(mutation.key.clone(), replacement);
+        let prepared = super::delta_totals::prepare(*totals, &mutation.key, previous, replacement)
+            .map_err(|error| match error {
+                super::delta_totals::ReplayError::Unchanged => {
+                    invalid(object, "KV delta contains a no-op mutation")
+                },
+                super::delta_totals::ReplayError::Accounting(cause) => {
+                    replay_accounting_error(cause)
+                },
+            })?;
+        overlay.replay(prepared, totals);
     }
     Ok(())
 }
 
-fn update_totals(
-    totals: &mut NodeTotals,
-    key: &[u8],
-    previous: Option<&[u8]>,
-    replacement: Option<&[u8]>,
-) -> StorageResult<()> {
-    let key_bytes = u64::try_from(key.len())
-        .map_err(|_| StorageError::Internal("KV key length overflow".to_owned()))?;
-    let previous_bytes = previous.map_or(0, |value| value.len() as u64);
-    let replacement_bytes = replacement.map_or(0, |value| value.len() as u64);
-    totals.entries = match (previous, replacement) {
-        (None, Some(_)) => totals.entries.checked_add(1),
-        (Some(_), None) => totals.entries.checked_sub(1),
-        _ => Some(totals.entries),
-    }
-    .ok_or_else(|| StorageError::Internal("KV entry total overflow".to_owned()))?;
-    totals.logical_bytes = totals
-        .logical_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(|| StorageError::Internal("KV logical total overflow".to_owned()))?;
-    totals.quota_bytes = totals
-        .quota_bytes
-        .checked_sub(previous_bytes)
-        .and_then(|total| {
-            if previous.is_none() {
-                total.checked_add(key_bytes)
-            } else if replacement.is_none() {
-                total.checked_sub(key_bytes)
-            } else {
-                Some(total)
-            }
-        })
-        .and_then(|total| total.checked_add(replacement_bytes))
-        .ok_or_else(|| StorageError::Internal("KV quota total overflow".to_owned()))?;
-    Ok(())
+fn replay_accounting_error(error: super::delta_totals::Error) -> StorageError {
+    use super::delta_totals::Error;
+    StorageError::Internal(
+        match error {
+            Error::Key => "KV key length overflow",
+            Error::Entries => "KV entry total overflow",
+            Error::Logical => "KV logical total overflow",
+            Error::Quota => "KV quota total overflow",
+        }
+        .to_owned(),
+    )
 }
 
 pub(super) fn load_typed<P, E>(

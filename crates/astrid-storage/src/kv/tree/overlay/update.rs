@@ -14,6 +14,18 @@ use vstd::prelude::*;
 
 verus! {
 
+/// Install the addressed bytes and accounting of the same admitted replay row.
+pub(super) fn replay(root:&mut Option<Arc<Node>>,change:super::delta_totals::Prepared,
+    totals:&mut super::checkpoint_totals::NodeTotals)
+    requires ordered(*old(root)),
+    ensures *final(totals) == change.totals, ordered(*final(root)),
+        forall|q:Seq<u8>| #[trigger] lookup_spec(*final(root),q) ==
+            if q == change.key@ {Some(change.value)} else {lookup_spec(*old(root),q)},
+{
+    *totals = change.totals;
+    put(root,change.key,change.value);
+}
+
 /// Stage the resolved bytes and return the corresponding durable mutation.
 pub(super) fn stage<E,F:FnOnce(&Vec<u8>)->Result<ValueSlot,E>>(
     root:&mut Option<Arc<Node>>, key:Vec<u8>, replacement:Option<Vec<u8>>, encode:F,

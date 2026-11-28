@@ -380,4 +380,45 @@ fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64
         }
     }
 }
+
+fn apply_insert(key:&[u8],data:Vec<u8>,prior:crate::checkpoint_totals::NodeTotals,
+    root:&mut Option<std::sync::Arc<crate::traversal::Node>>)
+    requires crate::traversal::ordered(*old(root)),prior.entries < u64::MAX,
+        prior.logical_bytes as int + data.len() <= u64::MAX,
+        prior.quota_bytes as int + key.len() + data.len() <= u64::MAX,
+    ensures forall|q:Seq<u8>| #[trigger] crate::traversal::lookup_spec(*final(root),q) ==
+        if q == key@ {Some(Some(data))} else {crate::traversal::lookup_spec(*old(root),q)},
+{
+    let wrote = crate::delta_totals::update(prior,key.len(),None,Some(data.len()));
+    let got = crate::delta_totals::prepare(prior,key,None,Some(data));
+    assert(got.is_ok());
+    let Ok(p) = got else {unreached()};
+    let mut totals = prior;
+    crate::overlay_update::replay(root,p,&mut totals);
+    assert(wrote == Ok(totals));
+    assert(totals.entries == prior.entries as int+1 && totals.logical_bytes == prior.logical_bytes as int + data.len() &&
+        totals.quota_bytes == prior.quota_bytes as int + key.len() + data.len());
+}
+
+fn replay_noop(old:crate::checkpoint_totals::NodeTotals,key:&[u8],before:&[u8],after:Vec<u8>)
+    requires before@ == after@,
+{
+    let out = crate::delta_totals::prepare(old,key,Some(before),Some(after));
+    assert(out == Err(crate::delta_totals::ReplayError::Unchanged));
+}
+
+fn replay_delete(key:&[u8],prior:&[u8],totals:crate::checkpoint_totals::NodeTotals) {
+    use crate::delta_totals::{prepare,ReplayError,Error};
+    let out = prepare(totals,key,Some(prior),None);
+    proof {
+        if totals.entries == 0 {assert(out == Err(ReplayError::Accounting(Error::Entries)));}
+        else if totals.logical_bytes < prior.len() {assert(out == Err(ReplayError::Accounting(Error::Logical)));}
+        else if totals.quota_bytes < prior.len()+key.len() {assert(out == Err(ReplayError::Accounting(Error::Quota)));}
+        else {
+            assert(out matches Ok(p) && p.key@ == key@ && p.value.is_none() &&
+                p.totals.entries+1 == totals.entries && p.totals.logical_bytes+prior.len() == totals.logical_bytes &&
+                p.totals.quota_bytes+key.len()+prior.len() == totals.quota_bytes);
+        }
+    }
+}
 }
