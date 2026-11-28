@@ -148,6 +148,69 @@ pub(super) fn materialize(
     Ok(rows)
 }
 
+/// Origin of a declared record during live commit preparation. Reusing an
+/// existing record still requires the caller to compare its complete contents.
+pub(super) enum Placement<'a,P,L> { Unreachable, Pending(&'a P), Indexed(L), NewCommit, NewObject }
+
+pub(super) fn placement<'a,P,L:Copy>(id:ObjectId,commit:ObjectId,reachable:&BTreeSet<ObjectId>,
+    pending:&'a BTreeMap<ObjectId,P>,index:&BTreeMap<ObjectId,L>) -> (out:Placement<'a,P,L>)
+    requires obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        vstd::std_specs::btree::btree_set_inv(reachable),btree_map_inv(pending),btree_map_inv(index),
+    ensures match out {
+        Placement::Unreachable=>!reachable@.contains(id),
+        Placement::Pending(record)=>reachable@.contains(id) && pending@.contains_key(id) && *record==pending@[id],
+        Placement::Indexed(location)=>reachable@.contains(id) && !pending@.contains_key(id) && index@.contains_key(id) && location==index@[id],
+        Placement::NewCommit=>reachable@.contains(id) && !pending@.contains_key(id) && !index@.contains_key(id) && id==commit,
+        Placement::NewObject=>reachable@.contains(id) && !pending@.contains_key(id) && !index@.contains_key(id) && id!=commit,
+    },
+{
+    if !reachable.contains(&id) { return Placement::Unreachable; }
+    if let Some(record)=pending.get(&id) { return Placement::Pending(record); }
+    if let Some(location)=index.get(&id) { return Placement::Indexed(*location); }
+    if id.same(&commit) {Placement::NewCommit} else {Placement::NewObject}
+}
+
+pub(super) enum Fresh { Commit, Object }
+pub(super) enum PlacementError<E> { Collision(ObjectId), Read(E) }
+
+/// A record can be omitted at an existing address only when its full contents
+/// match. A failed indexed read propagates unchanged to the transaction.
+pub(super) fn prepare_row<'a,P,L,E,F,R>(route:Placement<'a,P,L>,id:ObjectId,record:&ObjectRecord,
+    pending:F,read:R) -> (out:Result<Option<Fresh>,PlacementError<E>>)
+    where F:FnOnce(&'a P)->&'a ObjectRecord,R:FnOnce(ObjectId,L)->Result<ObjectRecord,E>,
+    requires vstd::laws_eq::obeys_concrete_eq::<ObjectRecord>(),
+        route matches Placement::Pending(p) ==> pending.requires((p,)),
+        route matches Placement::Indexed(loc) ==> read.requires((id,loc)),
+    ensures match route {
+        Placement::Unreachable=>out matches Ok(None),
+        Placement::NewCommit=>out matches Ok(Some(Fresh::Commit)),
+        Placement::NewObject=>out matches Ok(Some(Fresh::Object)),
+        Placement::Pending(p)=>exists|r:&ObjectRecord| #[trigger] pending.ensures((p,),r) &&
+            (if *r==*record {out matches Ok(None)} else {out matches Err(PlacementError::Collision(k)) && k==id}),
+        Placement::Indexed(loc)=>match out {
+            Ok(None)=>read.ensures((id,loc),Ok(*record)),
+            Err(PlacementError::Read(e))=>read.ensures((id,loc),Err(e)),
+            Err(PlacementError::Collision(k))=>k==id && exists|r:ObjectRecord| r!=*record && #[trigger] read.ensures((id,loc),Ok(r)),
+            _=>false,
+        },
+    },
+{
+    proof {reveal(vstd::laws_eq::obeys_concrete_eq);}
+    match route {
+        Placement::Unreachable=>Ok(None),
+        Placement::NewCommit=>Ok(Some(Fresh::Commit)),
+        Placement::NewObject=>Ok(Some(Fresh::Object)),
+        Placement::Pending(p)=>{
+            let existing=pending(p);
+            if existing==record {Ok(None)} else {Err(PlacementError::Collision(id))}
+        },
+        Placement::Indexed(loc)=>match read(id,loc) {
+            Ok(existing)=>if existing==*record {Ok(None)} else {Err(PlacementError::Collision(id))},
+            Err(e)=>Err(PlacementError::Read(e)),
+        },
+    }
+}
+
 pub(super) enum CommitError { Missing, WrongKind(ObjectKind) }
 
 /// The checked graph traversal has already admitted all owning edges. Check

@@ -794,28 +794,37 @@ where
         let mut objects = Vec::new();
         let mut commit_frame = None;
         for (id, record) in unique {
-            if !reachable.contains(&id) {
+            use super::closure_load::{Fresh, PlacementError};
+            let destination = super::closure_load::placement(
+                id,
+                commit_id,
+                &reachable,
+                inner.pending_wal.object_index(),
+                &inner.index,
+            );
+            let Some(fresh) = super::closure_load::prepare_row(
+                destination,
+                id,
+                &record,
+                |object| object.record(),
+                |id, location| {
+                    let files = live_files_mut(&mut inner.files)?;
+                    read_indexed_object(&files.arena, id, location, &self.identity, self.limits)
+                },
+            )
+            .map_err(|error| match error {
+                PlacementError::Collision(id) => {
+                    DurableError::from(ModelError::ObjectCollision(id))
+                },
+                PlacementError::Read(error) => error,
+            })?
+            else {
                 continue;
-            }
-            if let Some(existing) = inner.pending_wal.get_object(&id) {
-                if existing.record() != &record {
-                    return Err(ModelError::ObjectCollision(id).into());
-                }
-                continue;
-            }
-            if let Some(location) = inner.index.get(&id).copied() {
-                let files = live_files_mut(&mut inner.files)?;
-                let existing =
-                    read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;
-                if existing != record {
-                    return Err(ModelError::ObjectCollision(id).into());
-                }
-                continue;
-            }
+            };
             let payload: Arc<[u8]> =
                 encode_object_frame(self.identity.scheme(), id, &record)?.into();
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
-            if id == commit_id {
+            if matches!(fresh, Fresh::Commit) {
                 commit_frame = Some((id, payload));
             } else {
                 objects.push((id, payload));

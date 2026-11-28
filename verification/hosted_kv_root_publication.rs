@@ -150,4 +150,97 @@ pub(crate) fn materialize<'a,P>(g:&Graph<P>,table:&'a BTreeMap<ObjectId,ObjectRe
     }
     Ok(rows)
 }
+
+spec fn skippable(id:ObjectId,root:ObjectId,state:ObjectId,component:ObjectId,cached:Set<ObjectId>) -> bool {
+    id!=root && ((id==state && cached.contains(root)) ||
+        (id==component && (cached.contains(root) || cached.contains(state))))
+}
+
+/// Use the same incremental owning walk and placement selector as live preparation.
+/// A validated ancestor can stop traversal. A fresh uncached path reaches
+/// every record even when unrelated declarations are included in the graph.
+fn graph_placement<'a,P,T,L:Copy>(g:&Graph<P>,id:ObjectId,table:&BTreeMap<ObjectId,ObjectRecord>,v:ObjectFormatVersion,
+    cached:&std::collections::BTreeSet<ObjectId>,pending:&'a BTreeMap<ObjectId,T>,index:&BTreeMap<ObjectId,L>)
+    -> (out:Result<crate::closure_load::Placement<'a,T,L>,crate::closure_walk::Failure<ObjectId,ObjectId>>)
+    requires g.records@.contains_key(id),g.links(g.selected.binding().0,g.selected.binding().1,g.records@[g.component],v),
+        obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),btree_map_inv(table),
+        btree_map_inv(pending),btree_map_inv(index),vstd::std_specs::btree::btree_set_inv(cached),
+        forall|id:ObjectId| #[trigger] g.records@.contains_key(id) ==> table@.contains_key(id) && table@[id]==g.records@[id],
+    ensures out matches Ok(route) ==> match route {
+        crate::closure_load::Placement::Unreachable=>skippable(id,g.selected.binding().2.commit,g.state,g.component,cached@),
+        crate::closure_load::Placement::Pending(r)=>pending@.contains_key(id) && *r==pending@[id],
+        crate::closure_load::Placement::Indexed(loc)=>!pending@.contains_key(id) && index@.contains_key(id) && loc==index@[id],
+        crate::closure_load::Placement::NewCommit=>id==g.selected.binding().2.commit && !pending@.contains_key(id) && !index@.contains_key(id),
+        crate::closure_load::Placement::NewObject=>id!=g.selected.binding().2.commit && !pending@.contains_key(id) && !index@.contains_key(id),
+    },
+{
+    use crate::closure_walk::Source;
+    let mut src=crate::closure_load::Preload(table);
+    let root=g.selected.replacement().commit;
+    let seen=crate::closure_walk::walk(&mut src,cached,root)?;
+    proof {
+        let edges=src.edges();
+        assert(g.records@.contains_key(root) && g.records@.contains_key(g.state));
+        selected_child(table@[root],header_graph::STATE@,g.state);
+        selected_child(table@[g.state],header_graph::KV@,g.component);
+        assert(edges.contains_key(root) && edges.contains_key(g.state));
+        assert(edges[root].contains(g.state) && edges[g.state].contains(g.component));
+        if !cached@.contains(root) {
+            assert(seen@.contains(g.state));
+            if !cached@.contains(g.state) {assert(seen@.contains(g.component));}
+        }
+        assert(id==root || id==g.state || id==g.component);
+    }
+    Ok(crate::closure_load::placement(id,root,&seen,pending,index))
+}
+
+fn borrowed(record:&ObjectRecord) -> (out:&ObjectRecord) ensures *out==*record {record}
+
+enum Prepared { Omitted, Fresh(crate::closure_load::Fresh,Vec<u8>) }
+enum PrepareError<E> { Closure(crate::closure_walk::Failure<ObjectId,ObjectId>), Collision(ObjectId), Read(E) }
+
+/// Prepare any of the three declarations against the same source table and
+/// existing destinations. A reused address must contain the declared record.
+fn prepare_graph_row<P,L:Copy,E,R>(g:&Graph<P>,id:ObjectId,table:&BTreeMap<ObjectId,ObjectRecord>,v:ObjectFormatVersion,
+    cached:&std::collections::BTreeSet<ObjectId>,pending:&BTreeMap<ObjectId,ObjectRecord>,index:&BTreeMap<ObjectId,L>,
+    scheme:crate::root_wire::Scheme,read:R)
+    -> (out:Result<Prepared,PrepareError<E>>)
+    where R:FnOnce(ObjectId,L)->Result<ObjectRecord,E>,
+    requires g.links(g.selected.binding().0,g.selected.binding().1,g.records@[g.component],v),g.records@.contains_key(id),
+        obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),obeys_concrete_eq::<ObjectRecord>(),
+        btree_map_inv(table),btree_map_inv(&g.records),btree_map_inv(pending),btree_map_inv(index),
+        vstd::std_specs::btree::btree_set_inv(cached),
+        forall|k:ObjectId| #[trigger] g.records@.contains_key(k) ==> table@.contains_key(k) && table@[k]==g.records@[k],
+        forall|loc:L| #[trigger] read.requires((id,loc)),
+    ensures ({
+        let root=g.selected.binding().2.commit;
+        let row=g.records@[id];
+        match out {
+            Ok(Prepared::Omitted)=>skippable(id,root,g.state,g.component,cached@) ||
+                (pending@.contains_key(id) && pending@[id]==row) ||
+                (!pending@.contains_key(id) && index@.contains_key(id) && read.ensures((id,index@[id]),Ok(row))),
+            Ok(Prepared::Fresh(kind,bytes))=>{
+                let f=row.contents();
+                &&& !pending@.contains_key(id) && !index@.contains_key(id)
+                &&& (kind is Commit)==(id==root)
+                &&& bytes@==scheme.algorithm@+scheme.construction@+seq![32u8,0u8,0u8,0u8]+id.digest()+
+                    crate::verified_record::header_wire(f.0,f.1,f.5)+crate::verified_record::payload_wire(f.4,f.2,f.3.len() as usize)+
+                    crate::verified_record::reference_prefix(f.3,f.3.len(),scheme)
+            },
+            Err(PrepareError::Read(e))=>!pending@.contains_key(id) && index@.contains_key(id) && read.ensures((id,index@[id]),Err(e)),
+            Err(PrepareError::Collision(k))=>k==id && ((pending@.contains_key(id) && pending@[id]!=row) ||
+                (!pending@.contains_key(id) && index@.contains_key(id) && exists|r:ObjectRecord| r!=row && #[trigger] read.ensures((id,index@[id]),Ok(r)))),
+            Err(PrepareError::Closure(_))=>true,
+        }
+    }),
+{
+    let route=match graph_placement(g,id,table,v,cached,pending,index) {Ok(r)=>r,Err(e)=>return Err(PrepareError::Closure(e))};
+    let row=g.records.get(&id).unwrap();
+    match crate::closure_load::prepare_row(route,id,row,borrowed,read) {
+        Ok(None)=>Ok(Prepared::Omitted),
+        Ok(Some(kind))=>Ok(Prepared::Fresh(kind,crate::verified_record::encode(scheme,id,row).unwrap())),
+        Err(crate::closure_load::PlacementError::Collision(k))=>Err(PrepareError::Collision(k)),
+        Err(crate::closure_load::PlacementError::Read(e))=>Err(PrepareError::Read(e)),
+    }
+}
 }

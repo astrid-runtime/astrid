@@ -125,3 +125,25 @@ def consumer_defects():
         lambda s: replace_once(s, "&&& walk::closed(root,Set::empty(),graph,ids)", "&&& true"),
         publication,
     )
+
+    placement = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
+    for label, clause, weaker in [
+        ("uncached path", "Placement::Unreachable=>!reachable@.contains(id)", "Placement::Unreachable=>true"),
+        ("pending contents", "&& *record==pending@[id],", ","),
+        ("arena location", "&& location==index@[id],", ","),
+        ("commit identity", "&& id==commit,", ","),
+    ]:
+        yield (
+            f"live marker placement loses {label}", placement,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), publication,
+        )
+
+    for label, clause, weaker in [
+        ("pending equality", "(if *r==*record {out matches Ok(None)} else {out matches Err(PlacementError::Collision(k)) && k==id})", "(out matches Ok(None) || out matches Err(PlacementError::Collision(k)) && k==id)"),
+        ("indexed contents", "Ok(None)=>read.ensures((id,loc),Ok(*record)),", "Ok(None)=>true,"),
+        ("indexed error identity", "Err(PlacementError::Read(e))=>read.ensures((id,loc),Err(e)),", "Err(PlacementError::Read(_))=>true,"),
+    ]:
+        yield (
+            f"prepared graph row loses {label}", placement,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), publication,
+        )
