@@ -320,6 +320,22 @@ def marker_batch_consumers():
     record = Path("crates/astrid-storage/src/kv/tree/checkpoint_record.rs")
     record_reader = Path("verification/hosted_checkpoint_record.rs")
     for label, clause, weaker in [
+        ("staged page", "scheduled_result(page,&staged@[id],version,validate,out)", "true"),
+        ("engine owner and ID", "#[trigger] engine.ensures((owner,id),Ok(Some(r)))",
+         "(#[trigger] engine.ensures((owner,id),Ok(Some(r))) || true)"),
+        ("missing ID", "engine.ensures((owner,id),Ok(None)) && missing.ensures((id,),e)",
+         "engine.ensures((owner,id),Ok(None))"),
+    ]:
+        yield (
+            f"owner page selection loses {label}", record,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), record_reader,
+        )
+    for label, clause, weaker in [
+        ("scheduled summary", "checkpoint_page::agrees(*page,Handle {object:checkpoint_page::object(*page),node:n}) &&", "true &&"),
+        ("decode rejection", "=> refusal(record,validate,e) && match e", "=> true && match e"),
+        ("summary mismatch", "!checkpoint_page::agrees(*page,Handle {object:checkpoint_page::object(*page),node:n})", "true"),
+        ("kind error precedence", "EnvelopeError::Kind) => record.contents().1 == version.number() &&",
+         "EnvelopeError::Kind) => true &&"),
         ("record version", "&&& record.contents().1 == version.number() &&", "&&& true &&"),
         ("record binding", "body == n.contents()", "true"),
         ("source failure", "=> load.ensures((checkpoint_page::object(*page),),Err(e))", "=> true"),

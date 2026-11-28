@@ -30,10 +30,17 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             state,
             |page| {
                 let object = page.object();
-                checkpoint_record::load_scheduled(
+                checkpoint_record::owner_page(
+                    &self.records,
+                    self.principal(),
                     &page,
                     super::FORMAT_VERSION,
-                    |id| self.record(id),
+                    |owner, id| {
+                        self.engine
+                            .load_kv_object_for(owner, id)
+                            .map_err(|e| super::map_engine(&e))
+                    },
+                    |id| super::map_engine(&super::ModelError::MissingObject(id).into()),
                     |key| super::super::validation::validate_composite_key(object, key),
                 )
                 .map_err(|error| match error {

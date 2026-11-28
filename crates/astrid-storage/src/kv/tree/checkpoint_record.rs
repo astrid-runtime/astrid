@@ -3,7 +3,13 @@ use super::checkpoint_page::{self, Handle, Node};
 use super::checkpoint_range::Page;
 use super::checkpoint_walk::Contents;
 use super::{ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord};
+use std::collections::BTreeMap;
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
+    std_specs::btree::btree_map_inv,
+};
 
 #[cfg(verus_keep_ghost)]
 use super::checkpoint_branch::Header;
@@ -214,7 +220,9 @@ pub(super) open spec fn scheduled_result<E,F:Fn(&[u8])->Result<(),E>>(
         Err(ScheduledError::Record(e)) => refusal(record,validate,e) && match e {
             ReadError::Envelope(EnvelopeError::Header) => record.contents().1 != version.number() ||
                 record.contents().4 != 0 || record.contents().5 != ObjectClass::Metadata,
-            ReadError::Envelope(EnvelopeError::Kind) => !(record.contents().0 is KvLeaf) && !(record.contents().0 is KvBranch),
+            ReadError::Envelope(EnvelopeError::Kind) => record.contents().1 == version.number() &&
+                record.contents().4 == 0 && record.contents().5 == ObjectClass::Metadata &&
+                !(record.contents().0 is KvLeaf) && !(record.contents().0 is KvBranch),
             _ => true,
         },
         Err(ScheduledError::Summary) => exists|n:DecodedNode| #[trigger] parsed(record,n,validate) &&
@@ -259,6 +267,52 @@ pub(super) fn load_scheduled<E,F:Fn(&[u8])->Result<(),E>+Copy,L:FnOnce(ObjectId)
     let id = page.object();
     let record = match load(id) { Ok(r) => r, Err(e) => return Err(ScheduledError::Source(e)) };
     scheduled(page,&record,version,validate)
+}
+
+/// Traverse a staged record in place. Only a miss consults the captured owner's engine.
+pub(super) fn owner_page<P,E,F,L,M>(
+    staged:&BTreeMap<ObjectId,ObjectRecord>,owner:&P,page:&Page<ObjectId,NodeTotals>,
+    version:ObjectFormatVersion,engine:L,missing:M,validate:F,
+) -> (out:Result<Contents<ObjectId,NodeTotals,ValueSlot>,ScheduledError<E>>)
+    where F:Fn(&[u8])->Result<(),E>+Copy,L:FnOnce(&P,ObjectId)->Result<Option<ObjectRecord>,E>,
+        M:FnOnce(ObjectId)->E,
+    requires btree_map_inv(staged),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        engine.requires((owner,checkpoint_page::object(*page))),missing.requires((checkpoint_page::object(*page),)),
+        forall|k:&[u8]| #[trigger] validate.requires((k,)),
+        vstd::laws_eq::obeys_concrete_eq::<ObjectId>(),vstd::laws_eq::obeys_concrete_eq::<NodeTotals>(),
+    ensures ({
+        let id = checkpoint_page::object(*page);
+        if staged@.contains_key(id) {
+            scheduled_result(page,&staged@[id],version,validate,out)
+        } else {
+            match out {
+                Err(ScheduledError::Source(e)) => engine.ensures((owner,id),Err(e)) ||
+                    (engine.ensures((owner,id),Ok(None)) && missing.ensures((id,),e)),
+                _ => exists|r:ObjectRecord| #[trigger] engine.ensures((owner,id),Ok(Some(r))) &&
+                    scheduled_result(page,&r,version,validate,out),
+            }
+        }
+    }),
+{
+    let id = page.object();
+    if let Some(record) = staged.get(&id) {
+        return scheduled(page,record,version,validate);
+    }
+    let fetch = |key:ObjectId| -> (r:Result<ObjectRecord,E>)
+        requires key == id,
+        ensures match r {
+            Ok(record) => engine.ensures((owner,key),Ok(Some(record))),
+            Err(e) => engine.ensures((owner,key),Err(e)) ||
+                (engine.ensures((owner,key),Ok(None)) && missing.ensures((key,),e)),
+        },
+    {
+        match engine(owner,key) {
+            Ok(Some(record)) => Ok(record),
+            Ok(None) => Err(missing(key)),
+            Err(e) => Err(e),
+        }
+    };
+    load_scheduled(page,version,fetch,validate)
 }
 
 }

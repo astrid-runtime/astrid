@@ -71,8 +71,49 @@ fn range_reader<E,F:Fn(&[u8])->Result<(),E>+Copy,L:FnOnce(ObjectId)->Result<Obje
         forall|i:int| 0 <= i < children.len() ==> (#[trigger] children@[i]).level as nat + 1 == level,
         out matches Ok(body) ==> exists|record:ObjectRecord| #[trigger] load.ensures((crate::checkpoint_page::object(*page),),Ok(record)) &&
             record.contents().1 == v.number() && exists|node:Node<ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>|
-                #[trigger] checkpoint_record::parsed(&record,node,validate) && node.contents() == body,
+                #[trigger] checkpoint_record::parsed(&record,node,validate) && node.contents() == body &&
+                crate::checkpoint_page::agrees(*page,Handle {object:crate::checkpoint_page::object(*page),node}),
+        out matches Err(checkpoint_record::ScheduledError::Record(e)) ==> exists|record:ObjectRecord|
+            #[trigger] load.ensures((crate::checkpoint_page::object(*page),),Ok(record)) &&
+            checkpoint_record::refusal(&record,validate,e) &&
+            (e matches checkpoint_record::ReadError::Envelope(EnvelopeError::Kind) ==> record.contents().1 == v.number() &&
+                record.contents().4 == 0 && record.contents().5 == ObjectClass::Metadata &&
+                !(record.contents().0 is KvLeaf) && !(record.contents().0 is KvBranch)),
+        out matches Err(checkpoint_record::ScheduledError::Summary) ==> exists|record:ObjectRecord|
+            #[trigger] load.ensures((crate::checkpoint_page::object(*page),),Ok(record)) &&
+            exists|node:Node<ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>|
+                #[trigger] checkpoint_record::parsed(&record,node,validate) &&
+                !crate::checkpoint_page::agrees(*page,Handle {object:crate::checkpoint_page::object(*page),node}),
         out matches Err(checkpoint_record::ScheduledError::Source(e)) ==> load.ensures((crate::checkpoint_page::object(*page),),Err(e)),
 { checkpoint_record::load_scheduled(page,v,load,validate) }
+
+// A denied owner and an absent ID take distinct paths; a staged body at the
+// scheduled address wins even when the backing reader would deny this owner.
+fn owner_selection<F:Fn(&[u8])->Result<(),u8>+Copy>(
+    staged:&std::collections::BTreeMap<ObjectId,ObjectRecord>,owner:u64,allowed:u64,
+    page:&crate::checkpoint_range::Page<ObjectId,crate::checkpoint_totals::NodeTotals>,
+    version:ObjectFormatVersion,address:ObjectId,record:ObjectRecord,validate:F,
+) -> (out:Result<crate::checkpoint_walk::Contents<ObjectId,crate::checkpoint_totals::NodeTotals,crate::checkpoint_value::ValueSlot>,
+        checkpoint_record::ScheduledError<u8>>)
+    requires vstd::std_specs::btree::btree_map_inv(staged),
+        vstd::laws_cmp::obeys_cmp::<ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|k:&[u8]| #[trigger] validate.requires((k,)),
+        vstd::laws_eq::obeys_concrete_eq::<ObjectId>(),vstd::laws_eq::obeys_concrete_eq::<crate::checkpoint_totals::NodeTotals>(),
+    ensures ({
+        let id = crate::checkpoint_page::object(*page);
+        if staged@.contains_key(id) { checkpoint_record::scheduled_result(page,&staged@[id],version,validate,out) }
+        else if owner != allowed { out == Err(checkpoint_record::ScheduledError::Source(1u8)) }
+        else if id != address { out == Err(checkpoint_record::ScheduledError::Source(2u8)) }
+        else { checkpoint_record::scheduled_result(page,&record,version,validate,out) }
+    }),
+{
+    let engine = |p:&u64,k:ObjectId| -> (r:Result<Option<ObjectRecord>,u8>)
+        ensures r == (if *p != allowed {Err(1u8)} else if k == address {Ok(Some(record))} else {Ok(None)}),
+    {
+        if *p != allowed {Err(1u8)} else if k.same(&address) {Ok(Some(record))} else {Ok(None)}
+    };
+    checkpoint_record::owner_page(staged,&owner,page,version,engine,
+        |_id:ObjectId| -> (e:u8) ensures e == 2u8, {2u8},validate)
+}
 
 }
