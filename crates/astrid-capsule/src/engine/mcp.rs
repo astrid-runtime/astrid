@@ -225,22 +225,36 @@ impl ExecutionEngine for McpHostEngine {
             CapsuleError::ExecutionFailed("MCP server has not been prepared".to_string())
         })?;
         let server_id = config.name.clone();
-        // Record ownership before the first await. If activation is cancelled
-        // or times out halfway through process startup, request_cancel/unload
-        // can still synchronously find and reclaim the manager entry.
-        if !self.teardown.register(server_id.clone()) {
-            return Err(CapsuleError::ExecutionFailed(
+        // Own the name across the connection attempt. Retirement can be
+        // requested immediately, but cleanup waits until this guard settles
+        // and then reclaims this same registration. Releasing the guard does
+        // not start cleanup; request_cancel and unload do. If retirement wins,
+        // wait for that cleanup and fail activation instead of reporting success.
+        let mut activation = self.teardown.register(server_id.clone()).ok_or_else(|| {
+            CapsuleError::ExecutionFailed(
                 "MCP runtime generation was retired before activation".to_string(),
-            ));
-        }
-        self.mcp_client
+            )
+        })?;
+        let connected = self
+            .mcp_client
             .connect_dynamic(&server_id, config)
             .await
-            .map_err(|e| {
+            .map_err(|error| {
                 CapsuleError::UnsupportedEntryPoint(format!(
-                    "Failed to connect MCP host engine: {e}"
+                    "Failed to connect MCP host engine: {error}"
                 ))
-            })?;
+            });
+        activation.settle();
+        if self.teardown.retirement_started() {
+            self.teardown.wait().await;
+            return Err(CapsuleError::ExecutionFailed(match &connected {
+                Ok(()) => "MCP runtime generation was retired during activation".to_string(),
+                Err(error) => {
+                    format!("MCP runtime generation was retired during activation: {error}")
+                },
+            }));
+        }
+        connected?;
 
         Ok(())
     }
