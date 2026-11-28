@@ -139,7 +139,7 @@ def consumer_defects():
         )
 
     for label, clause, weaker in [
-        ("pending equality", "(if *r==*record {out matches Ok(None)} else {out matches Err(PlacementError::Collision(k)) && k==id})", "(out matches Ok(None) || out matches Err(PlacementError::Collision(k)) && k==id)"),
+        ("pending equality", "(if *r==*record {out matches Ok(None)} else {out matches Err(PlacementError::Collision(k)) && k==id})", "(if *r==*record {out matches Ok(None)} else {true})"),
         ("indexed contents", "Ok(None)=>read.ensures((id,loc),Ok(*record)),", "Ok(None)=>true,"),
         ("indexed error identity", "Err(PlacementError::Read(e))=>read.ensures((id,loc),Err(e)),", "Err(PlacementError::Read(_))=>true,"),
     ]:
