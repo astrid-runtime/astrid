@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::PrincipalId;
 use astrid_core::local_transport::{self, LocalListener, LocalStream};
@@ -41,8 +40,10 @@ use crate::Kernel;
 mod admin_projection;
 #[cfg(target_os = "macos")]
 mod callback_resolver;
+mod expiry;
 mod filesystem;
 mod volume_info;
+use expiry::LeaseExpiry;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
 #[cfg(any(unix, windows))]
 mod process_broker;
@@ -54,7 +55,6 @@ pub(super) use process_broker::{
     platform_process_provider_name, retry_failed_projection, validate_process_provider_ready,
 };
 
-const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 const MAX_CALLBACK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const LEASE_MANIFEST_NAME: &str = "lease.json";
 
@@ -86,7 +86,7 @@ pub(crate) struct StorageMountLeaseState {
     resource_path: PathBuf,
     callback_path: PathBuf,
     token_hash: [u8; 32],
-    expires_at_epoch_secs: AtomicU64,
+    expiry: LeaseExpiry,
     revoked: AtomicBool,
     dirty: AtomicBool,
     in_flight_mutations: AtomicU64,
@@ -128,8 +128,7 @@ impl StorageMountLeaseState {
     }
 
     fn is_live(&self) -> bool {
-        !self.revoked.load(Ordering::Acquire)
-            && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
+        !self.revoked.load(Ordering::Acquire) && self.expiry.live()
     }
 
     #[cfg(test)]
@@ -138,10 +137,7 @@ impl StorageMountLeaseState {
     }
 
     fn renew(&self) {
-        self.expires_at_epoch_secs.store(
-            now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS),
-            Ordering::Release,
-        );
+        self.expiry.renew();
     }
 
     fn public_lease(&self, token: String) -> StorageMountLeaseV1 {
@@ -152,7 +148,7 @@ impl StorageMountLeaseState {
             resource_path: self.resource_path.clone(),
             callback_path: self.callback_path.clone(),
             lease_token: token,
-            expires_at_epoch_secs: self.expires_at_epoch_secs.load(Ordering::Acquire),
+            expires_at_epoch_secs: self.expiry.epoch_secs(),
         }
     }
 }
@@ -197,6 +193,7 @@ pub(crate) async fn issue_lease(
     let callback_path = resource_path.join("control.sock");
     #[cfg(not(unix))]
     let callback_path = resource_path.join("control.endpoint");
+    let expiry = LeaseExpiry::new()?;
     astrid_core::platform_fs::ensure_private_directory(&resource_path)
         .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
@@ -211,7 +208,7 @@ pub(crate) async fn issue_lease(
         resource_path: resource_path.clone(),
         callback_path: callback_path.clone(),
         token_hash,
-        expires_at_epoch_secs: AtomicU64::new(now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS)),
+        expiry,
         revoked: AtomicBool::new(false),
         dirty: AtomicBool::new(false),
         in_flight_mutations: AtomicU64::new(0),
@@ -261,7 +258,7 @@ pub(crate) fn lease_status(
         "callback_path": state.callback_path,
         "dirty": state.dirty.load(Ordering::Acquire),
         "in_flight_mutations": state.in_flight_mutations.load(Ordering::Acquire),
-        "expires_at_epoch_secs": state.expires_at_epoch_secs.load(Ordering::Acquire),
+        "expires_at_epoch_secs": state.expiry.epoch_secs(),
     }))
 }
 
@@ -965,12 +962,6 @@ fn token_hash(token: &str) -> [u8; 32] {
 
 fn token_matches(expected: &[u8; 32], supplied: &str) -> bool {
     bool::from(expected.ct_eq(&token_hash(supplied)))
-}
-
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 fn write_private_manifest(path: &Path, lease: &StorageMountLeaseV1) -> io::Result<()> {
