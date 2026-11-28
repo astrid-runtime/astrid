@@ -74,6 +74,7 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
                 let row=#[trigger] rows@[i];
                 &&& index@.contains_key(row.0)
                 &&& arena_entry(index@[row.0],row.1@,final(arena).image(),old(arena).image().len())
+                &&& crate::arena_frame::hashed(hash,crate::arena_frame::ARENA_MAGIC,row.1@,index@[row.0].checksum)
             }
             &&& forall|k:ObjectId| #[trigger] index@.contains_key(k) ==> exists|i:int| 0<=i<rows.len() && #[trigger] rows@[i].0==k
         },
@@ -111,7 +112,8 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
     while i<locations.len()
         invariant i<=locations.len(),btree_map_inv(&index),
             forall|j:int| 0<=j<i ==> index@.contains_key(#[trigger] rows@[j].0) &&
-                arena_entry(index@[rows@[j].0],rows@[j].1@,arena.image(),prior.len()),
+                arena_entry(index@[rows@[j].0],rows@[j].1@,arena.image(),prior.len()) &&
+                frame::hashed(hash,frame::ARENA_MAGIC,rows@[j].1@,index@[rows@[j].0].checksum),
             forall|k:ObjectId| #[trigger] index@.contains_key(k) ==> exists|j:int| 0<=j<i && #[trigger] rows@[j].0==k,
         decreases locations.len()-i,
     {
@@ -124,10 +126,12 @@ pub(super) fn append_fresh_arena<A:crate::arena_frame::ReplayArena,H:Fn([u8;8],u
                 packed.subrange(start,start+52+loc.payload_len)==frame::header_bytes(frame::ARENA_MAGIC,frame::FRAME_VERSION,loc.payload_len,loc.checksum)+b@;
             assert(arena.image().subrange(loc.offset as int,loc.offset as int+52+loc.payload_len) =~= packed.subrange(start,start+52+loc.payload_len));
             assert(arena_entry(loc,rows@[i as int].1@,arena.image(),prior.len()));
+            assert(frame::hashed(hash,frame::ARENA_MAGIC,rows@[i as int].1@,loc.checksum));
         }
         index.insert(rows[i].0,loc);
         i+=1;
     }
     Ok((index,flush))
 }
+
 }

@@ -193,8 +193,8 @@ def consumer_defects():
     for label, source, clause, weakness, consumer in [
         ("WAL root", named_batch, "let root=p.journal.replacement.commit;",
          "let root=ObjectId::new([0;32]);", named_batch),
-        ("walk refusal", named_batch, "Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(flush,e)),",
-         "Ok(rows)=>rows,Err(_)=>return Ok((table,index,flush)),", named_batch),
+        ("walk refusal", named_batch, "Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(receipt.flush,e)),",
+         "Ok(rows)=>rows,Err(_)=>return Ok((table,receipt)),", named_batch),
         ("owning path", publication, "owning_child(decoded.contents().3,i);",
          "owning_child(source.contents().3,i);", publication),
         ("acyclicity", publication, "rank.dom()==ids && #[trigger] crate::closure_walk::ranked(",
@@ -249,5 +249,27 @@ def consumer_defects():
     ]:
         yield (
             f"arena sync loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
+        )
+
+    reopen = Path("verification/hosted_wal_arena_reopen.rs")
+    for label, source, clause, weakness, consumer in [
+        ("physical address", reopen, "io::with_span(media,loc.offset,size,consume)",
+         "io::with_span(media,0,size,consume)", reopen),
+        ("reference identity", reopen, "let result=indexed::read(data,base,loc,id,",
+         "let result=indexed::read(data,base,loc,ObjectId::new([0;32]),", reopen),
+        ("complete index", reopen, "table.insert(*id,record);",
+         "if record.references().is_empty() {table.insert(*id,record);}", reopen),
+        ("confirmed checksum", arena_batch,
+         "crate::arena_frame::hashed(hash,crate::arena_frame::ARENA_MAGIC,row.1@,index@[row.0].checksum)",
+         "index@[row.0].payload_len==row.1.len()", named_batch),
+        ("container decision", reopen,
+         "if let crate::frontier::JournalFlush::AwaitingContainer(())=receipt.flush",
+         "if let crate::frontier::JournalFlush::StableFile=receipt.flush", reopen),
+        ("known set", reopen, "ColdRead::Loaded(media,table,known)",
+         "ColdRead::Loaded(media,table,std::collections::BTreeSet::new())", reopen),
+    ]:
+        yield (
+            f"cold native reread loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
         )
