@@ -15,7 +15,7 @@ use vstd::{
 verus! {
 
 pub(super) const PARENT: &[u8;6] = b"parent";
-pub(super) const STATE: &[u8;5] = b"state";
+pub(super) const STATE: &[u8;5] = super::header_graph::STATE;
 
 pub(super) open spec fn references(before:Seq<ObjectReference>, after:Seq<ObjectReference>,
     expected:Option<RootState>, state:ObjectId) -> bool {

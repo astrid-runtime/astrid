@@ -211,7 +211,18 @@ where
         })
         .map_err(|error| match error {
             super::header_graph::Error::Read(e) => e,
-            super::header_graph::Error::Invalid(id, why) => invalid(id, why),
+            super::header_graph::Error::Invalid(id, reason) => {
+                use super::header_graph::Invalid;
+                invalid(
+                    id,
+                    match reason {
+                        Invalid::KindOrVersion => "principal object has wrong kind or version",
+                        Invalid::Payload => "principal structural object carries payload",
+                        Invalid::MissingState => "required principal reference is missing",
+                        Invalid::NonOwningState => "required principal reference is not owning",
+                    },
+                )
+            },
         })
     }
 

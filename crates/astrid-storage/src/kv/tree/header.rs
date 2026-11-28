@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, PrincipalProjectionError};
 use crate::storage_model::{
-    ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
-    ReferenceLabel, RootState,
+    ModelError, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, RootState,
 };
 use parking_lot::Mutex;
 
@@ -75,34 +74,32 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let commit = load_typed(engine, &owner, root.commit, ObjectKind::Commit)?;
-    require_structural(root.commit, &commit)?;
-    let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-    let state = load_typed(engine, &owner, state_id, ObjectKind::PrincipalState)?;
-    require_structural(state_id, &state)?;
-    let (projection, checkpoint) = match state.reference(&ReferenceLabel::new(KV_LABEL)) {
+    let (graph, head) = read_kv_graph(engine, &owner, root)?;
+    let crate::storage_model::header_graph::Graph {
+        commit,
+        state_id,
+        state,
+    } = graph;
+    let (projection, checkpoint) = match head {
         None => (Projection::empty(), Some(TreeValidation::EMPTY)),
-        Some(reference) if reference.kind() == ReferenceKind::Owns => {
+        Some(component) => {
             let cached = captured_projection
-                .filter(|projection| projection.head == Some(reference.target()))
+                .filter(|projection| projection.head == Some(component))
                 .or_else(|| {
                     validation
                         .projections
                         .lock()
                         .get(&owner)
-                        .filter(|projection| projection.head == Some(reference.target()))
+                        .filter(|projection| projection.head == Some(component))
                         .cloned()
                 });
             if let Some(cached) = cached {
                 (cached, None)
             } else {
                 let (decoded, checkpoint) =
-                    decode_kv_component::<P, E>(engine, &owner, reference.target(), validation)?;
+                    decode_kv_component::<P, E>(engine, &owner, component, validation)?;
                 (decoded, Some(checkpoint))
             }
-        },
-        Some(_) => {
-            return Err(invalid(state_id, "principal KV component is not owning"));
         },
     };
     let (preserved_state, other_quota_bytes) = decode_other_components(
@@ -506,28 +503,31 @@ where
     Ok(record)
 }
 
-pub(super) fn require_structural(id: ObjectId, record: &ObjectRecord) -> StorageResult<()> {
-    if !record.canonical_bytes().is_empty()
-        || record.logical_bytes() != 0
-        || record.class() != ObjectClass::Metadata
-    {
-        return Err(invalid(id, "structural KV tree object carries payload"));
-    }
-    Ok(())
-}
-
-pub(super) fn owned_target(
-    id: ObjectId,
-    record: &ObjectRecord,
-    label: &[u8],
-) -> StorageResult<ObjectId> {
-    let reference = record
-        .reference(&ReferenceLabel::new(label))
-        .ok_or_else(|| invalid(id, "required KV tree reference is missing"))?;
-    if reference.kind() != ReferenceKind::Owns {
-        return Err(invalid(id, "required KV tree reference is not owning"));
-    }
-    Ok(reference.target())
+pub(super) fn read_kv_graph<P, E: KvProjectionEngine<P>>(
+    engine: &E,
+    owner: &P,
+    root: RootState,
+) -> StorageResult<(crate::storage_model::header_graph::Graph, Option<ObjectId>)> {
+    use crate::storage_model::header_graph::{self, Error, Invalid, KvError};
+    header_graph::read_kv(owner, root, FORMAT_VERSION, |principal, id| {
+        engine
+            .load_shared_kv_object_for(principal, id)
+            .map_err(|e| map_engine(&e))?
+            .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))
+    })
+    .map_err(|e| match e {
+        KvError::Graph(Error::Read(e)) => e,
+        KvError::Graph(Error::Invalid(id, reason)) => invalid(
+            id,
+            match reason {
+                Invalid::KindOrVersion => "object has the wrong KV tree kind or version",
+                Invalid::Payload => "structural KV tree object carries payload",
+                Invalid::MissingState => "required KV tree reference is missing",
+                Invalid::NonOwningState => "required KV tree reference is not owning",
+            },
+        ),
+        KvError::NonOwning(id) => invalid(id, "principal KV component is not owning"),
+    })
 }
 
 #[cfg(test)]

@@ -94,13 +94,13 @@ def defects():
         trace,
     )
 
-    source = Path("crates/astrid-storage/src/content/store/header_graph.rs")
+    source = Path("crates/astrid-storage/src/storage_model/header_graph.rs")
     for name, old, new in [
-        ("commit can belong to another lookup", "&&& load.ensures((owner,root.commit),Ok(g.commit))", "&&& true"),
-        ("state can belong to another lookup", "&&& load.ensures((owner,g.state_id),Ok(g.state))", "&&& true"),
+        ("commit can belong to another lookup", "&&& load.ensures((owner,root.commit),Ok(g.commit))\n", "&&& true\n"),
+        ("state can belong to another lookup", "&&& load.ensures((owner,g.state_id),Ok(g.state))\n", "&&& true\n"),
         ("success can substitute a different matching edge", "&& state_edge(*g.commit) == Some(r)", "&& true"),
         ("failure can substitute a different matching edge", "&& state_edge(*c) == Some(edge)", "&& true"),
-        ("state edge can point elsewhere", "r.fields() == (super::commit_candidate::STATE@,g.state_id,super::ReferenceKind::Owns)", "r.fields().0 == super::commit_candidate::STATE@"),
+        ("state edge can point elsewhere", "#[trigger] r.fields() == (STATE@,g.state_id,super::ReferenceKind::Owns)", "#[trigger] r.fields().0 == STATE@"),
         ("state can carry a different shape", "&&& structural(*g.state,ObjectKind::PrincipalState,v)", "&&& true"),
         ("read error may come from another object", "out matches Err(Error::Read(error)) ==> load.ensures((owner,root.commit),Err(error))", "out matches Err(Error::Read(error)) ==> true"),
     ]:
@@ -108,6 +108,26 @@ def defects():
             f"content graph {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    for label, clause, weaker in [
+        ("absent component", "None => kv_edge(*g.state).is_none()", "None => true"),
+        ("component address", "edge.fields() == (KV@,id,super::ReferenceKind::Owns)",
+         "edge.fields().0 == KV@"),
+        ("structural rejection", "==> invalid_at(owner,root,v,load,id,reason),\n        out matches Err(KvError",
+         "==> true,\n        out matches Err(KvError"),
+        ("non-owning rejection", "edge.fields().2 != super::ReferenceKind::Owns),",
+         "true),"),
+    ]:
+        yield (
+            f"captured KV graph loses {label}", source,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), trace,
+        )
+
+    yield (
+        "captured KV graph loses canonical row identity", Path("crates/astrid-storage/src/storage_model/reference_lookup.rs"),
+        lambda s: replace_once(s, "ensures selected(refs,refs[i].fields().0,lo,hi) == Some(refs[i])",
+                               "ensures selected(refs,refs[i].fields().0,lo,hi).is_some()"), trace,
+    )
 
     yield (
         "content graph canonical state edge can be missed", Path("crates/astrid-storage/src/storage_model/reference_lookup.rs"),

@@ -29,6 +29,22 @@ pub(crate) open spec fn selected(refs: Seq<ObjectReference>, label: Seq<u8>, lo:
     }
 }
 
+/// In a canonical record, the row bearing a label is the one the binary search returns.
+pub(crate) proof fn canonical_row(refs:Seq<ObjectReference>,i:int,lo:int,hi:int)
+    requires ObjectRecord::labels_ordered(refs),0 <= lo <= i < hi <= refs.len(),
+    ensures selected(refs,refs[i].fields().0,lo,hi) == Some(refs[i]),
+    decreases hi-lo,
+{
+    let mid = lo+(hi-lo)/2;
+    if mid < i {
+        ObjectRecord::ordered_pair(refs,mid,i);
+        canonical_row(refs,i,mid+1,hi);
+    } else if mid > i {
+        ObjectRecord::ordered_pair(refs,i,mid);
+        canonical_row(refs,i,lo,mid);
+    }
+}
+
 pub(crate) fn find<'a>(refs:&'a [ObjectReference],label:&[u8]) -> (out:Option<&'a ObjectReference>)
     ensures (match out { Some(r) => Some(*r), None => None }) == selected(refs@,label@,0,refs.len() as int),
         out matches Some(r) ==> refs@.contains(*r) && r.fields().0 == label@,

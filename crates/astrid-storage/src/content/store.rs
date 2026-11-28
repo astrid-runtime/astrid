@@ -951,8 +951,7 @@ mod handoff;
 mod header_cache;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod header_cache_tests;
-use crate::storage_model::reference_lookup;
-mod header_graph;
+use crate::storage_model::header_graph;
 #[cfg(test)]
 mod header_graph_tests;
 mod internals;

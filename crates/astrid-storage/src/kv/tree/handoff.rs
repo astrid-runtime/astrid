@@ -5,14 +5,13 @@
 //! certificate; missing or mismatched facts leave the destination cold.
 
 use crate::engine::KvProjectionEngine;
-use crate::storage_model::{ObjectId, ObjectKind, ReferenceKind, ReferenceLabel, RootState};
+use crate::storage_model::{ObjectId, RootState};
 
+use super::KvValidationCache;
 use super::delta::Projection;
-use super::header::{load_typed, owned_target, require_structural};
+use super::header::read_kv_graph;
 use super::validation::TreeValidation;
-use super::{KV_LABEL, KvValidationCache, STATE_LABEL};
 use crate::error::StorageResult;
-use crate::kv::tree_error::invalid;
 
 impl<P: Clone + Ord> KvValidationCache<P> {
     /// Snapshot one owner only when projection and tree certificate match.
@@ -145,14 +144,5 @@ fn live_kv_component_head<P, E>(
 where
     E: KvProjectionEngine<P>,
 {
-    let commit = load_typed(engine, owner, root.commit, ObjectKind::Commit)?;
-    require_structural(root.commit, &commit)?;
-    let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-    let state = load_typed(engine, owner, state_id, ObjectKind::PrincipalState)?;
-    require_structural(state_id, &state)?;
-    match state.reference(&ReferenceLabel::new(KV_LABEL)) {
-        None => Ok(None),
-        Some(reference) if reference.kind() == ReferenceKind::Owns => Ok(Some(reference.target())),
-        Some(_) => Err(invalid(state_id, "principal KV component is not owning")),
-    }
+    read_kv_graph(engine, owner, root).map(|(_, head)| head)
 }

@@ -208,7 +208,7 @@ INPUTS = [
     Path("verification/hosted_native_log.rs"),
     Path("crates/astrid-core/src/platform_fs/windows/projection_session/append/confirmation.rs"),
     Path("crates/astrid-core/src/platform_fs/private_projection/unix/append/selection.rs"),
-    Path("crates/astrid-storage/src/content/store/header_graph.rs"),
+    Path("crates/astrid-storage/src/storage_model/header_graph.rs"),
     Path("crates/astrid-storage/src/storage_model/reference_lookup.rs"),
     Path("crates/astrid-storage/src/content/store/components.rs"),
     Path("crates/astrid-storage/src/content/component_labels.rs"),

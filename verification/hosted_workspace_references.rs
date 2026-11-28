@@ -27,6 +27,57 @@ fn decoded_graph<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVers
     crate::header_graph::read(owner,root,v,load)
 }
 
+// A captured owner/commit and its owning state edge determine the exact KV
+// component used for ordinary reads and handoff. A valid graph must succeed.
+fn captured_kv<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersion,
+    commit:std::sync::Arc<crate::ObjectRecord>,state_id:ObjectId,state:std::sync::Arc<crate::ObjectRecord>,load:L,
+    table:Ghost<spec_fn(P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>>)
+    -> (out:Result<(crate::header_graph::Graph,Option<ObjectId>),crate::header_graph::KvError<E>>)
+    where L:Fn(&P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>,
+    requires forall|id:ObjectId| #[trigger] load.requires((owner,id)),
+        forall|id:ObjectId,x:Result<std::sync::Arc<crate::ObjectRecord>,E>|
+            #[trigger] load.ensures((owner,id),x) ==> x == (table@)(*owner,id),
+        (table@)(*owner,root.commit)==Ok(commit), (table@)(*owner,state_id)==Ok(state),
+        crate::header_graph::structural(*commit,crate::ObjectKind::Commit,v),
+        crate::header_graph::structural(*state,crate::ObjectKind::PrincipalState,v),
+        crate::header_graph::state_edge(*commit) matches Some(edge) && edge.fields() == (b"state"@,state_id,ReferenceKind::Owns),
+    ensures match crate::header_graph::kv_edge(*state) {
+        None => out matches Ok((g,None)) && g.commit == commit && g.state_id == state_id && g.state == state,
+        Some(edge) => if edge.fields().2 == ReferenceKind::Owns {
+            out matches Ok((g,Some(id))) && g.commit == commit && g.state_id == state_id && g.state == state &&
+                edge.fields() == (b"kv"@,id,ReferenceKind::Owns)
+        } else {out matches Err(crate::header_graph::KvError::NonOwning(id)) && id == state_id},
+    },
+{
+    crate::header_graph::read_kv(owner,root,v,load)
+}
+
+// Start with physical rows in the canonical record arrays, without assuming
+// the component selected by either binary search.
+fn kv_from_canonical_rows<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersion,
+    commit:std::sync::Arc<crate::ObjectRecord>,state_id:ObjectId,state:std::sync::Arc<crate::ObjectRecord>,
+    head:ObjectId,load:L,table:Ghost<spec_fn(P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>>,
+    Ghost(ci):Ghost<int>,Ghost(si):Ghost<int>)
+    -> (out:Result<(crate::header_graph::Graph,Option<ObjectId>),crate::header_graph::KvError<E>>)
+    where L:Fn(&P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>,
+    requires forall|id:ObjectId| #[trigger] load.requires((owner,id)),
+        forall|id:ObjectId,x:Result<std::sync::Arc<crate::ObjectRecord>,E>|
+            #[trigger] load.ensures((owner,id),x) ==> x == (table@)(*owner,id),
+        (table@)(*owner,root.commit)==Ok(commit), (table@)(*owner,state_id)==Ok(state),
+        crate::header_graph::structural(*commit,crate::ObjectKind::Commit,v),
+        crate::header_graph::structural(*state,crate::ObjectKind::PrincipalState,v),
+        crate::ObjectRecord::labels_ordered(commit.contents().3),crate::ObjectRecord::labels_ordered(state.contents().3),
+        0<=ci<commit.contents().3.len(),commit.contents().3[ci].fields()==(b"state"@,state_id,ReferenceKind::Owns),
+        0<=si<state.contents().3.len(),state.contents().3[si].fields()==(b"kv"@,head,ReferenceKind::Owns),
+    ensures out matches Ok((g,Some(id))) && id == head && g.commit == commit && g.state_id == state_id && g.state == state,
+{
+    proof {
+        crate::reference_lookup::canonical_row(commit.contents().3,ci,0,commit.contents().3.len() as int);
+        crate::reference_lookup::canonical_row(state.contents().3,si,0,state.contents().3.len() as int);
+    }
+    captured_kv(owner,root,v,commit,state_id,state,load,table)
+}
+
 fn find_canonical_state(refs:&[ObjectReference],i:Ghost<int>) -> (out:Option<&ObjectReference>)
     requires crate::ObjectRecord::labels_ordered(refs@), 0 <= i@ < refs.len(), refs@[i@].fields().0 == b"state"@,
     ensures out matches Some(r) && *r == refs@[i@],

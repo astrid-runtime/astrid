@@ -58,7 +58,7 @@ fn state_read_requires_an_owning_edge_and_preserves_the_selected_load_error() {
         });
         if kind == ReferenceKind::Lineage {
             assert!(
-                matches!(result,Err(header_graph::Error::Invalid(id,"required principal reference is not owning")) if id == root.commit)
+                matches!(result,Err(header_graph::Error::Invalid(id,header_graph::Invalid::NonOwningState)) if id == root.commit)
             );
             assert_eq!(calls.take(), [(owner, root.commit)]);
         } else {
