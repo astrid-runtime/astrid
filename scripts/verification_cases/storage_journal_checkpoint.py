@@ -194,7 +194,7 @@ def consumer_defects():
         ("WAL root", named_batch, "let root=p.journal.replacement.commit;",
          "let root=ObjectId::new([0;32]);", named_batch),
         ("walk refusal", named_batch, "Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(e)),",
-         "Ok(rows)=>rows,Err(_)=>return Ok(table),", named_batch),
+         "Ok(rows)=>rows,Err(_)=>return Ok((table,index)),", named_batch),
         ("owning path", publication, "owning_child(decoded.contents().3,i);",
          "owning_child(source.contents().3,i);", publication),
         ("acyclicity", publication, "rank.dom()==ids && #[trigger] crate::closure_walk::ranked(",
@@ -215,4 +215,21 @@ def consumer_defects():
         yield (
             f"cold table recovery loses {label}", reader,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), named_batch,
+        )
+
+    arena_batch = Path("verification/hosted_wal_recovered_arena.rs")
+    for label, source, clause, weakness, consumer in [
+        ("canonical body", named_batch, "payload.extend_from_slice(bytes);",
+         "payload.extend_from_slice(&bytes[..0]);", named_batch),
+        ("arena location", arena_batch, "index.insert(rows[i].0,loc);",
+         "index.insert(rows[i].0,locations[0]);", arena_batch),
+        ("arena header", arena_batch,
+         "frame::append_batch(arena,rows,payload_of,hash,frame::ARENA_MAGIC",
+         "frame::append_batch(arena,rows,payload_of,hash,frame::ROOT_MAGIC", arena_batch),
+        ("physical contents", arena_batch, "arena_entry(index@[row.0],row.1@,final(arena).image(),old(arena).image().len())",
+         "index@[row.0].payload_len==row.1.len()", named_batch),
+    ]:
+        yield (
+            f"recovered arena batch loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
         )

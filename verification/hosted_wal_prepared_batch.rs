@@ -1,6 +1,9 @@
 //! Bind ordered engine-prepared object declarations to their selected WAL storage encoding.
 use super::*;
 use crate::wal_object_storage as storage;
+#[path = "hosted_wal_recovered_arena.rs"]
+mod recovered_arena;
+use recovered_arena::{append_fresh_arena,arena_contains,arena_entry,same_extent};
 verus! {
 
 enum Payload<'a> { Plain(&'a [u8]), Lz4(Vec<u8>) }
@@ -234,7 +237,7 @@ spec fn refused(rows:Seq<(ObjectId,Vec<u8>)>,scheme:root_wire::Scheme,limit:u64,
 enum GraphError { Closure(crate::closure_walk::Failure<ObjectId,ObjectId>), Capacity, Batch(Error) }
 
 struct Publication<M> {
-    group:Released<M>, journal:crate::journal_transition::Record, rows:Ghost<Seq<(ObjectId,Vec<u8>)>>,
+    wal_target:Ghost<(int,Seq<u8>)>, group:Released<M>, journal:crate::journal_transition::Record, rows:Ghost<Seq<(ObjectId,Vec<u8>)>>,
 }
 
 /// Journal all fresh declarations with the root chosen by the publication CAS.
@@ -269,6 +272,7 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
         let r=p.group;
         let replacement=graph.selected.binding().2;
         &&& (target@)(r.media)==sink.wal_target() && r.media.image().take(base as int)==sink.buffered_image()
+        &&& p.wal_target@==sink.wal_target() && ordered(p.rows@,p.rows@.len())
         &&& p.journal.principal@==owner.bytes() && p.journal.expected==expected && p.journal.replacement==replacement
         &&& r.marker.marker().counts.sequence==sequence && r.marker.marker().counts.objects==graph.records.len() && r.marker.marker().counts.roots==1
         &&& r.roots.len()==1 && r.roots@[0].body@==crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement)
@@ -298,6 +302,7 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
         assert(crate::hosted_kv_root_publication::canonical_rows(graph,rows@,scheme));
         return Err(GraphError::Capacity);
     }
+    let ghost wal_target=sink.wal_target();
     let r=match submit(sequence,begin,&rows,&root,scheme,limit,encode,compression,sink,base,chunk_size,hash,checksum,finish,digest,reopen,target) {
         Ok(r)=>r, Err(e)=>{
             proof {match e {Error::Identity(i)=>{
@@ -315,10 +320,10 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
         },
     };
     let journal=crate::hosted_acknowledged_root::parse_written(&r.roots[0].body,&name,scheme,expected,replacement);
-    Ok(Publication{group:r,journal,rows:Ghost(rows@)})
+    Ok(Publication{wal_target:Ghost(wal_target),group:r,journal,rows:Ghost(rows@)})
 }
 
-enum RecoveryError<E> { Compression(usize,E), References(usize), Closure(crate::closure_walk::Failure<ObjectId,ObjectId>) }
+enum RecoveryError<E,A> { Arena(crate::arena_frame::BatchError<A>), Compression(usize,E), References(usize), Closure(crate::closure_walk::Failure<ObjectId,ObjectId>) }
 
 spec fn codec_failure<E,D:Fn(&[u8],usize)->Result<Vec<u8>,E>>(block:Seq<u8>,size:usize,decode:D,error:E) -> bool {
     exists|b:&[u8]| b@==block && #[trigger] decode.ensures((b,size),Err(error))
@@ -343,12 +348,16 @@ proof fn same_children(a:Seq<crate::ObjectReference>,b:Seq<crate::ObjectReferenc
 #[verifier::spinoff_prover]
 #[verifier::rlimit(35)]
 #[verifier::loop_isolation(false)]
-fn recover_closure<M:crate::positional_read::Media,E,D,H>(
+fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::BatchFile,F:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
     p:&Publication<M>,Ghost(graph):Ghost<&crate::hosted_kv_root_publication::Graph<Vec<u8>>>,
     version:crate::ObjectFormatVersion,scheme:root_wire::Scheme,limit:u64,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,
-    decode:D,hash:H) -> (out:Result<BTreeMap<ObjectId,ObjectRecord>,RecoveryError<E>>)
+    decode:D,hash:H,arena:&mut A,checksum:F)
+    -> (out:Result<(BTreeMap<ObjectId,ObjectRecord>,BTreeMap<ObjectId,crate::ArenaLocation>),RecoveryError<E,A::Error>>)
     where D:Fn(&[u8],usize)->Result<Vec<u8>,E>,H:Fn(&ObjectRecord)->[u8;32]+Copy,
-    requires p.journal.replacement==graph.selected.binding().2,
+    requires old(arena).image().len()<=u64::MAX,old(arena).target()!=p.wal_target@,
+        ordered(p.rows@,p.rows@.len()),
+        forall|n:u64,b:&[u8]| #[trigger] checksum.requires((crate::arena_frame::ARENA_MAGIC,n,b)),
+        p.journal.replacement==graph.selected.binding().2,
         graph.links(graph.selected.binding().0,graph.selected.binding().1,graph.records@[graph.component],version),
         crate::hosted_kv_root_publication::canonical_rows(graph,p.rows@,scheme),
         p.group.objects.len()==p.rows@.len(),
@@ -362,12 +371,23 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H>(
         forall|b:&[u8],n:usize| #[trigger] decode.requires((b,n)),
         forall|i:int,b:&[u8],v:Vec<u8>| 0<=i<p.rows@.len() && b@==(compression@)(p.rows@[i].1@) &&
             #[trigger] decode.ensures((b,p.rows@[i].1.len()),Ok(v)) ==> v@==p.rows@[i].1@,
-    ensures out matches Ok(t) ==> crate::closure_walk::closed(p.journal.replacement.commit,Set::empty(),
+    ensures final(arena).target()==old(arena).target(),
+        out matches Ok((t,index)) ==> index@.dom()==t@.dom() &&
+        (forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] arena_entry(index@[p.rows@[i].0],p.rows@[i].1@,final(arena).image(),old(arena).image().len())) &&
+        final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
+        crate::closure_walk::closed(p.journal.replacement.commit,Set::empty(),
             crate::hosted_kv_root_publication::owning_edges(t@),t@.dom()) &&
         (exists|rank:Map<ObjectId,nat>| rank.dom()==t@.dom() && #[trigger] crate::closure_walk::ranked(
             crate::hosted_kv_root_publication::owning_edges(t@),Set::empty(),rank)) &&
         t@.dom()==graph.records@.dom() &&
         forall|k:ObjectId| #[trigger] t@.contains_key(k) ==> crate::hosted_record_roundtrip::same_fields(t@[k],graph.records@[k]),
+        ((out matches Err(RecoveryError::References(_))) || (out matches Err(RecoveryError::Compression(_,_)))) ==> final(arena).image()==old(arena).image(),
+        out matches Err(RecoveryError::Closure(_)) ==> final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
+            forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] arena_contains(p.rows@[i].1@,final(arena).image(),old(arena).image().len()),
+        out matches Err(RecoveryError::Arena(crate::arena_frame::BatchError::Write(e))) ==> A::write_failed(old(arena).target(),e),
+        out matches Err(RecoveryError::Arena(crate::arena_frame::BatchError::Seek(e))) ==> old(arena).seek_failed(e) && final(arena).image()==old(arena).image(),
+        out matches Err(RecoveryError::Arena(crate::arena_frame::BatchError::Overflow)) ==> final(arena).image()==old(arena).image() &&
+            (raw_extent(p.rows@,p.rows@.len())>isize::MAX || old(arena).image().len()+raw_extent(p.rows@,p.rows@.len())>u64::MAX),
         out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Source(k,e))) ==> k==e && !graph.records@.contains_key(k),
         out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Cycle(k))) ==> crate::closure_walk::reaches(
             graph.records@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)),Set::empty(),k,k),
@@ -377,9 +397,11 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H>(
             codec_failure((compression@)(p.rows@[i as int].1@),p.rows@[i as int].1.len(),decode,e),
 {
     let mut table=BTreeMap::new();
+    let mut payloads:Vec<(ObjectId,Vec<u8>)>=Vec::new();
     let mut i=0;
     while i<p.group.objects.len()
-        invariant i<=p.rows@.len(),btree_map_inv(&table),
+        invariant i<=p.rows@.len(),btree_map_inv(&table),payloads.len()==i,
+            forall|j:int| 0<=j<i ==> (#[trigger] payloads@[j]).0==p.rows@[j].0 && payloads@[j].1@==p.rows@[j].1@,
             forall|k:ObjectId| #[trigger] table@.contains_key(k) ==> graph.records@.contains_key(k) &&
                 crate::hosted_record_roundtrip::same_fields(table@[k],graph.records@[k]),
             forall|j:int| 0<=j<i ==> table@.contains_key(#[trigger] p.rows@[j].0),
@@ -421,9 +443,37 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H>(
             Ok(row)=>row,Err(_)=>return Err(RecoveryError::References(i)),
         };
         table.insert(key,record);
+        let mut payload=Vec::new();
+        payload.extend_from_slice(bytes);
+        payloads.push((key,payload));
         i+=1;
     }
     assert(table@.dom() =~= graph.records@.dom());
+    proof {
+        assert forall|j:int,k:int| 0<=j<k<payloads.len() implies (#[trigger] payloads@[j].0)!=(#[trigger] payloads@[k].0) by {
+            assert(ObjectId::digest_before(p.rows@[j].0.digest(),p.rows@[k].0.digest()));
+        }
+    }
+    proof {same_extent(payloads@,p.rows@,p.rows@.len());}
+    let index=match append_fresh_arena(arena,&payloads,checksum) {Ok(index)=>index,Err(e)=>return Err(RecoveryError::Arena(e))};
+    proof {
+        assert forall|k:ObjectId| #[trigger] index@.contains_key(k) == table@.contains_key(k) by {
+            if index@.contains_key(k) {
+                let j=choose|i:int| 0<=i<payloads.len() && #[trigger] payloads@[i].0==k;
+                assert(p.rows@[j].0==k);
+            }
+            if table@.contains_key(k) {
+                assert(graph.records@.contains_key(k));
+                let j=choose|i:int| 0<=i<p.rows@.len() && #[trigger] p.rows@[i].0==k;
+                assert(payloads@[j].0==k);
+            }
+        }
+        assert(index@.dom() =~= table@.dom());
+        assert forall|i:int| 0<=i<p.rows@.len() implies #[trigger] arena_contains(p.rows@[i].1@,arena.image(),old(arena).image().len()) by {
+            let row=payloads@[i];
+            assert(arena_entry(index@[row.0],row.1@,arena.image(),old(arena).image().len()));
+        }
+    }
     let root=p.journal.replacement.commit;
     let ghost edges=table@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3));
     proof {
@@ -440,6 +490,6 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H>(
         let ids=crate::closure_load::row_ids(rows@).to_set();
         assert(ids =~= table@.dom());
     }
-    Ok(table)
+    Ok((table,index))
 }
 }
