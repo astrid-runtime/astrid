@@ -77,6 +77,7 @@ mod legacy_avl;
 mod maintenance;
 mod memo;
 mod memo_admission;
+mod mutation_ack;
 mod mutation_replay;
 mod node;
 mod overlay;
@@ -387,61 +388,63 @@ where
             let header = self.header_at_epoch(owner.clone(), epoch)?;
             let mut context = TreeContext::new(self.engine.as_ref(), owner);
             let (result, mutations, changed) = mutation(&mut context, &header)?;
-            if !changed {
+            let attempt = mutation_ack::finish(result, mutations, changed, |mutations| {
+                let projection = context.apply_mutations(&header, mutations)?;
+                let logical_bytes = projection.totals.logical_bytes;
+                let projection_used = projection.totals.quota_bytes;
+                let used = projection_used
+                    .checked_add(header.other_quota_bytes)
+                    .ok_or_else(|| {
+                        StorageError::Internal("principal quota total overflow".to_owned())
+                    })?;
+                let previous_used = header
+                    .quota_bytes
+                    .checked_add(header.other_quota_bytes)
+                    .ok_or_else(|| {
+                        StorageError::Internal("principal quota total overflow".to_owned())
+                    })?;
+                self.validate_mutation_quota(owner, quota, used, previous_used)?;
+                let tree = projection.tree;
+                let validated_projection = projection.clone();
+                let transaction = context.finish_projection(header, &projection)?;
+                match self.engine.commit_kv_root(transaction) {
+                    Ok(outcome) => {
+                        // A delta projection keeps the checkpoint tree unchanged;
+                        // its totals include the overlay and therefore must never
+                        // be cached as validation for that checkpoint tree.
+                        let checkpoint = if projection.depth == 0
+                            && let Some(certificate) = projection
+                                .boundary
+                                .filter(|certificate| certificate.matches_tree(tree))
+                        {
+                            Some(TreeValidation::from_certificate(
+                                certificate,
+                                projection.totals.entries,
+                                logical_bytes,
+                                projection_used,
+                            ))
+                        } else {
+                            None
+                        };
+                        self.validation.publish_if_current(
+                            self.engine.as_ref(),
+                            owner.clone(),
+                            outcome.root(),
+                            validated_projection,
+                            checkpoint,
+                            epoch,
+                        );
+                        if should_checkpoint(&projection) {
+                            self.schedule_checkpoint(owner.clone());
+                        }
+                        Ok(true)
+                    },
+                    Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),
+                    Err(error) => Err(map_engine(&error)),
+                }
+            })?;
+            if let Some(result) = attempt {
                 return Ok(result);
-            }
-            let projection = context.apply_mutations(&header, mutations)?;
-            let logical_bytes = projection.totals.logical_bytes;
-            let projection_used = projection.totals.quota_bytes;
-            let used = projection_used
-                .checked_add(header.other_quota_bytes)
-                .ok_or_else(|| {
-                    StorageError::Internal("principal quota total overflow".to_owned())
-                })?;
-            let previous_used = header
-                .quota_bytes
-                .checked_add(header.other_quota_bytes)
-                .ok_or_else(|| {
-                    StorageError::Internal("principal quota total overflow".to_owned())
-                })?;
-            self.validate_mutation_quota(owner, quota, used, previous_used)?;
-            let tree = projection.tree;
-            let validated_projection = projection.clone();
-            let transaction = context.finish_projection(header, &projection)?;
-            match self.engine.commit_kv_root(transaction) {
-                Ok(outcome) => {
-                    // A delta projection keeps the checkpoint tree unchanged;
-                    // its totals include the overlay and therefore must never
-                    // be cached as validation for that checkpoint tree.
-                    let checkpoint = if projection.depth == 0
-                        && let Some(certificate) = projection
-                            .boundary
-                            .filter(|certificate| certificate.matches_tree(tree))
-                    {
-                        Some(TreeValidation::from_certificate(
-                            certificate,
-                            projection.totals.entries,
-                            logical_bytes,
-                            projection_used,
-                        ))
-                    } else {
-                        None
-                    };
-                    self.validation.publish_if_current(
-                        self.engine.as_ref(),
-                        owner.clone(),
-                        outcome.root(),
-                        validated_projection,
-                        checkpoint,
-                        epoch,
-                    );
-                    if should_checkpoint(&projection) {
-                        self.schedule_checkpoint(owner.clone());
-                    }
-                    return Ok(result);
-                },
-                Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(map_engine(&error)),
             }
         }
     }

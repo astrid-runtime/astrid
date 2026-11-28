@@ -252,6 +252,31 @@ fn graph_compare(namespace:&[u8],key:&[u8],header:u64,observed_at:u64,prior:Opti
     }
 }
 
+// A conflicting root invalidates this entire changed comparison attempt. Even
+// an accepted comparison can return no answer until the next header is read.
+fn acknowledge_graph_compare(key:&[u8],prior:Option<Vec<u8>>,expected:Option<&[u8]>,
+    candidate:&[u8],commit:Result<bool,u64>) {
+    use crate::kv_replacement::{bytes,Replacement};
+    let ghost image = bytes(prior);
+    let ghost matches = image == match expected {Some(v)=>Some(v@),None=>None};
+    let read = |_:&(),_:&[u8]| -> (r:Result<Option<Vec<u8>>,u64>)
+        ensures r matches Ok(v) && bytes(v) == image, {Ok(prior)};
+    let Ok((accepted,rows,changed)) = Replacement::compare_at(&(),key,expected,candidate,read)
+        else {assert(false);return;};
+    let publish = |entries:Vec<Replacement>| -> (r:Result<bool,u64>)
+        requires entries.len() == 1, entries@[0].fields() == (key@,Some(candidate@),
+            Some((match image {Some(old)=>Some(old.len() as usize),None=>None},false))),
+        ensures r == commit, {commit};
+    let answer = crate::mutation_ack::finish(accepted,rows,changed,publish);
+    proof { if !matches {assert(answer == Ok(Some(false)));}
+    else if image == Some(candidate@) {assert(answer == Ok(Some(true)));}
+    else {
+        assert(answer == match commit {
+            Ok(true)=>Ok(Some(true)), Ok(false)=>Ok(None), Err(e)=>Err(e),
+        });
+    } }
+}
+
 /// Encoding failure leaves an arbitrary existing overlay intact. A delete
 /// writes a tombstone, leaving all other keys as they were.
 fn stage_refusal_and_delete(root:&mut Option<std::sync::Arc<crate::traversal::Node>>,

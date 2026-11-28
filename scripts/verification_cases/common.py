@@ -299,6 +299,7 @@ INPUTS = [
     Path("verification/hosted_checkpoint_leaf_record.rs"),
     Path("verification/hosted_checkpoint_record.rs"),
     Path("verification/hosted_checkpoint_walk.rs"),
+    Path("crates/astrid-storage/src/kv/tree/mutation_ack.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_progress.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_walk.rs"),
     Path("crates/astrid-storage/src/kv/tree/checkpoint_leaf.rs"),

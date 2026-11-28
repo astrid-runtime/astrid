@@ -399,6 +399,8 @@ mod hosted_checkpoint_totals;
 mod hosted_checkpoint_reference;
 mod hosted_checkpoint_page;
 mod hosted_checkpoint_leaf;
+#[path = "../crates/astrid-storage/src/kv/tree/mutation_ack.rs"]
+mod mutation_ack;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_progress.rs"]
 mod checkpoint_progress;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_walk.rs"]

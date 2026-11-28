@@ -6,6 +6,20 @@ from .common import replace_once
 
 
 def consumer_defects():
+    ack = Path("crates/astrid-storage/src/kv/tree/mutation_ack.rs")
+    for label, clause, weaker in [
+        ("unchanged result", "!changed ==> out == Ok(Some(output))", "true"),
+        ("returned comparison", "value == output && publish.ensures", "publish.ensures"),
+        ("accepted publication", "publish.ensures((mutations,),Ok(true))", "true"),
+        ("conflict retry", "publish.ensures((mutations,),Ok(false))", "true"),
+        ("failure propagation", "publish.ensures((mutations,),Err(e))", "true"),
+    ]:
+        yield (
+            f"graph CAS acknowledgement loses {label}", ack,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_retirement_recovery.rs"),
+        )
+
     receipt = Path("crates/astrid-storage/src/engine/durable/group/receipt.rs")
     for label, original, weaker in [
         ("submitter binding", "final(queue)@ == old(queue)@.push(Self {transaction,receipt:*receipt,observer})", "final(queue).len() == old(queue).len()+1"),
