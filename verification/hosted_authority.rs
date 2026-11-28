@@ -252,6 +252,8 @@ mod checkpoint_admission;
 mod arena_frame;
 #[path = "../crates/astrid-storage/src/engine/durable/frame_repair.rs"]
 mod frame_repair;
+#[path = "../crates/astrid-storage/src/engine/durable/recovery_barrier.rs"]
+mod recovery_barrier;
 use arena_frame::ArenaLocation;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_vectors.rs"]
 mod arena_vectors;
@@ -266,6 +268,7 @@ mod recovered_record;
 mod hosted_record_model;
 mod hosted_arena_placement;
 mod hosted_arena_append;
+mod hosted_recovery_barrier;
 mod hosted_checkpoint_recovery;
 mod hosted_duplicate_recovery;
 mod hosted_record_roundtrip;

@@ -812,6 +812,7 @@ mod checkpoint_admission;
 mod direct_placement;
 mod frame_repair;
 mod read_admission;
+mod recovery_barrier;
 mod staging;
 
 use crate::engine::durable_cache as cache;

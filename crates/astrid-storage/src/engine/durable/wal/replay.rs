@@ -210,21 +210,14 @@ where
     // A committed WAL transaction is authoritative only after every
     // canonical file it may have changed is stable.  If no transaction was
     // present this still makes the tail truncation ordering explicit.
-    arena
-        .sync_data()
-        .map_err(|source| io_error("flush WAL-replayed object arena", source))?;
-    roots
-        .sync_data()
-        .map_err(|source| io_error("flush WAL-replayed root journal", source))?;
-    if let Some(representations) = representations {
-        representations.flush()?;
-    }
+    let stable =
+        super::super::recovery::stabilize_files(arena, roots, representations, None, resume)?;
 
     // The caller still has to validate the repaired representation and root
     // closures. It checkpoints this resumed writer only after every such
     // authority check succeeds, so a failed recovery keeps the WAL evidence
     // available for the next attempt.
-    resume.into_writer(limits).map_err(durable_error)
+    stable.finish(|resume| resume.into_writer(limits).map_err(durable_error))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

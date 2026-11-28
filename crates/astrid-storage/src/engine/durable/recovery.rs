@@ -376,36 +376,76 @@ where
     Ok((recovered, wal))
 }
 
-fn stabilize_recovered_store<P: Ord>(
-    recovered: &mut RecoveredStore<P>,
-    faults: &dyn FaultInjector,
-) -> Result<(), DurableError> {
-    if faults.should_fail(FaultPoint::BeforeInProcessRecoveryArenaFlush) {
-        return Err(io_error(
-            "flush recovered object arena",
-            io::Error::other("injected recovery arena-flush I/O failure"),
-        ));
+struct CanonicalFiles<'a> {
+    arena: &'a mut super::File,
+    roots: &'a mut super::File,
+    representations: Option<&'a mut super::representations::RepresentationStore>,
+    faults: Option<&'a dyn FaultInjector>,
+}
+
+impl super::recovery_barrier::Files for CanonicalFiles<'_> {
+    type Error = DurableError;
+
+    fn representations_present(&self) -> bool {
+        self.representations.is_some()
     }
-    recovered
-        .files
-        .arena
-        .sync_data()
-        .map_err(|source| io_error("flush recovered object arena", source))?;
-    if faults.should_fail(FaultPoint::BeforeInProcessRecoveryRootFlush) {
-        return Err(io_error(
-            "flush recovered root journal",
-            io::Error::other("injected recovery root-flush I/O failure"),
-        ));
+
+    fn sync(&mut self, target: super::recovery_barrier::Target) -> Result<(), DurableError> {
+        use super::recovery_barrier::Target;
+        let (file, replay_label, recovery_label, point, injected) = match target {
+            Target::Arena => (
+                &mut self.arena,
+                "flush WAL-replayed object arena",
+                "flush recovered object arena",
+                FaultPoint::BeforeInProcessRecoveryArenaFlush,
+                "injected recovery arena-flush I/O failure",
+            ),
+            Target::Roots => (
+                &mut self.roots,
+                "flush WAL-replayed root journal",
+                "flush recovered root journal",
+                FaultPoint::BeforeInProcessRecoveryRootFlush,
+                "injected recovery root-flush I/O failure",
+            ),
+            Target::Representations => {
+                if let Some(representations) = self.representations.as_deref_mut() {
+                    representations.flush()?;
+                }
+                return Ok(());
+            },
+        };
+        let label = if let Some(faults) = self.faults {
+            if faults.should_fail(point) {
+                return Err(io_error(recovery_label, io::Error::other(injected)));
+            }
+            recovery_label
+        } else {
+            replay_label
+        };
+        file.sync_data().map_err(|source| io_error(label, source))
     }
-    recovered
-        .files
-        .roots
-        .sync_data()
-        .map_err(|source| io_error("flush recovered root journal", source))?;
-    if let Some(representations) = &mut recovered.representations {
-        representations.flush()?;
-    }
-    Ok(())
+}
+
+pub(super) fn stabilize_files<W>(
+    arena: &mut super::File,
+    roots: &mut super::File,
+    representations: Option<&mut super::representations::RepresentationStore>,
+    faults: Option<&dyn FaultInjector>,
+    wal: W,
+) -> Result<super::recovery_barrier::Stable<W>, DurableError> {
+    use super::recovery_barrier::{Error, stabilize};
+    stabilize(
+        &mut CanonicalFiles {
+            arena,
+            roots,
+            representations,
+            faults,
+        },
+        wal,
+    )
+    .map_err(|error| match error {
+        Error::Arena(e) | Error::Roots(e) | Error::Representations(e) => e,
+    })
 }
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -491,8 +531,14 @@ where
                 ))
             } else {
                 self.recover_media().and_then(|(mut recovered, wal)| {
-                    stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
-                    checkpoint_recovered_wal((recovered, wal))
+                    let stable = stabilize_files(
+                        &mut recovered.files.arena,
+                        &mut recovered.files.roots,
+                        recovered.representations.as_mut(),
+                        Some(self.faults.as_ref()),
+                        wal,
+                    )?;
+                    stable.finish(|wal| checkpoint_recovered_wal((recovered, wal)))
                 })
             };
             match recovered {

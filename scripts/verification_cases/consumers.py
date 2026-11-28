@@ -399,6 +399,22 @@ def consumer_defects():
     append = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     vectors = Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs")
     readback = Path("verification/hosted_arena_append.rs")
+    barrier = Path("crates/astrid-storage/src/engine/durable/recovery_barrier.rs")
+    for label, clause, weaker in [
+        ("WAL identity", "stable.wal() == wal", "true"),
+        ("handoff result", "ensures finish.ensures((self.wal(),),value)", "ensures true"),
+        ("represented order", "final(files).calls() == all && final(files).durable() == both.insert", "final(files).durable() == both.insert"),
+        ("unrepresented order", "final(files).calls() == roots && final(files).durable() == both", "final(files).durable() == both"),
+        ("represented images", "final(files).durable() == both.insert(x,old(files).pending()[x])", "true"),
+        ("unrepresented images", "final(files).durable() == both}", "true}"),
+        ("arena failure", "Err(Error::Arena(_)) => final(files).calls() == arena", "Err(Error::Arena(_)) => true"),
+        ("roots failure", "Err(Error::Roots(_)) => final(files).calls() == roots", "Err(Error::Roots(_)) => true"),
+        ("representations failure", "old(files).has_representations() && final(files).calls() == all", "true"),
+    ]:
+        yield (
+            f"recovery barrier loses {label}", barrier,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_recovery_barrier.rs"),
+        )
     repair = Path("crates/astrid-storage/src/engine/durable/frame_repair.rs")
     for label, clause, weaker in [
         ("committed protection", "w.protected == end && w.restore_cursor", "w.restore_cursor"),
