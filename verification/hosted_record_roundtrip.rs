@@ -119,8 +119,8 @@ fn replay_placement(map:&mut std::collections::BTreeMap<ObjectId,crate::ArenaLoc
     out
 }
 
-fn scan_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&ObjectRecord,scheme:Scheme,id:ObjectId,hash:H)
-    -> (out:Result<ObjectRecord,wire::Error<wire::BodyError>>)
+pub(super) fn scan_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],Ghost(source):Ghost<&ObjectRecord>,scheme:Scheme,Ghost(id):Ghost<ObjectId>,hash:H)
+    -> (out:Result<(ObjectId,ObjectRecord),wire::Error<wire::BodyError>>)
     requires frame@ == crate::recovered_record::encoding(scheme,id,*source),wire::tag(frame@,0,scheme),
         id.digest() == frame@.subrange(8,40),wire::complete_body(frame@,40,scheme),
         source.contents().3.len() == 0 ==> wire::leaf_body(frame@,40),
@@ -128,7 +128,7 @@ fn scan_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&ObjectRecord,s
         forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
         forall|r:&ObjectRecord,d:[u8;32]| same_fields(*r,*source) && #[trigger] hash.ensures((r,),d) ==> d@ == id.digest(),
     ensures match out {
-        Ok(decoded) => same_fields(decoded,*source),
+        Ok((key,decoded)) => key==id && same_fields(decoded,*source),
         Err(e) => source.contents().3.len() > 0 && e matches wire::Error::Decode(wire::DecodeError::Record(wire::BodyError::Allocation)),
     },
 {
@@ -139,7 +139,7 @@ fn scan_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&ObjectRecord,s
     match scan::recover(frame,scheme,identify) {
         Ok((name,r)) => {
             proof { ObjectId::same_digest(name,id); unique_record(frame@,scheme,r,*source); }
-            Ok(r)
+            Ok((name,r))
         },
         Err(Error::Decode(e)) => Err(wire::Error::Decode(e)),
         Err(Error::Identity) => {
@@ -182,10 +182,62 @@ fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,i
     recover_written(&frame,source,scheme,id,hash,scan)
 }
 
+/// Derive the decoder shape using only specification data. The frame length
+/// bounds both the canonical payload and its complete reference prefix.
+#[verifier::rlimit(45)]
+pub(super) proof fn canonical_shape(bytes:Seq<u8>,source:ObjectRecord,scheme:Scheme,id:ObjectId)
+    requires bytes==crate::recovered_record::encoding(scheme,id,source),bytes.len()<=usize::MAX,
+        scheme.algorithm@ != seq![0u8,0u8],scheme.construction@ != seq![0u8,0u8],
+        ObjectRecord::labels_ordered(source.contents().3),
+    ensures wire::tag(bytes,0,scheme),id.digest()==bytes.subrange(8,40),
+        wire::complete_body(bytes,40,scheme),wire::record_at(bytes,40,scheme,source),
+        source.contents().3.len()==0 ==> wire::leaf_body(bytes,40),
+{
+    let f = source.contents();
+    let n = f.3.len();
+    let refs = wire::reference_prefix(f.3,n,scheme);
+    let start = 69+f.2.len() as int;
+    let count=n as usize;
+    vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+    assert((f.2.len() as u64) as int == f.2.len());
+    assert(bytes.subrange(0,40) =~= wire::wire(scheme,id.raw()));
+    wire::tag_written(bytes,0,scheme,id.raw());
+    let h = wire::header_wire(f.0,f.1,f.5);
+    let payload = wire::payload_wire(f.4,f.2,count);
+    assert(bytes.subrange(40,45) =~= h);
+    assert(bytes.subrange(45,start) =~= payload);
+    crate::root_wire::subfield(bytes,40,h,0,2);
+    crate::root_wire::subfield(bytes,40,h,2,2);
+    assert(bytes.subrange(40,42) =~= wire::le16(f.0.wire_code()));
+    assert(bytes.subrange(42,44) =~= wire::le16(f.1));
+    assert forall|v:u16| (v as u8 as u16) | (((v >> 8) as u8 as u16) << 8) == v by {
+        assert((v as u8 as u16) | (((v >> 8) as u8 as u16) << 8) == v) by(bit_vector);
+    }
+    crate::root_wire::subfield(bytes,45,payload,0,8);
+    crate::root_wire::subfield(bytes,45,payload,8,8);
+    crate::root_wire::subfield(bytes,45,payload,16,8);
+    crate::root_wire::subfield(bytes,45,payload,24,f.2.len() as int);
+    assert(bytes.subrange(45,53) =~= vstd::bytes::spec_u64_to_le_bytes(f.4));
+    assert(bytes.subrange(53,61) =~= vstd::bytes::spec_u64_to_le_bytes(f.2.len() as u64));
+    assert(bytes.subrange(61,69) =~= vstd::bytes::spec_u64_to_le_bytes(count as u64));
+    assert(bytes.subrange(69,start) =~= f.2);
+    assert(bytes.subrange(start,bytes.len() as int) =~= refs);
+    reference_rows(bytes,start,f.3,n,scheme);
+    assert forall|i:nat| 0 < i < n implies ObjectRecord::label_before(wire::label_at(bytes,start,(i-1) as nat),#[trigger] wire::label_at(bytes,start,i)) by {
+        assert(wire::stored_reference(bytes,wire::position(bytes,start,i),f.3[i as int]));
+        assert(wire::stored_reference(bytes,wire::position(bytes,start,(i-1) as nat),f.3[i as int-1]));
+        assert(ObjectRecord::label_before(f.3[i as int-1].fields().0,f.3[i as int].fields().0));
+    }
+    source.version_nonzero();
+    assert(wire::record_at(bytes,40,scheme,source));
+    assert(wire::complete_body(bytes,40,scheme));
+    if n == 0 {assert(wire::leaf_body(bytes,40));}
+}
+
 /// Authenticate canonical bytes supplied by the storage reader. The source
 /// witnesses their meaning and is never used as the decoder input.
 #[verifier::rlimit(45)]
-pub(super) fn recover_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&ObjectRecord,scheme:Scheme,id:ObjectId,hash:H,scan:bool)
+fn recover_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&ObjectRecord,scheme:Scheme,id:ObjectId,hash:H,scan:bool)
     -> (out:Result<ObjectRecord,wire::Error<wire::BodyError>>)
     requires frame@==crate::recovered_record::encoding(scheme,id,*source),
         scheme.algorithm@ != seq![0u8,0u8],scheme.construction@ != seq![0u8,0u8],
@@ -197,50 +249,13 @@ pub(super) fn recover_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&
         Err(e) => source.contents().3.len() > 0 && e matches wire::Error::Decode(wire::DecodeError::Record(wire::BodyError::Allocation)),
     },
 {
-    let version = source.format_version().get();
-    let count = source.references().len();
-    let length = source.canonical_bytes().len();
-    proof {
-        let f = source.contents();
-        let n = f.3.len();
-        let refs = wire::reference_prefix(f.3,n,scheme);
-        let start = 69+f.2.len() as int;
-        let bytes = frame@;
-        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
-        assert((f.2.len() as u64) as int == f.2.len()) by {assert(length <= usize::MAX);}
-        assert(bytes.subrange(0,40) =~= wire::wire(scheme,id.raw()));
-        wire::tag_written(bytes,0,scheme,id.raw());
-        let h = wire::header_wire(f.0,f.1,f.5);
-        let payload = wire::payload_wire(f.4,f.2,count);
-        assert(bytes.subrange(40,45) =~= h);
-        assert(bytes.subrange(45,start) =~= payload);
-        crate::root_wire::subfield(bytes,40,h,0,2);
-        crate::root_wire::subfield(bytes,40,h,2,2);
-        assert(bytes.subrange(40,42) =~= wire::le16(f.0.wire_code()));
-        assert(bytes.subrange(42,44) =~= wire::le16(f.1));
-        assert forall|v:u16| (v as u8 as u16) | (((v >> 8) as u8 as u16) << 8) == v by {
-            assert((v as u8 as u16) | (((v >> 8) as u8 as u16) << 8) == v) by(bit_vector);
-        }
-        crate::root_wire::subfield(bytes,45,payload,0,8);
-        crate::root_wire::subfield(bytes,45,payload,8,8);
-        crate::root_wire::subfield(bytes,45,payload,16,8);
-        crate::root_wire::subfield(bytes,45,payload,24,f.2.len() as int);
-        assert(bytes.subrange(45,53) =~= vstd::bytes::spec_u64_to_le_bytes(f.4));
-        assert(bytes.subrange(53,61) =~= vstd::bytes::spec_u64_to_le_bytes(f.2.len() as u64));
-        assert(bytes.subrange(61,69) =~= vstd::bytes::spec_u64_to_le_bytes(count as u64));
-        assert(bytes.subrange(69,start) =~= f.2);
-        assert(bytes.subrange(start,bytes.len() as int) =~= refs);
-        reference_rows(bytes,start,f.3,n,scheme);
-        assert forall|i:nat| 0 < i < n implies ObjectRecord::label_before(wire::label_at(bytes,start,(i-1) as nat),#[trigger] wire::label_at(bytes,start,i)) by {
-            assert(wire::stored_reference(bytes,wire::position(bytes,start,i),f.3[i as int]));
-            assert(wire::stored_reference(bytes,wire::position(bytes,start,(i-1) as nat),f.3[i as int-1]));
-            assert(ObjectRecord::label_before(f.3[i as int-1].fields().0,f.3[i as int].fields().0));
-        }
-        assert(wire::record_at(bytes,40,scheme,*source));
-        assert(wire::complete_body(bytes,40,scheme));
-        if n == 0 {assert(wire::leaf_body(bytes,40));}
+    let _length=frame.len();
+    proof {canonical_shape(frame@,*source,scheme,id);}
+    if scan {
+        return match scan_written(frame,Ghost(source),scheme,Ghost(id),hash) {
+            Ok((_,record))=>Ok(record),Err(e)=>Err(e),
+        };
     }
-    if scan {return scan_written(frame,source,scheme,id,hash);}
     let result = wire::confirmed(frame,scheme,id,hash);
     proof {
         if let Err(wire::Error::Identity) = result {

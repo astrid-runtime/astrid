@@ -182,8 +182,8 @@ def consumer_defects():
     for label, clause, weakness in [
         ("captured plain body", "capture.body.as_slice()", "&capture.body[..0]"),
         ("decoded reference edges", "table.insert(key,record);", "if record.references().is_empty() {table.insert(key,record);}"),
-        ("recovered table domain", "while i<p.rows.len()", "while i<p.rows.len() && i<1"),
-        ("decoded identity", "let key=ObjectId::new(hash(&record));", "let key=ObjectId::new([0;32]);"),
+        ("recovered table domain", "while i<p.group.objects.len()", "while i<p.group.objects.len() && i<1"),
+        ("decoded identity", "table.insert(key,record);", "table.insert(ObjectId::new([0;32]),record);"),
     ]:
         yield (
             f"fresh table recovery loses {label}", named_batch,
@@ -203,4 +203,16 @@ def consumer_defects():
         yield (
             f"recovered publication walk loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
+        )
+
+    reader = Path("verification/hosted_record_roundtrip.rs")
+    for label, clause, weakness in [
+        ("scanner key", "Ok((key,decoded)) => key==id && same_fields(decoded,*source),",
+         "Ok((_,decoded)) => same_fields(decoded,*source),"),
+        ("decoded fields", "Ok((key,decoded)) => key==id && same_fields(decoded,*source),",
+         "Ok((key,_)) => key==id,"),
+    ]:
+        yield (
+            f"cold table recovery loses {label}", reader,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), named_batch,
         )

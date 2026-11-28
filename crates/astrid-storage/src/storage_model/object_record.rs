@@ -142,6 +142,12 @@ pub(crate) open spec fn labels_ordered(refs:Seq<ObjectReference>) -> bool {
         (self.kind,self.format_version.number(),self.canonical_bytes@,self.references@,self.logical_bytes,self.class)
     }
 
+    pub(crate) proof fn version_nonzero(&self)
+        ensures self.contents().1 != 0,
+    {
+        vstd::std_specs::nonzero::axiom_nonzero_is_not_zero(self.format_version.0);
+    }
+
     pub(crate) open spec fn same_contents(&self,other:&Self) -> bool {
         let a = self.contents();
         let b = other.contents();

@@ -234,7 +234,7 @@ spec fn refused(rows:Seq<(ObjectId,Vec<u8>)>,scheme:root_wire::Scheme,limit:u64,
 enum GraphError { Closure(crate::closure_walk::Failure<ObjectId,ObjectId>), Capacity, Batch(Error) }
 
 struct Publication<M> {
-    group:Released<M>, journal:crate::journal_transition::Record, rows:Vec<(ObjectId,Vec<u8>)>,
+    group:Released<M>, journal:crate::journal_transition::Record, rows:Ghost<Seq<(ObjectId,Vec<u8>)>>,
 }
 
 /// Journal all fresh declarations with the root chosen by the publication CAS.
@@ -275,7 +275,7 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
         &&& r.media.image().subrange(r.roots@[0].start as int+72,r.roots@[0].start as int+72+r.roots@[0].body.len())==r.roots@[0].body@
         &&& r.objects.len()==graph.records.len()
         &&& crate::hosted_kv_root_publication::canonical_rows(graph,p.rows@,scheme)
-        &&& forall|i:int| 0<=i<p.rows.len() ==> #[trigger] bound(r.objects@[i],p.rows@[i].0,p.rows@[i].1@,scheme,limit,compression@,r.media.image())
+        &&& forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] bound(r.objects@[i],p.rows@[i].0,p.rows@[i].1@,scheme,limit,compression@,r.media.image())
     },
     out matches Err(GraphError::Closure(crate::closure_walk::Failure::Source(k,e))) ==> k==e && !table@.contains_key(k),
     out matches Err(GraphError::Closure(crate::closure_walk::Failure::Cycle(k))) ==> crate::closure_walk::reaches(
@@ -315,7 +315,7 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
         },
     };
     let journal=crate::hosted_acknowledged_root::parse_written(&r.roots[0].body,&name,scheme,expected,replacement);
-    Ok(Publication{group:r,journal,rows})
+    Ok(Publication{group:r,journal,rows:Ghost(rows@)})
 }
 
 enum RecoveryError<E> { Compression(usize,E), References(usize), Closure(crate::closure_walk::Failure<ObjectId,ObjectId>) }
@@ -344,23 +344,23 @@ proof fn same_children(a:Seq<crate::ObjectReference>,b:Seq<crate::ObjectReferenc
 #[verifier::rlimit(35)]
 #[verifier::loop_isolation(false)]
 fn recover_closure<M:crate::positional_read::Media,E,D,H>(
-    p:&Publication<M>,graph:&crate::hosted_kv_root_publication::Graph<Vec<u8>>,
+    p:&Publication<M>,Ghost(graph):Ghost<&crate::hosted_kv_root_publication::Graph<Vec<u8>>>,
     version:crate::ObjectFormatVersion,scheme:root_wire::Scheme,limit:u64,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,
     decode:D,hash:H) -> (out:Result<BTreeMap<ObjectId,ObjectRecord>,RecoveryError<E>>)
     where D:Fn(&[u8],usize)->Result<Vec<u8>,E>,H:Fn(&ObjectRecord)->[u8;32]+Copy,
     requires p.journal.replacement==graph.selected.binding().2,
         graph.links(graph.selected.binding().0,graph.selected.binding().1,graph.records@[graph.component],version),
         crate::hosted_kv_root_publication::canonical_rows(graph,p.rows@,scheme),
-        p.group.objects.len()==p.rows.len(),btree_map_inv(&graph.records),
+        p.group.objects.len()==p.rows@.len(),
         obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
         scheme.algorithm@!=seq![0u8,0u8],scheme.construction@!=seq![0u8,0u8],
-        forall|i:int| 0<=i<p.rows.len() ==> #[trigger] bound(p.group.objects@[i],p.rows@[i].0,p.rows@[i].1@,scheme,limit,compression@,p.group.media.image()),
+        forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] bound(p.group.objects@[i],p.rows@[i].0,p.rows@[i].1@,scheme,limit,compression@,p.group.media.image()),
         forall|id:ObjectId| #[trigger] graph.records@.contains_key(id) ==> ObjectRecord::labels_ordered(graph.records@[id].contents().3),
         forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
         forall|k:ObjectId,r:&ObjectRecord,d:[u8;32]| #[trigger] graph.records@.contains_key(k) &&
             crate::hosted_record_roundtrip::same_fields(*r,graph.records@[k]) && #[trigger] hash.ensures((r,),d) ==> d@==k.digest(),
         forall|b:&[u8],n:usize| #[trigger] decode.requires((b,n)),
-        forall|i:int,b:&[u8],v:Vec<u8>| 0<=i<p.rows.len() && b@==(compression@)(p.rows@[i].1@) &&
+        forall|i:int,b:&[u8],v:Vec<u8>| 0<=i<p.rows@.len() && b@==(compression@)(p.rows@[i].1@) &&
             #[trigger] decode.ensures((b,p.rows@[i].1.len()),Ok(v)) ==> v@==p.rows@[i].1@,
     ensures out matches Ok(t) ==> crate::closure_walk::closed(p.journal.replacement.commit,Set::empty(),
             crate::hosted_kv_root_publication::owning_edges(t@),t@.dom()) &&
@@ -372,23 +372,24 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H>(
         out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Cycle(k))) ==> crate::closure_walk::reaches(
             graph.records@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)),Set::empty(),k,k),
         !(out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Root(_)))),
-        out matches Err(RecoveryError::References(i)) ==> i<p.rows.len() && graph.records@[p.rows@[i as int].0].contents().3.len()>0,
-        out matches Err(RecoveryError::Compression(i,e)) ==> i<p.rows.len() && p.group.objects@[i as int].flags==1 &&
+        out matches Err(RecoveryError::References(i)) ==> i<p.rows@.len() && graph.records@[p.rows@[i as int].0].contents().3.len()>0,
+        out matches Err(RecoveryError::Compression(i,e)) ==> i<p.rows@.len() && p.group.objects@[i as int].flags==1 &&
             codec_failure((compression@)(p.rows@[i as int].1@),p.rows@[i as int].1.len(),decode,e),
 {
     let mut table=BTreeMap::new();
     let mut i=0;
-    while i<p.rows.len()
-        invariant i<=p.rows.len(),btree_map_inv(&table),
+    while i<p.group.objects.len()
+        invariant i<=p.rows@.len(),btree_map_inv(&table),
             forall|k:ObjectId| #[trigger] table@.contains_key(k) ==> graph.records@.contains_key(k) &&
                 crate::hosted_record_roundtrip::same_fields(table@[k],graph.records@[k]),
             forall|j:int| 0<=j<i ==> table@.contains_key(#[trigger] p.rows@[j].0),
-        decreases p.rows.len()-i,
+        decreases p.rows@.len()-i,
     {
-        let (id,witness)=&p.rows[i];
-        let source=graph.records.get(id).unwrap();
+        let ghost id=p.rows@[i as int].0;
+        let ghost witness=p.rows@[i as int].1;
+        let ghost source=&graph.records@[id];
         let capture=&p.group.objects[i];
-        assert(bound(*capture,*id,witness@,scheme,limit,compression@,p.group.media.image()));
+        assert(bound(*capture,id,witness@,scheme,limit,compression@,p.group.media.image()));
         let expanded;
         let bytes=if capture.flags==0 {capture.body.as_slice()} else {
             proof {
@@ -415,11 +416,10 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H>(
             };
             expanded.as_slice()
         };
-        let record=match crate::hosted_record_roundtrip::recover_written(bytes,source,scheme,*id,hash,true) {
-            Ok(r)=>r,Err(_)=>return Err(RecoveryError::References(i)),
+        proof {crate::hosted_record_roundtrip::canonical_shape(bytes@,*source,scheme,id);}
+        let (key,record)=match crate::hosted_record_roundtrip::scan_written(bytes,Ghost(source),scheme,Ghost(id),hash) {
+            Ok(row)=>row,Err(_)=>return Err(RecoveryError::References(i)),
         };
-        let key=ObjectId::new(hash(&record));
-        proof {ObjectId::same_digest(key,*id);}
         table.insert(key,record);
         i+=1;
     }
@@ -433,7 +433,7 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H>(
         }
         assert(edges =~= graph.records@.map_values(|r:ObjectRecord| crate::closure_walk::children(r.contents().3)));
     }
-    let rows=match crate::hosted_kv_root_publication::materialize(graph,&table,root,version) {
+    let rows=match crate::hosted_kv_root_publication::materialize::<Vec<u8>>(Ghost(graph),&table,root,version) {
         Ok(rows)=>rows,Err(e)=>return Err(RecoveryError::Closure(e)),
     };
     proof {

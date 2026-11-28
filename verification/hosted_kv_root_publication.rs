@@ -136,7 +136,7 @@ proof fn recovered_child(source:ObjectRecord,decoded:ObjectRecord,label:Seq<u8>,
 /// Run the recovery materializer on a preloaded table. Other retained references
 /// can lead outside the declaration. A successful closure must include the
 /// selected marker even when those references lead to additional records.
-pub(crate) fn materialize<'a,P>(g:&Graph<P>,table:&'a BTreeMap<ObjectId,ObjectRecord>,root:ObjectId,v:ObjectFormatVersion)
+pub(crate) fn materialize<'a,P>(Ghost(g):Ghost<&Graph<P>>,table:&'a BTreeMap<ObjectId,ObjectRecord>,root:ObjectId,v:ObjectFormatVersion)
     -> (out:Result<Vec<(ObjectId,&'a ObjectRecord)>,crate::closure_walk::Failure<ObjectId,ObjectId>>)
     requires root==g.selected.binding().2.commit,g.links(g.selected.binding().0,g.selected.binding().1,g.records@[g.component],v),
         obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),btree_map_inv(table),
