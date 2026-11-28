@@ -6,6 +6,22 @@ from .common import replace_once
 
 
 def consumer_defects():
+    transition = Path("crates/astrid-storage/src/engine/durable/journal_transition.rs")
+    for label, clause, weaker in [
+        ("encoded fields", "bytes@ == wire(name@,scheme,expected,replacement)", "true"),
+        ("failure isolation", "out.is_err() ==> final(history)@ == old(history)@", "true"),
+        ("owner length refusal", "(out matches Err(Error::Length)) ==", "(out matches Err(Error::Length)) ==>"),
+        ("physical payload", "(out matches Err(Error::Noncanonical)) ==", "(out matches Err(Error::Noncanonical)) ==>"),
+        ("codec refusal", "out matches Err(Error::Principal) ==> exists", "false ==> exists"),
+        ("owner binding", "n@ == self.principal@ && #[trigger] named(n,p,decode,recode)", "#[trigger] named(n,p,decode,recode)"),
+        ("generation check", "out.is_ok() == (actual == self.expected", "out.is_ok() ==> (actual == self.expected"),
+        ("restored root and offset", "out.is_ok() ==> final(history)@ == old(history)@.insert(p,(self.replacement,at))", "true"),
+    ]:
+        yield (
+            f"scanned root replay loses {label}", transition,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_journal_history.rs"),
+        )
     frame = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     frontier = Path("crates/astrid-storage/src/engine/durable/frontier.rs")
     for label, source, clause, weaker in [

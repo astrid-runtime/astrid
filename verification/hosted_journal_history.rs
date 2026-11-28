@@ -76,6 +76,46 @@ fn journal_transition<K:Ord+Copy,F>(history:&mut BTreeMap<K,(RootState,u64)>,own
 }
 
 
+/// Commit one journal frame behind a prefix, then offer its physical payload
+/// to startup with independently supplied decoded fields and principal codec.
+fn replay_framed_transition<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(history:&mut BTreeMap<u8,(RootState,u64)>, mut batch:Vec<u8>,base:u64,magic:[u8;8],version:u16,hash:H,
+    scheme:root_wire::Scheme,record:crate::journal_transition::Record,observed_name:&[u8],
+    observed_expected:Option<RootState>,observed_next:RootState,decoded:Option<u8>,recoded:Vec<u8>)
+    requires btree_map_inv(old(history)),observed_name.len() < u64::MAX,
+        base as int + batch.len() <= u64::MAX,
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+{
+    use crate::journal_transition as transition;
+    let payload = transition::encode(observed_name,scheme,observed_expected,observed_next).unwrap();
+    let prefix = batch.len();
+    let frame = crate::arena_frame::extend_batch(&mut batch,base,magic,version,&payload,hash).unwrap();
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    assert(crate::arena_frame::header_bytes(magic,version,frame.payload_len,frame.checksum).len() == 52);
+    let start = (frame.offset-base) as usize;
+    assert(start == prefix && batch.len() == start + 52 + payload.len());
+    let body = &batch[start+52..];
+    assert(body@ =~= payload@);
+    let ghost expected_image = transition::wire(record.principal@,scheme,record.expected,record.replacement);
+    let ghost observed_image = transition::wire(observed_name@,scheme,observed_expected,observed_next);
+    let ghost before = history@;
+    let decode = |name:&[u8]| -> (o:Option<u8>) requires name@ == record.principal@, ensures o == decoded, {decoded};
+    let recode = |_:&u8| -> (b:Vec<u8>) ensures b@ == recoded@, {recoded};
+    let result = record.replay(history,scheme,frame.offset,body,decode,recode);
+    proof {
+        if record.principal.len() >= u64::MAX {assert(result matches Err(transition::Error::Length));}
+        else if observed_image != expected_image {assert(result matches Err(transition::Error::Noncanonical));}
+        else if decoded.is_none() || recoded@ != record.principal@ {assert(result matches Err(transition::Error::Principal));}
+        else {
+            let p = decoded.unwrap();
+            let actual = if before.contains_key(p) {Some(before[p].0)} else {None};
+            let next = match actual {Some(r)=>r.generation.value() as int + 1,None=>0int};
+            assert(result.is_ok() == (actual == record.expected && record.replacement.generation.value() == next));
+            if result.is_ok() {assert(history@ == before.insert(p,(record.replacement,(base as int + prefix) as u64)));}
+        }
+        if result.is_err() {assert(history@ == before);}
+    }
+}
+
 /// Decode one row emitted by the snapshot serializer at the running cursor.
 fn consume_snapshot_row(payload:&[u8],cursor:&mut usize,expected:&(Vec<u8>,RootState),scheme:root_wire::Scheme)
     -> (row:(Vec<u8>,RootState))

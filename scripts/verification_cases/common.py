@@ -260,6 +260,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
     Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
     Path("crates/astrid-storage/src/engine/durable/journal_history.rs"),
+    Path("crates/astrid-storage/src/engine/durable/journal_transition.rs"),
     Path("crates/astrid-storage/src/engine/durable/journal_snapshot.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
     Path("crates/astrid-storage/src/engine/durable/closure_walk.rs"),

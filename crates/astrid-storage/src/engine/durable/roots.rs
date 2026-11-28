@@ -7,6 +7,7 @@ use crate::storage_model::{ModelError, ObjectId, ObjectRecord, RootState};
 use super::closure_load::CommitError;
 use super::journal_history::{self, Rejection};
 use super::journal_snapshot::{self, SnapshotError};
+use super::journal_transition::{self, Record as DecodedRootRecord};
 use super::root_wire::{self, TailError};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
@@ -154,20 +155,7 @@ where
 {
     match record {
         DecodedRootJournalRecord::Transition(record) => {
-            let canonical = encode_root_record(
-                scheme,
-                &record.principal,
-                record.expected,
-                record.replacement,
-            )?;
-            if canonical != payload {
-                return Err(corrupt(
-                    ROOT_FILE,
-                    offset,
-                    "root-journal frame is not canonical",
-                ));
-            }
-            apply_transition(recovered, codec, offset, &record)
+            apply_transition(recovered, codec, scheme, offset, payload, &record)
         },
         DecodedRootJournalRecord::Snapshot(entries) => journal_snapshot::restore(
             recovered,
@@ -199,41 +187,50 @@ where
 fn apply_transition<P, C>(
     recovered: &mut BTreeMap<P, (RootState, u64)>,
     codec: &C,
+    scheme: IdentityScheme,
     offset: u64,
+    payload: &[u8],
     record: &DecodedRootRecord,
 ) -> Result<(), DurableError>
 where
     P: Ord,
     C: PrincipalCodec<P>,
 {
-    let principal = decode_principal(codec, &record.principal, offset)?;
-    journal_history::apply(
-        recovered,
-        principal,
-        record.expected,
-        record.replacement,
-        offset,
-    )
-    .map_err(|error| match error {
-        Rejection::Conflict(actual) => DurableError::RecoveryModel {
-            file: ROOT_FILE,
+    use journal_transition::Error;
+    record
+        .replay(
+            recovered,
+            scheme.into(),
             offset,
-            source: ModelError::RootConflict {
-                expected: record.expected,
-                actual,
+            payload,
+            |key| codec.decode(key),
+            |owner| codec.encode(owner),
+        )
+        .map_err(|error| match error {
+            Error::Length => DurableError::EncodingOverflow,
+            Error::Noncanonical => {
+                corrupt(ROOT_FILE, offset, "root-journal frame is not canonical")
             },
-        },
-        Rejection::Overflow => DurableError::RecoveryModel {
-            file: ROOT_FILE,
-            offset,
-            source: ModelError::ArithmeticOverflow,
-        },
-        Rejection::Generation => corrupt(
-            ROOT_FILE,
-            offset,
-            "replacement generation does not match journal history",
-        ),
-    })
+            Error::Principal => DurableError::InvalidPrincipal { offset },
+            Error::History(Rejection::Conflict(actual)) => DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset,
+                source: ModelError::RootConflict {
+                    expected: record.expected,
+                    actual,
+                },
+            },
+            Error::History(Rejection::Overflow) => DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset,
+                source: ModelError::ArithmeticOverflow,
+            },
+            Error::History(Rejection::Generation) => corrupt(
+                ROOT_FILE,
+                offset,
+                "replacement generation does not match journal history",
+            ),
+        })
 }
 
 fn decode_principal<P, C>(codec: &C, bytes: &[u8], offset: u64) -> Result<P, DurableError>
@@ -250,13 +247,8 @@ pub(super) fn encode_root_record(
     expected: Option<RootState>,
     replacement: RootState,
 ) -> Result<Vec<u8>, DurableError> {
-    super::root_wire::encode(
-        principal,
-        scheme.into(),
-        expected.map(Into::into),
-        replacement.into(),
-    )
-    .ok_or(DurableError::EncodingOverflow)
+    journal_transition::encode(principal, scheme.into(), expected, replacement)
+        .ok_or(DurableError::EncodingOverflow)
 }
 
 pub(super) fn encode_root_snapshot(
@@ -276,12 +268,6 @@ pub(super) fn encode_root_snapshot(
 enum DecodedRootJournalRecord {
     Transition(DecodedRootRecord),
     Snapshot(Vec<(Vec<u8>, RootState)>),
-}
-
-struct DecodedRootRecord {
-    principal: Vec<u8>,
-    expected: Option<RootState>,
-    replacement: RootState,
 }
 
 fn decode_root_journal_record(
