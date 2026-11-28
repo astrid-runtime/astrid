@@ -1,4 +1,4 @@
-//! Bind each compare-and-swap result to the key and bytes observed for this attempt.
+//! Bind each point-write result to the key and bytes observed for this attempt.
 use vstd::prelude::*;
 
 verus! {
@@ -85,6 +85,28 @@ impl Replacement {
         Ok(Self::compare_exchange(key,previous,expected,new))
     }
 
+    /// Read the addressed value at this attempt's header before choosing a replacement.
+    pub(crate) fn set_at<H,E,F:FnOnce(&H,&[u8])->Result<Option<Vec<u8>>,E>>(
+        header:&H,key:&[u8],new:&[u8],read:F,
+    ) -> (out:Result<((),Vec<Self>,bool),E>)
+        requires read.requires((header,key)),
+        ensures match out {
+            Err(e)=>read.ensures((header,key),Err(e)),
+            Ok((_,rows,changed))=>exists|observed:Option<Vec<u8>>| #[trigger] read.ensures((header,key),Ok(observed)) &&
+                Self::assignment(rows@,changed,key@,bytes(observed),new@),
+        },
+    {
+        let previous=read(header,key)?;
+        let (rows,changed)=Self::assign(key,previous,new);
+        Ok(((),rows,changed))
+    }
+
+    pub(crate) open spec fn assignment(rows:Seq<Self>,changed:bool,key:Seq<u8>,prior:Option<Seq<u8>>,new:Seq<u8>) -> bool {
+        &&& changed==(prior!=Some(new))
+        &&& rows.len()==if changed {1int} else {0int}
+        &&& changed ==> rows[0].fields()==(key,Some(new),Some((match prior {Some(v)=>Some(v.len() as usize),None=>None},false)))
+    }
+
     /// The enclosing writer retries on a root conflict. This decision uses only
     /// the value read at the current attempt's immutable header.
     fn compare_exchange(key:&[u8],previous:Option<Vec<u8>>,expected:Option<&[u8]>,new:&[u8])
@@ -92,7 +114,14 @@ impl Replacement {
         ensures Self::decision(out,key@,bytes(previous),match expected {Some(v) => Some(v@),None => None},new@),
     {
         if !same(previous.as_ref(),expected) {return (false,Vec::new(),false);}
-        if same(previous.as_ref(),Some(new)) {return (true,Vec::new(),false);}
+        let (rows,changed)=Self::assign(key,previous,new);
+        (true,rows,changed)
+    }
+
+    fn assign(key:&[u8],previous:Option<Vec<u8>>,new:&[u8]) -> (out:(Vec<Self>,bool))
+        ensures Self::assignment(out.0@,out.1,key@,bytes(previous),new@),
+    {
+        if same(previous.as_ref(),Some(new)) {return (Vec::new(),false);}
         let previous_len = previous.map(|v:Vec<u8>| -> (n:usize) ensures n == v.len(), {v.len()});
         let mut address = Vec::with_capacity(key.len());
         address.extend_from_slice(key);
@@ -103,7 +132,7 @@ impl Replacement {
         assert(previous_len == match bytes(previous) {Some(v) => Some(v.len() as usize),None => None});
         let row = Self {key:address,previous:PreviousValue::Loaded {previous_len,unchanged:false},
             value:Some(value)};
-        (true,vec![row],true)
+        (vec![row],true)
     }
 }
 }

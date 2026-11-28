@@ -46,6 +46,15 @@ def defects():
             lambda s, a=original, b=changed: replace_once(s, a, b), location,
         )
     cas = Path("crates/astrid-storage/src/kv/tree/context/replacement.rs")
+    for label, before, after in [
+        ("observed value", "Self::assign(key,previous,new);\n        Ok(((),rows,changed))", "Self::assign(key,None,new);\n        Ok(((),rows,changed))"),
+        ("target", "let previous=read(header,key)?;", "let previous=read(header,&[])?;"),
+        ("equal value", "return (Vec::new(),false);", "return (Vec::new(),true);"),
+    ]:
+        yield (
+            f"revocation point write loses {label}", cas,
+            lambda s, a=before, b=after: replace_once(s, a, b), cas,
+        )
     for name, original, changed in [
         ("comparison result", "out.0 == (prior == expected)", "true"),
         ("change decision", "out.2 == (prior == expected && prior != Some(new))", "true"),

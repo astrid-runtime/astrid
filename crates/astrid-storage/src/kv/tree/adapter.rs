@@ -80,19 +80,9 @@ where
         let blocking = self.blocking_store();
         run_blocking(move || {
             blocking.mutate(&owner, |context, header| {
-                let previous = context.projected_get(header, &composite)?;
-                if previous.as_deref() == Some(value.as_slice()) {
-                    return Ok(((), Vec::new(), false));
-                }
-                Ok((
-                    (),
-                    vec![Replacement::observed(
-                        composite.clone(),
-                        previous,
-                        Some(value.clone()),
-                    )],
-                    true,
-                ))
+                Replacement::set_at(header, &composite, &value, |header, key| {
+                    context.projected_get(header, key)
+                })
             })
         })
         .await

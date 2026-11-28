@@ -44,6 +44,8 @@ def consumer_defects():
     for label, before, after in [
         ("physical predecessor", "edge.fields().1==next && edge.fields().2==ReferenceKind::Owns", "edge.fields().2==ReferenceKind::Owns"),
         ("row key", "as int))!=address", "as int))==address"),
+        ("delete width", "if bytes[tag]==delta::DELETE {tag+1}", "if bytes[tag]==delta::DELETE {tag+2}"),
+        ("spilled length width", "} else {tag+9}", "} else {tag+8}"),
         ("inline payload width", "tag+9+crate::checkpoint_value::value_length(bytes,tag+1)", "tag+9"),
     ]:
         yield (

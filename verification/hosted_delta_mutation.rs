@@ -39,6 +39,7 @@ fn roundtrip(row:Mutation,index:usize,bytes:&mut Vec<u8>,refs:&mut Vec<ObjectRef
         None => {
             assert(bytes@[tag] == 0);
             assert(decoded matches Ok(Operation::Delete));
+            assert(row_end(bytes@,start)==tag+1);
             assert(refs@ == old(refs)@);
         },
         Some(ValueSlot::Inline(data)) => {
@@ -188,6 +189,7 @@ fn mixed_batch(object:ObjectId,trailing:bool,deny_second:bool) -> (out:Result<Ve
         assert(bytes@.subrange(45,53) =~= vstd::bytes::spec_u64_to_le_bytes(1));
         assert(bytes@.subrange(53,54) =~= seq![42u8]);
         assert(bytes@.subrange(62,70) =~= vstd::bytes::spec_u64_to_le_bytes(2048));
+        assert(row_end(bytes@,37)==54 && row_end(bytes@,54)==70);
         assert(refs.len() == 1 && refs@[0].fields() == (delta::label_bytes(1),object,ReferenceKind::Owns));
         assert(reference_lookup::selected(refs@,delta::label_bytes(1),0,1) == Some(refs@[0]));
         if out is Err {
@@ -306,7 +308,11 @@ proof fn absent_rows(rows:Seq<Mutation>,n:nat,address:Seq<u8>)
     ensures crate::overlay_batch::after_rows(rows,n,address,None).is_none(),
     decreases n,
 {
-    if n>0 {absent_rows(rows,(n-1) as nat,address);}
+    if n>0 {
+        assert(rows[n-1].key@!=address);
+        absent_rows(rows,(n-1) as nat,address);
+        reveal_with_fuel(crate::overlay_batch::after_rows,1);
+    }
 }
 
 pub(crate) proof fn decoded_link<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecord,next:ObjectId,address:Seq<u8>,
@@ -318,12 +324,23 @@ pub(crate) proof fn decoded_link<E,F:Fn(&[u8])->Option<E>>(record:&ObjectRecord,
     if let crate::delta_chain::Head::Delta{previous,depth,delta_bytes,mutations,totals}=head {
         let saved=crate::delta_recovery::Recovered{previous,depth,delta_bytes,rows:mutations,totals};
         let (bs,rs,path)=choose|bs:&[u8],rs:&[ObjectReference],p:Seq<usize>| #[trigger] crate::delta_recovery::admitted(record,check,saved,bs,rs,p);
+        let edge=reference_lookup::selected(rs@,crate::delta_header::PREVIOUS@,0,rs.len() as int).unwrap();
+        assert(edge.fields().1==next && previous==Some(edge.fields().1));
         assert forall|i:int| 0<=i<path.len()-1 implies path[i]<bs.len() && path[i+1]==row_end(bs@,#[trigger] path[i]) by {
             assert(delta::decoded(bs,path[i] as int,path[i+1],rs,i as usize,check,Ok(mutations@[i])));
+            let tag=path[i] as int+4+key::length(bs@,path[i] as int);
+            match mutations@[i].value {
+                None=>assert(path[i+1]==tag+1),
+                Some(ValueSlot::Inline(_))=>assert(path[i+1]==tag+9+crate::checkpoint_value::value_length(bs@,tag+1)),
+                Some(ValueSlot::Spilled{..})=>assert(path[i+1]==tag+9),
+            }
         }
         assert(spans(bs@,path));
         assert forall|i:int| 0<=i<mutations.len() implies (#[trigger] mutations@[i]).key@!=address by {
             assert(delta::decoded(bs,path[i] as int,path[i+1],rs,i as usize,check,Ok(mutations@[i])));
+            let begin=path[i] as int+4;
+            let end=begin+key::length(bs@,path[i] as int);
+            assert(bs@.subrange(begin,end)!=address && mutations@[i].key@==bs@.subrange(begin,end));
         }
         absent_rows(mutations@,mutations.len() as nat,address);
     }

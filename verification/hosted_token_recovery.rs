@@ -713,7 +713,8 @@ fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
         C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
     requires vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
         graph.from_arena(image@,index@,scheme,version),graph.component.is_some(),
-        path@.len()>0 && path@[0]==graph.component.unwrap() && graph.records@.contains_key(path@.last()),
+        path@.len()>0 && path@[0]==graph.component.unwrap(),
+        forall|i:int| 0<=i<path@.len() ==> graph.records@.contains_key(#[trigger] path@[i]),
         forall|text:Seq<u8>| #[trigger] marker_key::spells(target@,text) ==> crate::hosted_delta_mutation::marker_bytes(
             crate::hosted_journal_history::component_bytes(image@,index@[path@.last()]),ns_bytes(kind)+seq![0u8]+text),
         forall|i:int,text:Seq<u8>| 0<=i<path@.len()-1 && #[trigger] marker_key::spells(target@,text) ==>
@@ -732,6 +733,7 @@ fn reopen_loaded_marker<'a,P:Ord+Copy,S,B,V,T,W,E,KE,Check,Select,Fail,M,I,K,D,A
     ensures out matches Ok(decision) ==> (kind is Revoked ==> decision is Revoked) && (single_use ==> !(decision is Allowed)),
 {
     let head=graph.component.unwrap();
+    assert(path@[path@.len()-1]==path@.last());
     let ghost writer=path@.last();
     let text=marker_key::encode(&target);
     let address=Ghost(ns_bytes(kind)+seq![0u8]+text@);
@@ -916,6 +918,53 @@ fn checkpoint_marker_decision(target:Id,kind:Marker) -> (out:Result<Admission,Re
     match kind {
         Marker::Revoked => reopen_from_pages(Some(1u64),None,read,empty,None,None,target,true,legacy),
         Marker::Consumed => reopen_from_pages(None,Some(1u64),empty,read,None,None,target,true,legacy),
+    }
+}
+
+spec fn revocation_address(id:Id,text:[u8;36],key:&[u8]) -> bool {
+    marker_key::spells(id@,text@) && key@=="caps:revoked".spec_bytes()+seq![0u8]+text@
+}
+
+spec fn publication_result<E>(attempt:Result<Option<()>,E>) -> Result<bool,E> {
+    match attempt {Err(e)=>Err(e),Ok(done)=>Ok(done.is_some())}
+}
+
+/// A persistent revocation reaches one point-write attempt on the header supplied by
+/// the blocking tree store. A root conflict requests a retry; it cannot acknowledge the caller.
+fn revocation_write_attempt<H,E,R,W>(live:&mut HashMap<Id,token_authority::TokenStatus>,id:Id,header:&H,read:R,publish:W)
+    -> (out:Result<Option<()>,E>)
+    where R:FnOnce(&H,&[u8])->Result<Option<Vec<u8>>,E>,W:FnOnce(Vec<crate::kv_replacement::Replacement>)->Result<bool,E>,
+    requires hash_map_inv(old(live)),obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),vstd::pervasive::obeys_clone_eq::<Id>(),
+        forall|key:&[u8]| #[trigger] read.requires((header,key)),
+        forall|rows:Vec<crate::kv_replacement::Replacement>| #[trigger] publish.requires((rows,)),
+    ensures final(live)@.contains_key(id) && final(live)@[id].revoked(),
+        exists|text:[u8;36],key:&[u8]| #[trigger] revocation_address(id,text,key) && (
+                (out matches Err(e) && read.ensures((header,key),Err(e))) ||
+                exists|old:Option<Vec<u8>>| #[trigger] read.ensures((header,key),Ok(old)) && (
+                    if crate::kv_replacement::bytes(old)==Some(seq![1u8]) {out==Ok(Some(()))}
+                    else {exists|rows:Vec<crate::kv_replacement::Replacement>| rows.len()==1 &&
+                        rows@[0].fields()==(key@,Some(seq![1u8]),Some((match old {Some(v)=>Some(v.len()),None=>None},false))) &&
+                        #[trigger] publish.ensures((rows,),publication_result(out))}
+                )
+            ),
+{
+    use crate::kv_replacement::Replacement;
+    let uuid=|k:&Id| -> (v:Id) ensures v==*k, {*k};
+    let submit=|ns:&'static str,key:[u8;36],value:[u8;1]| -> (r:(&'static str,[u8;36],[u8;1])) ensures r==(ns,key,value), {(ns,key,value)};
+    let (ns,text,value)=token_authority::submit_revocation(live,&id,uuid,submit);
+    assert(marker_key::spells(id@,text@));
+    let address=crate::encoding::composite(ns.as_bytes(),&text);
+    let key=address.as_slice();
+    assert(revocation_address(id,text,key));
+    let r=Replacement::set_at(header,key,&value,read);
+    match r {
+        Err(e)=>Err(e),
+        Ok(((),rows,changed))=>{
+            let ghost prior=choose|v:Option<Vec<u8>>| #[trigger] read.ensures((header,key),Ok(v)) &&
+                Replacement::assignment(rows@,changed,key@,crate::kv_replacement::bytes(v),value@);
+            let result=crate::mutation_ack::finish((),rows,changed,publish);
+            result
+        }
     }
 }
 
