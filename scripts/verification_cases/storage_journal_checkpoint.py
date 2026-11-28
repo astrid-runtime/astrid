@@ -178,3 +178,14 @@ def consumer_defects():
             f"fresh declaration batch loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
         )
+
+    for label, clause, weakness in [
+        ("captured plain body", "capture.body.as_slice()", "&capture.body[..0]"),
+        ("decoded reference edges", "table.insert(key,record);", "if record.references().is_empty() {table.insert(key,record);}"),
+        ("recovered table domain", "while i<p.rows.len()", "while i<p.rows.len() && i<1"),
+        ("decoded identity", "let key=ObjectId::new(hash(&record));", "let key=ObjectId::new([0;32]);"),
+    ]:
+        yield (
+            f"fresh table recovery loses {label}", named_batch,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), named_batch,
+        )

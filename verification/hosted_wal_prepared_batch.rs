@@ -317,4 +317,89 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
     let journal=crate::hosted_acknowledged_root::parse_written(&r.roots[0].body,&name,scheme,expected,replacement);
     Ok(Publication{group:r,journal,rows})
 }
+
+enum RecoveryError<E> { Compression(usize,E), References(usize) }
+
+spec fn codec_failure<E,D:Fn(&[u8],usize)->Result<Vec<u8>,E>>(block:Seq<u8>,size:usize,decode:D,error:E) -> bool {
+    exists|b:&[u8]| b@==block && #[trigger] decode.ensures((b,size),Err(error))
+}
+
+/// Reconstruct the freshly declared part of the object table from the bodies
+/// captured during stable WAL readback. Name each entry from its decoded fields.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(35)]
+#[verifier::loop_isolation(false)]
+fn recover_table<M:crate::positional_read::Media,E,D,H>(
+    p:&Publication<M>,graph:&crate::hosted_kv_root_publication::Graph<Vec<u8>>,
+    scheme:root_wire::Scheme,limit:u64,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,
+    decode:D,hash:H) -> (out:Result<BTreeMap<ObjectId,ObjectRecord>,RecoveryError<E>>)
+    where D:Fn(&[u8],usize)->Result<Vec<u8>,E>,H:Fn(&ObjectRecord)->[u8;32]+Copy,
+    requires crate::hosted_kv_root_publication::canonical_rows(graph,p.rows@,scheme),
+        p.group.objects.len()==p.rows.len(),btree_map_inv(&graph.records),
+        obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        scheme.algorithm@!=seq![0u8,0u8],scheme.construction@!=seq![0u8,0u8],
+        forall|i:int| 0<=i<p.rows.len() ==> #[trigger] bound(p.group.objects@[i],p.rows@[i].0,p.rows@[i].1@,scheme,limit,compression@,p.group.media.image()),
+        forall|id:ObjectId| #[trigger] graph.records@.contains_key(id) ==> ObjectRecord::labels_ordered(graph.records@[id].contents().3),
+        forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
+        forall|k:ObjectId,r:&ObjectRecord,d:[u8;32]| #[trigger] graph.records@.contains_key(k) &&
+            crate::hosted_record_roundtrip::same_fields(*r,graph.records@[k]) && #[trigger] hash.ensures((r,),d) ==> d@==k.digest(),
+        forall|b:&[u8],n:usize| #[trigger] decode.requires((b,n)),
+        forall|i:int,b:&[u8],v:Vec<u8>| 0<=i<p.rows.len() && b@==(compression@)(p.rows@[i].1@) &&
+            #[trigger] decode.ensures((b,p.rows@[i].1.len()),Ok(v)) ==> v@==p.rows@[i].1@,
+    ensures out matches Ok(t) ==> t@.dom()==graph.records@.dom() &&
+        forall|k:ObjectId| #[trigger] t@.contains_key(k) ==> crate::hosted_record_roundtrip::same_fields(t@[k],graph.records@[k]),
+        out matches Err(RecoveryError::References(i)) ==> i<p.rows.len() && graph.records@[p.rows@[i as int].0].contents().3.len()>0,
+        out matches Err(RecoveryError::Compression(i,e)) ==> i<p.rows.len() && p.group.objects@[i as int].flags==1 &&
+            codec_failure((compression@)(p.rows@[i as int].1@),p.rows@[i as int].1.len(),decode,e),
+{
+    let mut table=BTreeMap::new();
+    let mut i=0;
+    while i<p.rows.len()
+        invariant i<=p.rows.len(),btree_map_inv(&table),
+            forall|k:ObjectId| #[trigger] table@.contains_key(k) ==> graph.records@.contains_key(k) &&
+                crate::hosted_record_roundtrip::same_fields(table@[k],graph.records@[k]),
+            forall|j:int| 0<=j<i ==> table@.contains_key(#[trigger] p.rows@[j].0),
+        decreases p.rows.len()-i,
+    {
+        let (id,witness)=&p.rows[i];
+        let source=graph.records.get(id).unwrap();
+        let capture=&p.group.objects[i];
+        assert(bound(*capture,*id,witness@,scheme,limit,compression@,p.group.media.image()));
+        let expanded;
+        let bytes=if capture.flags==0 {capture.body.as_slice()} else {
+            proof {
+                vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+                assert(capture.flags==1);
+                assert(capture.body@==vstd::bytes::spec_u64_to_le_bytes(witness.len() as u64)+(compression@)(witness@));
+                assert(capture.body.len()>=8);
+            }
+            let (size,block)=storage::split(&capture.body).unwrap();
+            proof {
+                vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+                assert(capture.body@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(witness.len() as u64));
+                assert(capture.body@.skip(8) =~= (compression@)(witness@));
+            }
+            expanded=match decode(block,size as usize) {
+                Ok(v)=>v, Err(e)=>{
+                    assert(decode.ensures((block,witness.len()),Err(e)));
+                    assert(exists|b:&[u8]| b@==(compression@)(witness@) && #[trigger] decode.ensures((b,witness.len()),Err(e)));
+                    assert(p.group.objects@[i as int].flags==1);
+                    assert(exists|b:&[u8]| b@==(compression@)(p.rows@[i as int].1@) && #[trigger] decode.ensures((b,p.rows@[i as int].1.len()),Err(e)));
+                    assert(codec_failure((compression@)(witness@),witness.len(),decode,e));
+                    return Err(RecoveryError::Compression(i,e))
+                },
+            };
+            expanded.as_slice()
+        };
+        let record=match crate::hosted_record_roundtrip::recover_written(bytes,source,scheme,*id,hash,true) {
+            Ok(r)=>r,Err(_)=>return Err(RecoveryError::References(i)),
+        };
+        let key=ObjectId::new(hash(&record));
+        proof {ObjectId::same_digest(key,*id);}
+        table.insert(key,record);
+        i+=1;
+    }
+    assert(table@.dom() =~= graph.records@.dom());
+    Ok(table)
+}
 }

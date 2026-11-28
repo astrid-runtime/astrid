@@ -179,6 +179,24 @@ fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,i
     },
 {
     let Ok(frame) = wire::encode(scheme,id,source) else {assert(false);unreachable!()};
+    recover_written(&frame,source,scheme,id,hash,scan)
+}
+
+/// Authenticate canonical bytes supplied by the storage reader. The source
+/// witnesses their meaning and is never used as the decoder input.
+#[verifier::rlimit(45)]
+pub(super) fn recover_written<H:Fn(&ObjectRecord)->[u8;32]>(frame:&[u8],source:&ObjectRecord,scheme:Scheme,id:ObjectId,hash:H,scan:bool)
+    -> (out:Result<ObjectRecord,wire::Error<wire::BodyError>>)
+    requires frame@==crate::recovered_record::encoding(scheme,id,*source),
+        scheme.algorithm@ != seq![0u8,0u8],scheme.construction@ != seq![0u8,0u8],
+        ObjectRecord::labels_ordered(source.contents().3),
+        forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
+        forall|r:&ObjectRecord,d:[u8;32]| same_fields(*r,*source) && #[trigger] hash.ensures((r,),d) ==> d@ == id.digest(),
+    ensures match out {
+        Ok(decoded) => same_fields(decoded,*source),
+        Err(e) => source.contents().3.len() > 0 && e matches wire::Error::Decode(wire::DecodeError::Record(wire::BodyError::Allocation)),
+    },
+{
     let version = source.format_version().get();
     let count = source.references().len();
     let length = source.canonical_bytes().len();
@@ -222,8 +240,8 @@ fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,i
         assert(wire::complete_body(bytes,40,scheme));
         if n == 0 {assert(wire::leaf_body(bytes,40));}
     }
-    if scan {return scan_written(&frame,source,scheme,id,hash);}
-    let result = wire::confirmed(&frame,scheme,id,hash);
+    if scan {return scan_written(frame,source,scheme,id,hash);}
+    let result = wire::confirmed(frame,scheme,id,hash);
     proof {
         if let Err(wire::Error::Identity) = result {
             let (other,digest) = choose|r:ObjectRecord,d:[u8;32]| d@ != id.digest() &&
