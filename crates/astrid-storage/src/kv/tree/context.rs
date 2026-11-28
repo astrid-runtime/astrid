@@ -520,13 +520,24 @@ where
     }
 
     pub(super) fn record(&self, object: ObjectId) -> StorageResult<ObjectRecord> {
-        if let Some(record) = self.records.get(&object) {
-            return Ok(record.clone());
-        }
-        self.engine
-            .load_kv_object_for(self.principal, object)
-            .map_err(|error| map_engine(&error))?
-            .ok_or_else(|| map_engine(&ModelError::MissingObject(object).into()))
+        self.load_record(object, ObjectRecord::owned_record, |principal, id| {
+            self.engine.load_kv_object_for(principal, id)
+        })
+    }
+
+    fn load_record<T>(
+        &self,
+        object: ObjectId,
+        copy: impl FnOnce(&ObjectRecord) -> T,
+        engine: impl FnOnce(&P, ObjectId) -> Result<Option<T>, crate::engine::KvProjectionError>,
+    ) -> StorageResult<T> {
+        use super::record_source::{self, Error};
+        record_source::load(&self.records, self.principal, object, copy, engine).map_err(|error| {
+            match error {
+                Error::Source(error) => map_engine(&error),
+                Error::Missing(id) => map_engine(&ModelError::MissingObject(id).into()),
+            }
+        })
     }
 
     fn insert_node(&mut self, record: &ObjectRecord) -> StorageResult<NodeHandle> {

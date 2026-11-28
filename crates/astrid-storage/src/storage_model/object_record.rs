@@ -39,7 +39,7 @@ impl ObjectFormatVersion {
 /// object. Structural objects normally contribute zero. The complete canonical
 /// record—including payload and references—remains part of retained accounting
 /// regardless of class.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ObjectRecord {
     pub(super) kind: ObjectKind,
     pub(super) format_version: ObjectFormatVersion,
@@ -49,6 +49,10 @@ pub struct ObjectRecord {
     pub(super) class: ObjectClass,
 }
 
+
+impl Clone for ObjectRecord {
+    fn clone(&self) -> Self { self.owned_record() }
+}
 
 impl ObjectRecord {
     // Stable widths in the logical canonical record encoding. Durable engines
@@ -136,6 +140,33 @@ pub(crate) open spec fn labels_ordered(refs:Seq<ObjectReference>) -> bool {
 
     pub closed spec fn contents(&self) -> (ObjectKind,u16,Seq<u8>,Seq<ObjectReference>,u64,ObjectClass) {
         (self.kind,self.format_version.number(),self.canonical_bytes@,self.references@,self.logical_bytes,self.class)
+    }
+
+    pub(crate) open spec fn same_contents(&self,other:&Self) -> bool {
+        let a = self.contents();
+        let b = other.contents();
+        &&& a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.4 == b.4 && a.5 == b.5
+        &&& a.3.len() == b.3.len()
+        &&& forall|i:int| 0 <= i < a.3.len() ==> (#[trigger] a.3[i]).fields() == (#[trigger] b.3[i]).fields()
+    }
+
+    pub(crate) fn owned_record(&self) -> (copy:Self)
+        ensures copy.same_contents(self),
+    {
+        let bytes = self.canonical_bytes.clone();
+        assert(bytes@ =~= self.canonical_bytes@);
+        let mut refs = Vec::<ObjectReference>::with_capacity(self.references.len());
+        let mut i = 0usize;
+        while i < self.references.len()
+            invariant i <= self.references.len(), refs.len() == i,
+                forall|j:int| 0 <= j < i ==> (#[trigger] refs@[j]).fields() == self.references@[j].fields(),
+            decreases self.references.len()-i,
+        {
+            refs.push(self.references[i].duplicate());
+            i = i.saturating_add(1);
+        }
+        Self {kind:self.kind,format_version:self.format_version,canonical_bytes:bytes,
+            references:refs,logical_bytes:self.logical_bytes,class:self.class}
     }
 
     pub(crate) fn from_fields(kind:ObjectKind,format_version:ObjectFormatVersion,canonical_bytes:Vec<u8>,

@@ -359,6 +359,8 @@ mod spill_record;
 mod projection_record;
 #[path = "../crates/astrid-storage/src/kv/tree/replay_values.rs"]
 mod replay_values;
+#[path = "../crates/astrid-storage/src/kv/tree/record_source.rs"]
+mod record_source;
 mod hosted_projection_record;
 mod hosted_checkpoint_point;
 mod hosted_checkpoint_descent;
@@ -373,6 +375,7 @@ mod hosted_delta_replay;
 mod delta_header;
 mod hosted_delta_mutation;
 mod hosted_replay_values;
+mod hosted_record_source;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_entries.rs"]
 mod checkpoint_entries;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_leaf_summary.rs"]

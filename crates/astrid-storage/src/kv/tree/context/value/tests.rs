@@ -469,6 +469,7 @@ impl ObjectIdentity for StagingCollisionIdentity {
 
 #[test]
 fn chunked_value_rejects_unequal_staged_body_without_overwriting() {
+    use crate::kv::tree_error::map_engine;
     use crate::storage_model::ModelError;
 
     let bytes = bytes();

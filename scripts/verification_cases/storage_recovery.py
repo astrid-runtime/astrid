@@ -209,6 +209,22 @@ def consumer_defects():
             f"delta chain loses {label}", chain,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_chain.rs"),
         )
+    source = Path("crates/astrid-storage/src/kv/tree/record_source.rs")
+    record = Path("crates/astrid-storage/src/storage_model/object_record.rs")
+    for label, path, clause, weaker in [
+        ("staged contents", source, "out matches Ok(t) && copy.ensures((&staged@[id],),t)", "out is Ok"),
+        ("engine value", source, "Ok(t) => engine.ensures((owner,id),Ok(Some(t)))", "Ok(t) => true"),
+        ("missing address", source, "k == id && engine.ensures", "engine.ensures"),
+        ("engine error", source, "Err(Error::Source(e)) => engine.ensures((owner,id),Err(e))", "Err(Error::Source(e)) => true"),
+        ("canonical payload", record, "a.2 == b.2 && a.4", "a.4"),
+        ("logical size", record, "a.4 == b.4 && a.5", "a.5"),
+        ("reference sequence", record, "a.3.len() == b.3.len()", "true"),
+        ("reference fields", record, "(#[trigger] a.3[i]).fields() == (#[trigger] b.3[i]).fields()", "(#[trigger] a.3[i]).fields().1 == (#[trigger] b.3[i]).fields().1"),
+    ]:
+        yield (
+            f"staged record source loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_record_source.rs"),
+        )
     descent = Path("crates/astrid-storage/src/kv/tree/checkpoint_descent.rs")
     for label, clause, weaker in [
         ("scheduled root", "== (initial,Page::Root(root))", "== (if path.len()==0 {at} else {path[0].0})"),

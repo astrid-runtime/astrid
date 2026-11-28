@@ -11,17 +11,17 @@ use std::sync::Arc;
 use super::super::node::{spilled_opaque_payload, value_record};
 use super::{
     INLINE_VALUE_MAX, KvProjectionEngine, ObjectId, ObjectRecord, StorageError, StorageResult,
-    TreeContext, ValueSlot, arithmetic_overflow, invalid, map_engine,
+    TreeContext, ValueSlot, arithmetic_overflow, invalid,
 };
 use crate::content_dag::{
     ChunkingProfile, ContentSource, OpenedContent, build_content, open_content,
     read_opened_content, validate_opened_content,
 };
-use crate::storage_model::{ModelError, ObjectFormatVersion, ObjectIdentity};
 #[cfg(test)]
 use crate::storage_model::{
     ObjectClass, ObjectKind, ObjectReference, ReferenceKind, ReferenceLabel,
 };
+use crate::storage_model::{ObjectFormatVersion, ObjectIdentity};
 
 // These are immutable encoding rules, not operator memory limits. They pin
 // identities and the canonical representation chosen for the same KV bytes.
@@ -170,14 +170,12 @@ impl<P: Ord, E: KvProjectionEngine<P>> ContentSource for TreeContext<'_, P, E> {
     }
 
     fn load_shared_content_object(&self, id: ObjectId) -> StorageResult<Option<Arc<ObjectRecord>>> {
-        if let Some(record) = self.records.get(&id) {
-            return Ok(Some(Arc::new(record.clone())));
-        }
-        self.engine
-            .load_shared_kv_object_for(self.principal, id)
-            .map_err(|error| map_engine(&error))?
-            .map(Some)
-            .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))
+        self.load_record(
+            id,
+            super::super::record_source::shared,
+            |principal, object| self.engine.load_shared_kv_object_for(principal, object),
+        )
+        .map(Some)
     }
 
     fn load_shared_content_objects(
