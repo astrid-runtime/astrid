@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import authority, file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, workspace_commit
+from . import authority, file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, storage_recovery, workspace_commit
 from .common import (
     AUTHORITY,
     MODEL,
@@ -399,57 +399,7 @@ def consumer_defects():
     append = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     vectors = Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs")
     readback = Path("verification/hosted_arena_append.rs")
-    barrier = Path("crates/astrid-storage/src/engine/durable/recovery_barrier.rs")
-    for label, clause, weaker in [
-        ("WAL identity", "stable.wal() == wal", "true"),
-        ("handoff result", "ensures finish.ensures((self.wal(),),value)", "ensures true"),
-        ("represented order", "final(files).calls() == all && final(files).durable() == both.insert", "final(files).durable() == both.insert"),
-        ("unrepresented order", "final(files).calls() == roots && final(files).durable() == both", "final(files).durable() == both"),
-        ("represented images", "final(files).durable() == both.insert(x,old(files).pending()[x])", "true"),
-        ("unrepresented images", "final(files).durable() == both}", "true}"),
-        ("arena failure", "Err(Error::Arena(_)) => final(files).calls() == arena", "Err(Error::Arena(_)) => true"),
-        ("roots failure", "Err(Error::Roots(_)) => final(files).calls() == roots", "Err(Error::Roots(_)) => true"),
-        ("representations failure", "old(files).has_representations() && final(files).calls() == all", "true"),
-    ]:
-        yield (
-            f"recovery barrier loses {label}", barrier,
-            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_recovery_barrier.rs"),
-        )
-    repair = Path("crates/astrid-storage/src/engine/durable/frame_repair.rs")
-    for label, clause, weaker in [
-        ("committed protection", "w.protected == end && w.restore_cursor", "w.restore_cursor"),
-        ("live protection", "w.protected == p && !w.restore_cursor", "!w.restore_cursor"),
-        ("complete end", "n == next && offset < n", "offset < n"),
-        ("oversize interior", "interior == (next <= end)", "true"),
-        ("reject evidence", "(blocked || (probe && old(media).probe_result(offset,Ok(true))))", "true"),
-        ("probe finding", "(probe ==> old(media).probe_result(offset,Ok(false)))", "true"),
-        ("protected cutoff", "_ => !blocked &&", "_ => true &&"),
-        ("resize failure", "Err(Error::Resize(_)) => final(media).calls() == prefix.push(Event::Resize(offset))", "Err(Error::Resize(_)) => true"),
-        ("flush ordering", "_ => final(media).calls() == prefix.push(Event::Resize(offset)).push(Event::Flush)", "_ => true"),
-        ("retained prefix", "final(media).bytes() == old(media).bytes().take(offset as int) &&", "true &&"),
-        ("durable prefix", "final(media).durable() == final(media).bytes()", "true"),
-    ]:
-        yield (
-            f"frame repair loses {label}", repair,
-            lambda s, a=clause, b=weaker: replace_once(s, a, b), readback,
-        )
-
-    for label, clause, weaker in [
-        ("frame domain", "ok == (bytes@.take(8) == magic@)", "true"),
-        ("version refusal", "(out matches Err(HeaderError::Version)) == !current", "(out matches Err(HeaderError::Version)) ==> !current"),
-        ("reserved bits", "(out matches Err(HeaderError::Reserved)) == (current && !clear)", "(out matches Err(HeaderError::Reserved)) ==> (current && !clear)"),
-        ("declared length", "h.payload_len == vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(12,20))", "true"),
-        ("saved checksum", "h.checksum@ == bytes@.subrange(20,52)", "true"),
-        ("payload length", "(out matches Err(PayloadError::Length)) == (payload.len() != header.payload_len)", "(out matches Err(PayloadError::Length)) ==> (payload.len() != header.payload_len)"),
-        ("accepted digest", "sum == header.checksum && hash.ensures", "hash.ensures"),
-        ("hash arguments", "sum == header.checksum && hash.ensures((magic,header.payload_len,payload),sum)", "sum == header.checksum"),
-        ("checksum refusal", "sum != header.checksum &&", "true &&"),
-    ]:
-        yield (
-            f"physical frame loses {label}", append,
-            lambda s, a=clause, b=weaker: replace_once(s, a, b), readback,
-        )
-
+    yield from storage_recovery.consumer_defects()
     for name, source, original, changed, target in [
         ("omits the frame header width", append, "offset.checked_add(WIDTH as u64)?.checked_add(size)?", "offset.checked_add(size)?", append),
         ("reverses a vector pair", vectors, "parts.push(P::borrow(header));\n        parts.push(P::borrow(payload));", "parts.push(P::borrow(payload));\n        parts.push(P::borrow(header));", vectors),
