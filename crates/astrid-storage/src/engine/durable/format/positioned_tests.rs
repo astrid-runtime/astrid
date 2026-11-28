@@ -391,11 +391,23 @@ fn coalesced_delivery_preserves_order_and_stops_at_the_first_failure() {
     outcome.unwrap();
     assert_eq!(seen, frames);
     let duplicates = [requests[0], requests[2], requests[0], requests[1]];
+    source.reads.borrow_mut().clear();
     let (outcome, seen) = visit(&duplicates, None, u64::MAX);
     outcome.unwrap();
     let mut expected = frames.clone();
     expected.push(frames[2].clone());
     assert_eq!(seen, expected);
+    let last = &frames[2];
+    let frame_len = FRAME_HEADER_LEN_USIZE.saturating_add(last.3.len());
+    let batch_len = frames
+        .iter()
+        .map(|(_, _, _, payload)| FRAME_HEADER_LEN_USIZE.saturating_add(payload.len()))
+        .sum();
+    assert_eq!(
+        *source.reads.borrow(),
+        vec![(frames[0].1.offset, batch_len), (last.1.offset, frame_len)]
+    );
+
     let (outcome, seen) = visit(&requests, Some(2), u64::MAX);
     assert!(matches!(outcome, Err(DurableError::EncodingOverflow)));
     assert_eq!(seen, frames[..2]);

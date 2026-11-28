@@ -397,10 +397,13 @@ proof fn dispatched_prefix<V:Fn(Vec<IndexedRow>,&[IndexedRow],u64,u64)->Result<V
 
 /// Observe the production dispatcher's physical requests. The reader rejects
 /// any mismatched address or extent and may independently fail at one offset.
-fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -> (out:Option<Vec<IndexedRow>>)
+fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -> (out:Result<Vec<IndexedRow>,usize>)
     requires forall|i:int| 0 <= i < rows.len() ==> #[trigger] crate::indexed_frame::frame_end(rows@[i].1) <= u64::MAX,
         forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].1.payload_len <= limit,
-    ensures out matches Some(trace) ==> trace@ == rows@, fault.is_none() ==> out.is_some(),
+    ensures match out {
+        Ok(trace) => trace@ == rows@,
+        Err(n) => n < rows.len() && fault == Some(rows@[n as int].1.offset),
+    },
 {
     use crate::indexed_frame::{dispatch,dispatched,frame_end,DispatchError};
     let visit = |before:Vec<IndexedRow>,part:&[IndexedRow],base:u64,size:u64| -> (out:Result<Vec<IndexedRow>,Option<usize>>)
@@ -433,7 +436,7 @@ fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -
             dispatched_prefix(rows@,rows.len() as int,start,trace,limit,visit);
             assert(rows@.take(rows.len() as int) =~= rows@);
             assert(trace@ =~= rows@);
-        } Some(trace)},
+        } Ok(trace)},
         Err(DispatchError::Visit(e)) => { proof {
             let (lo,prior) = choose|lo:int,state:Vec<IndexedRow>| 0 <= lo < rows.len() &&
                 #[trigger] dispatched(rows@,lo,start,state,limit,visit) &&
@@ -442,15 +445,25 @@ fn observe_dispatch(rows:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>) -
             assert(prior@ =~= rows@.take(lo));
             assert(e == Some(lo as usize) && fault == Some(rows@[lo].1.offset));
             assert(exists|i:int| 0 <= i < rows.len() && e == Some(i as usize) && fault == Some(#[trigger] rows@[i].1.offset));
-        } None},
-        Err(_) => { assert(false); None },
+        } Err(e.unwrap())},
+        Err(_) => { assert(false); Err(0) },
     }
 }
 
 /// Sorting preserves every occurrence before positional dispatch.
 fn ordered_dispatch(requested:&[IndexedRow],target:u64,limit:u64,fault:Option<u64>)
+    -> (out:Result<Vec<IndexedRow>,(Vec<IndexedRow>,usize)>)
     requires forall|i:int| 0 <= i < requested.len() ==> #[trigger] crate::indexed_frame::frame_end(requested@[i].1) <= u64::MAX,
         forall|i:int| 0 <= i < requested.len() ==> #[trigger] requested@[i].1.payload_len <= limit,
+    ensures ({
+        let trace = match out {Ok(t)=>t,Err((t,_))=>t};
+        &&& trace@.to_multiset() == requested@.to_multiset()
+        &&& forall|i:int,j:int| #![trigger trace@[i],trace@[j]] 0 <= i < j < trace.len()
+            ==> trace@[i].1.offset <= trace@[j].1.offset
+        &&& out matches Err((table,n)) ==> n < table.len() && fault == Some(table@[n as int].1.offset) &&
+            requested@.contains(table@[n as int]) &&
+            table@.take(n as int).to_multiset().add(table@.skip(n as int).to_multiset()) == requested@.to_multiset()
+    }),
 {
     use crate::indexed_frame::frame_end;
     let rows = crate::indexed_frame::ordered(requested);
@@ -468,11 +481,21 @@ fn ordered_dispatch(requested:&[IndexedRow],target:u64,limit:u64,fault:Option<u6
             assert(frame_end(requested@[k].1) <= u64::MAX && requested@[k].1.payload_len <= limit);
         }
     }
-    if let Some(trace) = observe_dispatch(&rows,target,limit,fault) {
-        assert(trace@.to_multiset() == requested@.to_multiset());
-        assert forall|i:int,j:int| #![trigger trace@[i],trace@[j]] 0 <= i < j < trace.len()
-            implies trace@[i].1.offset <= trace@[j].1.offset by {};
-    } else { assert(fault.is_some()); }
+    match observe_dispatch(&rows,target,limit,fault) {
+        Ok(trace) => Ok(trace),
+        Err(n) => {
+            proof {
+                assert(rows@.contains(rows@[n as int]));
+                assert(rows@.to_multiset().count(rows@[n as int]) > 0);
+                assert(requested@.contains(rows@[n as int]));
+                let prefix = rows@.take(n as int);
+                let suffix = rows@.skip(n as int);
+                assert(prefix + suffix =~= rows@);
+                vstd::seq_lib::lemma_multiset_commutative(prefix,suffix);
+            }
+            Err((rows,n))
+        },
+    }
 }
 
 /// Each successful positional read can cover exactly the next range of
