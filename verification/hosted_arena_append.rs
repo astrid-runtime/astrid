@@ -19,6 +19,7 @@ fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52],magic:[u8
     proof {
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         assert(canonical.take(8) =~= magic@);
+        assert(canonical.subrange(8,12) =~= seq![version as u8,(version >> 8) as u8,0u8,0u8]);
         assert(canonical.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(size));
         assert(canonical.subrange(20,52) =~= sum@);
     }
@@ -33,6 +34,12 @@ fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52],magic:[u8
                     if i < 8 {assert(header@.take(8)[i] == header@[i]);}
                     else if i >= 20 {assert(header@.subrange(20,52)[i-20] == header@[i]);}
                     else if i >= 12 {assert(header@.subrange(12,20)[i-12] == header@[i]);}
+                    else {
+                        assert(header@[8] == version as u8 && header@[9] == (version >> 8) as u8);
+                        assert(header@[10] == 0 && header@[11] == 0);
+                        assert(header@.subrange(8,12) =~= canonical.subrange(8,12));
+                        assert(header@.subrange(8,12)[i-8] == header@[i]);
+                    }
                 }
             }
             true
@@ -49,6 +56,78 @@ fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52],magic:[u8
             }}
             false
         },
+    }
+}
+
+/// Normal frames advance the cursor to their full end; oversize frames retain their interior classification.
+fn frame_extent(at:u64,end:u64,len:u64,limit:u64) -> (result:(u8,u64))
+    ensures ({
+        let next = at as int + 52 + len;
+        result == if len > limit {(if next <= end {1u8} else {2u8},0u64)}
+            else if next > u64::MAX {(3u8,0u64)} else if next > end {(4u8,0u64)}
+            else {(0u8,next as u64)}
+    }),
+{
+    use crate::frame_repair::{extent,Extent};
+    match extent(at,end,len,limit) {
+        Extent::Complete(n) => (0,n),
+        Extent::Oversize {interior:true} => (1,0),Extent::Oversize {interior:false} => (2,0),
+        Extent::Overflow => (3,0),Extent::Incomplete => (4,0),
+    }
+}
+
+/// A captured committed range cannot probe, resize, or flush even when its first frame is damaged.
+fn preserve_committed<M:crate::frame_repair::Medium>(media:&mut M,start:u64,end:u64,physical:u64,at:u64,
+    damage:crate::frame_repair::Damage) -> (rejected:bool)
+    requires start <= at < end <= physical,
+    ensures rejected, final(media).calls() == old(media).calls(), final(media).bytes() == old(media).bytes(),
+        final(media).durable() == old(media).durable(),
+{
+    use crate::frame_repair as r;
+    let w = r::window(physical,r::Bound::Committed {start,end}).unwrap();
+    matches!(r::repair(media,at,w.end,w.protected,damage),Ok(r::Outcome::Reject))
+}
+
+/// A live scan may discard an incomplete payload only beyond the protected prefix.
+/// The native adapter reports success only after synchronizing the new length on the same handle.
+fn incomplete_payload<M:crate::frame_repair::Medium>(media:&mut M,physical:u64,protected:u64,at:u64,len:u64,limit:u64)
+    -> (out:Result<bool,crate::frame_repair::Error<M::Error>>)
+    requires protected <= physical, at < physical, len <= limit, physical < at as int + 52 + len <= u64::MAX,
+        physical <= old(media).bytes().len(),
+    ensures ({
+        let calls = old(media).calls();
+        let resized = calls.push(crate::frame_repair::Event::Resize(at));
+        &&& match out {
+            Ok(false) => at < protected && final(media).calls() == calls && final(media).bytes() == old(media).bytes(),
+            Ok(true) => at >= protected && final(media).calls() == resized.push(crate::frame_repair::Event::Flush)
+                && final(media).durable() == old(media).bytes().take(at as int) && final(media).bytes() == final(media).durable(),
+            Err(crate::frame_repair::Error::Resize(_)) => at >= protected && final(media).calls() == resized,
+            Err(crate::frame_repair::Error::Flush(_)) => at >= protected && final(media).calls() == resized.push(crate::frame_repair::Event::Flush),
+            Err(_) => false,
+        }
+    }),
+{
+    use crate::frame_repair as r;
+    let w = r::window(physical,r::Bound::Live(protected)).unwrap();
+    match r::extent(at,w.end,len,limit) {
+        r::Extent::Incomplete => {},
+        _ => {assert(false);return Ok(false);},
+    }
+    match r::repair(media,at,w.end,w.protected,r::Damage::Incomplete) {
+        Ok(r::Outcome::Reject) => Ok(false),Ok(r::Outcome::Repaired) => Ok(true),Err(e) => Err(e),
+    }
+}
+
+/// If the later-frame probe finds a frame or fails, recovery leaves the media unchanged.
+fn preserve_later_frame<M:crate::frame_repair::Medium>(media:&mut M,at:u64,end:u64,protected:u64,known_interior:bool)
+    -> (refused:bool)
+    requires protected <= at < end, !old(media).probe_result(at,Ok(false)),
+    ensures refused, final(media).calls() == if known_interior {old(media).calls()} else {old(media).calls().push(crate::frame_repair::Event::Probe(at))},
+        final(media).bytes() == old(media).bytes(), final(media).durable() == old(media).durable(),
+{
+    use crate::frame_repair as r;
+    match r::repair(media,at,end,protected,r::Damage::Suspect {known_interior}) {
+        Ok(r::Outcome::Reject) | Err(r::Error::Probe(_)) => true,_ => false,
     }
 }
 

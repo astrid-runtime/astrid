@@ -8,6 +8,7 @@ use super::{
     frame_checksum, frame_checksum_hasher, io_error, read_exact_at, scan_frames_with_source,
     validate_positioned_header, validate_positioned_payload,
 };
+use crate::engine::durable::frame_repair::{self, Damage};
 
 /// Successful scans leave the cursor at the current append boundary. After
 /// an error the cursor is unspecified: callers must abandon or reposition the
@@ -205,31 +206,25 @@ pub(super) fn scan_frames_with_bound<F: DurableIo>(
         .durable_metadata()
         .map_err(|source| io_error("read principal-store metadata", source))?
         .len();
-    let (scan_start, scan_end, protected_len, restore_cursor) = match bound {
-        FrameScanBound::LiveRepair { protected_len } => {
-            if physical_len < protected_len {
-                return Err(corrupt(
-                    file_name,
-                    physical_len,
-                    "published durable prefix is truncated",
-                ));
-            }
-            (0_u64, physical_len, protected_len, false)
-        },
-        FrameScanBound::Committed(range) => {
-            let start = range.start().get();
-            let end = range.end().get();
-            if physical_len < end {
-                return Err(corrupt(
-                    file_name,
-                    physical_len,
-                    "published durable prefix is truncated",
-                ));
-            }
-            // The whole committed window is protected: torn/cutoff bytes fail closed.
-            (start, end, end, true)
+    let mode = match bound {
+        FrameScanBound::LiveRepair { protected_len } => frame_repair::Bound::Live(protected_len),
+        FrameScanBound::Committed(range) => frame_repair::Bound::Committed {
+            start: range.start().get(),
+            end: range.end().get(),
         },
     };
+    let frame_repair::Window {
+        start: scan_start,
+        end: scan_end,
+        protected: protected_len,
+        restore_cursor,
+    } = frame_repair::window(physical_len, mode).ok_or_else(|| {
+        corrupt(
+            file_name,
+            physical_len,
+            "published durable prefix is truncated",
+        )
+    })?;
     let policy = FrameScanPolicy {
         file_name,
         magic,
@@ -311,20 +306,18 @@ where
     let magic = policy.magic;
     let limits = policy.limits;
     let file_len = policy.file_len;
-    let protected_len = policy.protected_len;
     while offset < file_len {
         let remaining = file_len
             .checked_sub(offset)
             .ok_or(DurableError::EncodingOverflow)?;
         if remaining < FRAME_HEADER_LEN {
-            if offset < protected_len {
-                return Err(corrupt(
-                    file_name,
-                    offset,
-                    "published frame header is truncated",
-                ));
-            }
-            truncate_tail(get_file(reader), offset)?;
+            repair_tail(
+                get_file(reader),
+                policy,
+                offset,
+                Damage::Incomplete,
+                corrupt(file_name, offset, "published frame header is truncated"),
+            )?;
             break;
         }
         let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
@@ -332,63 +325,60 @@ where
             .read_exact(&mut header)
             .map_err(|source| io_error("read durable frame header", source))?;
         if !arena_frame::magic_matches(&header, magic) {
-            truncate_unpublished_tail_or_fail(
+            repair_tail(
                 get_file(reader),
                 policy,
                 offset,
-                false,
+                Damage::Suspect {
+                    known_interior: false,
+                },
                 corrupt(file_name, offset, "frame magic mismatch"),
             )?;
             break;
         }
         let decoded = decode_frame_header(file_name, offset, &header)?;
         let payload_len = decoded.payload_len;
-        if payload_len > limits.max_frame_bytes {
-            let error = DurableError::FrameTooLarge {
-                file: file_name,
-                offset,
-                declared: payload_len,
-                limit: limits.max_frame_bytes,
+        let frame_end =
+            match frame_repair::extent(offset, file_len, payload_len, limits.max_frame_bytes) {
+                frame_repair::Extent::Complete(end) => end,
+                frame_repair::Extent::Overflow => return Err(DurableError::EncodingOverflow),
+                frame_repair::Extent::Oversize { interior } => {
+                    repair_tail(
+                        get_file(reader),
+                        policy,
+                        offset,
+                        Damage::Suspect {
+                            known_interior: interior,
+                        },
+                        DurableError::FrameTooLarge {
+                            file: file_name,
+                            offset,
+                            declared: payload_len,
+                            limit: limits.max_frame_bytes,
+                        },
+                    )?;
+                    break;
+                },
+                frame_repair::Extent::Incomplete => {
+                    repair_tail(
+                        get_file(reader),
+                        policy,
+                        offset,
+                        Damage::Incomplete,
+                        corrupt(file_name, offset, "published frame payload is truncated"),
+                    )?;
+                    break;
+                },
             };
-            if offset < protected_len {
-                return Err(error);
-            }
-            let claimed_end = FRAME_HEADER_LEN
-                .checked_add(payload_len)
-                .and_then(|frame_len| offset.checked_add(frame_len));
-            truncate_unpublished_tail_or_fail(
-                get_file(reader),
-                policy,
-                offset,
-                claimed_end.is_some_and(|end| end <= file_len),
-                error,
-            )?;
-            break;
-        }
-        let frame_len = FRAME_HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(DurableError::EncodingOverflow)?;
-        let frame_end = offset
-            .checked_add(frame_len)
-            .ok_or(DurableError::EncodingOverflow)?;
-        if frame_end > file_len {
-            if offset < protected_len {
-                return Err(corrupt(
-                    file_name,
-                    offset,
-                    "published frame payload is truncated",
-                ));
-            }
-            truncate_tail(get_file(reader), offset)?;
-            break;
-        }
         let payload = read_frame_payload(reader, payload_len)?;
         if arena_frame::check_payload(decoded, magic, &payload, frame_checksum).is_err() {
-            truncate_unpublished_tail_or_fail(
+            repair_tail(
                 get_file(reader),
                 policy,
                 offset,
-                false,
+                Damage::Suspect {
+                    known_interior: false,
+                },
                 corrupt(file_name, offset, "frame checksum mismatch"),
             )?;
             break;
@@ -414,20 +404,60 @@ fn read_frame_payload<F: std::io::Read>(
     Ok(payload)
 }
 
-fn truncate_unpublished_tail_or_fail<F: DurableIo>(
+struct RepairMedia<'a, F> {
+    file: &'a mut F,
+    policy: FrameScanPolicy,
+}
+
+impl<F: DurableIo> frame_repair::Medium for RepairMedia<'_, F> {
+    type Error = DurableError;
+
+    fn later_frame(&mut self, offset: u64) -> Result<bool, DurableError> {
+        valid_frame_follows(
+            self.file,
+            self.policy.magic,
+            offset,
+            self.policy.file_len,
+            self.policy.limits,
+        )
+    }
+
+    fn resize(&mut self, offset: u64) -> Result<(), DurableError> {
+        self.file
+            .durable_set_len(offset)
+            .map_err(|source| io_error("truncate incomplete durable tail", source))
+    }
+
+    fn flush(&mut self) -> Result<(), DurableError> {
+        self.file
+            .durable_sync_data()
+            .map_err(|source| io_error("flush durable tail truncation", source))
+    }
+}
+
+fn repair_tail<F: DurableIo>(
     file: &mut F,
     policy: FrameScanPolicy,
     offset: u64,
-    known_interior: bool,
+    damage: Damage,
     error: DurableError,
 ) -> Result<(), DurableError> {
-    if offset < policy.protected_len
-        || known_interior
-        || valid_frame_follows(file, policy.magic, offset, policy.file_len, policy.limits)?
-    {
-        return Err(error);
+    let mut media = RepairMedia { file, policy };
+    match frame_repair::repair(
+        &mut media,
+        offset,
+        policy.file_len,
+        policy.protected_len,
+        damage,
+    ) {
+        Ok(frame_repair::Outcome::Repaired) => Ok(()),
+        Ok(frame_repair::Outcome::Reject) => Err(error),
+        Err(
+            frame_repair::Error::Probe(e)
+            | frame_repair::Error::Resize(e)
+            | frame_repair::Error::Flush(e),
+        ) => Err(e),
     }
-    truncate_tail(file, offset)
 }
 
 fn valid_frame_follows<F: DurableIo>(
@@ -541,11 +571,4 @@ fn physical_frame_is_valid<F: DurableIo>(
             .ok_or(DurableError::EncodingOverflow)?;
     }
     Ok(hasher.finalize().as_bytes() == &expected)
-}
-
-fn truncate_tail<F: DurableIo>(file: &mut F, valid_len: u64) -> Result<(), DurableError> {
-    file.durable_set_len(valid_len)
-        .map_err(|source| io_error("truncate incomplete durable tail", source))?;
-    file.durable_sync_data()
-        .map_err(|source| io_error("flush durable tail truncation", source))
 }

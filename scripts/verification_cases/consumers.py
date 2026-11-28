@@ -399,6 +399,25 @@ def consumer_defects():
     append = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
     vectors = Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs")
     readback = Path("verification/hosted_arena_append.rs")
+    repair = Path("crates/astrid-storage/src/engine/durable/frame_repair.rs")
+    for label, clause, weaker in [
+        ("committed protection", "w.protected == end && w.restore_cursor", "w.restore_cursor"),
+        ("live protection", "w.protected == p && !w.restore_cursor", "!w.restore_cursor"),
+        ("complete end", "n == next && offset < n", "offset < n"),
+        ("oversize interior", "interior == (next <= end)", "true"),
+        ("reject evidence", "(blocked || (probe && old(media).probe_result(offset,Ok(true))))", "true"),
+        ("probe finding", "(probe ==> old(media).probe_result(offset,Ok(false)))", "true"),
+        ("protected cutoff", "_ => !blocked &&", "_ => true &&"),
+        ("resize failure", "Err(Error::Resize(_)) => final(media).calls() == prefix.push(Event::Resize(offset))", "Err(Error::Resize(_)) => true"),
+        ("flush ordering", "_ => final(media).calls() == prefix.push(Event::Resize(offset)).push(Event::Flush)", "_ => true"),
+        ("retained prefix", "final(media).bytes() == old(media).bytes().take(offset as int) &&", "true &&"),
+        ("durable prefix", "final(media).durable() == final(media).bytes()", "true"),
+    ]:
+        yield (
+            f"frame repair loses {label}", repair,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), readback,
+        )
+
     for label, clause, weaker in [
         ("frame domain", "ok == (bytes@.take(8) == magic@)", "true"),
         ("version refusal", "(out matches Err(HeaderError::Version)) == !current", "(out matches Err(HeaderError::Version)) ==> !current"),

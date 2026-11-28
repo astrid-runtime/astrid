@@ -140,6 +140,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/engine/durable/format/checkpoint_reader.rs"),
     Path("crates/astrid-storage/src/engine/durable/format/duplicates.rs"),
     Path("crates/astrid-storage/src/engine/durable/arena_frame.rs"),
+    Path("crates/astrid-storage/src/engine/durable/frame_repair.rs"),
     Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs"),
     Path("crates/astrid-storage/src/engine/durable/direct_placement.rs"),
     Path("crates/astrid-storage/src/engine/durable/format/arena_span.rs"),

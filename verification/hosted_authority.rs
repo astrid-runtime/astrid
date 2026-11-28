@@ -250,6 +250,8 @@ mod checkpoint_rebuild;
 mod checkpoint_admission;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_frame.rs"]
 mod arena_frame;
+#[path = "../crates/astrid-storage/src/engine/durable/frame_repair.rs"]
+mod frame_repair;
 use arena_frame::ArenaLocation;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_vectors.rs"]
 mod arena_vectors;
