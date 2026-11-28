@@ -113,6 +113,16 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), group,
         )
 
+    header_writer = Path("crates/astrid-storage/src/storage_model/header_writer.rs")
+    for label, before, after in [
+        ("state destination", "commit(commit_refs,prior,sid,v)", "commit(commit_refs,prior,head,v)"),
+        ("parent", "commit(commit_refs,prior,sid,v)", "commit(commit_refs,None,sid,v)"),
+        ("commit identity", "            Ok(t)\n", "            Ok((t.0,sid))\n"),
+    ]:
+        yield (
+            f"staged publication loses {label}", header_writer,
+            lambda s, a=before, b=after: replace_once(s, a, b), header_writer,
+        )
     publication = Path("verification/hosted_kv_root_publication.rs")
     for label, clause, expected, substituted in [
         ("commit state edge", "header_graph::state_edge(rows[bound.2.commit]) matches Some(e) && e.fields()==(header_graph::STATE@,self.state,ReferenceKind::Owns)", ",self.state,", ",self.component,"),

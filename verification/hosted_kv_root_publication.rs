@@ -7,6 +7,9 @@ use vstd::{prelude::*,std_specs::btree::btree_map_inv,laws_cmp::{obeys_cmp,obeys
 
 verus! {
 
+type Rows=Vec<(ObjectId,ObjectRecord)>;
+
+
 pub(crate) struct Graph<P> {
     pub(crate) selected:root_transition::SelectedRoot<P>,
     pub(crate) component:ObjectId,
@@ -61,15 +64,37 @@ pub(crate) fn prepare<P:Ord,I:Fn(&ObjectRecord)->ObjectId+Copy>(
             actual!=expected && actual==(if pending@.contains_key(owner) {Some(pending@[owner])} else {published@.get(owner)}),
 {
     let head=transaction_records::identify(component,identify);
-    let state=match header_writer::kv_state(state_refs,head.0,v) {Some(r)=>transaction_records::identify(r,identify),None=>return Err(Error::State)};
-    let commit=match header_writer::commit(commit_refs,prior,state.0,v) {Some(r)=>transaction_records::identify(r,identify),None=>return Err(Error::Commit)};
     let id=head.0;
-    let state_id=state.0;
-    let commit_id=commit.0;
-    let update=root_declaration::Update{principal:owner,expected:prior,commit:commit_id,records:vec![head,state,commit]};
+    let insert=|mut rows:Rows,record:ObjectRecord| -> (out:Result<(Rows,ObjectId),()>)
+        ensures out matches Ok((next,k)) && next@==rows@.push((k,record)) && identify.ensures((&record,),k),
+    {
+        let row=transaction_records::identify(record,identify);
+        let k=row.0;
+        rows.push(row);
+        Ok((rows,k))
+    };
+    let initial=vec![head];
+    let (staged,commit_id)=match header_writer::stage_headers(initial,state_refs,commit_refs,id,prior,v,insert) {
+        Ok(t)=>t,
+        Err(header_writer::StageError::State)=>return Err(Error::State),
+        Err(header_writer::StageError::Commit)=>return Err(Error::Commit),
+        Err(header_writer::StageError::Insert(()))=>{proof {reveal(header_writer::insert_error);} assert(false);unreached()},
+    };
+    proof {reveal(header_writer::finished);}
+    let ghost (middle,sid,state_record,commit_record)=choose|mid:Rows,sid:ObjectId,state:ObjectRecord,commit:ObjectRecord|
+        #[trigger] header_writer::staged(insert,initial,mid,staged,id,sid,commit_id,state,commit,prior,v,state_refs@,commit_refs@);
+    assert(staged@ =~= seq![head,(sid,state_record),(commit_id,commit_record)]);
+    assert(staged.len()==3);
+
+    let state_id=staged[1].0;
+    let ghost state=staged@[1];
+    let ghost commit=staged@[2];
+    let update=root_declaration::Update{principal:owner,expected:prior,commit:commit_id,records:staged};
     let (selected,rows)=match root_transition::select_update(pending,published,update) {Ok(v)=>v,Err(e)=>return Err(Error::Selection(e))};
     let table=match transaction_records::unique(rows) {Ok(t)=>t,Err(k)=>return Err(Error::Collision(k))};
     proof {
+        assert(rows@[0]==head && rows@[1]==state && rows@[2]==(commit_id,commit.1));
+        assert(table@.contains_key(rows@[0].0) && table@.contains_key(rows@[2].0));
         assert(table@.contains_key(id) && table@[id]==head.1);
         assert(table@.contains_key(state_id) && table@[state_id]==state.1);
         assert(table@.contains_key(commit_id) && table@[commit_id]==commit.1);

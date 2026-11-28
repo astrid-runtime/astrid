@@ -421,21 +421,25 @@ where
         header: TreeHeader<P>,
         head: ObjectId,
     ) -> StorageResult<RootTransaction<P>> {
-        let state = crate::storage_model::header_writer::kv_state(
+        use crate::storage_model::header_writer::{StageError, stage_headers};
+        let (_, commit) = stage_headers(
+            &mut self,
             header.preserved_state,
-            head,
-            FORMAT_VERSION,
-        )
-        .ok_or_else(|| model_error(&ModelError::NonCanonicalReferences))?;
-        let state = self.insert(state)?;
-        let commit = crate::storage_model::header_writer::commit(
             header.preserved_commit,
+            head,
             header.root,
-            state,
             FORMAT_VERSION,
+            |context, record| {
+                let id = context.insert(record)?;
+                Ok((context, id))
+            },
         )
-        .ok_or_else(|| model_error(&ModelError::NonCanonicalReferences))?;
-        let commit = self.insert(commit)?;
+        .map_err(|error| match error {
+            StageError::State | StageError::Commit => {
+                model_error(&ModelError::NonCanonicalReferences)
+            },
+            StageError::Insert(error) => error,
+        })?;
         self.retain_reachable(commit);
         let records = self.records.into_iter().collect();
         Ok(match self.identity_session {
