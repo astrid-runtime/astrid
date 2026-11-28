@@ -77,14 +77,10 @@ fn journal_transition<K:Ord+Copy,F>(history:&mut BTreeMap<K,(RootState,u64)>,own
 
 
 /// Restore two distinct principals from a compacted journal, then advance just the fleet root.
-/// The snapshot encoder is supplied by the caller. Its codec and parser are separate obligations.
-fn compacted_transition<C>(system:RootState, fleet:RootState, replacement:RootState, id:[u8;32],
-    payload:&[u8], offset:u64, encode:C) -> (history:BTreeMap<u8,(RootState,u64)>)
-    where C:FnOnce(&Vec<(Vec<u8>,RootState)>)->Result<Vec<u8>,()>,
-    requires forall|rows:Vec<(Vec<u8>,RootState)>| #[trigger] encode.requires((&rows,)),
-        forall|rows:Vec<(Vec<u8>,RootState)>, r:Result<Vec<u8>,()>|
-            #[trigger] encode.ensures((&rows,),r) ==> (r matches Ok(w) && w@ == payload@),
-        replacement.generation.value() == fleet.generation.value() as int + 1,
+/// Use the production snapshot serializer for both the durable payload and the canonical check.
+fn compacted_transition(system:RootState, fleet:RootState, replacement:RootState, id:[u8;32],
+    scheme:root_wire::Scheme, offset:u64) -> (history:BTreeMap<u8,(RootState,u64)>)
+    requires replacement.generation.value() == fleet.generation.value() as int + 1,
     ensures history@.dom() == set![0u8,2u8],
         history@.get(0) == Some((system,0u64)), history@.get(2) == Some((replacement,offset)),
 {
@@ -110,7 +106,23 @@ fn compacted_transition<C>(system:RootState, fleet:RootState, replacement:RootSt
     };
     assert(rows@[0].0@ == seq![0u8]);
     assert(rows@[1].0.len() == 33 && rows@[1].0[0] == 2);
-    match snapshot::restore(&mut history,0,payload,rows,encode,decode) {
+    let payload = snapshot::serialize(&rows,scheme).unwrap();
+    assert(payload@ == snapshot::header(2) + snapshot::row_bytes(rows@[0],scheme) +
+        snapshot::row_bytes(rows@[1],scheme)) by {
+        reveal_with_fuel(snapshot::prefix,3);
+    }
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    assert(snapshot::header(2).len() == 17);
+    assert(payload@.take(17) =~= vstd::bytes::spec_u64_to_le_bytes(u64::MAX) + seq![1u8] +
+        vstd::bytes::spec_u64_to_le_bytes(2));
+    let ghost first = vstd::bytes::spec_u64_to_le_bytes(1) + seq![0u8] +
+        vstd::bytes::spec_u64_to_le_bytes(system.generation.value()) + scheme.algorithm@ +
+        scheme.construction@ + seq![32u8,0,0,0] + system.commit.digest();
+    assert(snapshot::row_bytes(rows@[0],scheme) =~= first);
+    let encode = |input:&Vec<(Vec<u8>,RootState)>| -> (r:Result<Vec<u8>,()>)
+        ensures r matches Ok(w) && w@ == snapshot::prefix(input@,input.len() as nat,scheme),
+    { Ok(snapshot::serialize(input,scheme).unwrap()) };
+    match snapshot::restore(&mut history,0,&payload,rows,encode,decode) {
         Ok(()) => {
             let ghost ids = choose|ids:Seq<u8>| ids.len() == rows.len() &&
                 snapshot::decoded(rows@,ids,decode) && #[trigger] snapshot::image(rows@,ids,history@);

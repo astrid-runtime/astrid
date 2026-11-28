@@ -1,5 +1,5 @@
 //! Seed replay history only after every compacted root has been accepted.
-use super::RootState;
+use super::{RootState, journal_history, root_wire};
 use std::collections::BTreeMap;
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
@@ -10,6 +10,53 @@ use vstd::{
 
 verus! {
 type Row = (Vec<u8>,RootState);
+pub(super) const SENTINEL:u64 = u64::MAX;
+pub(super) const RECORD:u8 = 1;
+
+pub(super) open spec fn header(count:u64) -> Seq<u8> {
+    vstd::bytes::spec_u64_to_le_bytes(SENTINEL) + seq![RECORD] + vstd::bytes::spec_u64_to_le_bytes(count)
+}
+
+pub(super) open spec fn row_bytes(row:Row, scheme:root_wire::Scheme) -> Seq<u8> {
+    vstd::bytes::spec_u64_to_le_bytes(row.0.len() as u64) + row.0@ +
+        vstd::bytes::spec_u64_to_le_bytes(row.1.generation.value()) + scheme.algorithm@ +
+        scheme.construction@ + seq![32u8,0,0,0] + row.1.commit.digest()
+}
+
+pub(super) open spec fn prefix(rows:Seq<Row>,n:nat,scheme:root_wire::Scheme) -> Seq<u8>
+    decreases n,
+{
+    if n == 0 {header(rows.len() as u64)}
+    else {prefix(rows,(n-1) as nat,scheme) + row_bytes(rows[n-1],scheme)}
+}
+
+/// The caller checks strict owner ordering before serializing.
+pub(super) fn serialize(rows:&[Row],scheme:root_wire::Scheme) -> (out:Option<Vec<u8>>)
+    ensures out.is_some(), out matches Some(bytes) ==> bytes@ == prefix(rows@,rows.len() as nat,scheme),
+{
+    let count = u64::try_from(rows.len()).ok()?;
+    let mut bytes = vstd::bytes::u64_to_le_bytes(SENTINEL);
+    bytes.push(RECORD);
+    bytes.extend_from_slice(&root_wire::little_endian(count));
+    assert(bytes@ =~= header(count));
+    let mut i = 0usize;
+    while i < rows.len()
+        invariant i <= rows.len(), bytes@ == prefix(rows@,i as nat,scheme),
+        decreases rows.len() - i,
+    {
+        let (principal,root) = &rows[i];
+        let length = u64::try_from(principal.len()).ok()?;
+        let ghost before = bytes@;
+        bytes.extend_from_slice(&root_wire::little_endian(length));
+        bytes.extend_from_slice(principal);
+        let wire = journal_history::to_wire(*root);
+        wire.append(&mut bytes,scheme);
+        assert(bytes@ =~= before + row_bytes(rows@[i as int],scheme));
+        i = i.saturating_add(1);
+    }
+    Some(bytes)
+}
+
 pub(super) enum SnapshotError<E> { Position, Noncanonical, Duplicate, Codec(E) }
 
 pub(super) open spec fn decoded<P,E,D:Fn(&Vec<u8>)->Result<P,E>>(rows:Seq<Row>,ids:Seq<P>,decode:D) -> bool {

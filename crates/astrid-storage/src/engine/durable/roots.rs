@@ -13,8 +13,7 @@ use super::{
     preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
 };
 
-const SNAPSHOT_SENTINEL: u64 = u64::MAX;
-const SNAPSHOT_RECORD: u8 = 1;
+use journal_snapshot::{RECORD as SNAPSHOT_RECORD, SENTINEL as SNAPSHOT_SENTINEL};
 impl From<IdentityScheme> for super::root_wire::Scheme {
     fn from(scheme: IdentityScheme) -> Self {
         Self {
@@ -262,23 +261,7 @@ pub(super) fn encode_root_snapshot(
             "root snapshot principals are not strictly ordered",
         ));
     }
-    let count = u64::try_from(roots.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&SNAPSHOT_SENTINEL.to_le_bytes());
-    bytes.push(SNAPSHOT_RECORD);
-    bytes.extend_from_slice(&count.to_le_bytes());
-    for (principal, root) in roots {
-        let principal_len =
-            u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        bytes.extend_from_slice(&principal_len.to_le_bytes());
-        bytes.extend_from_slice(principal);
-        encode_root_state(&mut bytes, scheme, *root);
-    }
-    Ok(bytes)
-}
-
-fn encode_root_state(bytes: &mut Vec<u8>, scheme: IdentityScheme, root: RootState) {
-    super::root_wire::Root::from(root).append(bytes, scheme.into());
+    journal_snapshot::serialize(roots, scheme.into()).ok_or(DurableError::EncodingOverflow)
 }
 
 enum DecodedRootJournalRecord {
