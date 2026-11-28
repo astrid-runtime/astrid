@@ -377,12 +377,12 @@ where
         ))
     }
 
-    pub(super) fn get(&self, owner: &P, root: Option<RootState>, key: &[u8]) -> HotRead {
+    pub(super) fn get(&self, owner: &P, root: Option<RootState>, key: &Vec<u8>) -> HotRead {
         let owners = self.owners.load();
         super::hot_lookup::lookup(&owners, owner, root, key, |cache, requested, key| {
             let snapshot = cache.snapshot.load();
             super::hot_lookup::at_root(snapshot.root, requested, key, |key| {
-                snapshot.entries.get(key).map(CachedValue::to_vec)
+                super::hot_lookup::row(&snapshot.entries, key).map(CachedValue::to_vec)
             })
         })
         .map_or(HotRead::Miss, HotRead::Hit)
@@ -526,7 +526,7 @@ where
             next.insertion_order.retain(|candidate| candidate != &key);
         }
         next.resident_bytes = next.resident_bytes.saturating_add(entry_bytes);
-        next.entries.insert(key.clone(), value);
+        super::hot_lookup::store_row(&mut next.entries, key.clone(), value);
         next.insertion_order.push_back(key);
 
         let mut previous_global = writer.resident_bytes.saturating_sub(previous_bytes);
@@ -646,7 +646,7 @@ mod tests {
             );
         }
         assert!(
-            matches!(cache.get(&"alice", Some(root(1)), b"first"), HotRead::Hit(Some(value)) if value == b"value")
+            matches!(cache.get(&"alice", Some(root(1)), &b"first".to_vec()), HotRead::Hit(Some(value)) if value == b"value")
         );
     }
 
@@ -663,18 +663,18 @@ mod tests {
         assert!(observed.entries.contains_key(b"first".as_slice()));
         assert!(!observed.entries.contains_key(b"second".as_slice()));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"second"),
+            cache.get(&"alice", Some(root(1)), &b"second".to_vec()),
             HotRead::Hit(None)
         ));
         cache.insert(&"alice", Some(root(2)), b"third".to_vec(), Some(b"new"));
         assert_eq!(observed.root, Some(root(1)));
         assert!(observed.entries.contains_key(b"first".as_slice()));
         assert!(matches!(
-            cache.get(&"alice", Some(root(2)), b"first"),
+            cache.get(&"alice", Some(root(2)), &b"first".to_vec()),
             HotRead::Miss
         ));
         assert!(
-            matches!(cache.get(&"alice", Some(root(2)), b"third"), HotRead::Hit(Some(value)) if value == b"new")
+            matches!(cache.get(&"alice", Some(root(2)), &b"third".to_vec()), HotRead::Hit(Some(value)) if value == b"new")
         );
     }
 
@@ -704,15 +704,15 @@ mod tests {
         // copy of all owner identities for the unchanged lookup index.
         assert!(CLONES.load(Ordering::Relaxed) <= 2 * 128);
         assert!(matches!(
-            cache.get(&Owner(64), Some(root(2)), b"key"),
+            cache.get(&Owner(64), Some(root(2)), &b"key".to_vec()),
             HotRead::Hit(Some(value)) if value == b"new"
         ));
         assert!(matches!(
-            cache.get(&Owner(64), Some(root(1)), b"key"),
+            cache.get(&Owner(64), Some(root(1)), &b"key".to_vec()),
             HotRead::Miss
         ));
         assert!(matches!(
-            cache.get(&Owner(63), Some(root(1)), b"key"),
+            cache.get(&Owner(63), Some(root(1)), &b"key".to_vec()),
             HotRead::Hit(Some(value)) if value == b"old"
         ));
     }
@@ -722,21 +722,21 @@ mod tests {
         let cache = KvHotCache::with_limits(1_024, 1_024, 4, 4);
         cache.insert(&"alice", Some(root(1)), b"key".to_vec(), Some(b"old"));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"key"),
+            cache.get(&"alice", Some(root(1)), &b"key".to_vec()),
             HotRead::Hit(Some(value)) if value == b"old"
         ));
         assert!(matches!(
-            cache.get(&"alice", Some(root(2)), b"key"),
+            cache.get(&"alice", Some(root(2)), &b"key".to_vec()),
             HotRead::Miss
         ));
 
         cache.insert(&"alice", Some(root(2)), b"key".to_vec(), Some(b"new"));
         assert!(matches!(
-            cache.get(&"alice", Some(root(2)), b"key"),
+            cache.get(&"alice", Some(root(2)), &b"key".to_vec()),
             HotRead::Hit(Some(value)) if value == b"new"
         ));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"key"),
+            cache.get(&"alice", Some(root(1)), &b"key".to_vec()),
             HotRead::Miss
         ));
     }
@@ -747,21 +747,21 @@ mod tests {
         cache.insert(&"alice", Some(root(1)), b"first".to_vec(), Some(&[1; 100]));
         cache.insert(&"alice", Some(root(1)), b"second".to_vec(), Some(&[2; 100]));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"first"),
+            cache.get(&"alice", Some(root(1)), &b"first".to_vec()),
             HotRead::Miss
         ));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"second"),
+            cache.get(&"alice", Some(root(1)), &b"second".to_vec()),
             HotRead::Hit(Some(value)) if value == vec![2; 100]
         ));
 
         cache.insert(&"bob", Some(root(1)), b"key".to_vec(), None);
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"second"),
+            cache.get(&"alice", Some(root(1)), &b"second".to_vec()),
             HotRead::Miss
         ));
         assert!(matches!(
-            cache.get(&"bob", Some(root(1)), b"key"),
+            cache.get(&"bob", Some(root(1)), &b"key".to_vec()),
             HotRead::Hit(None)
         ));
     }
@@ -773,11 +773,11 @@ mod tests {
         cache.insert(&"bob", Some(root(1)), b"key".to_vec(), Some(&[2; 100]));
 
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"key"),
+            cache.get(&"alice", Some(root(1)), &b"key".to_vec()),
             HotRead::Miss
         ));
         assert!(matches!(
-            cache.get(&"bob", Some(root(1)), b"key"),
+            cache.get(&"bob", Some(root(1)), &b"key".to_vec()),
             HotRead::Hit(Some(value)) if value == vec![2; 100]
         ));
     }
@@ -787,14 +787,14 @@ mod tests {
         let cache = KvHotCache::new(KvReadCacheConfig::default());
         cache.insert(&"alice", Some(root(1)), b"key".to_vec(), Some(b"value"));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"key"),
+            cache.get(&"alice", Some(root(1)), &b"key".to_vec()),
             HotRead::Miss
         ));
 
         let cache = KvHotCache::new(KvReadCacheConfig::reserved_64_mib());
         cache.insert(&"alice", Some(root(1)), b"key".to_vec(), Some(b"value"));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"key"),
+            cache.get(&"alice", Some(root(1)), &b"key".to_vec()),
             HotRead::Hit(Some(value)) if value == b"value"
         ));
     }
@@ -808,7 +808,7 @@ mod tests {
         ));
         cache.insert(&"alice", Some(root(1)), b"key".to_vec(), Some(b"value"));
         assert!(matches!(
-            cache.get(&"alice", Some(root(1)), b"key"),
+            cache.get(&"alice", Some(root(1)), &b"key".to_vec()),
             HotRead::Miss
         ));
     }

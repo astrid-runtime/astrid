@@ -180,16 +180,48 @@ spec fn cached_bytes(result:Option<Option<Vec<u8>>>) -> Option<Option<Seq<u8>>> 
     match result { Some(Some(v)) => Some(Some(v@)), Some(None) => Some(None), None => None }
 }
 
+/// A replacement in an arbitrary sampled table preserves every other byte key.
+fn update_row(rows:&mut std::collections::BTreeMap<Vec<u8>,crate::hot_lookup::CachedValue>,
+    key:Vec<u8>,value:crate::hot_lookup::CachedValue,request:&Vec<u8>) -> (out:Option<Option<Vec<u8>>>)
+    requires vstd::std_specs::btree::btree_map_inv(old(rows)),vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),
+        vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+    ensures cached_bytes(out) == if request@ == key@ {Some(value.bytes_view())}
+        else {old(rows).deep_view().get(request@)},
+{
+    crate::hot_lookup::store_row(rows,key,value);
+    match crate::hot_lookup::row(rows,request) {
+        Some(v) => Some(v.to_vec()),
+        None => None,
+    }
+}
+
 /// The runtime point-cache may return a cached absence. An unavailable sample,
 /// missing owner, stale root or different composite key must remain a miss.
 fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published:Option<crate::RootState>,
     before:bool,after:bool,namespace:&[u8],logical:&[u8],stored:&[u8],value:&crate::hot_lookup::CachedValue)
     -> (out:Option<Option<Vec<u8>>>)
+    requires vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
     ensures cached_bytes(out) == if before && after && owner == requester && recorded == published &&
         stored@ == namespace@ + seq![0u8] + logical@ {Some(value.bytes_view())} else {None},
 {
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
     let mut owners = std::collections::BTreeMap::new();
     owners.insert(owner,recorded);
+    let mut rows = std::collections::BTreeMap::new();
+    let mut stored_key = Vec::with_capacity(stored.len());
+    stored_key.extend_from_slice(stored);
+    assert(stored_key@ =~= stored@);
+    proof {
+        vstd::std_specs::btree::lemma_btree_map_deepview_dom(rows);
+        assert(rows@.dom() =~= Set::<Vec<u8>>::empty());
+        assert(rows.deep_view().dom() =~= Set::<Seq<u8>>::empty());
+        assert(rows.deep_view() =~= Map::<Seq<u8>,Option<Seq<u8>>>::empty());
+    }
+    let copy = crate::hot_lookup::CachedValue::clone(value);
+    assert(copy == *value);
+    crate::hot_lookup::store_row(&mut rows,stored_key,copy);
+    assert(rows.deep_view().get(stored@) == Some(value.bytes_view()));
+    assert(rows.deep_view().dom() =~= set![stored@]);
     let select = |p:&u64| -> (r:Option<crate::RootState>)
         ensures r == if *p == owner {published} else {None},
         {if *p == owner {published} else {None}};
@@ -198,12 +230,12 @@ fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published
         || -> (ready:bool) ensures ready == after {after})?.get();
     let address = crate::encoding::composite(namespace,logical);
     crate::hot_lookup::lookup(&owners,&requester,root,&address,
-        |sample:&Option<crate::RootState>,wanted:Option<crate::RootState>,key:&[u8]| -> (r:Option<Option<Vec<u8>>>)
+        |sample:&Option<crate::RootState>,wanted:Option<crate::RootState>,key:&Vec<u8>| -> (r:Option<Option<Vec<u8>>>)
             ensures cached_bytes(r) == if *sample == wanted && key@ == stored@ {Some(value.bytes_view())} else {None},
         {
-            crate::hot_lookup::at_root(*sample,wanted,key,|k:&[u8]| -> (v:Option<Option<Vec<u8>>>)
+            crate::hot_lookup::at_root(*sample,wanted,key,|k:&Vec<u8>| -> (v:Option<Option<Vec<u8>>>)
                 ensures cached_bytes(v) == if k@ == stored@ {Some(value.bytes_view())} else {None},
-                {if matches!(crate::encoding::bytewise_cmp(k,stored),std::cmp::Ordering::Equal) {Some(value.to_vec())} else {None}})
+                {match crate::hot_lookup::row(&rows,k) {Some(v) => Some(v.to_vec()),None => None}})
         })
 }
 

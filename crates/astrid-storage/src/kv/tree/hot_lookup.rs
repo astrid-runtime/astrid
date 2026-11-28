@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::{
-    laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
+    laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq, obeys_cmp_deep_eq},
     std_specs::btree::btree_map_inv,
 };
 
@@ -44,9 +44,35 @@ impl CachedValue {
     }
 }
 
+impl DeepView for CachedValue {
+    type V = Option<Seq<u8>>;
+    closed spec fn deep_view(&self) -> Self::V { self.bytes_view() }
+}
+
+pub(super) fn store_row(rows:&mut BTreeMap<Vec<u8>,CachedValue>,key:Vec<u8>,value:CachedValue)
+    requires btree_map_inv(old(rows)),obeys_cmp::<Vec<u8>>(),obeys_cmp_deep_eq::<Vec<u8>>(),
+    ensures btree_map_inv(final(rows)),final(rows).deep_view() == old(rows).deep_view().insert(key@,value.bytes_view()),
+{
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
+    assert(key.deep_view() =~= key@);
+    rows.insert(key,value);
+}
+
+pub(super) fn row<'a>(rows:&'a BTreeMap<Vec<u8>,CachedValue>,key:&Vec<u8>) -> (out:Option<&'a CachedValue>)
+    requires btree_map_inv(rows),obeys_cmp::<Vec<u8>>(),obeys_cmp_deep_eq::<Vec<u8>>(),
+    ensures match out {
+        Some(v) => rows.deep_view().get(key@) == Some(v.bytes_view()),
+        None => !rows.deep_view().contains_key(key@),
+    },
+{
+    broadcast use vstd::std_specs::btree::group_btree_axioms;
+    assert(key.deep_view() =~= key@);
+    rows.get::<Vec<u8>>(key)
+}
+
 /// The payload can itself represent an absent value cached at this root.
-pub(super) fn at_root<V,F>(observed:Option<RootState>,requested:Option<RootState>,key:&[u8],read:F)
-    -> (out:Option<V>) where F:FnOnce(&[u8])->Option<V>,
+pub(super) fn at_root<V,F>(observed:Option<RootState>,requested:Option<RootState>,key:&Vec<u8>,read:F)
+    -> (out:Option<V>) where F:FnOnce(&Vec<u8>)->Option<V>,
     requires observed == requested ==> read.requires((key,)),
     ensures if observed == requested {read.ensures((key,),out)} else {out.is_none()},
 {
@@ -59,7 +85,7 @@ pub(super) fn at_root<V,F>(observed:Option<RootState>,requested:Option<RootState
 }
 
 pub(super) fn lookup<P:Ord,S,V,F>(owners:&BTreeMap<P,S>,owner:&P,requested:Option<RootState>,
-    key:&[u8],snapshot:F) -> (out:Option<V>) where F:FnOnce(&S,Option<RootState>,&[u8])->Option<V>,
+    key:&Vec<u8>,snapshot:F) -> (out:Option<V>) where F:FnOnce(&S,Option<RootState>,&Vec<u8>)->Option<V>,
     requires btree_map_inv(owners),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
         owners@.contains_key(*owner) ==> snapshot.requires((&owners@[*owner],requested,key)),
     ensures if owners@.contains_key(*owner) {snapshot.ensures((&owners@[*owner],requested,key),out)}
