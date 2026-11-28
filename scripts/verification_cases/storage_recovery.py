@@ -6,6 +6,17 @@ from .common import replace_once
 
 
 def consumer_defects():
+    frontier = Path("crates/astrid-storage/src/engine/durable/frontier.rs")
+    for label, clause, weaker in [
+        ("native synced bytes", "Ok(JournalFlush::StableFile)=>final(sink).durable()==old(sink).pending()+bytes@", "Ok(JournalFlush::StableFile)=>true"),
+        ("observed write and flush", "ensures journal_completed(old(sink).journal_calls(),final(sink).journal_calls(),bytes@,out),", "ensures true,"),
+    ]:
+        yield (
+            f"legacy journal sync loses {label}", frontier,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_acknowledged_root.rs"),
+        )
+
     transition = Path("crates/astrid-storage/src/engine/durable/journal_transition.rs")
     for label, clause, weaker in [
         ("owner bytes", "r.principal@==bytes@.subrange(at,at+length)", "true"),

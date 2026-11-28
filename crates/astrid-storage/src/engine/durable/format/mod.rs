@@ -390,6 +390,17 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
     magic: [u8; 8],
     payloads: &[T],
 ) -> Result<Vec<ArenaLocation>, DurableError> {
+    let (encoded, locations) = prepare_frame_batch(file, magic, payloads)?;
+    file.write_all(&encoded)
+        .map_err(|source| io_error("append durable frame batch", source))?;
+    Ok(locations)
+}
+
+pub(super) fn prepare_frame_batch<T: AsRef<[u8]>, F: DurableIo>(
+    file: &mut F,
+    magic: [u8; 8],
+    payloads: &[T],
+) -> Result<(Vec<u8>, Vec<ArenaLocation>), DurableError> {
     let capacity = payloads.iter().try_fold(0_usize, |total, payload| {
         let payload = payload.as_ref();
         total
@@ -420,9 +431,7 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
         .ok_or(DurableError::EncodingOverflow)?;
         locations.push(location);
     }
-    file.write_all(&encoded)
-        .map_err(|source| io_error("append durable frame batch", source))?;
-    Ok(locations)
+    Ok((encoded, locations))
 }
 
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {

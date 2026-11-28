@@ -731,18 +731,14 @@ where
         let journals =
             super::frontier::journals(accepted, |entry| entry.prepared.root.journal().as_slice());
         let publication_started = Instant::now();
-        append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
-        record_group(
+        let (encoded, _) =
+            super::format::prepare_frame_batch(&mut files.roots, ROOT_MAGIC, &journals)?;
+        let mut journal = RootJournalBatch {
+            file: &mut files.roots,
             accepted,
-            ProjectionPhase::RootPublication,
             publication_started,
-        );
-        let flush_started = Instant::now();
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush grouped root-journal frames", source))?;
-        record_group(accepted, ProjectionPhase::Flush, flush_started);
+        };
+        super::frontier::persist_journal(&mut journal, &encoded)?;
         self.fail_if(FaultPoint::AfterRootCas)
     }
 
@@ -798,6 +794,39 @@ where
             )?);
         }
         representations.append_direct_update(&direct)
+    }
+}
+
+struct RootJournalBatch<'a, P: Ord> {
+    file: &'a mut File,
+    accepted: &'a [AcceptedCommit<P>],
+    publication_started: Instant,
+}
+
+impl<P: Ord> super::frontier::JournalSink for RootJournalBatch<'_, P> {
+    type Error = DurableError;
+
+    fn write_batch(&mut self, bytes: &[u8]) -> Result<(), DurableError> {
+        use std::io::Write;
+        self.file
+            .write_all(bytes)
+            .map_err(|source| io_error("append durable frame batch", source))?;
+        record_group(
+            self.accepted,
+            ProjectionPhase::RootPublication,
+            self.publication_started,
+        );
+        Ok(())
+    }
+
+    fn flush_batch(&mut self) -> Result<super::frontier::JournalFlush, DurableError> {
+        let started = Instant::now();
+        let scope = self
+            .file
+            .flush_region()
+            .map_err(|source| io_error("flush grouped root-journal frames", source))?;
+        record_group(self.accepted, ProjectionPhase::Flush, started);
+        Ok(scope)
     }
 }
 

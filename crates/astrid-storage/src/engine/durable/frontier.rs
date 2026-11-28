@@ -40,6 +40,47 @@ pub(super) fn wal_position<L: Copy>(current: u64, tail: Option<L>, observed: u64
     }
 }
 
+pub(super) enum JournalFlush { StableFile, AwaitingContainer }
+#[cfg(verus_keep_ghost)]
+pub(super) ghost enum JournalCall<E> { Write(Seq<u8>,Result<(),E>), Sync(Result<JournalFlush,E>) }
+
+/// A journal handle positioned at the append offset. A failed host operation may
+/// leave partial bytes. Only a successful sync certifies the complete pending image.
+pub(super) trait JournalSink {
+    type Error;
+    spec fn pending(&self) -> Seq<u8>;
+    spec fn durable(&self) -> Seq<u8>;
+    spec fn position(&self) -> int;
+    spec fn journal_calls(&self) -> Seq<JournalCall<Self::Error>>;
+    fn write_batch(&mut self,bytes:&[u8]) -> (out:Result<(),Self::Error>)
+        ensures final(self).journal_calls()==old(self).journal_calls().push(JournalCall::Write(bytes@,out)),
+            out.is_ok() && old(self).position()==old(self).pending().len()
+            ==> final(self).pending()==old(self).pending()+bytes@;
+    fn flush_batch(&mut self) -> (out:Result<JournalFlush,Self::Error>)
+        ensures final(self).journal_calls()==old(self).journal_calls().push(JournalCall::Sync(out)),
+            out matches Ok(JournalFlush::StableFile) ==> final(self).durable()==old(self).pending(),
+            out matches Ok(JournalFlush::AwaitingContainer) ==> final(self).pending()==old(self).pending();
+}
+
+pub(super) open spec fn journal_completed<E>(prior:Seq<JournalCall<E>>,after:Seq<JournalCall<E>>,batch:Seq<u8>,out:Result<JournalFlush,E>) -> bool {
+    let submitted=prior.push(JournalCall::Write(batch,Ok(())));
+    after==submitted.push(JournalCall::Sync(out)) ||
+        (out matches Err(e) && after==prior.push(JournalCall::Write(batch,Err(e))))
+}
+
+/// Use the same journal handle for both operations and propagate its first error.
+pub(super) fn persist_journal<S:JournalSink>(sink:&mut S,bytes:&[u8]) -> (out:Result<JournalFlush,S::Error>)
+    ensures journal_completed(old(sink).journal_calls(),final(sink).journal_calls(),bytes@,out),
+        old(sink).position()==old(sink).pending().len() ==> match out {
+            Ok(JournalFlush::StableFile)=>final(sink).durable()==old(sink).pending()+bytes@,
+            Ok(JournalFlush::AwaitingContainer)=>final(sink).pending()==old(sink).pending()+bytes@,
+            Err(_)=>true,
+        },
+{
+    sink.write_batch(bytes)?;
+    sink.flush_batch()
+}
+
 pub(super) enum PublicationError<E> { Active, Empty, Sync(E) }
 
 /// Consume the pending count only after the actual writer sync succeeds.

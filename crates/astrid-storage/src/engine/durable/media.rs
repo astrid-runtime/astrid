@@ -107,10 +107,15 @@ impl File {
     }
 
     pub(in crate::engine::durable) fn sync_data(&self) -> io::Result<()> {
+        self.flush_region().map(|_| ())
+    }
+
+    pub(super) fn flush_region(&self) -> io::Result<super::frontier::JournalFlush> {
+        use super::frontier::JournalFlush;
         match self {
-            Self::Native(file) => file.sync_data(),
+            Self::Native(file) => file.sync_data().map(|()| JournalFlush::StableFile),
             // ASTVOL1 durability is one container fsync via AstridVolume::sync.
-            Self::Volume(_) => Ok(()),
+            Self::Volume(_) => Ok(JournalFlush::AwaitingContainer),
         }
     }
 
