@@ -75,10 +75,18 @@ proof fn fail_at<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Vec<Mutation>,NodeTotals)
     requires 0 <= i < rows.len(), replayed(initial,base,tree,rows,i+1,apply,prior), rejected(tree,prior,rows[i],apply,error),
     ensures failed(initial,base,tree,rows,apply,error),
 {}
+pub(super) open spec fn preserves<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Vec<Mutation>,NodeTotals)->Result<(S,NodeTotals),E>>(
+    apply:F,valid:spec_fn(S)->bool,
+) -> bool {
+    &&& forall|s:S,t:Option<ObjectId>,id:ObjectId,r:&Vec<Mutation>,n:NodeTotals|
+        valid(s) ==> #[trigger] apply.requires((s,t,id,r,n))
+    &&& forall|s:S,t:Option<ObjectId>,id:ObjectId,r:&Vec<Mutation>,n:NodeTotals,next:S,m:NodeTotals|
+        valid(s) && #[trigger] apply.ensures((s,t,id,r,n),Ok((next,m))) ==> valid(next)
+}
+
 pub(super) fn run<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Vec<Mutation>,NodeTotals)->Result<(S,NodeTotals),E>>(
-    initial:S,base:NodeTotals,tree:Option<ObjectId>,input:Vec<Step>,apply:F) -> (out:Result<Cursor<S>,Error<E>>)
-    requires forall|s:S,t:Option<ObjectId>,id:ObjectId,r:&Vec<Mutation>,n:NodeTotals|
-        #[trigger] apply.requires((s,t,id,r,n)),
+    initial:S,base:NodeTotals,tree:Option<ObjectId>,input:Vec<Step>,apply:F,Ghost(valid):Ghost<spec_fn(S)->bool>) -> (out:Result<Cursor<S>,Error<E>>)
+    requires valid(initial),preserves(apply,valid),
     ensures
         out matches Ok(c) ==> replayed(initial,base,tree,input@,0,apply,c),
         out matches Err(e) ==> failed(initial,base,tree,input@,apply,e),
@@ -88,8 +96,7 @@ pub(super) fn run<S,E,F:Fn(S,Option<ObjectId>,ObjectId,&Vec<Mutation>,NodeTotals
     let mut cursor = Cursor {state:initial,totals:base,depth:0,bytes:0};
     let ghost mut h = seq![cursor];
     loop
-        invariant all == input@, forall|s:S,t:Option<ObjectId>,id:ObjectId,r:&Vec<Mutation>,n:NodeTotals|
-            #[trigger] apply.requires((s,t,id,r,n)),
+        invariant all == input@,valid(cursor.state),preserves(apply,valid),
             rows@ == all.take(rows.len() as int), rows.len() <= all.len(),
             history(initial,base,tree,all,rows.len() as int,apply,h), h.last() == cursor,
         decreases rows.len(),

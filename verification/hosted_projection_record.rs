@@ -74,7 +74,7 @@ fn base(owner:u64,id:ObjectId,tree:Option<ObjectId>,totals:NodeTotals,available:
         let apply = |_s:u64,_tree:Option<ObjectId>,_k:ObjectId,_r:&Vec<Mutation>,_totals:NodeTotals|
             -> (out:Result<(u64,NodeTotals),u8>) ensures out == Err(9u8) {Err(9u8)};
         let ghost selected = c;
-        let result = checkpoint::recover(c,observed_root,measured,start,apply);
+        let result = checkpoint::recover(c,observed_root,measured,start,apply,Ghost(|_| true));
         let ghost out = result;
         proof {
             assert(selected.newest_first.len() == 0);

@@ -7,7 +7,9 @@ use crate::storage_model::{
 };
 use parking_lot::Mutex;
 
-use super::delta::{Mutation, Projection};
+#[cfg(test)]
+use super::delta::Mutation;
+use super::delta::Projection;
 use super::memo::MemoSnapshot;
 use super::node::NodeTotals;
 use super::overlay::OverlayMap;
@@ -331,97 +333,100 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    use super::{checkpoint_replay, delta_chain, delta_recovery::CounterError, delta_replay};
-    let validated_trees = &validation_cache.trees;
-    let chain = delta_chain::walk(owner, head_id, |principal, object| {
-        use super::projection_record::{self, LoadError};
-        projection_record::read_at(
-            principal,
-            object,
-            FORMAT_VERSION,
-            super::ROOT_LABEL,
-            |p, id| load_typed(engine, p, id, ObjectKind::NamespaceMap),
-            |key| super::validation::validate_composite_key(object, key).err(),
-        )
-        .map_err(|error| match error {
-            LoadError::Source(e) => e,
-            LoadError::Record(id, e) => super::delta::projection_error(id, e),
-        })
-    })
-    .map_err(|error| match error {
-        delta_chain::Error::Cycle(id) => invalid(id, "KV delta chain contains a cycle"),
-        delta_chain::Error::Source(e) => e,
-    })?;
-    let tree = chain.tree;
-    let cached = validated_trees
-        .lock()
-        .get(owner)
-        .copied()
-        .filter(|validation| validation.root() == tree);
-    let validation = if let Some(validation) = cached {
-        validation
-    } else {
-        #[cfg(test)]
-        validation_cache.record_tree_validation_for_test();
-        let mut context = TreeContext::<P, E>::new(engine, owner);
-        context.validate_tree(tree)?
+    use super::{
+        checkpoint_replay, delta_chain, delta_recovery::CounterError, delta_replay,
+        projection_recovery,
     };
-    let replay = checkpoint_replay::recover(
-        chain,
-        validation.root(),
-        NodeTotals {
-            entries: validation.entries,
-            logical_bytes: validation.logical_bytes,
-            quota_bytes: validation.quota_bytes,
-        },
-        || {
-            (
-                TreeContext::<P, E>::new(engine, owner),
-                OverlayMap::default(),
+    projection_recovery::read(
+        owner,
+        head_id,
+        |principal, object| {
+            use super::projection_record::{self, LoadError};
+            projection_record::read_at(
+                principal,
+                object,
+                FORMAT_VERSION,
+                super::ROOT_LABEL,
+                |p, id| load_typed(engine, p, id, ObjectKind::NamespaceMap),
+                |key| super::validation::validate_composite_key(object, key).err(),
             )
+            .map_err(|error| match error {
+                LoadError::Source(e) => e,
+                LoadError::Record(id, e) => super::delta::projection_error(id, e),
+            })
         },
-        |(mut context, overlay), base, object, mutations, totals| {
-            let (overlay, totals) =
-                apply_validated_mutations(object, &mut context, base, overlay, totals, mutations)?;
-            Ok(((context, overlay), totals))
+        |owner, tree| {
+            let cached = validation_cache
+                .trees
+                .lock()
+                .get(owner)
+                .copied()
+                .filter(|validation| validation.root() == tree);
+            let validation = if let Some(validation) = cached {
+                validation
+            } else {
+                #[cfg(test)]
+                validation_cache.record_tree_validation_for_test();
+                let mut context = TreeContext::<P, E>::new(engine, owner);
+                context.validate_tree(tree)?
+            };
+            Ok(projection_recovery::Measured {
+                root: validation.root(),
+                totals: NodeTotals {
+                    entries: validation.entries,
+                    logical_bytes: validation.logical_bytes,
+                    quota_bytes: validation.quota_bytes,
+                },
+                boundary: validation.certificate(),
+                validation,
+            })
         },
+        |principal| TreeContext::<P, E>::new(engine, principal),
+        (
+            |mut context: TreeContext<'_, P, E>, base, key: &Vec<u8>| {
+                let old = context.get(base, key)?;
+                Ok((context, old))
+            },
+            |context: TreeContext<'_, P, E>, slot: &super::node::ValueSlot| {
+                let bytes = context.value_bytes(slot)?;
+                Ok((context, bytes))
+            },
+        ),
+        mutation_error,
     )
     .map_err(|error| match error {
-        checkpoint_replay::Error::Root => {
-            invalid(head_id, "KV checkpoint validation root disagrees")
+        projection_recovery::Error::Chain(delta_chain::Error::Cycle(id)) => {
+            invalid(id, "KV delta chain contains a cycle")
         },
-        checkpoint_replay::Error::Totals => {
-            invalid(head_id, "KV checkpoint accounting totals disagree")
-        },
-        checkpoint_replay::Error::Replay(error) => match error {
-            delta_replay::Error::Counter(id, CounterError::Disagree) => {
-                invalid(id, "KV delta chain counters disagree")
+        projection_recovery::Error::Chain(delta_chain::Error::Source(e))
+        | projection_recovery::Error::Validation(e) => e,
+        projection_recovery::Error::Checkpoint(error) => match error {
+            checkpoint_replay::Error::Root => {
+                invalid(head_id, "KV checkpoint validation root disagrees")
             },
-            delta_replay::Error::Counter(_, CounterError::RowOverflow) => {
-                super::delta::arithmetic_overflow()
+            checkpoint_replay::Error::Totals => {
+                invalid(head_id, "KV checkpoint accounting totals disagree")
             },
-            delta_replay::Error::Counter(id, CounterError::ChainOverflow) => {
-                invalid(id, "KV delta byte total overflow")
+            checkpoint_replay::Error::Replay(error) => match error {
+                delta_replay::Error::Counter(id, CounterError::Disagree) => {
+                    invalid(id, "KV delta chain counters disagree")
+                },
+                delta_replay::Error::Counter(_, CounterError::RowOverflow) => {
+                    super::delta::arithmetic_overflow()
+                },
+                delta_replay::Error::Counter(id, CounterError::ChainOverflow) => {
+                    invalid(id, "KV delta byte total overflow")
+                },
+                delta_replay::Error::Apply(error) => error,
+                delta_replay::Error::Totals(id) => {
+                    invalid(id, "KV delta accounting totals disagree")
+                },
             },
-            delta_replay::Error::Apply(error) => error,
-            delta_replay::Error::Totals(id) => invalid(id, "KV delta accounting totals disagree"),
         },
-    })?;
-    let (_, overlay) = replay.state;
-    Ok((
-        Projection {
-            head: Some(head_id),
-            tree,
-            overlay,
-            depth: replay.depth,
-            delta_bytes: replay.bytes,
-            totals: replay.totals,
-            boundary: Some(validation.certificate()),
-        },
-        validation,
-    ))
+    })
 }
 
+#[cfg(test)]
 fn apply_validated_mutations<P, E>(
     object: ObjectId,
     context: &mut TreeContext<'_, P, E>,
@@ -434,7 +439,6 @@ where
     P: Ord,
     E: KvProjectionEngine<P>,
 {
-    use super::delta_totals::ApplyError;
     let (_, overlay, totals) = overlay
         .recover(
             (context, totals),
@@ -450,16 +454,24 @@ where
                 Ok((context, data))
             },
         )
-        .map_err(|(_, (object, error))| match error {
-            ApplyError::Load(e) => e,
-            ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
-                invalid(object, "KV delta contains a no-op mutation")
-            },
-            ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
-                replay_accounting_error(e)
-            },
-        })?;
+        .map_err(|(_, (object, error))| mutation_error(object, error))?;
     Ok((overlay, totals))
+}
+
+fn mutation_error(
+    object: ObjectId,
+    error: super::delta_totals::ApplyError<StorageError>,
+) -> StorageError {
+    use super::delta_totals::ApplyError;
+    match error {
+        ApplyError::Load(e) => e,
+        ApplyError::Change(super::delta_totals::ReplayError::Unchanged) => {
+            invalid(object, "KV delta contains a no-op mutation")
+        },
+        ApplyError::Change(super::delta_totals::ReplayError::Accounting(e)) => {
+            replay_accounting_error(e)
+        },
+    }
 }
 
 fn replay_accounting_error(error: super::delta_totals::Error) -> StorageError {

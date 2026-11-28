@@ -85,6 +85,9 @@ mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
 mod projection_record;
+mod projection_recovery;
+#[cfg(verus_keep_ghost)]
+use overlay::batch as overlay_batch;
 mod publication;
 mod record_source;
 mod replay_values;

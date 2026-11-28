@@ -16,9 +16,9 @@ pub(super) enum Error<E> {
 }
 
 pub(super) fn recover<S,E,I:FnOnce()->S,F:Fn(S,Option<ObjectId>,ObjectId,&Vec<Mutation>,NodeTotals)->Result<(S,NodeTotals),E>>(
-    chain:Chain,root:Option<ObjectId>,measured:NodeTotals,start:I,apply:F) -> (out:Result<Cursor<S>,Error<E>>)
+    chain:Chain,root:Option<ObjectId>,measured:NodeTotals,start:I,apply:F,Ghost(valid):Ghost<spec_fn(S)->bool>) -> (out:Result<Cursor<S>,Error<E>>)
     requires start.requires(()),
-        forall|s:S,t:Option<ObjectId>,id:ObjectId,r:&Vec<Mutation>,n:NodeTotals| #[trigger] apply.requires((s,t,id,r,n)),
+        forall|s:S| #[trigger] start.ensures((),s) ==> valid(s),delta_replay::preserves(apply,valid),
     ensures
         (out is Err && out->Err_0 is Root) == (chain.tree != root),
         (out is Err && out->Err_0 is Totals) == (chain.tree == root && measured != chain.totals),
@@ -36,7 +36,7 @@ pub(super) fn recover<S,E,I:FnOnce()->S,F:Fn(S,Option<ObjectId>,ObjectId,&Vec<Mu
     if measured.entries != chain.totals.entries || measured.logical_bytes != chain.totals.logical_bytes ||
         measured.quota_bytes != chain.totals.quota_bytes {return Err(Error::Totals);}
     let state = start();
-    match delta_replay::run(state,chain.totals,chain.tree,chain.newest_first,apply) {
+    match delta_replay::run(state,chain.totals,chain.tree,chain.newest_first,apply,Ghost(valid)) {
         Ok(cursor) => Ok(cursor),
         Err(e) => Err(Error::Replay(e)),
     }

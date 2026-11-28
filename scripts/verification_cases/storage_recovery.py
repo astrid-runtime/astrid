@@ -703,6 +703,44 @@ def consumer_defects():
             f"chronological replay loses {label}", fold,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_replay.rs"),
         )
+    cold = Path("crates/astrid-storage/src/kv/tree/projection_recovery.rs")
+    for label, old, new in [
+        ("component head", "out.0.head == Some(head)", "out.0.head.is_some()"),
+        ("checkpoint tree", "out.0.tree == chain.tree", "true"),
+        ("replayed overlay", "out.0.overlay == cursor.state.1", "true"),
+        ("empty replay base", "empty.is_empty_snapshot() &&\n                    #[trigger] delta_replay::replayed((s,empty),m.totals,m.root,chain.", "true &&\n                    #[trigger] delta_replay::replayed((s,empty),m.totals,m.root,chain."),
+        ("replay depth", "out.0.depth == cursor.depth", "true"),
+        ("boundary", "out.0.boundary == Some(m.boundary)", "out.0.boundary.is_some()"),
+        ("validation result", "out.1 == m.validation", "true"),
+        ("measured totals rejection", "=> m.root == chain.tree && m.totals != chain.totals", "=> m.root == chain.tree"),
+    ]:
+        yield (
+            f"cold projection loses {label}", cold,
+            lambda s, a=old, b=new: replace_once(s, a, b), Path("verification/hosted_cold_projection.rs"),
+        )
+
+    replay = Path("verification/hosted_token_recovery.rs")
+    for label, path, old, new, consumer in [
+        ("batch last write", Path("crates/astrid-storage/src/kv/tree/overlay/batch.rs"),
+         "after_rows(rows@,rows.len() as nat,key,presence(initial.1,key)),", "presence(s.1,key),",
+         Path("crates/astrid-storage/src/kv/tree/overlay/snapshot.rs")),
+        ("recovered key", cold, "pair.0.overlay.presence(key) == after_chain(c.newest_first@,c.newest_first.len() as nat,key)",
+         "pair.0.overlay.presence(key) == pair.0.overlay.presence(key)", cold),
+        ("projection result", cold, "out matches Ok(pair) ==> recovered(owner,head,load,measure,pair)",
+         "out matches Ok(pair) ==> pair.0.head == Some(head)", replay),
+        ("owner-scoped predecessor link", cold, "previous==Some(path[i+1]) &&", "true &&", cold),
+        ("untouched newer key", cold, "super::overlay_batch::after_rows(mutations@,mutations.len() as nat,key,None).is_none())", "true)", cold),
+        ("addressed marker write", cold, "&& head_writes(owner,path.last(),load,key,present)", "&& true", cold),
+        ("retained marker", cold, "ensures pair.0.overlay.presence(key)==Some(present)",
+         "ensures pair.0.overlay.presence(key).is_some()", replay),
+        ("reopen decision", replay, "(kind is Revoked ==> a is Revoked) && (single_use ==> !(a is Allowed)),\n        Err",
+         "(single_use ==> !(a is Allowed)),\n        Err", replay),
+    ]:
+        yield (
+            f"cold marker recovery loses {label}", path,
+            lambda s, a=old, b=new: replace_once(s, a, b), consumer,
+        )
+
     checkpoint = Path("crates/astrid-storage/src/kv/tree/checkpoint_replay.rs")
     for label, clause, weaker in [
         ("root refusal", "(out is Err && out->Err_0 is Root) == (chain.tree != root)", "chain.tree != root ==> (out is Err && out->Err_0 is Root)"),

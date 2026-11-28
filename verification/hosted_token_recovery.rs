@@ -551,6 +551,84 @@ fn reopen_from_pages<I,T,V,E,R,C,F>(rev_id:Option<I>,used_id:Option<I>,rev_read:
     Ok(recovered_admission(groups,target,single_use))
 }
 
+// Run both real namespace scans on the projection roots and overlays. The
+// selected projection comes from cold replay of the owner-addressed component.
+fn reopen_after_delta<P,B,V,T,W,E,L,M,R,C,F>(kind:Marker,target:Id,single_use:bool,
+    revoked:&(crate::memo_projection::Projection<B>,V),consumed:&(crate::memo_projection::Projection<B>,V),
+    rev_read:R,used_read:C,legacy:F,Ghost(owner):Ghost<P>,head:crate::ObjectId,Ghost(load):Ghost<L>,
+    Ghost(measure):Ghost<M>,Ghost(text):Ghost<Seq<u8>>,Ghost(path):Ghost<Seq<crate::ObjectId>>) -> (out:Result<Admission,RecoveryError<E>>)
+    where L:Fn(&P,crate::ObjectId)->Result<crate::delta_chain::Head,E>,
+        M:FnOnce(&P,Option<crate::ObjectId>)->Result<crate::projection_recovery::Measured<B,V>,E>,
+        R:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,
+        C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
+    requires checkpoint::readable(rev_read),checkpoint::readable(used_read),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+        marker_key::spells(target@,text),
+        crate::projection_recovery::retained(&owner,head,path,load,ns_bytes(kind)+seq![0u8]+text,true),
+        crate::projection_recovery::recovered(&owner,head,load,measure,if kind is Revoked {*revoked} else {*consumed}),
+        if kind is Revoked {consumed.0.overlay.ordered_snapshot()} else {revoked.0.overlay.ordered_snapshot()},
+    ensures match out {
+        Ok(a) => (kind is Revoked ==> a is Revoked) && (single_use ==> !(a is Allowed)),
+        Err(RecoveryError::Page(Marker::Revoked,e)) => read_failed(rev_read,e),
+        Err(RecoveryError::Page(Marker::Consumed,e)) => read_failed(used_read,e),
+        Err(RecoveryError::Decoder(_,e)) => decoder_failed(legacy,e),
+    },
+{
+    proof {
+        let pair=if kind is Revoked {*revoked} else {*consumed};
+        let address=ns_bytes(kind)+seq![0u8]+text;
+        crate::projection_recovery::retained_write(&owner,head,load,measure,pair,path,address,true);
+        assert(crate::traversal::lookup_spec(pair.0.overlay.root,address) matches Some(Some(_)));
+        if kind is Revoked {
+            assert(marker_in_snapshot(kind,target,revoked.0.tree,rev_read,revoked.0.overlay.root));
+        } else {
+            assert(marker_in_snapshot(kind,target,consumed.0.tree,used_read,consumed.0.overlay.root));
+        }
+    }
+    reopen_from_pages(revoked.0.tree,consumed.0.tree,rev_read,used_read,
+        revoked.0.overlay.root.as_ref(),consumed.0.overlay.root.as_ref(),target,single_use,legacy)
+}
+
+enum ReopenError<E> { Projection(crate::projection_recovery::Error<E>), Namespace(RecoveryError<E>) }
+
+// On a cache miss, connect the production decoder's *returned* projection to
+// the two namespace scans. Reconstruction failure stops here before admission.
+fn decode_then_reopen<'a,P,S,B,V,T,W,E,L,M,I,K,D,A,R,C,F>(owner:&'a P,head:crate::ObjectId,kind:Marker,
+    target:Id,single_use:bool,other:&(crate::memo_projection::Projection<B>,V),load:L,measure:M,start:I,
+    values:(K,D),translate:A,rev_read:R,used_read:C,legacy:F,Ghost(text):Ghost<Seq<u8>>,Ghost(path):Ghost<Seq<crate::ObjectId>>)
+    -> (out:Result<Admission,ReopenError<E>>)
+    where L:Fn(&P,crate::ObjectId)->Result<crate::delta_chain::Head,E>,
+        M:FnOnce(&P,Option<crate::ObjectId>)->Result<crate::projection_recovery::Measured<B,V>,E>,I:FnOnce(&'a P)->S,
+        K:Fn(S,Option<crate::ObjectId>,&Vec<u8>)->Result<(S,Option<Vec<u8>>),E>+Copy,
+        D:Fn(S,&crate::checkpoint_value::ValueSlot)->Result<(S,Vec<u8>),E>+Copy,A:Fn(crate::ObjectId,crate::delta_totals::ApplyError<E>)->E,
+        R:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,
+        C:Fn(Page<crate::ObjectId,T>)->Result<Contents<crate::ObjectId,T,W>,E>,F:Fn(&[u8])->Result<Id,E>+Copy,
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|p:&P,id:crate::ObjectId| #[trigger] load.requires((p,id)),
+        forall|tree:Option<crate::ObjectId>| #[trigger] measure.requires((owner,tree)),start.requires((owner,)),
+        forall|s:S,t:Option<crate::ObjectId>,key:&Vec<u8>| #[trigger] values.0.requires((s,t,key)),
+        forall|s:S,v:&crate::checkpoint_value::ValueSlot| #[trigger] values.1.requires((s,v)),
+        forall|id:crate::ObjectId,e:crate::delta_totals::ApplyError<E>| #[trigger] translate.requires((id,e)),
+        checkpoint::readable(rev_read),checkpoint::readable(used_read),other.0.overlay.ordered_snapshot(),
+        vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
+        obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
+        marker_key::spells(target@,text),
+        crate::projection_recovery::retained(owner,head,path,load,ns_bytes(kind)+seq![0u8]+text,true),
+    ensures out matches Ok(a) ==> (kind is Revoked ==> a is Revoked) && (single_use ==> !(a is Allowed)),
+{
+    let ghost reader = load;
+    let ghost measured = measure;
+    let selected=match crate::projection_recovery::read(owner,head,load,measure,start,values,translate) {
+        Ok(p)=>p,Err(e)=>return Err(ReopenError::Projection(e)),
+    };
+    let (revoked,consumed)=match kind {Marker::Revoked=>(&selected,other),Marker::Consumed=>(other,&selected)};
+    match reopen_after_delta::<P,B,V,T,W,E,L,M,R,C,F>(kind,target,single_use,revoked,consumed,rev_read,used_read,legacy,
+        Ghost(*owner),head,Ghost(reader),Ghost(measured),Ghost(text),Ghost(path)) {
+        Ok(a)=>Ok(a),Err(e)=>Err(ReopenError::Namespace(e)),
+    }
+}
+
 /// Instantiate the page evidence for an actual decoded leaf and recover its
 /// marker with the full walker, merger and store replay.
 fn checkpoint_marker_decision(target:Id,kind:Marker) -> (out:Result<Admission,RecoveryError<()>>)

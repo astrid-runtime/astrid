@@ -363,6 +363,8 @@ mod delta_recovery;
 mod delta_replay;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_replay.rs"]
 mod checkpoint_replay;
+#[path = "../crates/astrid-storage/src/kv/tree/projection_recovery.rs"]
+mod projection_recovery;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_totals.rs"]
 mod delta_totals;
 #[path = "../crates/astrid-storage/src/kv/tree/spill_record.rs"]
@@ -385,6 +387,7 @@ mod delta_batch;
 mod delta_chain;
 mod hosted_delta_chain;
 mod hosted_delta_replay;
+mod hosted_cold_projection;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_header.rs"]
 mod delta_header;
 mod hosted_delta_mutation;
@@ -431,6 +434,7 @@ mod overlay_update;
 use overlay_update as update;
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/batch.rs"]
 mod overlay_batch;
+use overlay_batch as batch;
 mod hosted_overlay_batch;
 
 #[path = "../crates/astrid-kernel/src/kernel_router/principal_scope.rs"]

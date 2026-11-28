@@ -129,12 +129,19 @@ fn projection_for_root(
         else if now@.contains_key(owner) && now@[owner].head==Some(head) {out == Ok((now@[owner],None))}
         else {match cold {Ok((p,c)) => out==Ok((p,Some(c))),Err(e) => out==Err(e)}},
 {
+    assert(vstd::laws_cmp::obeys_cmp::<u64>());
+    assert(vstd::laws_cmp::obeys_cmp_concrete_eq::<u64>());
     let captured = crate::memo_projection::capture(before,&owner);
     let lookup = |p:&u64,id:ObjectId| -> (r:Option<crate::memo_projection::Projection<u64>>)
         ensures r == if now@.contains_key(*p) && now@[*p].head==Some(id) {Some(now@[*p])} else {None},
     { crate::memo_projection::current(now,p,id) };
     let decode = |p:&u64,id:ObjectId| -> (r:Result<(crate::memo_projection::Projection<u64>,u32),u8>)
         requires *p==owner && id==head, ensures r==cold, {cold};
+    assert(lookup.requires((&owner,head)) && decode.requires((&owner,head)));
+    assert forall|m:crate::memo_projection::Projection<u64>|
+        #[trigger] lookup.ensures((&owner,head),Some(m)) implies m.head == Some(head) by {
+        assert(m == now@[owner]);
+    }
     crate::memo_projection::resolve(&owner,head,captured,lookup,decode)
 }
 

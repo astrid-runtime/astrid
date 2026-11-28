@@ -58,12 +58,51 @@ pub(super) open spec fn history<C,E,L:Fn(C,Option<ObjectId>,&Vec<u8>)->Result<(C
     &&& forall|i:int| 0 <= i < states.len()-1 ==> transition(#[trigger] states[i],tree,id,&rows[i],lookup,value,Ok(states[i+1]))
 }
 
+/// Absent, deleted and present are distinct observations of an immutable overlay.
+pub(super) open spec fn presence(root:Option<Arc<traversal::Node>>,key:Seq<u8>) -> Option<bool> {
+    match traversal::lookup_spec(root,key) {None => None,Some(v) => Some(v.is_some())}
+}
+
+pub(super) open spec fn after_rows(rows:Seq<Mutation>,n:nat,key:Seq<u8>,initial:Option<bool>) -> Option<bool>
+    decreases n,
+{
+    if n==0 {initial}
+    else if rows[n-1].key@==key {Some(rows[n-1].value.is_some())}
+    else {after_rows(rows,(n-1) as nat,key,initial)}
+}
+
+proof fn replay_presence<C,E,L:Fn(C,Option<ObjectId>,&Vec<u8>)->Result<(C,Bytes),E>,V:Fn(C,&ValueSlot)->Result<(C,Vec<u8>),E>>(
+    initial:State<C>,tree:Option<ObjectId>,id:ObjectId,rows:Seq<Mutation>,lookup:L,value:V,h:Seq<State<C>>,n:nat,key:Seq<u8>)
+    requires history(initial,tree,id,rows,lookup,value,h),n<h.len(),
+    ensures presence(h[n as int].1,key) == after_rows(rows,n,key,presence(initial.1,key)),
+    decreases n,
+{
+    if n==0 {return;}
+    replay_presence(initial,tree,id,rows,lookup,value,h,(n-1) as nat,key);
+    let before=h[n-1];let after=h[n as int];let row=rows[n-1];
+    assert(transition(before,tree,id,&row,lookup,value,Ok(after)));
+    let pair=choose|pair:(Bytes,Bytes)| #[trigger] installed(before,tree,&row,lookup,value,after,pair);
+    assert(update::changed(before.1,after.1,&row,before.2,after.2,pair,Ok(())));
+    if key==row.key@ {
+        if traversal::lookup_spec(before.1,key).is_none() {
+            let (c,prior)=choose|c:C,prior:Bytes| #[trigger] lookup.ensures((before.0,tree,&row.key),Ok((c,prior))) &&
+                replay_values::finish(c,prior,replay_values::borrowed(&row.value),value,Ok((after.0,pair)));
+            assert(pair.1.is_some() == row.value.is_some());
+        }
+        assert(pair.1.is_some()==row.value.is_some());
+    }
+    assert(traversal::lookup_spec(after.1,key)==if key==row.key@ {Some(pair.1)} else {traversal::lookup_spec(before.1,key)});
+}
+
 pub(super) fn run<C,E,L:Fn(C,Option<ObjectId>,&Vec<u8>)->Result<(C,Bytes),E>+Copy,
     V:Fn(C,&ValueSlot)->Result<(C,Vec<u8>),E>+Copy>(initial:State<C>,tree:Option<ObjectId>,id:ObjectId,
     rows:&[Mutation],lookup:L,value:V) -> (out:Result<State<C>,Failure<E>>)
     requires traversal::ordered(initial.1),forall|s:C,t:Option<ObjectId>,key:&Vec<u8>| #[trigger] lookup.requires((s,t,key)),
         forall|s:C,v:&ValueSlot| #[trigger] value.requires((s,v)),
-    ensures exists|h:Seq<State<C>>| #[trigger] history(initial,tree,id,rows@,lookup,value,h) && match out {
+    ensures out matches Ok(s) ==> traversal::ordered(s.1),
+        out matches Ok(s) ==> forall|key:Seq<u8>| #[trigger] presence(s.1,key) ==
+            after_rows(rows@,rows.len() as nat,key,presence(initial.1,key)),
+        exists|h:Seq<State<C>>| #[trigger] history(initial,tree,id,rows@,lookup,value,h) && match out {
         Ok(s) => h.len()==rows.len()+1 && h.last()==s,
         Err((i,e)) => i<rows.len() && h.len()==i+1 && transition(h.last(),tree,id,&rows@[i as int],lookup,value,Err(e)),
     },
@@ -118,6 +157,7 @@ pub(super) fn run<C,E,L:Fn(C,Option<ObjectId>,&Vec<u8>)->Result<(C,Bytes),E>+Cop
         }
     }
     let out = mutation_replay::run_at(initial,tree,id,rows,step);
+    let ghost saved = out;
     proof {
         let h=choose|h:Seq<State<C>>| #[trigger] mutation_replay::prefix(initial,tree,id,rows@,h,step) && match out {
             Ok(s)=>h.len()==rows.len()+1 && h.last()==s,
@@ -127,6 +167,16 @@ pub(super) fn run<C,E,L:Fn(C,Option<ObjectId>,&Vec<u8>)->Result<(C,Bytes),E>+Cop
             assert(step.ensures((h[j],tree,id,&rows@[j]),Ok(h[j+1])));
         }
         assert(history(initial,tree,id,rows@,lookup,value,h));
+        if let Ok(s)=saved {
+            if rows.len()>0 {
+                assert(transition(h[rows.len()-1],tree,id,&rows@[rows.len()-1],lookup,value,Ok(s)));
+            }
+            assert(traversal::ordered(s.1));
+            assert forall|key:Seq<u8>| #[trigger] presence(s.1,key) ==
+                after_rows(rows@,rows.len() as nat,key,presence(initial.1,key)) by {
+                replay_presence(initial,tree,id,rows@,lookup,value,h,rows.len() as nat,key);
+            }
+        }
     }
     out
 }

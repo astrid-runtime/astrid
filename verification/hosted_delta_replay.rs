@@ -31,7 +31,7 @@ fn two_steps(tree:ObjectId,older:ObjectId,newer:ObjectId,wrong_depth:bool,wrong_
         else if n == 1 && id.same(&newer) && last && !refuse {Ok((2,totals))}
         else {Err(8u8)}
     };
-    let result = replay::run(0u8,base,Some(tree),rows,apply);
+    let result = replay::run(0u8,base,Some(tree),rows,apply,Ghost(|_| true));
     let ghost out = result;
     proof {
         reveal_with_fuel(delta_batch::usage,2);

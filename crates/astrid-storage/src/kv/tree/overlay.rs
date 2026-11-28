@@ -11,7 +11,7 @@ use super::{
     mutation_replay, replay_values,
 };
 use crate::kv::encoding;
-mod batch;
+pub(super) mod batch;
 mod range;
 mod traversal;
 mod update;
@@ -24,26 +24,6 @@ impl OverlayMap {
 
     pub(super) fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
         update::put(&mut self.root, key, value);
-    }
-
-    pub(super) fn recover<C, E>(
-        self,
-        initial: (C, checkpoint_totals::NodeTotals),
-        tree: Option<ObjectId>,
-        id: ObjectId,
-        rows: &[delta_mutation::Mutation],
-        lookup: impl Fn(C, Option<ObjectId>, &Vec<u8>) -> Result<(C, Option<Vec<u8>>), E> + Copy,
-        value: impl Fn(C, &checkpoint_value::ValueSlot) -> Result<(C, Vec<u8>), E> + Copy,
-    ) -> Result<(C, Self, checkpoint_totals::NodeTotals), batch::Failure<E>> {
-        let (context, root, totals) = batch::run(
-            (initial.0, self.root, initial.1),
-            tree,
-            id,
-            rows,
-            lookup,
-            value,
-        )?;
-        Ok((context, Self { root }, totals))
     }
 
     pub(super) fn stage<E>(
