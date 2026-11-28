@@ -12,6 +12,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
+use super::hot_lookup::CachedValue;
 use crate::storage_model::RootState;
 
 const ENTRY_ACCOUNTING_BYTES: usize = 128;
@@ -217,20 +218,7 @@ pub(super) enum HotRead {
     Miss,
 }
 
-#[derive(Clone)]
-enum CachedValue {
-    Present(Arc<[u8]>),
-    Missing,
-}
-
 impl CachedValue {
-    fn to_vec(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Present(value) => Some(value.to_vec()),
-            Self::Missing => None,
-        }
-    }
-
     fn bytes(&self) -> usize {
         match self {
             Self::Present(value) => value.len(),
@@ -391,17 +379,13 @@ where
 
     pub(super) fn get(&self, owner: &P, root: Option<RootState>, key: &[u8]) -> HotRead {
         let owners = self.owners.load();
-        let Some(owner_cache) = owners.get(owner) else {
-            return HotRead::Miss;
-        };
-        let snapshot = owner_cache.snapshot.load();
-        if snapshot.root != root {
-            return HotRead::Miss;
-        }
-        snapshot
-            .entries
-            .get(key)
-            .map_or(HotRead::Miss, |value| HotRead::Hit(value.to_vec()))
+        super::hot_lookup::lookup(&owners, owner, root, key, |cache, requested, key| {
+            let snapshot = cache.snapshot.load();
+            super::hot_lookup::at_root(snapshot.root, requested, key, |key| {
+                snapshot.entries.get(key).map(CachedValue::to_vec)
+            })
+        })
+        .map_or(HotRead::Miss, HotRead::Hit)
     }
 
     pub(super) fn insert(

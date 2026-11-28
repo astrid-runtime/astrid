@@ -176,6 +176,37 @@ fn resident_lookup(owner:u64,requester:u64,stored:ObjectId,request:ObjectId,reco
     out
 }
 
+spec fn cached_bytes(result:Option<Option<Vec<u8>>>) -> Option<Option<Seq<u8>>> {
+    match result { Some(Some(v)) => Some(Some(v@)), Some(None) => Some(None), None => None }
+}
+
+/// The runtime point-cache may return a cached absence. An unavailable sample,
+/// missing owner, stale root or different composite key must remain a miss.
+fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published:Option<crate::RootState>,
+    before:bool,after:bool,namespace:&[u8],logical:&[u8],stored:&[u8],value:&crate::hot_lookup::CachedValue)
+    -> (out:Option<Option<Vec<u8>>>)
+    ensures cached_bytes(out) == if before && after && owner == requester && recorded == published &&
+        stored@ == namespace@ + seq![0u8] + logical@ {Some(value.bytes_view())} else {None},
+{
+    let mut owners = std::collections::BTreeMap::new();
+    owners.insert(owner,recorded);
+    let select = |p:&u64| -> (r:Option<crate::RootState>)
+        ensures r == if *p == owner {published} else {None},
+        {if *p == owner {published} else {None}};
+    let root = crate::ready_root::ReadyKvRoot::sample_ready(&requester,
+        || -> (ready:bool) ensures ready == before {before},select,
+        || -> (ready:bool) ensures ready == after {after})?.get();
+    let address = crate::encoding::composite(namespace,logical);
+    crate::hot_lookup::lookup(&owners,&requester,root,&address,
+        |sample:&Option<crate::RootState>,wanted:Option<crate::RootState>,key:&[u8]| -> (r:Option<Option<Vec<u8>>>)
+            ensures cached_bytes(r) == if *sample == wanted && key@ == stored@ {Some(value.bytes_view())} else {None},
+        {
+            crate::hot_lookup::at_root(*sample,wanted,key,|k:&[u8]| -> (v:Option<Option<Vec<u8>>>)
+                ensures cached_bytes(v) == if k@ == stored@ {Some(value.bytes_view())} else {None},
+                {if matches!(crate::encoding::bytewise_cmp(k,stored),std::cmp::Ordering::Equal) {Some(value.to_vec())} else {None}})
+        })
+}
+
 fn load_visits<R,E,F>(plan:&[child_range::Visit],read:F, table:Ghost<spec_fn(ObjectId)->Option<R>>,
     error:Ghost<E>) -> (out:Result<Vec<(child_range::Visit,R)>,child_range::LoadError<E>>)
     where F:FnOnce(Vec<ObjectId>)->Result<Vec<Option<R>>,E>,

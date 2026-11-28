@@ -13,6 +13,10 @@ mod batch_slots;
 mod read_admission;
 #[path = "../crates/astrid-storage/src/engine/durable_cache/resident.rs"]
 mod resident;
+#[path = "../crates/astrid-storage/src/engine/kv/ready_root.rs"]
+mod ready_root;
+#[path = "../crates/astrid-storage/src/kv/tree/hot_lookup.rs"]
+mod hot_lookup;
 #[path = "../crates/astrid-storage/src/kv/tree/memo_admission.rs"]
 mod memo_admission;
 #[path = "../crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs"]

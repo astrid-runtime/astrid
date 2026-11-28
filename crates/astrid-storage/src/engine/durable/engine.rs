@@ -663,16 +663,14 @@ where
     pub(crate) fn root_if_ready(&self, principal: &P) -> Option<crate::engine::ReadyKvRoot> {
         // Reject an unusable entry before capturing an old root view. Recovery
         // may replace that view and return to USABLE while lookup is in flight.
-        if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
-            return None;
-        }
-        let root = self.published_roots.get(principal);
-        // Close may clear the map during lookup. That means unavailable, not
-        // a live empty store; preserve the terminal fence after the snapshot.
-        if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
-            return None;
-        }
-        Some(crate::engine::ReadyKvRoot::new(root))
+        let usable =
+            || self.lifecycle.load(std::sync::atomic::Ordering::Acquire) == LIFECYCLE_USABLE;
+        crate::engine::ReadyKvRoot::sample_ready(
+            principal,
+            usable,
+            |owner| self.published_roots.get(owner),
+            usable,
+        )
     }
 
     /// Return a consistent copy of every current principal root.

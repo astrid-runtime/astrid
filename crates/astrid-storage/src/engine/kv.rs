@@ -23,29 +23,8 @@ const KV_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 
-/// A root that is already resident without taking the engine writer lock.
-///
-/// Durable engines publish this from an in-process snapshot used by the
-/// disposable KV hot cache. It is not recovery authority: WAL replay and
-/// writer-locked [`KvProjectionEngine::current_kv_root`] remain the source of
-/// committed truth. Embeddings may see `None` while the engine is recovering
-/// or closed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadyKvRoot(Option<RootState>);
-
-impl ReadyKvRoot {
-    /// Wrap a resident root, including the valid empty-store state.
-    #[must_use]
-    pub const fn new(root: Option<RootState>) -> Self {
-        Self(root)
-    }
-
-    /// Return the resident root.
-    #[must_use]
-    pub const fn get(self) -> Option<RootState> {
-        self.0
-    }
-}
+mod ready_root;
+pub use ready_root::ReadyKvRoot;
 
 /// Complete logical key/value state owned by one principal.
 ///

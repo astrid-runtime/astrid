@@ -822,6 +822,28 @@ def publication_cache_consumers():
         )
 
 
+def hot_point_consumers():
+    root = Path("crates/astrid-storage/src/engine/kv/ready_root.rs")
+    cache = Path("crates/astrid-storage/src/kv/tree/hot_lookup.rs")
+    for path, label, clause, weaker in [
+        (root, "entry observation", "Some(root) => before.ensures((),true) &&", "Some(root) =>"),
+        (root, "final observation", " && after.ensures((),true),", ","),
+        (root, "published root", " && load.ensures((owner,),root.sampled())", ""),
+        (root, "readiness refusal", "before.ensures((),false) || after.ensures((),false)", "true"),
+        (cache, "owner sample", "{snapshot.ensures((&owners@[*owner],requested,key),out)}", "{true}"),
+        (cache, "unknown owner", "else {out.is_none()},\n{\n    let selected", "else {true},\n{\n    let selected"),
+        (cache, "value bytes", "self.bytes_view() == Some(v@)", "true"),
+        (cache, "cached absence", "None => self.bytes_view().is_none()", "None => true"),
+        (cache, "matching root", "{read.ensures((key,),out)}", "{true}"),
+        (cache, "stale root", "else {out.is_none()},\n{\n    let same", "else {true},\n{\n    let same"),
+    ]:
+        yield (
+            f"hot point loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_batch_slots.rs"),
+        )
+
+
 def resident_cache_consumers():
     path = Path("crates/astrid-storage/src/engine/durable_cache/resident.rs")
     for label, clause, weaker in [
@@ -859,3 +881,4 @@ def checkpoint_decode_consumers():
     yield from durable_read_consumers()
     yield from publication_cache_consumers()
     yield from resident_cache_consumers()
+    yield from hot_point_consumers()
