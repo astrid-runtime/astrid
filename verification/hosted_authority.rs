@@ -316,6 +316,7 @@ mod hosted_record_model;
 mod hosted_arena_placement;
 mod hosted_arena_append;
 mod hosted_recovery_barrier;
+mod hosted_live_checkpoint;
 mod hosted_checkpoint_recovery;
 mod hosted_duplicate_recovery;
 mod hosted_checkpoint_scan;

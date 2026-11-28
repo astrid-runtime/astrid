@@ -35,6 +35,30 @@ impl<W> Prepared<W> {
     { finish(self.wal) }
 }
 
+/// The live checkpoint publishes any new representation before syncing the root journal.
+/// Each completed phase supplies the handle for the next phase; the final handle permits retirement.
+pub(super) fn stabilize_fold<S,E,A,R,J,V>(initial:S,arena:A,representations:R,roots:J,volume:V)
+    -> (out:Result<Prepared<S>,E>)
+    where A:FnOnce(S)->Result<S,E>,R:FnOnce(S)->Result<S,E>,J:FnOnce(S)->Result<S,E>,V:FnOnce(S)->Result<S,E>,
+    requires arena.requires((initial,)),forall|s:S| #[trigger] representations.requires((s,)),
+        forall|s:S| #[trigger] roots.requires((s,)),forall|s:S| #[trigger] volume.requires((s,)),
+    ensures match out {
+        Ok(stable)=>exists|a:S,r:S,j:S| #[trigger] arena.ensures((initial,),Ok(a)) &&
+            #[trigger] representations.ensures((a,),Ok(r)) && #[trigger] roots.ensures((r,),Ok(j)) &&
+            volume.ensures((j,),Ok(stable.wal())),
+        Err(e)=>arena.ensures((initial,),Err(e)) ||
+            exists|a:S| #[trigger] arena.ensures((initial,),Ok(a)) && (representations.ensures((a,),Err(e)) ||
+            exists|r:S| #[trigger] representations.ensures((a,),Ok(r)) && (roots.ensures((r,),Err(e)) ||
+            exists|j:S| #[trigger] roots.ensures((r,),Ok(j)) && volume.ensures((j,),Err(e)))),
+    },
+{
+    let a=arena(initial)?;
+    let r=representations(a)?;
+    let j=roots(r)?;
+    let wal=volume(j)?;
+    Ok(Prepared {wal})
+}
+
 pub(super) enum Error<E> { Arena(E), Roots(E), Representations(E) }
 pub(super) fn stabilize<M:Files,W>(files:&mut M,wal:W) -> (out:Result<Prepared<W>,Error<M::Error>>)
     requires old(files).pending().contains_key(Target::Arena),old(files).pending().contains_key(Target::Roots),
@@ -63,4 +87,34 @@ pub(super) fn stabilize<M:Files,W>(files:&mut M,wal:W) -> (out:Result<Prepared<W
     if let Err(e) = files.sync(Target::Representations) {return Err(Error::Representations(e));}
     Ok(Prepared {wal})
 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stabilize_fold;
+    use std::cell::RefCell;
+
+    #[test]
+    fn live_fold_stops_at_each_failed_sync_before_releasing_the_wal() {
+        for failure in [Some(0), Some(1), Some(2), Some(3), None] {
+            let calls = RefCell::new(Vec::new());
+            let sync = |phase: usize| {
+                let calls = &calls;
+                move |handle| {
+                    calls.borrow_mut().push(phase);
+                    assert_eq!(handle, (47, phase));
+                    if failure == Some(phase) {
+                        Err(phase)
+                    } else {
+                        Ok((47, phase + 1))
+                    }
+                }
+            };
+            let result = stabilize_fold((47, 0), sync(0), sync(1), sync(2), sync(3))
+                .map(|stable| stable.finish(|handle| handle));
+            assert_eq!(result, failure.map_or(Ok((47, 4)), Err));
+            let count = failure.map_or(4, |phase| phase + 1);
+            assert_eq!(calls.into_inner(), (0..count).collect::<Vec<_>>());
+        }
+    }
 }

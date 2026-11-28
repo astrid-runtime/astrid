@@ -147,6 +147,7 @@ INPUTS = [
     Path("verification/hosted_arena_placement.rs"),
     Path("verification/hosted_arena_append.rs"),
     Path("verification/hosted_recovery_barrier.rs"),
+    Path("verification/hosted_live_checkpoint.rs"),
     Path("verification/hosted_checkpoint_recovery.rs"),
     Path("verification/hosted_duplicate_recovery.rs"),
     Path("verification/hosted_checkpoint_scan.rs"),

@@ -533,7 +533,7 @@ def consumer_defects():
     ]:
         yield (
             f"retained WAL fold loses {label}", transition,
-            lambda s, a=clause: replace_once(s, a, "true"), Path("verification/hosted_kv_model.rs"),
+            lambda s, a=clause: replace_once(s, a, "true"), Path("verification/hosted_live_checkpoint.rs"),
         )
     for label, clause in [
         ("writer map", "final(writer)@ == old(writer)@.insert(self.binding().0,self.binding().2),"),
@@ -544,6 +544,17 @@ def consumer_defects():
         yield (
             f"root publication loses {label}", transition,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_kv_model.rs"),
+        )
+    live = Path("verification/hosted_live_checkpoint.rs")
+    for label, source, clause in [
+        ("checkpoint prefix", live, "final(file).image().take(old(file).image().len() as int)==old(file).image()"),
+        ("frame at end of file", live, "rows@.last().offset as int+crate::arena_frame::WIDTH+rows@.last().payload_len==final(file).image().len()"),
+        ("encoded transition", transition, "                    bytes@==super::journal_transition::wire(n@,scheme,prior,next)"),
+        ("selected owner and roots", transition, "(owner,prior,next)==self.binding()"),
+    ]:
+        yield (
+            f"cold live checkpoint loses {label}", source,
+            lambda s, a=clause: replace_once(s, a, "true"), live,
         )
     declaration = Path("crates/astrid-storage/src/engine/root_declaration.rs")
     for label, clause in [
@@ -1024,6 +1035,22 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_recovery_barrier.rs"),
         )
     barrier = Path("crates/astrid-storage/src/engine/durable/recovery_barrier.rs")
+    for label, clause in [
+        ("arena receipt", "#[trigger] arena.ensures((initial,),Ok(a)) &&\n            #[trigger] representations"),
+        ("representation receipt", "#[trigger] representations.ensures((a,),Ok(r)) && #[trigger] roots"),
+        ("root journal receipt", "#[trigger] roots.ensures((r,),Ok(j)) &&\n            volume"),
+        ("volume receipt", "volume.ensures((j,),Ok(stable.wal()))"),
+    ]:
+        # Leave every existential witness in a valid trigger after dropping its callback relation.
+        if label == "volume receipt":
+            replacement = "true"
+        else:
+            start, suffix = clause.split(" &&", 1)
+            replacement = f"(#[trigger] {start.removeprefix('#[trigger] ')} || true) &&{suffix}"
+        yield (
+            f"live WAL checkpoint loses {label}", barrier,
+            lambda s, a=clause, b=replacement: replace_once(s, a, b), Path("verification/hosted_recovery_barrier.rs"),
+        )
     for label, clause, weaker in [
         ("WAL identity", "stable.wal() == wal", "true"),
         ("handoff result", "ensures finish.ensures((self.wal(),),value)", "ensures true"),

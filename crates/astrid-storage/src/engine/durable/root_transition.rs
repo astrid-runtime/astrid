@@ -71,6 +71,30 @@ impl<P> SelectedRoot<P> {
     {
         PreparedRoot::encode(self.owner,self.expected,self.replacement,encoder)
     }
+
+    /// Construct the actual checkpoint journal for this selected CAS transition.
+    pub(super) fn encode_journal<F:FnOnce(&P)->Vec<u8>>(self,scheme:super::root_wire::Scheme,name:F)
+        -> (out:Option<PreparedRoot<P,RootState>>)
+        requires name.requires((&self.binding().0,)),
+        ensures match out {
+            Some(prepared)=>{
+                let (owner,prior,next,bytes)=prepared.binding();
+                &&& (owner,prior,next)==self.binding()
+                &&& exists|n:Vec<u8>| #[trigger] name.ensures((&owner,),n) &&
+                    bytes@==super::journal_transition::wire(n@,scheme,prior,next)
+            },
+            None=>exists|n:Vec<u8>| #[trigger] name.ensures((&self.binding().0,),n) && n.len()>=u64::MAX,
+        },
+    {
+        let n=name(&self.owner);
+        let encoded=self.encode(|_:&P,prior:Option<RootState>,next:RootState| -> (v:Result<Vec<u8>,()>)
+            ensures match v {
+                Ok(bytes)=>bytes@==super::journal_transition::wire(n@,scheme,prior,next),
+                Err(())=>n.len()>=u64::MAX,
+            },
+        { super::journal_transition::encode(&n,scheme,prior,next).ok_or(()) });
+        encoded.ok()
+    }
 }
 
 type DeclaredRows = Vec<(super::ObjectId,super::ObjectRecord)>;

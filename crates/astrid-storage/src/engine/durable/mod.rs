@@ -915,7 +915,9 @@ use native_io::{
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
 use recovery::{RecoveryScope, recover_store, recover_volume};
-use roots::{encode_root_record, encode_root_snapshot, recover_root_history, recover_roots};
+#[cfg(test)]
+use roots::encode_root_record;
+use roots::{encode_root_snapshot, recover_root_history, recover_roots};
 use validation::{
     ClosureObjects, materialize_closure, preload_indexed_closures, recovery_closure_error,
     usage_from_closure, validate_incremental_closure,

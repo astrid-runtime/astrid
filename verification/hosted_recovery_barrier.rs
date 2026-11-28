@@ -109,6 +109,66 @@ fn retire_wal<S:crate::group_frontier::ResizeWal,R:FnOnce(S)->Result<S,S::Error>
         })
 }
 
+/// Every sync acts on the same checkpoint and keeps its pending root and arena images.
+pub(super) open spec fn same_fold<S:crate::group_frontier::ResizeWal>(before:S,after:S) -> bool {
+    &&& after.arena_target()==before.arena_target() && after.roots_target()==before.roots_target()
+    &&& after.wal_target()==before.wal_target() && after.volume_wal()==before.volume_wal()
+    &&& after.canonical_pending()==before.canonical_pending() && after.buffered_image()==before.buffered_image()
+}
+
+/// File sync installs only the selected canonical image. Volume durability comes from container sync.
+pub(super) open spec fn synced<S:crate::group_frontier::ResizeWal>(before:S,after:S,which:Target) -> bool {
+    &&& same_fold(before,after)
+    &&& !before.volume_wal() ==> after.canonical_stable()==
+        (if before.canonical_pending().contains_key(which) {
+            before.canonical_stable().insert(which,before.canonical_pending()[which])
+        } else {before.canonical_stable()})
+}
+
+pub(super) open spec fn live_phases<S,A,R,J,V,Seek>(initial:S,arena:A,representations:R,roots:J,volume:V,rewind:Seek) -> bool
+    where S:crate::group_frontier::ResizeWal,A:FnOnce(S)->Result<S,S::Error>,R:FnOnce(S)->Result<S,S::Error>,
+        J:FnOnce(S)->Result<S,S::Error>,V:FnOnce(S)->Result<S,S::Error>,Seek:FnOnce(S)->Result<S,S::Error>
+{
+    &&& initial.canonical_pending().contains_key(Target::Arena) && initial.canonical_pending().contains_key(Target::Roots)
+    &&& arena.requires((initial,))
+    &&& forall|s:S| #[trigger] representations.requires((s,))
+    &&& forall|s:S| #[trigger] roots.requires((s,))
+    &&& forall|s:S| #[trigger] volume.requires((s,))
+    &&& forall|a:S| #[trigger] arena.ensures((initial,),Ok(a)) ==> synced(initial,a,Target::Arena)
+    &&& forall|a:S,r:S| #[trigger] representations.ensures((a,),Ok(r)) ==> synced(a,r,Target::Representations)
+    &&& forall|r:S,j:S| #[trigger] roots.ensures((r,),Ok(j)) ==> synced(r,j,Target::Roots)
+    &&& forall|j:S,v:S| #[trigger] volume.ensures((j,),Ok(v)) ==> same_fold(j,v) &&
+        v.canonical_stable()==(if j.volume_wal() {j.canonical_pending()} else {j.canonical_stable()})
+    &&& forall|s:S| #[trigger] rewind.requires((s,))
+    &&& forall|s:S,r:S| #[trigger] rewind.ensures((s,),Ok(r)) ==> same_fold(s,r) && r.canonical_stable()==s.canonical_stable()
+}
+
+/// Use the live fold barrier before the production writer's WAL resize, rewind and final sync.
+pub(super) fn retire_live_fold<S,A,R,J,V,Seek>(initial:S,arena:A,representations:R,roots:J,volume:V,rewind:Seek)
+    -> (out:Result<Result<S,crate::group_frontier::CheckpointError<S::Error>>,S::Error>)
+    where S:crate::group_frontier::ResizeWal,A:FnOnce(S)->Result<S,S::Error>,R:FnOnce(S)->Result<S,S::Error>,
+        J:FnOnce(S)->Result<S,S::Error>,V:FnOnce(S)->Result<S,S::Error>,Seek:FnOnce(S)->Result<S,S::Error>,
+    requires live_phases(initial,arena,representations,roots,volume,rewind),
+    ensures out matches Ok(Ok(s)) ==> {
+        &&& s.wal_target()==initial.wal_target() && s.roots_target()==initial.roots_target() && s.arena_target()==initial.arena_target()
+        &&& s.stable_image()==Seq::<u8>::empty()
+        &&& s.canonical_stable().get(Target::Roots)==initial.canonical_pending().get(Target::Roots)
+        &&& s.canonical_stable().get(Target::Arena)==initial.canonical_pending().get(Target::Arena)
+        &&& initial.canonical_pending().contains_key(Target::Representations) ==>
+            s.canonical_stable().get(Target::Representations)==initial.canonical_pending().get(Target::Representations)
+    },
+{
+    let stable=barrier::stabilize_fold(initial,arena,representations,roots,volume)?;
+    let media=stable.finish(|s:S| -> (v:S) ensures v==s, {s});
+    proof {
+        let (a,r,j)=choose|a:S,r:S,j:S| #[trigger] arena.ensures((initial,),Ok(a)) &&
+            #[trigger] representations.ensures((a,),Ok(r)) && #[trigger] roots.ensures((r,),Ok(j)) && volume.ensures((j,),Ok(media));
+        assert(same_fold(initial,media));
+        assert(media.canonical_stable().get(Target::Roots)==initial.canonical_pending().get(Target::Roots));
+    }
+    Ok(retire_wal(media,rewind))
+}
+
 /// Match the writer to the canonical handles that recovery just handed off.
 pub(crate) fn recovered_checkpoint<M:Files,W:Copy,S:crate::group_frontier::ResizeWal,F:FnOnce(W,&M)->S,R:FnOnce(S)->Result<S,S::Error>>(
     files:&mut M,wal:W,bind:F,rewind:R,target:Ghost<spec_fn(W)->(int,Seq<u8>)>)

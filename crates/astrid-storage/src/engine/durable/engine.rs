@@ -5,9 +5,9 @@ use super::{
     LIFECYCLE_USABLE, ModelError, ObjectCacheStats, ObjectId, ObjectRecord,
     PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
     ProjectionCacheKey, ROOT_FILE, RecoveryScope, RootSnapshot, RootState, RootTransaction,
-    append_frame, canonical_record_bytes, encode_object_frame, encode_root_record,
-    ensure_payload_limit, io_error, live_files_mut, materialize_closure, read_indexed_object,
-    read_indexed_objects, usage_from_closure, validate_incremental_closure,
+    append_frame, canonical_record_bytes, encode_object_frame, ensure_payload_limit, io_error,
+    live_files_mut, materialize_closure, read_indexed_object, read_indexed_objects,
+    usage_from_closure, validate_incremental_closure,
 };
 use crate::engine::{KvIdentitySession, ProjectionObserver, ProjectionPhase};
 use crate::storage_model::ObjectIdentity;
@@ -830,10 +830,11 @@ where
                 objects.push((id, payload));
             }
         }
-        let root = selected.encode(|owner, expected, replacement| {
-            let bytes = self.principal_codec.encode(owner);
-            encode_root_record(self.identity.scheme(), &bytes, expected, replacement)
-        })?;
+        let root = selected
+            .encode_journal(self.identity.scheme().into(), |owner| {
+                self.principal_codec.encode(owner)
+            })
+            .ok_or(DurableError::EncodingOverflow)?;
         ensure_payload_limit(ROOT_FILE, 0, root.journal().len(), self.limits)?;
 
         Ok(Prepared {

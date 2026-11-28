@@ -306,8 +306,8 @@ where
         let mut poison =
             super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
         let result = (|| {
-            self.fold_pending_wal(inner, representations.as_deref_mut())?;
-            let mut wal = self.wal.lock();
+            let folded = self.fold_pending_wal(inner, representations.as_deref_mut(), &self.wal)?;
+            let mut wal = folded.finish(|wal| wal.lock());
             if let Some(writer) = wal.as_mut() {
                 writer.checkpoint().map_err(wal_durable_error)?;
             }
@@ -322,11 +322,12 @@ where
         result
     }
 
-    fn fold_pending_wal(
+    fn fold_pending_wal<W>(
         &self,
         inner: &mut DurableInner<P>,
         mut representations: Option<&mut super::representations::RepresentationStore>,
-    ) -> Result<(), DurableError> {
+        wal: W,
+    ) -> Result<super::recovery_barrier::Prepared<W>, DurableError> {
         let pending = inner.pending_wal.take();
         let mut new_ids = Vec::new();
         let mut new_payloads = Vec::new();
@@ -383,22 +384,36 @@ where
             &staged_direct,
         )?;
         let files = live_files_mut(&mut inner.files)?;
-        files
-            .arena
-            .sync_data()
-            .map_err(|source| io_error("flush WAL checkpoint object arena", source))?;
-        if let Some(store) = representations.as_mut() {
-            if let Some(update) = representation_update {
-                store.publish_direct_update(update)?;
-            }
-            store.flush()?;
-        }
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
-        self.sync_volume()?;
-        Ok(())
+        super::recovery_barrier::stabilize_fold(
+            wal,
+            |wal| {
+                files
+                    .arena
+                    .sync_data()
+                    .map_err(|source| io_error("flush WAL checkpoint object arena", source))?;
+                Ok(wal)
+            },
+            |wal| {
+                if let Some(store) = representations {
+                    if let Some(update) = representation_update {
+                        store.publish_direct_update(update)?;
+                    }
+                    store.flush()?;
+                }
+                Ok(wal)
+            },
+            |wal| {
+                files
+                    .roots
+                    .sync_data()
+                    .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
+                Ok(wal)
+            },
+            |wal| {
+                self.sync_volume()?;
+                Ok(wal)
+            },
+        )
     }
 
     fn checkpoint_index(
