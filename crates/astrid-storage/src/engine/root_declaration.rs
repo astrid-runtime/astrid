@@ -1,9 +1,16 @@
 //! Owner, CAS expectation, target and immutable rows carried through identity admission.
+use super::staged_closure;
 #[cfg(verus_keep_ghost)]
 use super::transaction_records::authentic;
 use super::transaction_records::{Admission, IdentityProof};
 use super::{ObjectId, ObjectRecord, RootState};
+use std::collections::BTreeMap;
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
+    std_specs::btree::btree_map_inv,
+};
 
 verus! {
 #[derive(Debug,PartialEq,Eq)]
@@ -69,6 +76,24 @@ impl<P,A> Declaration<P,A> {
         if matches!(self.identity,IdentityProof::Engine(_)) {
             *slot = Some(make(&self.update.principal,self.update.commit));
         }
+    }
+
+    /// Bind the writer's retained records and the captured identity session in one declaration.
+    pub(super) fn from_staged(principal:P,expected:Option<RootState>,commit:ObjectId,
+        staged:BTreeMap<ObjectId,ObjectRecord>,authority:Option<A>) -> (out:Self)
+        requires btree_map_inv(&staged),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        ensures out.payload().principal==principal,out.payload().expected==expected,out.payload().commit==commit,
+            exists|kept:Map<ObjectId,ObjectRecord>| #[trigger] staged_closure::exact_rows(staged@,commit,kept,out.payload().records@),
+            out.proof_source()==match authority {Some(a)=>IdentityProof::Engine(a),None=>IdentityProof::Untrusted},
+    {
+        let records=staged_closure::select(staged,commit);
+        let ghost kept=choose|m:Map<ObjectId,ObjectRecord>| staged_closure::exact_rows(staged@,commit,m,records@);
+        let declaration=match authority {
+            Some(a)=>Self::sealed(Update {principal,expected,commit,records},a),
+            None=>Self::untrusted(principal,expected,commit,records),
+        };
+        assert(staged_closure::exact_rows(staged@,commit,kept,declaration.payload().records@));
+        declaration
     }
 
     /// The native identity session provides the authority paired with its hasher.

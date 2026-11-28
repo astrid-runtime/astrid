@@ -89,8 +89,7 @@ pub(crate) fn prepare<P:Ord,I:Fn(&ObjectRecord)->ObjectId+Copy>(
     let state_id=staged[1].0;
     let ghost state=staged@[1];
     let ghost commit=staged@[2];
-    let update=root_declaration::Update{principal:owner,expected:prior,commit:commit_id,records:staged};
-    let (selected,rows)=match root_transition::select_update(pending,published,update) {Ok(v)=>v,Err(e)=>return Err(Error::Selection(e))};
+    let rows=staged;
     let table=match transaction_records::unique(rows) {Ok(t)=>t,Err(k)=>return Err(Error::Collision(k))};
     proof {
         assert(rows@[0]==head && rows@[1]==state && rows@[2]==(commit_id,commit.1));
@@ -104,18 +103,43 @@ pub(crate) fn prepare<P:Ord,I:Fn(&ObjectRecord)->ObjectId+Copy>(
         }
         assert(table@.dom() =~= set![id,state_id,commit_id]);
     }
-    let kept=crate::staged_closure::select(table,commit_id);
+    let ghost source=table@;
+    let declaration=root_declaration::Declaration::from_staged(owner,prior,commit_id,table,Some(()));
+    let ghost payload=declaration.payload();
+    let ghost kept=choose|m:Map<ObjectId,ObjectRecord>| crate::staged_closure::exact_rows(source,commit_id,m,payload.records@);
+    let same=|a:&(),b:&()| -> (yes:bool) ensures yes {true};
+    let (update,_)=match declaration.admit(&(),same,identify) {
+        Ok(v)=>v,
+        Err(_)=>{assert(false);unreached()},
+    };
+    let (selected,admitted)=match root_transition::select_update(pending,published,update) {Ok(v)=>v,Err(e)=>return Err(Error::Selection(e))};
+    let records=match transaction_records::unique(admitted) {Ok(t)=>t,Err(k)=>return Err(Error::Collision(k))};
     proof {
-        kept_edge(table@,kept@.dom(),commit_id,commit_id,header_graph::STATE@,state_id);
-        kept_edge(table@,kept@.dom(),commit_id,state_id,header_graph::KV@,id);
-        assert(kept@.dom().contains(commit_id) && kept@.dom().contains(state_id) && kept@.dom().contains(id));
-        assert(kept@.dom() =~= table@.dom());
-        assert forall|k:ObjectId| table@.contains_key(k) implies kept@[k]==#[trigger] table@[k] by {
-            assert(kept@.contains_key(k));
+        kept_edge(source,kept.dom(),commit_id,commit_id,header_graph::STATE@,state_id);
+        kept_edge(source,kept.dom(),commit_id,state_id,header_graph::KV@,id);
+        assert(kept.dom().contains(commit_id) && kept.dom().contains(state_id) && kept.dom().contains(id));
+        assert(kept.dom() =~= source.dom());
+        assert forall|k:ObjectId| source.contains_key(k) implies kept[k]==#[trigger] source[k] by {
+            assert(kept.contains_key(k));
         }
-        assert(kept@ =~= table@);
+        assert(kept =~= source);
     }
-    Ok(Graph{selected,component:id,state:state_id,records:kept})
+    proof {
+        admitted@.to_set_ensures();
+        assert forall|k:ObjectId| kept.contains_key(k) implies #[trigger] records@.contains_key(k) by {
+            assert(admitted@.to_set().contains((k,kept[k])));
+            assert(admitted@.contains((k,kept[k])));
+            let i=admitted@.index_of((k,kept[k]));
+            assert(admitted@[i].0==k);
+        }
+        assert forall|k:ObjectId| records@.contains_key(k) implies kept.contains_key(k) && #[trigger] records@[k]==kept[k] by {
+            let i=choose|i:int| 0<=i<admitted.len() && #[trigger] admitted@[i].0==k;
+            assert(admitted@.contains(admitted@[i]));
+            assert(admitted@.to_set().contains(admitted@[i]));
+        }
+        assert(records@ =~= kept);
+    }
+    Ok(Graph{selected,component:id,state:state_id,records})
 }
 
 proof fn selected_member(refs:Seq<ObjectReference>,label:Seq<u8>,lo:int,hi:int,edge:ObjectReference)
@@ -138,6 +162,8 @@ proof fn staged_target(refs:Seq<ObjectReference>,edge:ObjectReference)
         let at=refs.index_of(edge);
         assert(refs.drop_last()[at]==edge);
         staged_target(refs.drop_last(),edge);
+    } else {
+        assert(crate::staged_closure::targets(refs)==crate::staged_closure::targets(refs.drop_last()).insert(edge.fields().1));
     }
 }
 

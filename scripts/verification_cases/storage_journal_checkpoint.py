@@ -117,11 +117,22 @@ def consumer_defects():
     for label, before, after in [
         ("commit root", "let mut stack=vec![root];", "let mut stack=vec![ObjectId::new([0;32])];"),
         ("owning target", "stack.push(child);", "stack.push(ObjectId::new([0;32]));"),
-        ("retained declarations", "    kept\n}", "    remaining\n}"),
+        ("declaration order", "rows.as_mut_slice().sort_unstable_by_key(key);", ""),
+        ("retained declarations", "    rows\n}", "    Vec::new()\n}"),
     ]:
         yield (
             f"transaction pruning loses {label}", pruning,
             lambda s, a=before, b=after: replace_once(s, a, b), pruning,
+        )
+    declaration = Path("crates/astrid-storage/src/engine/root_declaration.rs")
+    for label, before, after in [
+        ("staged records", "staged_closure::select(staged,commit)", "staged_closure::select(BTreeMap::new(),commit)"),
+        ("expected root", "Some(a)=>Self::sealed(Update {principal,expected,commit,records},a)", "Some(a)=>Self::sealed(Update {principal,expected:None,commit,records},a)"),
+        ("session seal", "Some(a)=>Self::sealed(Update {principal,expected,commit,records},a)", "Some(_)=>Self::untrusted(principal,expected,commit,records)"),
+    ]:
+        yield (
+            f"writer declaration loses {label}", declaration,
+            lambda s, a=before, b=after: replace_once(s, a, b), declaration,
         )
     header_writer = Path("crates/astrid-storage/src/storage_model/header_writer.rs")
     for label, before, after in [

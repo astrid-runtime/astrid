@@ -20,7 +20,7 @@
 
 use crate::storage_model::{
     GcReport, InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectRecord, PinId,
-    PrincipalUsage, RootState, World,
+    PrincipalUsage, RootState, World, staged_closure,
 };
 use parking_lot::RwLock;
 

@@ -45,6 +45,7 @@ impl<'a> KvIdentitySession<'a> {
         self.identity.identify(record)
     }
 
+    #[cfg(test)]
     pub(crate) fn seal_transaction<P>(
         self,
         principal: P,
@@ -61,6 +62,27 @@ impl<'a> KvIdentitySession<'a> {
                     records,
                 },
                 Arc::clone(self.authority),
+            ),
+            kv_checkpoint_publication: None,
+        }
+    }
+}
+
+impl<P> RootTransaction<P> {
+    pub(crate) fn from_staged(
+        principal: P,
+        expected: Option<RootState>,
+        commit: ObjectId,
+        staged: std::collections::BTreeMap<ObjectId, ObjectRecord>,
+        session: Option<KvIdentitySession<'_>>,
+    ) -> Self {
+        Self {
+            declaration: super::root_declaration::Declaration::from_staged(
+                principal,
+                expected,
+                commit,
+                staged,
+                session.map(|s| Arc::clone(s.authority)),
             ),
             kv_checkpoint_publication: None,
         }

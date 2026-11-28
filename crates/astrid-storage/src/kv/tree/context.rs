@@ -440,13 +440,13 @@ where
             },
             StageError::Insert(error) => error,
         })?;
-        let records = crate::storage_model::staged_closure::select(self.records, commit)
-            .into_iter()
-            .collect();
-        Ok(match self.identity_session {
-            Some(session) => session.seal_transaction(header.owner, header.root, commit, records),
-            None => RootTransaction::new(header.owner, header.root, commit, records),
-        })
+        Ok(RootTransaction::from_staged(
+            header.owner,
+            header.root,
+            commit,
+            self.records,
+            self.identity_session,
+        ))
     }
 
     fn pack_branches(&mut self, children: &[ChildPointer]) -> StorageResult<Vec<NodeHandle>> {
