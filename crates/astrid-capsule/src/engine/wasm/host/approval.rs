@@ -406,9 +406,9 @@ impl approval::Host for HostState {
         &mut self,
         mut request: ApprovalRequest,
     ) -> Result<ApprovalResponse, ErrorCode> {
-        if !self.invocation_authority_active() {
-            return Err(ErrorCode::StoreUnavailable);
-        }
+        let request_principal = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::StoreUnavailable)?;
         let allowance_store = self.allowance_store.clone();
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -524,6 +524,8 @@ impl approval::Host for HostState {
             "Approval request details"
         );
 
+        // The prompt can outlive its originating principal.
+        drop(request_principal);
         // Block until response, timeout, or cancellation.
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
@@ -550,6 +552,13 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
+                            let _principal = self.begin_host_operation().map_err(|()| {
+                                audit.denied(
+                                    "authority_unavailable",
+                                    "could not re-admit the approval reply",
+                                );
+                                ErrorCode::StoreUnavailable
+                            })?;
                             if decision == "approve_always"
                                 && let Err(error) =
                                     persist_always(self, &principal, &request.action)
