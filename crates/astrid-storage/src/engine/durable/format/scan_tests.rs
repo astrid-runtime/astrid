@@ -101,6 +101,33 @@ fn stream(hosted: bool) -> (tempfile::TempDir, ObservedStream) {
 }
 
 #[test]
+fn short_probe_reads_preserve_valid_frames_after_damage() {
+    for hosted in [false, true] {
+        let (_dir, mut stream) = self::stream(hosted);
+        stream.write_all(&[0; FRAME_HEADER_LEN_USIZE]).unwrap();
+        append_frame(&mut stream, ARENA_MAGIC, b"retained frame").unwrap();
+        let mut original = Vec::new();
+        stream.rewind().unwrap();
+        stream.read_to_end(&mut original).unwrap();
+
+        stream.short_reads = true;
+        let error = scan_frames(
+            &mut stream,
+            "test frames",
+            ARENA_MAGIC,
+            RecoveryLimits::process_addressable(),
+            |_, _| panic!("interior damage must stop the scan"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, DurableError::Corrupt { offset: 0, .. }));
+        stream.rewind().unwrap();
+        let mut preserved = Vec::new();
+        stream.read_to_end(&mut preserved).unwrap();
+        assert_eq!(preserved, original);
+    }
+}
+
+#[test]
 fn callback_rejection_never_repairs_or_overwrites_the_stream() {
     for hosted in [false, true] {
         let (_dir, mut stream) = self::stream(hosted);
