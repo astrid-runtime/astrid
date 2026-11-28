@@ -88,6 +88,41 @@ fn snapshot<P:Copy>(principal:P,id:ObjectId,generation:u64,reader_generation:u64
     read_admission::attempt(&principal,id,generation,pending,location,read,keep)
 }
 
+/// Follow an actual confirmed frame through both warm-cache gates. A reference-free
+/// record requires no fallible reference allocation, so admission is an equivalence.
+fn published<P:Ord+Copy>(owner:P,commit:&crate::read_admission::PublishedCommitPayload,current:u64,
+    roots:&std::collections::BTreeMap<P,crate::RootState>,index:&std::collections::BTreeMap<ObjectId,crate::ArenaLocation>,
+    checksum:[u8;32],scheme:crate::root_wire::Scheme,derived:[u8;32])
+    -> (out:Option<(P,ObjectId,ObjectRecord)>)
+    requires vstd::std_specs::btree::btree_map_inv(roots),vstd::std_specs::btree::btree_map_inv(index),
+        vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
+        vstd::laws_cmp::obeys_cmp::<ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),
+        crate::verified_record::leaf_body((*commit.payload)@,40),
+    ensures ({
+        let b = (*commit.payload)@;
+        let id = commit.root.commit;
+        &&& out.is_some() == (b.len() == commit.location.payload_len && checksum == commit.location.checksum &&
+            crate::verified_record::tag(b,0,scheme) && id.digest() == b.subrange(8,40) && derived@ == id.digest() &&
+            commit.arena_generation == current && roots@.contains_key(owner) && roots@[owner] == commit.root &&
+            index@.contains_key(id) && index@[id] == commit.location)
+        &&& out matches Some((p,key,r)) ==> p == owner && key == id && crate::verified_record::record_at(b,40,scheme,r)
+    }),
+{
+    let hash = |_:u64,_:&[u8]| -> (sum:[u8;32]) ensures sum == checksum {checksum};
+    let confirm = |b:&[u8],key:ObjectId| -> (out:Option<ObjectRecord>)
+        requires crate::verified_record::leaf_body(b@,40),
+        ensures out.is_some() == (crate::verified_record::tag(b@,0,scheme) && key.digest() == b@.subrange(8,40) &&
+            derived@ == key.digest()), out matches Some(r) ==> crate::verified_record::record_at(b@,40,scheme,r),
+    {
+        let name = |_:&ObjectRecord| -> (v:[u8;32]) ensures v == derived {derived};
+        crate::verified_record::confirmed(b,scheme,key,name).ok()
+    };
+    let candidate = commit.prepare(hash,confirm)?;
+    let offer = |p:&P,key:ObjectId,r:ObjectRecord| -> (row:(P,ObjectId,ObjectRecord))
+        ensures row == (*p,key,r) {(*p,key,r)};
+    candidate.warm(&owner,current,roots,index,offer)
+}
+
 fn load_visits<R,E,F>(plan:&[child_range::Visit],read:F, table:Ghost<spec_fn(ObjectId)->Option<R>>,
     error:Ghost<E>) -> (out:Result<Vec<(child_range::Visit,R)>,child_range::LoadError<E>>)
     where F:FnOnce(Vec<ObjectId>)->Result<Vec<Option<R>>,E>,

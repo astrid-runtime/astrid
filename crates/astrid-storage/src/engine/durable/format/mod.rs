@@ -541,6 +541,18 @@ pub(super) fn decode_object_frame(
     recovered_record::unpack(bytes, scheme.into()).map_err(body_error_detail)
 }
 
+/// Decode a published frame only if both its wire name and computed identity match the commit.
+pub(super) fn published_record<I: PersistentObjectIdentity>(
+    payload: &[u8],
+    expected: ObjectId,
+    identity: &I,
+) -> Option<ObjectRecord> {
+    verified_record::confirmed(payload, identity.scheme().into(), expected, |record| {
+        *identity.identify(record).as_bytes()
+    })
+    .ok()
+}
+
 /// Confirm a prepared WAL frame before retaining its immutable payload and record.
 pub(super) fn pending_object_frame<I: PersistentObjectIdentity>(
     frame: &std::sync::Arc<[u8]>,

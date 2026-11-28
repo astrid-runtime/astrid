@@ -802,6 +802,26 @@ def durable_read_consumers():
         )
 
 
+def publication_cache_consumers():
+    path = Path("crates/astrid-storage/src/engine/durable/read_admission.rs")
+    for label, clause, weaker in [
+        ("borrowed publication", "w.parts().0 == *self &&", ""),
+        ("payload length", "&& b.len() == self.location.payload_len &&", "&&"),
+        ("frame checksum", "checksum.ensures((self.location.payload_len,b),self.location.checksum) &&", ""),
+        ("confirmed record", "confirm.ensures((b,self.root.commit),Some(w.parts().1))", "true"),
+        ("preparation refusal", "confirm.ensures((b,self.root.commit),None),", "true,"),
+        ("arena generation", "&&& self.arena_generation == generation", "&&& true"),
+        ("principal root", "&& roots[owner] == self.root", ""),
+        ("exact placement", "&& index[self.root.commit] == self.location", ""),
+        ("cache arguments", "insert.ensures((owner,self.parts().0.root.commit,self.parts().1),c)", "true"),
+    ]:
+        yield (
+            f"published cache loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_batch_slots.rs"),
+        )
+
+
 def checkpoint_decode_consumers():
     yield from checkpoint_page_consumers()
     yield from checkpoint_reference_consumers()
@@ -815,3 +835,4 @@ def checkpoint_decode_consumers():
     yield from checkpoint_entries_consumers()
     yield from checkpoint_record_consumers()
     yield from durable_read_consumers()
+    yield from publication_cache_consumers()
