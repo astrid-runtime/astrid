@@ -286,3 +286,18 @@ def consumer_defects():
             f"cold arena scan loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )
+
+    journal_scan = Path("verification/hosted_cold_journal.rs")
+    for label, source, clause, weakness in [
+        ("root file magic", journal_scan, "offset,end,limit,frame::ROOT_MAGIC,hash",
+         "offset,end,limit,frame::ARENA_MAGIC,hash"),
+        ("root offset", journal_scan, "r.replay(history,scheme,offset,", "r.replay(history,scheme,0,"),
+        ("journal cursor", journal_scan, "at=next;", "at=end;"),
+        ("root projection", journal_scan, "    Ok(history)\n}", "    Ok(BTreeMap::new())\n}"),
+        ("recovered root set", reopen, "crate::journal_closure::validate(&history,&table)",
+         "crate::journal_closure::validate(&BTreeMap::<P,(RootState,u64)>::new(),&table)"),
+    ]:
+        yield (
+            f"cold root history loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )

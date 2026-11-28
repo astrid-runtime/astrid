@@ -1,5 +1,6 @@
 //! Reopen synchronized replay frames and revalidate the recovered journal roots.
 use super::*;
+use crate::hosted_cold_journal as journal;
 verus! {
 type ReadError<E> = crate::positional_read::SpanError<E,crate::indexed_frame::Error>;
 
@@ -13,58 +14,6 @@ spec fn read_failure<M:crate::positional_read::Media>(media:&M,loc:crate::ArenaL
                 source.contents().3.len()>0,
         _=>false,
     }
-}
-
-/// Scan from the physical cursor. The writer's location and payload are ghost
-/// witnesses only. Even a checksum failure must be inconsistent with these bytes.
-#[verifier::spinoff_prover]
-fn scan_written<R:crate::frame_repair::FrameReader,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
-    reader:&mut R,offset:u64,end:u64,limit:u64,hash:H,
-    Ghost(loc):Ghost<crate::ArenaLocation>,Ghost(raw):Ghost<Seq<u8>>)
-    -> (out:Result<crate::frame_repair::ScannedFrame,crate::frame_repair::FrameError<R::Error>>)
-    requires old(reader).position()==offset,offset==loc.offset,end==old(reader).image().len(),loc.payload_len<=limit,
-        arena_entry(loc,raw,old(reader).image(),0),
-        crate::arena_frame::hashed(hash,crate::arena_frame::ARENA_MAGIC,raw,loc.checksum),
-        forall|n:u64,b:&[u8]| #[trigger] hash.requires((crate::arena_frame::ARENA_MAGIC,n,b)),
-        forall|a:&[u8],b:&[u8],d:[u8;32],e:[u8;32]| a@==b@ &&
-            #[trigger] hash.ensures((crate::arena_frame::ARENA_MAGIC,loc.payload_len,a),d) &&
-            #[trigger] hash.ensures((crate::arena_frame::ARENA_MAGIC,loc.payload_len,b),e) ==> d==e,
-    ensures final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),
-        match out {
-            Ok(f)=>final(reader).position()==f.end && f.end==offset as int+52+loc.payload_len && f.body@==raw,
-            Err(crate::frame_repair::FrameError::Io(e))=>old(reader).failed(offset as int,52,e) ||
-                exists|r:R| r.image()==old(reader).image() && r.target()==old(reader).target() &&
-                    r.position()==offset as int+52 && #[trigger] r.failed(offset as int+52,loc.payload_len,e),
-            _=>false,
-        },
-{
-    use crate::{arena_frame as frame,frame_repair as scan};
-    let ghost image=reader.image();
-    let result=scan::next_frame(reader,offset,end,frame::ARENA_MAGIC,frame::FRAME_VERSION,limit,hash);
-    proof {
-        let start=offset as int;
-        let next=start+52+loc.payload_len;
-        let header=frame::header_bytes(frame::ARENA_MAGIC,frame::FRAME_VERSION,loc.payload_len,loc.checksum);
-        let h=scan::header_at(image,offset);
-        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
-        assert(image.subrange(start,next)==header+raw);
-        assert(h =~= header);
-        assert(h.take(8) =~= frame::ARENA_MAGIC@);
-        assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(loc.payload_len));
-        assert(h.subrange(20,52) =~= loc.checksum@);
-        assert(header.len()==52);
-        assert forall|j:int| 0<=j<raw.len() implies image[start+52+j]==#[trigger] raw[j] by {
-            assert(image.subrange(start,next)[52+j]==(header+raw)[52+j]);
-        }
-        assert(image.subrange(start+52,next) =~= raw);
-        if result matches Err(scan::FrameError::Tail(scan::TailError::Checksum)) {
-            let written=choose|b:&[u8]| b@==raw && #[trigger] hash.ensures((frame::ARENA_MAGIC,loc.payload_len,b),loc.checksum);
-            let (bytes,sum)=choose|b:&[u8],sum:[u8;32]| b@==image.subrange(start+52,next) && sum@!=h.subrange(20,52) &&
-                #[trigger] hash.ensures((frame::ARENA_MAGIC,loc.payload_len,b),sum);
-            assert(sum==loc.checksum);
-        }
-    }
-    result
 }
 
 /// Authenticate an indexed fresh record again after reopening the arena.
@@ -229,7 +178,7 @@ fn rebuild<R:crate::frame_repair::FrameReader,H,I>(reader:&mut R,start:u64,end:u
         assert(receipt.index@.contains_key(id));
         assert(loc.offset==at);
         let ghost before=*reader;
-        let f=match scan_written(reader,at,end,limit,hash,Ghost(loc),Ghost(raw)) {
+        let f=match crate::hosted_acknowledged_root::scan_written(reader,at,end,limit,frame::ARENA_MAGIC,hash,Ghost(loc),Ghost(raw)) {
             Ok(f)=>f,Err(e)=>{
                 proof {if let crate::frame_repair::FrameError::Io(io)=&e {
                     if before.failed(at as int,52,*io) {assert(before.position()==loc.offset);}
@@ -351,7 +300,8 @@ fn read_index<M:crate::positional_read::Media,H,I>(media:&M,index:&BTreeMap<Obje
 }
 
 
-enum ColdRead<M:crate::positional_read::Media,E> {
+enum ColdRead<M:crate::positional_read::Media,E,JE> {
+    Journal(u64,journal::Failure<JE>),
     Scan(RebuildError<E>),
     AwaitingContainer,
     Read(M,ObjectId,ReadError<M::Error>),
@@ -364,25 +314,26 @@ spec fn restored(table:&BTreeMap<ObjectId,ObjectRecord>,records:Map<ObjectId,Obj
     &&& forall|k:ObjectId| #[trigger] table@.contains_key(k) ==> crate::hosted_record_roundtrip::same_fields(table@[k],records[k])
 }
 
-spec fn authorized<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,table:&BTreeMap<ObjectId,ObjectRecord>,known:Set<ObjectId>) -> bool {
-    (forall|p:P| #[trigger] history@.contains_key(p) ==> exists|s:Set<ObjectId>| #[trigger] crate::journal_closure::admitted(table,history@[p].0.commit,s) && s.subset_of(known)) &&
-                (forall|k:ObjectId| #[trigger] known.contains(k) ==> exists|p:P,s:Set<ObjectId>| history@.contains_key(p) &&
-                    #[trigger] crate::journal_closure::admitted(table,history@[p].0.commit,s) && s.contains(k))
+spec fn authorized<P:Ord>(history:Map<P,(RootState,u64)>,table:&BTreeMap<ObjectId,ObjectRecord>,known:Set<ObjectId>) -> bool {
+    (forall|p:P| #[trigger] history.contains_key(p) ==> exists|s:Set<ObjectId>| #[trigger] crate::journal_closure::admitted(table,history[p].0.commit,s) && s.subset_of(known)) &&
+                (forall|k:ObjectId| #[trigger] known.contains(k) ==> exists|p:P,s:Set<ObjectId>| history.contains_key(p) &&
+                    #[trigger] crate::journal_closure::admitted(table,history[p].0.commit,s) && s.contains(k))
 }
 
-spec fn refused_history<P:Ord>(history:&BTreeMap<P,(RootState,u64)>,table:&BTreeMap<ObjectId,ObjectRecord>,e:crate::journal_closure::Failure) -> bool {
-    exists|p:P| history@.contains_key(p) && #[trigger] crate::journal_closure::refused(table,history@[p].0.commit,history@[p].1,e)
+spec fn refused_history<P:Ord>(history:Map<P,(RootState,u64)>,table:&BTreeMap<ObjectId,ObjectRecord>,e:crate::journal_closure::Failure) -> bool {
+    exists|p:P| history.contains_key(p) && #[trigger] crate::journal_closure::refused(table,history[p].0.commit,history[p].1,e)
 }
 
 /// Reopen the same synchronized native arena, discard the table built during
-/// WAL replay, and validate the supplied recovered journal against fresh reads.
+/// WAL replay, scan the independent root journal, and validate both recovered maps.
 /// A region receipt cannot take this path before container persistence.
 #[verifier::spinoff_prover]
-fn reopen_native<A:crate::arena_frame::ReplayArena,M:crate::positional_read::Media,R:crate::frame_repair::FrameReader,P:Ord,H,I,O>(
+fn reopen_native<A:crate::arena_frame::ReplayArena,M:crate::positional_read::Media,R:crate::frame_repair::FrameReader,P:Ord,H,I,O,J:crate::frontier::JournalContainer,Q:crate::frame_repair::FrameReader,OJ,D,C>(
     Ghost(receipt):Ghost<ArenaReceipt>,flush:crate::frontier::JournalFlush<()>,arena:&A,open:O,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,
-    history:&BTreeMap<P,(RootState,u64)>,scheme:root_wire::Scheme,limit:u64,hash:H,identify:I,
-    Ghost(records):Ghost<Map<ObjectId,ObjectRecord>>) -> (out:ColdRead<M,R::Error>)
+    journal_file:&J,open_journal:OJ,decode:D,recode:C,Ghost(rows):Ghost<Seq<journal::Row<P>>>,scheme:root_wire::Scheme,limit:u64,hash:H,identify:I,
+    Ghost(records):Ghost<Map<ObjectId,ObjectRecord>>) -> (out:ColdRead<M,R::Error,Q::Error>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&ObjectRecord)->[u8;32]+Copy,O:FnOnce(&A)->(R,M,u64,u64),
+        OJ:FnOnce(&J)->(Q,u64),D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy,
     requires flush==receipt.flush,receipt.covers(records,scheme,limit,hash),arena.target()==receipt.target@,
         receipt.flush is StableFile ==> arena.stable()==receipt.image@ && arena.stable().len()<=u64::MAX && open.requires((arena,)),
         forall|opened:(R,M,u64,u64)| #[trigger] open.ensures((arena,),opened) ==> {
@@ -391,7 +342,15 @@ fn reopen_native<A:crate::arena_frame::ReplayArena,M:crate::positional_read::Med
             &&& reader.image()==media.image() && reader.target()==arena.target()
             &&& reader.position()==start && start==receipt.start@ && start<=end==media.image().len()
         },
-        btree_map_inv(history),obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
+        (journal_file.container_id(),journal_file.region_id())!=arena.target(),
+        flush is StableFile ==> open_journal.requires((journal_file,)),
+        forall|opened:(Q,u64)| #[trigger] open_journal.ensures((journal_file,),opened) ==> {
+            let (r,end)=opened;
+            &&& r.image()==journal_file.durable_image() && end==r.image().len() && r.position()==0
+            &&& r.target()==(journal_file.container_id(),journal_file.region_id())
+        },
+        journal::readable(rows,journal_file.durable_image(),journal_file.durable_image().len() as u64,scheme,limit,hash,decode,recode),
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),
         obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
         scheme.algorithm@!=seq![0u8,0u8],scheme.construction@!=seq![0u8,0u8],
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((crate::arena_frame::ARENA_MAGIC,n,b)),
@@ -404,13 +363,14 @@ fn reopen_native<A:crate::arena_frame::ReplayArena,M:crate::positional_read::Med
     ensures (out is AwaitingContainer)==(receipt.flush is AwaitingContainer),
         match out {
             ColdRead::AwaitingContainer=>true,
+            ColdRead::Journal(at,e)=>journal::failed::<Q,P>(rows,journal_file.durable_image(),(journal_file.container_id(),journal_file.region_id()),at,e),
             ColdRead::Scan(e)=>rebuild_failure::<R>(&receipt,records,e),
             ColdRead::Read(m,k,e)=> (target@)(m)==receipt.target@ && m.image()==receipt.image@ &&
                 receipt.index@.contains_key(k) && read_failure(&m,receipt.index@[k],records[k],e),
             ColdRead::Refused(m,e,table)=> (target@)(m)==receipt.target@ && m.image()==receipt.image@ && restored(&table@,records) &&
-                refused_history(history,&table@,e),
+                journal::consecutive(rows,rows.len()) && refused_history(journal::prefix(rows,rows.len()),&table@,e),
             ColdRead::Loaded(m,table,known)=> (target@)(m)==receipt.target@ && m.image()==receipt.image@ && restored(&table,records) &&
-                authorized(history,&table,known@),
+                journal::consecutive(rows,rows.len()) && authorized(journal::prefix(rows,rows.len()),&table,known@),
         },
 {
     if let crate::frontier::JournalFlush::AwaitingContainer(())=flush {return ColdRead::AwaitingContainer;}
@@ -423,14 +383,18 @@ fn reopen_native<A:crate::arena_frame::ReplayArena,M:crate::positional_read::Med
     };
     assert(restored(&table,records));
     assert((target@)(media)==receipt.target@ && media.image()==receipt.image@);
-    match crate::journal_closure::validate(history,&table) {
-        Ok(known)=>{assert(authorized(history,&table,known@));return ColdRead::Loaded(media,table,known);},
+    let (mut root_reader,journal_end)=open_journal(journal_file);
+    let history=match journal::recover(&mut root_reader,journal_end,scheme,limit,hash,decode,recode,Ghost(rows)) {
+        Ok(history)=>history,Err((at,e))=>return ColdRead::Journal(at,e),
+    };
+    match crate::journal_closure::validate(&history,&table) {
+        Ok(known)=>{assert(authorized(history@,&table,known@));return ColdRead::Loaded(media,table,known);},
         Err(e)=>{
             assert(exists|p:P| history@.contains_key(p) && #[trigger] crate::journal_closure::refused(&table,history@[p].0.commit,history@[p].1,e));
             let ghost witness=choose|p:P| history@.contains_key(p) && #[trigger] crate::journal_closure::refused(&table,history@[p].0.commit,history@[p].1,e);
             let snapshot=Ghost(table);
             assert(crate::journal_closure::refused(&snapshot@,history@[witness].0.commit,history@[witness].1,e));
-            assert(refused_history(history,&snapshot@,e));
+            assert(refused_history(history@,&snapshot@,e));
             assert(restored(&snapshot@,records));
             return ColdRead::Refused(media,e,snapshot);
         },

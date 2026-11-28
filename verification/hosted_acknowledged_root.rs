@@ -5,11 +5,15 @@ use std::collections::BTreeMap;
 use vstd::{prelude::*,laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},pervasive::obeys_clone_eq,std_specs::btree::btree_map_inv};
 
 verus! {
-/// Parse the production journal header and transition body from the bytes emitted by preparation.
-pub(super) fn parse_written(body:&[u8],name:&[u8],scheme:root_wire::Scheme,expected:Option<RootState>,next:RootState)
+/// Decode a canonical transition directly from the recovered bytes. All
+/// expected fields used to establish the round trip are erased.
+pub(super) fn parse_transition(body:&[u8],scheme:root_wire::Scheme,
+    Ghost(name):Ghost<Seq<u8>>,Ghost(prior):Ghost<Option<root_wire::Root>>,Ghost(replacement):Ghost<root_wire::Root>)
     -> (out:journal::Record)
-    requires name.len()<u64::MAX,body@==journal::wire(name@,scheme,expected,next),
-    ensures out.principal@==name@ && out.expected==expected && out.replacement==next,
+    requires name.len()<u64::MAX,body@==vstd::bytes::spec_u64_to_le_bytes(name.len() as u64)+name+
+        root_wire::prior(prior,scheme)+replacement.wire(scheme),
+    ensures out.principal@==name && history::represents(replacement,out.replacement) &&
+        match (prior,out.expected) {(None,None)=>true,(Some(a),Some(b))=>history::represents(a,b),_=>false},
 {
     let mut cursor=0usize;
     proof {
@@ -19,10 +23,8 @@ pub(super) fn parse_written(body:&[u8],name:&[u8],scheme:root_wire::Scheme,expec
     let length=match journal_snapshot::read_header(body,&mut cursor) {
         Ok(journal_snapshot::JournalHeader::Transition(n))=>n,_=>{assert(false);unreached()}
     };
-    let prior=match expected {Some(r)=>Some(history::to_wire(r)),None=>None};
-    let replacement=history::to_wire(next);
-    let ghost pos=8+name.len();
-    assert(body@.subrange(8,pos) =~= name@);
+    let ghost pos=8+name.len() as int;
+    assert(body@.subrange(8,pos) =~= name);
     assert(body@.skip(pos) =~= root_wire::prior(prior,scheme)+replacement.wire(scheme));
     assert(root_wire::tail(body@,pos,scheme,prior,replacement));
     let out=match journal::decode(body,&mut cursor,length,scheme) {Ok(r)=>r,Err(_)=>{assert(false);unreached()}};
@@ -32,13 +34,81 @@ pub(super) fn parse_written(body:&[u8],name:&[u8],scheme:root_wire::Scheme,expec
             match (e,out.expected) {(None,None)=>true,(Some(a),Some(b))=>history::represents(a,b),_=>false};
         root_wire::unique_tail(body@,pos,scheme,e,r,prior,replacement);
         assert(r.generation =~= replacement.generation);assert(r.commit =~= replacement.commit);
-        history::unique(r,out.replacement,next);
         if let Some(a)=e {
             assert(a.generation =~= prior.unwrap().generation);assert(a.commit =~= prior.unwrap().commit);
-            history::unique(a,out.expected.unwrap(),expected.unwrap());
         }
     }
     out
+}
+
+/// Parse the production journal header and transition body from the bytes emitted by preparation.
+pub(super) fn parse_written(body:&[u8],name:&[u8],scheme:root_wire::Scheme,expected:Option<RootState>,next:RootState)
+    -> (out:journal::Record)
+    requires name.len()<u64::MAX,body@==journal::wire(name@,scheme,expected,next),
+    ensures out.principal@==name@ && out.expected==expected && out.replacement==next,
+{
+    let prior=match expected {Some(r)=>Some(history::to_wire(r)),None=>None};
+    let replacement=history::to_wire(next);
+    let out=parse_transition(body,scheme,Ghost(name@),Ghost(prior),Ghost(replacement));
+    proof {
+        history::unique(replacement,out.replacement,next);
+        if let Some(a)=prior {history::unique(a,out.expected.unwrap(),expected.unwrap());}
+    }
+    out
+}
+
+/// Scan from the physical cursor. The writer's location and payload are ghost
+/// witnesses only. Even a checksum failure must be inconsistent with these bytes.
+#[verifier::spinoff_prover]
+pub(crate) fn scan_written<R:crate::frame_repair::FrameReader,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+    reader:&mut R,offset:u64,end:u64,limit:u64,magic:[u8;8],hash:H,
+    Ghost(loc):Ghost<crate::ArenaLocation>,Ghost(raw):Ghost<Seq<u8>>)
+    -> (out:Result<crate::frame_repair::ScannedFrame,crate::frame_repair::FrameError<R::Error>>)
+    requires old(reader).position()==offset,offset==loc.offset,end==old(reader).image().len(),loc.payload_len<=limit,
+        loc.payload_len==raw.len(),offset as int+52+loc.payload_len<=end,
+        old(reader).image().subrange(offset as int,offset as int+52+loc.payload_len)==
+            crate::arena_frame::header_bytes(magic,crate::arena_frame::FRAME_VERSION,loc.payload_len,loc.checksum)+raw,
+        crate::arena_frame::hashed(hash,magic,raw,loc.checksum),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+        forall|a:&[u8],b:&[u8],d:[u8;32],e:[u8;32]| a@==b@ &&
+            #[trigger] hash.ensures((magic,loc.payload_len,a),d) &&
+            #[trigger] hash.ensures((magic,loc.payload_len,b),e) ==> d==e,
+    ensures final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),
+        match out {
+            Ok(f)=>final(reader).position()==f.end && f.end==offset as int+52+loc.payload_len && f.body@==raw,
+            Err(crate::frame_repair::FrameError::Io(e))=>old(reader).failed(offset as int,52,e) ||
+                exists|r:R| r.image()==old(reader).image() && r.target()==old(reader).target() &&
+                    r.position()==offset as int+52 && #[trigger] r.failed(offset as int+52,loc.payload_len,e),
+            _=>false,
+        },
+{
+    use crate::{arena_frame as frame,frame_repair as scan};
+    let ghost image=reader.image();
+    let result=scan::next_frame(reader,offset,end,magic,frame::FRAME_VERSION,limit,hash);
+    proof {
+        let start=offset as int;
+        let next=start+52+loc.payload_len;
+        let header=frame::header_bytes(magic,frame::FRAME_VERSION,loc.payload_len,loc.checksum);
+        let h=scan::header_at(image,offset);
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(image.subrange(start,next)==header+raw);
+        assert(h =~= header);
+        assert(h.take(8) =~= magic@);
+        assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(loc.payload_len));
+        assert(h.subrange(20,52) =~= loc.checksum@);
+        assert(header.len()==52);
+        assert forall|j:int| 0<=j<raw.len() implies image[start+52+j]==#[trigger] raw[j] by {
+            assert(image.subrange(start,next)[52+j]==(header+raw)[52+j]);
+        }
+        assert(image.subrange(start+52,next) =~= raw);
+        if result matches Err(scan::FrameError::Tail(scan::TailError::Checksum)) {
+            let written=choose|b:&[u8]| b@==raw && #[trigger] hash.ensures((magic,loc.payload_len,b),loc.checksum);
+            let (bytes,sum)=choose|b:&[u8],sum:[u8;32]| b@==image.subrange(start+52,next) && sum@!=h.subrange(20,52) &&
+                #[trigger] hash.ensures((magic,loc.payload_len,b),sum);
+            assert(sum==loc.checksum);
+        }
+    }
+    result
 }
 
 /// Consume the final canonical frame from the buffered reader at its actual

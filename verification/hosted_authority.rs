@@ -218,6 +218,7 @@ mod journal_snapshot;
 mod hosted_journal_history;
 mod hosted_recovered_header;
 mod hosted_acknowledged_root;
+mod hosted_cold_journal;
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/root_history.rs"]
