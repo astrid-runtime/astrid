@@ -77,6 +77,19 @@ pub(crate) open spec fn exact_rows(source:Map<ObjectId,ObjectRecord>,root:Object
     &&& ordered(rows)
 }
 
+proof fn permutation_members<T>(before:Seq<T>,after:Seq<T>)
+    requires before.to_multiset()==after.to_multiset(),
+    ensures before.to_set()==after.to_set(),
+{
+    before.to_multiset_ensures(); after.to_multiset_ensures();
+    before.to_set_ensures(); after.to_set_ensures();
+    assert(before.to_set() =~= after.to_set()) by {
+        assert forall|r:T| before.to_set().contains(r) <==> #[trigger] after.to_set().contains(r) by {
+            assert(before.to_multiset().count(r)==after.to_multiset().count(r));
+        }
+    }
+}
+
 #[verifier::loop_isolation(false)]
 pub(crate) fn select(staged:BTreeMap<ObjectId,ObjectRecord>,root:ObjectId) -> (rows:Vec<(ObjectId,ObjectRecord)>)
     requires btree_map_inv(&staged),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
@@ -170,13 +183,7 @@ pub(crate) fn select(staged:BTreeMap<ObjectId,ObjectRecord>,root:ObjectId) -> (r
     proof { reveal(vstd::laws_cmp::obeys_cmp_ord); }
     rows.as_mut_slice().sort_unstable_by_key(key);
     proof {
-        before.to_multiset_ensures(); rows@.to_multiset_ensures();
-        before.to_set_ensures(); rows@.to_set_ensures();
-        assert(rows@.to_set() =~= before.to_set()) by {
-            assert forall|r:(ObjectId,ObjectRecord)| rows@.to_set().contains(r) <==> #[trigger] before.to_set().contains(r) by {
-                assert(rows@.to_multiset().count(r)==before.to_multiset().count(r));
-            }
-        }
+        permutation_members(before,rows@);
         assert forall|i:int,j:int| #![trigger rows@[i],rows@[j]] 0<=i<j<rows.len() implies
             vstd::std_specs::cmp::OrdSpec::cmp_spec(&rows@[i].0,&rows@[j].0)!=core::cmp::Ordering::Greater by {
             assert(vstd::std_specs::slice::key_le(key,rows@[i],rows@[j]));
