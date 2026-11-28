@@ -4,6 +4,8 @@ use crate::storage_model::{ObjectClass, ObjectId, ObjectKind, ObjectRecord, Obje
 
 use super::super::tree_error::invalid;
 use super::FORMAT_VERSION;
+use super::checkpoint_branch::Header;
+use super::checkpoint_header::{self, Kind};
 use super::checkpoint_reference::{self, Rejection, Relation};
 use super::validation::validate_composite_key;
 use crate::error::{StorageError, StorageResult};
@@ -12,8 +14,6 @@ pub(super) const INLINE_VALUE_MAX: usize = 1_024;
 pub(super) const NODE_MAX_RETAINED_BYTES: u64 = 4_096;
 pub(super) use super::checkpoint_branch::{MAX_TREE_LEVEL, NODE_MAX_ENTRIES};
 
-const LEAF_MAGIC: &[u8] = b"astrid-kv-bplus-leaf-v1\0";
-const BRANCH_MAGIC: &[u8] = b"astrid-kv-bplus-branch-v1\0";
 const INLINE_VALUE: u8 = 0;
 const SPILLED_VALUE: u8 = 1;
 
@@ -112,9 +112,17 @@ pub(super) fn leaf_record(entries: &[LeafEntry]) -> StorageResult<ObjectRecord> 
     }
     let totals = leaf_totals(entries)?;
     let mut canonical = Vec::new();
-    canonical.extend_from_slice(LEAF_MAGIC);
-    push_count(&mut canonical, entries.len())?;
-    totals.append(&mut canonical);
+    if !checkpoint_header::append(
+        &mut canonical,
+        Kind::Leaf,
+        Header {
+            level: 0,
+            count: entries.len(),
+            totals,
+        },
+    ) {
+        return Err(arithmetic_overflow());
+    }
     let mut references = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if !super::checkpoint_key_field::append(&mut canonical, &entry.key) {
@@ -170,10 +178,17 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
         .ok_or_else(arithmetic_overflow)?;
     let totals = super::checkpoint_summary::sum(children).ok_or_else(arithmetic_overflow)?;
     let mut canonical = Vec::new();
-    canonical.extend_from_slice(BRANCH_MAGIC);
-    canonical.extend_from_slice(&level.to_le_bytes());
-    push_count(&mut canonical, children.len())?;
-    totals.append(&mut canonical);
+    if !checkpoint_header::append(
+        &mut canonical,
+        Kind::Branch,
+        Header {
+            level,
+            count: children.len(),
+            totals,
+        },
+    ) {
+        return Err(arithmetic_overflow());
+    }
     let mut references = Vec::with_capacity(children.len());
     for (index, child) in children.iter().enumerate() {
         if !super::checkpoint_key_field::append(&mut canonical, &child.lower_bound) {
@@ -248,10 +263,10 @@ pub(super) fn spilled_opaque_payload(
 }
 
 fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
-    let mut cursor = Cursor::new(id, record.canonical_bytes());
-    cursor.require(LEAF_MAGIC)?;
-    let count = cursor.count()?;
-    let totals = cursor.totals()?;
+    let bytes = record.canonical_bytes();
+    let (offset, Header { count, totals, .. }) =
+        checkpoint_header::read(bytes, Kind::Leaf).map_err(|e| header_error(id, e))?;
+    let mut cursor = Cursor { id, bytes, offset };
     if count == 0 || count > NODE_MAX_ENTRIES {
         return Err(invalid(id, "invalid KV leaf entry count"));
     }
@@ -306,45 +321,43 @@ fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
 }
 
 fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
-    use super::checkpoint_branch::{DecodeError, Header, RowsError};
+    use super::checkpoint_branch::{DecodeError, RowsError};
     use super::checkpoint_child::ChildError;
     use super::checkpoint_key_field::KeyError;
     use super::checkpoint_summary::FinishError;
 
-    let mut cursor = Cursor::new(id, record.canonical_bytes());
-    cursor.require(BRANCH_MAGIC)?;
-    let level = cursor.u16()?;
-    let count = cursor.count()?;
-    let totals = cursor.totals()?;
-    let branch = Header {
-        level,
-        count,
-        totals,
-    }
-    .decode(cursor.bytes, record.references(), cursor.offset, |field| {
-        validate_composite_key(id, field)
-    })
-    .map_err(|reason| match reason {
-        DecodeError::Header => invalid(id, "invalid KV branch header"),
-        DecodeError::Rows(RowsError::Level) => invalid(id, "invalid KV branch level"),
-        DecodeError::Rows(RowsError::Child(reason)) => match reason {
-            ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => page_read_error(id, e),
-            ChildError::Key(KeyError::Length) => invalid(id, "persistent KV length is too large"),
-            ChildError::InvalidKey(e) => e,
-            ChildError::Empty => invalid(id, "empty KV branch child"),
-            ChildError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
-            ChildError::Reference(Rejection::Missing | Rejection::Mismatch) => {
-                invalid(id, "invalid KV branch child reference")
+    let branch =
+        checkpoint_header::branch(record.canonical_bytes(), record.references(), |field| {
+            validate_composite_key(id, field)
+        })
+        .map_err(|reason| match reason {
+            checkpoint_header::RecordError::Prefix(e) => header_error(id, e),
+            checkpoint_header::RecordError::Body(reason) => match reason {
+                DecodeError::Header => invalid(id, "invalid KV branch header"),
+                DecodeError::Rows(RowsError::Level) => invalid(id, "invalid KV branch level"),
+                DecodeError::Rows(RowsError::Child(reason)) => match reason {
+                    ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => {
+                        page_read_error(id, e)
+                    },
+                    ChildError::Key(KeyError::Length) => {
+                        invalid(id, "persistent KV length is too large")
+                    },
+                    ChildError::InvalidKey(e) => e,
+                    ChildError::Empty => invalid(id, "empty KV branch child"),
+                    ChildError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
+                    ChildError::Reference(Rejection::Missing | Rejection::Mismatch) => {
+                        invalid(id, "invalid KV branch child reference")
+                    },
+                },
+                DecodeError::Finish(FinishError::Trailing) => {
+                    invalid(id, "trailing persistent KV page bytes")
+                },
+                DecodeError::Finish(FinishError::NonCanonical) => {
+                    invalid(id, "non-canonical persistent KV branch")
+                },
+                DecodeError::Finish(FinishError::Overflow) => arithmetic_overflow(),
             },
-        },
-        DecodeError::Finish(FinishError::Trailing) => {
-            invalid(id, "trailing persistent KV page bytes")
-        },
-        DecodeError::Finish(FinishError::NonCanonical) => {
-            invalid(id, "non-canonical persistent KV branch")
-        },
-        DecodeError::Finish(FinishError::Overflow) => arithmetic_overflow(),
-    })?;
+        })?;
     Ok(Node::Branch(branch))
 }
 
@@ -361,12 +374,6 @@ fn sum_totals(totals: impl IntoIterator<Item = NodeTotals>) -> StorageResult<Nod
     totals
         .into_iter()
         .try_fold(NodeTotals::default(), NodeTotals::add)
-}
-
-fn push_count(bytes: &mut Vec<u8>, count: usize) -> StorageResult<()> {
-    let count = u16::try_from(count).map_err(|_| arithmetic_overflow())?;
-    bytes.extend_from_slice(&count.to_le_bytes());
-    Ok(())
 }
 
 fn arithmetic_overflow() -> StorageError {
@@ -388,6 +395,13 @@ fn page_read_error(id: ObjectId, error: crate::storage_fields::ReadError) -> Sto
     }
 }
 
+fn header_error(id: ObjectId, e: checkpoint_header::Error) -> StorageError {
+    match e {
+        checkpoint_header::Error::Field(error) => page_read_error(id, error),
+        checkpoint_header::Error::Magic => invalid(id, "invalid persistent KV page magic"),
+    }
+}
+
 struct Cursor<'a> {
     id: ObjectId,
     bytes: &'a [u8],
@@ -395,24 +409,9 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    const fn new(id: ObjectId, bytes: &'a [u8]) -> Self {
-        Self {
-            id,
-            bytes,
-            offset: 0,
-        }
-    }
-
     fn take(&mut self, length: usize) -> StorageResult<&'a [u8]> {
         crate::storage_fields::take(self.bytes, &mut self.offset, length)
             .map_err(|error| page_read_error(self.id, error))
-    }
-
-    fn require(&mut self, expected: &[u8]) -> StorageResult<()> {
-        if self.take(expected.len())? != expected {
-            return Err(invalid(self.id, "invalid persistent KV page magic"));
-        }
-        Ok(())
     }
 
     fn array<const N: usize>(&mut self) -> StorageResult<[u8; N]> {
@@ -422,10 +421,6 @@ impl<'a> Cursor<'a> {
 
     fn u8(&mut self) -> StorageResult<u8> {
         Ok(self.array::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> StorageResult<u16> {
-        Ok(u16::from_le_bytes(self.array()?))
     }
 
     fn key(&mut self) -> StorageResult<&'a [u8]> {
@@ -439,15 +434,6 @@ impl<'a> Cursor<'a> {
 
     fn u64(&mut self) -> StorageResult<u64> {
         Ok(u64::from_le_bytes(self.array()?))
-    }
-
-    fn count(&mut self) -> StorageResult<usize> {
-        Ok(usize::from(self.u16()?))
-    }
-
-    fn totals(&mut self) -> StorageResult<NodeTotals> {
-        NodeTotals::read(self.bytes, &mut self.offset)
-            .map_err(|error| page_read_error(self.id, error))
     }
 
     fn done(self) -> StorageResult<()> {
@@ -475,8 +461,11 @@ mod tests {
         assert_eq!(NODE_MAX_RETAINED_BYTES, 4_096);
         assert_eq!(NODE_MAX_ENTRIES, 64);
         assert_eq!(MAX_TREE_LEVEL, 16);
-        assert_eq!(LEAF_MAGIC, b"astrid-kv-bplus-leaf-v1\0");
-        assert_eq!(BRANCH_MAGIC, b"astrid-kv-bplus-branch-v1\0");
+        assert_eq!(checkpoint_header::LEAF_MAGIC, b"astrid-kv-bplus-leaf-v1\0");
+        assert_eq!(
+            checkpoint_header::BRANCH_MAGIC,
+            b"astrid-kv-bplus-branch-v1\0"
+        );
         assert_eq!(INLINE_VALUE, 0);
         assert_eq!(SPILLED_VALUE, 1);
     }

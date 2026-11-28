@@ -681,6 +681,23 @@ def checkpoint_summary_consumers():
         )
 
 
+def checkpoint_header_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_header.rs")
+    consumer = Path("verification/hosted_checkpoint_header.rs")
+    for label, clause, weaker in [
+        ("written bytes", "out ==> final(bytes)@ == old(bytes)@ + wire(kind,h)", "true"),
+        ("decoded bytes", "Ok(pair) => present(bytes@,kind,pair.1,pair.0)", "Ok(pair) => true"),
+        ("prefix rejection", "Err(e) => prefix_error(bytes@,kind,e)", "Err(e) => true"),
+        ("body error evidence", "h.outcome(bytes,refs,s,validate,Err(e))", "true"),
+        ("branch prefix error evidence", "Err(RecordError::Prefix(e)) => prefix_error(bytes@,Kind::Branch,e)", "Err(RecordError::Prefix(e)) => true"),
+        ("raw branch binding", "present(bytes@,Kind::Branch,h,s) &&\n            h.outcome(bytes,refs,s,validate,Ok(b))", "present(bytes@,Kind::Branch,h,s)"),
+    ]:
+        yield (
+            f"checkpoint header loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )
+
+
 def checkpoint_decode_consumers():
     yield from checkpoint_page_consumers()
     yield from checkpoint_reference_consumers()
@@ -689,3 +706,4 @@ def checkpoint_decode_consumers():
     yield from checkpoint_child_consumers()
     yield from checkpoint_branch_consumers()
     yield from checkpoint_summary_consumers()
+    yield from checkpoint_header_consumers()
