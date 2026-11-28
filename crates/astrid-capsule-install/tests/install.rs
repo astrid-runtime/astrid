@@ -324,6 +324,11 @@ fn install_preserves_node_modules() {
     let output = install_from_local_path(base, &home, install_options(&storage))
         .expect("install should succeed");
 
+    assert_eq!(output.capsule_id.as_str(), "install-test");
+    assert_eq!(
+        output.manifest_hash,
+        astrid_crypto::ContentHash::hash(&std::fs::read(base.join("Capsule.toml")).unwrap())
+    );
     let installed = output.target_dir;
     assert!(installed.join("Capsule.toml").exists());
     assert!(installed.join("node_modules/got/index.js").exists());

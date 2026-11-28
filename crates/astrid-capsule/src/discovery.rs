@@ -260,8 +260,13 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
         message: e.to_string(),
     })?;
 
+    parse_manifest(path, &content)
+}
+
+/// Parse and validate a manifest from captured bytes. The path identifies it in diagnostics.
+pub fn parse_manifest(path: &Path, content: &str) -> CapsuleResult<CapsuleManifest> {
     let mut manifest: CapsuleManifest =
-        toml::from_str(&content).map_err(|e| CapsuleError::ManifestParseError {
+        toml::from_str(content).map_err(|e| CapsuleError::ManifestParseError {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;

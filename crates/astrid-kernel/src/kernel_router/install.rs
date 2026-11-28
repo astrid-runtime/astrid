@@ -709,12 +709,8 @@ async fn activate_installed_capsule(
     caller: &astrid_core::principal::PrincipalId,
     output: &InstallOutput,
 ) -> Result<(), String> {
-    let manifest =
-        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml"))
-            .map_err(|error| format!("installed capsule could not be activated: {error}"))?;
-    let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
     kernel
-        .reload_one_capsule(&id, caller)
+        .reload_one_capsule(&output.capsule_id, caller)
         .await
         .map_err(|error| format!("capsule installed on disk but live activation failed: {error:#}"))
 }

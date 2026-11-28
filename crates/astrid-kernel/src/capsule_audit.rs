@@ -108,23 +108,15 @@ pub(crate) async fn record_capsule_installed(
     principal: &PrincipalId,
     output: &astrid_capsule_install::InstallOutput,
 ) {
-    let manifest_path = output.target_dir.join("Capsule.toml");
-    let capsule_id = match astrid_capsule::discovery::load_manifest(&manifest_path) {
-        Ok(manifest) => manifest.package.name,
-        Err(error) => {
-            warn!(%error, "Cannot read installed manifest for the install audit entry");
-            return;
-        },
-    };
     let action = AuditAction::CapsuleInstalled {
-        capsule_id,
+        capsule_id: output.capsule_id.as_str().to_owned(),
         version: output.installed_version.clone(),
         target_principal: Some(principal.clone()),
         wasm_hash: output
             .wasm_hash
             .as_deref()
             .and_then(|hex| ContentHash::from_hex(hex).ok()),
-        manifest_hash: manifest_hash(&output.target_dir),
+        manifest_hash: Some(output.manifest_hash),
     };
     append(kernel, principal, action).await;
 }
