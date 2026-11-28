@@ -33,6 +33,7 @@ pub(crate) mod header_writer;
 mod object_reference;
 pub(crate) mod reference_lookup;
 mod root_state;
+pub(crate) mod staged_closure;
 pub use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 pub use root_state::{RootGeneration, RootState};
 mod object_codes;

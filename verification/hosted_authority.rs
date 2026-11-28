@@ -58,6 +58,8 @@ mod header_cache;
 mod header_graph;
 #[path = "../crates/astrid-storage/src/storage_model/header_writer.rs"]
 mod header_writer;
+#[path = "../crates/astrid-storage/src/storage_model/staged_closure.rs"]
+mod staged_closure;
 #[path = "../crates/astrid-storage/src/content/store/components.rs"]
 mod header_components;
 #[path = "../crates/astrid-storage/src/content/component_labels.rs"]

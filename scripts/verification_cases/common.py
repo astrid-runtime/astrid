@@ -229,6 +229,7 @@ INPUTS = [
     Path("crates/astrid-core/src/platform_fs/private_projection/unix/append/selection.rs"),
     Path("crates/astrid-storage/src/storage_model/header_graph.rs"),
     Path("crates/astrid-storage/src/storage_model/header_writer.rs"),
+    Path("crates/astrid-storage/src/storage_model/staged_closure.rs"),
     Path("crates/astrid-storage/src/storage_model/reference_lookup.rs"),
     Path("crates/astrid-storage/src/content/store/components.rs"),
     Path("crates/astrid-storage/src/content/component_labels.rs"),

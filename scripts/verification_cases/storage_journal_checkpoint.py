@@ -113,6 +113,16 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), group,
         )
 
+    pruning = Path("crates/astrid-storage/src/storage_model/staged_closure.rs")
+    for label, before, after in [
+        ("commit root", "let mut stack=vec![root];", "let mut stack=vec![ObjectId::new([0;32])];"),
+        ("owning target", "stack.push(child);", "stack.push(ObjectId::new([0;32]));"),
+        ("retained declarations", "    kept\n}", "    remaining\n}"),
+    ]:
+        yield (
+            f"transaction pruning loses {label}", pruning,
+            lambda s, a=before, b=after: replace_once(s, a, b), pruning,
+        )
     header_writer = Path("crates/astrid-storage/src/storage_model/header_writer.rs")
     for label, before, after in [
         ("state destination", "commit(commit_refs,prior,sid,v)", "commit(commit_refs,prior,head,v)"),

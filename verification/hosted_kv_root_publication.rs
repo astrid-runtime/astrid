@@ -104,7 +104,18 @@ pub(crate) fn prepare<P:Ord,I:Fn(&ObjectRecord)->ObjectId+Copy>(
         }
         assert(table@.dom() =~= set![id,state_id,commit_id]);
     }
-    Ok(Graph{selected,component:id,state:state_id,records:table})
+    let kept=crate::staged_closure::select(table,commit_id);
+    proof {
+        kept_edge(table@,kept@.dom(),commit_id,commit_id,header_graph::STATE@,state_id);
+        kept_edge(table@,kept@.dom(),commit_id,state_id,header_graph::KV@,id);
+        assert(kept@.dom().contains(commit_id) && kept@.dom().contains(state_id) && kept@.dom().contains(id));
+        assert(kept@.dom() =~= table@.dom());
+        assert forall|k:ObjectId| table@.contains_key(k) implies kept@[k]==#[trigger] table@[k] by {
+            assert(kept@.contains_key(k));
+        }
+        assert(kept@ =~= table@);
+    }
+    Ok(Graph{selected,component:id,state:state_id,records:kept})
 }
 
 proof fn selected_member(refs:Seq<ObjectReference>,label:Seq<u8>,lo:int,hi:int,edge:ObjectReference)
@@ -116,6 +127,32 @@ proof fn selected_member(refs:Seq<ObjectReference>,label:Seq<u8>,lo:int,hi:int,e
     if refs[mid].fields().0==label {assert(refs[mid]==edge);}
     else if ObjectRecord::label_before(refs[mid].fields().0,label) {selected_member(refs,label,mid+1,hi,edge);}
     else {selected_member(refs,label,lo,mid,edge);}
+}
+
+proof fn staged_target(refs:Seq<ObjectReference>,edge:ObjectReference)
+    requires refs.contains(edge),edge.fields().2 is Owns,
+    ensures crate::staged_closure::targets(refs).contains(edge.fields().1),
+    decreases refs.len(),
+{
+    if refs.last()!=edge {
+        let at=refs.index_of(edge);
+        assert(refs.drop_last()[at]==edge);
+        staged_target(refs.drop_last(),edge);
+    }
+}
+
+proof fn kept_edge(table:Map<ObjectId,ObjectRecord>,kept:Set<ObjectId>,root:ObjectId,parent:ObjectId,label:Seq<u8>,child:ObjectId)
+    requires crate::staged_closure::closed(table,root,kept),kept.contains(parent),
+        table.contains_key(parent),table.contains_key(child),
+        crate::reference_lookup::selected(table[parent].contents().3,label,0,table[parent].contents().3.len() as int)
+            matches Some(e) && e.fields()==(label,child,ReferenceKind::Owns),
+    ensures kept.contains(child),
+{
+    let refs=table[parent].contents().3;
+    let edge=crate::reference_lookup::selected(refs,label,0,refs.len() as int).unwrap();
+    selected_member(refs,label,0,refs.len() as int,edge);
+    staged_target(refs,edge);
+    assert(crate::staged_closure::targets(refs).intersect(table.dom()).subset_of(kept));
 }
 
 proof fn owning_child(refs:Seq<ObjectReference>,i:int)
@@ -189,6 +226,9 @@ pub(crate) fn materialize<'a,P>(Ghost(g):Ghost<&Graph<P>>,table:&'a BTreeMap<Obj
         let ids=crate::closure_load::row_ids(rows@).to_set();
         use crate::closure_walk::Source;
         let edges=crate::closure_load::Preload(table).edges();
+        assert(edges =~= owning_edges(table@));
+        let rank=choose|r:Map<ObjectId,nat>| r.dom()==ids && #[trigger] crate::closure_walk::ranked(edges,Set::empty(),r);
+        assert(crate::closure_walk::ranked(owning_edges(table@),Set::empty(),rank));
         assert(edges.contains_key(root) && edges.contains_key(g.state));
         assert(edges[root].contains(g.state));
         assert(edges[g.state].contains(g.component));

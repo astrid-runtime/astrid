@@ -1,6 +1,6 @@
 //! Path-copy operations over canonical KV pages.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use crate::engine::{KvIdentitySession, KvProjectionEngine, RootTransaction};
@@ -440,8 +440,9 @@ where
             },
             StageError::Insert(error) => error,
         })?;
-        self.retain_reachable(commit);
-        let records = self.records.into_iter().collect();
+        let records = crate::storage_model::staged_closure::select(self.records, commit)
+            .into_iter()
+            .collect();
         Ok(match self.identity_session {
             Some(session) => session.seal_transaction(header.owner, header.root, commit, records),
             None => RootTransaction::new(header.owner, header.root, commit, records),
@@ -570,20 +571,6 @@ where
     ) -> StorageResult<ObjectId> {
         crate::engine::transaction_records::insert(&mut self.records, object, record)
             .map_err(|id| map_engine(&ModelError::ObjectCollision(id).into()))
-    }
-
-    fn retain_reachable(&mut self, root: ObjectId) {
-        let mut reachable = BTreeSet::new();
-        let mut stack = vec![root];
-        while let Some(object) = stack.pop() {
-            if !reachable.insert(object) {
-                continue;
-            }
-            if let Some(record) = self.records.get(&object) {
-                stack.extend(record.owning_references());
-            }
-        }
-        self.records.retain(|object, _| reachable.contains(object));
     }
 }
 
