@@ -134,7 +134,7 @@ def defects():
     ]:
         yield (
             f"recovered header provenance loses {label}", path,
-            lambda s, a=clause, b=weaker: replace_once(s, a, b), journal,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_recovered_header.rs"),
         )
 
     projection = Path("crates/astrid-storage/src/kv/tree/memo_projection.rs")

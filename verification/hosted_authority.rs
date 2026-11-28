@@ -213,6 +213,7 @@ mod journal_transition;
 #[path = "../crates/astrid-storage/src/engine/durable/journal_snapshot.rs"]
 mod journal_snapshot;
 mod hosted_journal_history;
+mod hosted_recovered_header;
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/root_history.rs"]

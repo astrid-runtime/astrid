@@ -63,6 +63,7 @@ INPUTS = [
     Path("crates/astrid-capsule/src/engine/mcp_registration.rs"),
     Path("verification/hosted_batch_slots.rs"),
     Path("verification/hosted_journal_history.rs"),
+    Path("verification/hosted_recovered_header.rs"),
     Path("crates/astrid-storage/src/engine/durable/batch_slots.rs"),
     Path("verification/hosted_chunk_tree_range.rs"),
     Path("crates/astrid-storage/src/content_dag/child_range.rs"),
