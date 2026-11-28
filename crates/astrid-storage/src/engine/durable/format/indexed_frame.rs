@@ -226,7 +226,10 @@ pub(super) fn deliver<'a,S,E,D:Fn(ObjectId,ArenaLocation)->Result<(ObjectRecord,
     A:Fn(S,ObjectId,ArenaLocation,ObjectRecord,&'a [u8])->Result<S,E>>(
     rows:&[Row],initial:S,decode:D,accept:A) -> (out:Result<S,E>)
     requires forall|id:ObjectId,loc:ArenaLocation| #[trigger] decode.requires((id,loc)),
-        forall|s:S,id:ObjectId,loc:ArenaLocation,r:ObjectRecord,p:&'a [u8]| #[trigger] accept.requires((s,id,loc,r,p)),
+        forall|i:int,states:Seq<S>,r:ObjectRecord,p:&'a [u8]| 0 <= i < rows.len() &&
+            states.first()==initial && #[trigger] delivered(rows@.take(i),states,decode,accept) &&
+            #[trigger] decode.ensures((rows@[i].0,rows@[i].1),Ok((r,p))) ==>
+            accept.requires((states.last(),rows@[i].0,rows@[i].1,r,p)),
     ensures match out {
         Ok(s) => exists|states:Seq<S>| #[trigger] delivered(rows@,states,decode,accept) &&
             states.first()==initial && states.last()==s,
@@ -243,12 +246,16 @@ pub(super) fn deliver<'a,S,E,D:Fn(ObjectId,ArenaLocation)->Result<(ObjectRecord,
     while i < rows.len()
         invariant i <= rows.len(), delivered(rows@.take(i as int),states,decode,accept),
             forall|id:ObjectId,loc:ArenaLocation| #[trigger] decode.requires((id,loc)),
-            forall|s:S,id:ObjectId,loc:ArenaLocation,r:ObjectRecord,p:&'a [u8]| #[trigger] accept.requires((s,id,loc,r,p)),
+            forall|i:int,states:Seq<S>,r:ObjectRecord,p:&'a [u8]| 0 <= i < rows.len() &&
+            states.first()==initial && #[trigger] delivered(rows@.take(i),states,decode,accept) &&
+            #[trigger] decode.ensures((rows@[i].0,rows@[i].1),Ok((r,p))) ==>
+            accept.requires((states.last(),rows@[i].0,rows@[i].1,r,p)),
             states.first()==initial, states.last()==state,
         decreases rows.len()-i,
     {
         let (id,location) = rows[i];
         let (r,p) = decode(id,location)?;
+        assert(accept.requires((state,id,location,r,p)));
         state = accept(state,id,location,r,p)?;
         proof {
             let next = states.push(state);

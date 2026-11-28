@@ -476,68 +476,109 @@ proof fn permute_frontier(input:Seq<ReadRow>,output:Seq<ReadRow>)
     assert(old.to_set() =~= new.to_set());
 }
 
-/// Model-independent reader witness. Each success uses the real accept
-/// operation on a fresh row. Errors discard the partial private table.
-fn read_wave<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::ObjectRecord>>(
-    initial:PreloadTable,rows:&[ReadRow],decode:D) -> (out:Result<(PreloadTable,PendingIds),()>)
+type WaveState = (PreloadTable,PendingIds);
+type Decoded<'a> = Result<(crate::ObjectRecord,&'a [u8]),()>;
+
+spec fn installed(s:WaveState,id:crate::ObjectId,r:crate::ObjectRecord,t:WaveState) -> bool {
+    &&& btree_map_inv(&t.0) && vstd::std_specs::btree::btree_set_inv(&t.1)
+    &&& t.0@ == s.0@.insert(id,r)
+    &&& t.1@ == s.1@.union(crate::closure_walk::children(r.contents().3).difference(s.0@.dom()))
+}
+
+/// Interpret the successful prefix exposed by the production delivery loop.
+proof fn delivery_wave<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>,
+    A:Fn(WaveState,crate::ObjectId,crate::ArenaLocation,crate::ObjectRecord,&'a [u8])->Result<WaveState,()>>(
+    rows:Seq<ReadRow>,states:Seq<WaveState>,decode:D,accept:A,end:int)
+    requires 0 <= end <= rows.len(), crate::indexed_frame::delivered(rows,states,decode,accept),
+        rows.map(|_,r:ReadRow|r.0).no_duplicates(),
+        states.first().0@.dom().disjoint(crate::journal_preload::selected(rows)),
+        btree_map_inv(&states.first().0),vstd::std_specs::btree::btree_set_inv(&states.first().1),
+        states.first().1@ == Set::empty(),
+        forall|s:WaveState,id,loc,r,p,t| #[trigger] accept.ensures((s,id,loc,r,p),Ok(t)) ==> installed(s,id,r,t),
+    ensures btree_map_inv(&states[end].0),vstd::std_specs::btree::btree_set_inv(&states[end].1),
+        crate::journal_preload::wave(states.first().0@,crate::journal_preload::selected(rows.take(end)),states[end].0@,states[end].1@),
+    decreases end,
+{
+    use crate::journal_preload::{wave,selected};
+    let initial = states.first().0@;
+    let ids = rows.map(|_,r:ReadRow|r.0);
+    ids.to_set_ensures();
+    if end == 0 {
+        assert(selected(rows.take(0)) =~= Set::empty());
+        assert(initial.dom().union(Set::empty()) =~= initial.dom());
+        assert(initial.submap_of(initial));
+    } else {
+        let i = end - 1;
+        delivery_wave(rows,states,decode,accept,i);
+        let (id,loc) = rows[i];
+        let prior = rows.take(i).map(|_,r:ReadRow|r.0);
+        prior.to_set_ensures();
+        assert(!prior.contains(id)) by {
+            if prior.contains(id) {
+                let j = choose|j:int| 0 <= j < prior.len() && prior[j]==id;
+                assert(ids[j]==ids[i] && j<i);
+            }
+        }
+        assert(ids[i]==id && ids.contains(id));
+        assert(crate::indexed_frame::sent(rows[i],states[i],states[i+1],decode,accept));
+        let (r,p) = choose|r:crate::ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((id,loc),Ok((r,p))) &&
+            accept.ensures((states[i],id,loc,r,p),Ok(states[i+1]));
+        extend_wave(initial,prior.to_set(),states[i].0@,states[i].1@,id,r);
+        assert(rows.take(i+1).map(|_,r:ReadRow|r.0) =~= prior.push(id));
+        prior.push(id).to_set_ensures();
+        assert forall|k:crate::ObjectId| prior.push(id).to_set().contains(k) == prior.to_set().insert(id).contains(k) by {
+            vstd::seq_lib::lemma_seq_contains_after_push(prior,id,k);
+        }
+        assert(prior.push(id).to_set() =~= prior.to_set().insert(id));
+    }
+
+}
+
+fn read_wave<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>>(
+    initial:PreloadTable,rows:&[ReadRow],decode:D) -> (out:Result<WaveState,()>)
     requires initial@.dom().disjoint(crate::journal_preload::selected(rows@)),
         rows@.map(|_,row:ReadRow|row.0).no_duplicates(),btree_map_inv(&initial),obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
         forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
     ensures out matches Ok((t,n)) ==> btree_map_inv(&t) && vstd::std_specs::btree::btree_set_inv(&n) &&
         crate::journal_preload::wave(initial@,crate::journal_preload::selected(rows@),t@,n@),
 {
-    use crate::journal_preload::{accept,wave,selected};
-    let mut table = initial;
-    let mut next = PendingIds::new();
-    let mut n = 0usize;
-    assert(selected(rows@.take(0)) =~= Set::empty());
-    assert(next@ =~= Set::empty());
-    assert(initial@.dom().union(Set::empty()) =~= table@.dom());
-    assert(initial@.submap_of(table@));
-    assert(wave(initial@,Set::empty(),table@,Set::empty()));
-    while n < rows.len()
-        invariant n <= rows.len(), btree_map_inv(&table), vstd::std_specs::btree::btree_set_inv(&next),
-            obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
-            forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
-            rows@.map(|_,row:ReadRow|row.0).no_duplicates(),initial@.dom().disjoint(selected(rows@)),
-            wave(initial@,selected(rows@.take(n as int)),table@,next@),
-        decreases rows.len()-n,
+    let start = (initial,PendingIds::new());
+    assert(start.1@ =~= Set::empty());
+    let accept = |s:WaveState,id:crate::ObjectId,_loc:crate::ArenaLocation,r:crate::ObjectRecord,_p:&'a [u8]| -> (out:Result<WaveState,()>)
+        requires btree_map_inv(&s.0),vstd::std_specs::btree::btree_set_inv(&s.1),
+        ensures out matches Ok(t) && installed(s,id,r,t),
     {
-        let (id,loc) = rows[n];
-        proof {
-            let ids = rows@.map(|_,row:ReadRow|row.0);
-            let prior = rows@.take(n as int).map(|_,row:ReadRow|row.0);
-            ids.to_set_ensures();
-            prior.to_set_ensures();
-            assert(ids[n as int] == id && ids.contains(id));
-            assert(!prior.contains(id)) by {
-                if prior.contains(id) {
-                    let j = choose|j:int| 0 <= j < prior.len() && prior[j]==id;
-                    assert(ids[j]==id && j<n);
-                }
-            }
-            assert(!table@.contains_key(id));
+        let (mut table,mut next) = s;
+        crate::journal_preload::accept(&mut table,&mut next,id,r);
+        Ok((table,next))
+    };
+    assert forall|i:int,states:Seq<WaveState>,r:crate::ObjectRecord,p:&'a [u8]| 0 <= i < rows.len() &&
+        states.first()==start && #[trigger] crate::indexed_frame::delivered(rows@.take(i),states,decode,accept) &&
+        #[trigger] decode.ensures((rows@[i].0,rows@[i].1),Ok((r,p))) implies
+        accept.requires((states.last(),rows@[i].0,rows@[i].1,r,p)) by {
+        let prefix = rows@.take(i);
+        let ids = rows@.map(|_,r:ReadRow|r.0);
+        let keys = prefix.map(|_,r:ReadRow|r.0);
+        assert(keys =~= ids.take(i));
+        ids.to_set_ensures();
+        keys.to_set_ensures();
+        assert forall|k:crate::ObjectId| keys.contains(k) implies ids.contains(k) by {
+            let j = choose|j:int| 0 <= j < keys.len() && keys[j]==k;
+            assert(ids[j]==k);
         }
-        let Some(r) = decode(id,loc) else {return Err(());};
-        proof { extend_wave(initial@,selected(rows@.take(n as int)),table@,next@,id,r); }
-        accept(&mut table,&mut next,id,r);
-        proof {
-            let keys = rows@.take(n as int).map(|_,row:ReadRow|row.0);
-            assert(rows@.take(n as int+1).map(|_,row:ReadRow|row.0) =~= keys.push(id));
-            keys.push(id).to_set_ensures();
-            keys.to_set_ensures();
-            assert forall|k:crate::ObjectId| keys.push(id).to_set().contains(k) == keys.to_set().insert(id).contains(k) by {
-                vstd::seq_lib::lemma_seq_contains_after_push(keys,id,k);
-            }
-            assert(keys.push(id).to_set() =~= keys.to_set().insert(id));
-        }
-        n = n.saturating_add(1);
+        delivery_wave(prefix,states,decode,accept,i);
     }
-    assert(rows@.take(n as int) =~= rows@);
-    Ok((table,next))
+    let out = crate::indexed_frame::deliver(rows,start,decode,accept);
+    if let Ok(t) = &out { proof {
+        let states = choose|states:Seq<WaveState>| #[trigger] crate::indexed_frame::delivered(rows@,states,decode,accept) &&
+            states.first()==start && states.last()==*t;
+        delivery_wave(rows@,states,decode,accept,rows.len() as int);
+        assert(rows@.take(rows.len() as int) =~= rows@);
+    }}
+    out
 }
 
-fn preload_closure<D:Fn(crate::ObjectId,crate::ArenaLocation)->Option<crate::ObjectRecord>+Copy>(
+fn preload_closure<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>+Copy>(
     index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,roots:PendingIds,decode:D)
     requires btree_map_inv(index),vstd::std_specs::btree::btree_set_inv(&roots),
         obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
