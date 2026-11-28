@@ -46,20 +46,7 @@ impl Projection {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Head {
-    Checkpoint {
-        tree: Option<ObjectId>,
-        totals: NodeTotals,
-    },
-    Delta {
-        previous: Option<ObjectId>,
-        depth: u64,
-        delta_bytes: u64,
-        mutations: Vec<Mutation>,
-        totals: NodeTotals,
-    },
-}
+pub(super) use super::delta_chain::Head;
 
 pub(super) fn checkpoint_record(
     tree: Option<ObjectId>,

@@ -55,6 +55,7 @@ mod context;
 mod delta;
 use crate::storage_model::reference_lookup;
 mod delta_batch;
+mod delta_chain;
 mod delta_header;
 mod delta_mutation;
 mod delta_recovery;

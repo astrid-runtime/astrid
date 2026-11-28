@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, PrincipalProjectionError};
@@ -8,7 +8,7 @@ use crate::storage_model::{
 };
 use parking_lot::Mutex;
 
-use super::delta::{Head, Mutation, Projection, decode_head};
+use super::delta::{Mutation, Projection, decode_head};
 use super::memo::MemoSnapshot;
 use super::node::NodeTotals;
 use super::overlay::OverlayMap;
@@ -343,33 +343,18 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
+    use super::delta_chain::{self, Step};
     let validated_trees = &validation_cache.trees;
-    let mut deltas = Vec::<(ObjectId, u64, u64, Vec<Mutation>, NodeTotals)>::new();
-    let mut cursor = Some(head_id);
-    let mut visited = BTreeSet::new();
-    let (tree, checkpoint_totals) = loop {
-        let object = cursor.ok_or_else(|| invalid(head_id, "KV delta chain has no checkpoint"))?;
-        if !visited.insert(object) {
-            return Err(invalid(object, "KV delta chain contains a cycle"));
-        }
-        let record = load_typed(engine, owner, object, ObjectKind::NamespaceMap)?;
-        match decode_head(object, &record)? {
-            Head::Checkpoint { tree, totals } => break (tree, totals),
-            Head::Delta {
-                previous,
-                depth,
-                delta_bytes,
-                mutations,
-                totals,
-            } => {
-                deltas.push((object, depth, delta_bytes, mutations, totals));
-                cursor = previous;
-                if cursor.is_none() {
-                    break (None, NodeTotals::default());
-                }
-            },
-        }
-    };
+    let chain = delta_chain::walk(owner, head_id, |principal, object| {
+        let record = load_typed(engine, principal, object, ObjectKind::NamespaceMap)?;
+        decode_head(object, &record)
+    })
+    .map_err(|error| match error {
+        delta_chain::Error::Cycle(id) => invalid(id, "KV delta chain contains a cycle"),
+        delta_chain::Error::Source(e) => e,
+    })?;
+    let tree = chain.tree;
+    let checkpoint_totals = chain.totals;
     let cached = validated_trees
         .lock()
         .get(owner)
@@ -394,7 +379,14 @@ where
     let mut totals = checkpoint_totals;
     let mut prior_depth = 0_u64;
     let mut prior_delta_bytes = 0_u64;
-    for (object, depth, delta_bytes, mutations, declared) in deltas.into_iter().rev() {
+    for Step {
+        object,
+        depth,
+        delta_bytes,
+        mutations,
+        totals: declared,
+    } in chain.newest_first.into_iter().rev()
+    {
         use super::delta_recovery::{self, CounterError};
         delta_recovery::counters(
             prior_depth,

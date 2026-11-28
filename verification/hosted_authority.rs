@@ -350,6 +350,9 @@ mod spill_record;
 mod hosted_spill_record;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_batch.rs"]
 mod delta_batch;
+#[path = "../crates/astrid-storage/src/kv/tree/delta_chain.rs"]
+mod delta_chain;
+mod hosted_delta_chain;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_header.rs"]
 mod delta_header;
 mod hosted_delta_mutation;

@@ -195,6 +195,19 @@ def consumer_defects():
             f"addressed replay loses {label}", path,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
         )
+    chain = Path("crates/astrid-storage/src/kv/tree/delta_chain.rs")
+    for label, clause, weaker in [
+        ("checkpoint endpoint", "&&\n            read.ensures((owner,id),Ok(Head::Checkpoint {tree:c.tree,totals:c.totals}))", ""),
+        ("genesis totals", "c.tree.is_none() && zero(c.totals)", "c.tree.is_none()"),
+        ("head origin", "if steps.len() == 0 {next == Some(head)}", "if steps.len() == 0 {true}"),
+        ("source failure", "&& read.ensures((owner,id),Err(cause))", ""),
+        ("cycle address", "k == id && ids(steps).contains(id)", "ids(steps).contains(id)"),
+        ("complete linked path", "follows(owner,head,c.newest_first@,end,read) && match end", "true && match end"),
+    ]:
+        yield (
+            f"delta chain loses {label}", chain,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_chain.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),
