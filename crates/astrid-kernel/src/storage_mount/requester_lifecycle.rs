@@ -207,9 +207,8 @@ mod tests {
     #[tokio::test]
     async fn retirement_closes_prepared_publication_and_preserves_other_requesters() {
         let dir = tempfile::tempdir().unwrap();
-        let kernel =
-            crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(dir.path()))
-                .await;
+        let home = astrid_core::dirs::AstridHome::from_path(dir.path().join(".astrid"));
+        let kernel = crate::test_kernel_with_home(home).await;
         let original = PrincipalId::default();
         let uid = kernel.principal_directory.uid_for(&original).unwrap();
         let renamed = PrincipalId::new("renamed").unwrap();
