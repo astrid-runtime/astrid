@@ -315,6 +315,8 @@ def marker_batch_consumers():
          "==> (#[trigger] encoding::matches_prefix(k,ns@ + seq![0u8]) || true)", replay),
         ("root membership", walk, "(table.deep_view().get(k) == Some(true)) == (root matches Some(id) && h(Page::Root(id)))",
          "(table.deep_view().get(k) == Some(true)) ==> (root matches Some(id) && h(Page::Root(id)))", replay),
+        ("reopened consumption", replay, "single_use && marker_in_snapshot(Marker::Consumed,target,used_id,used_read,crate::traversal::deref_option(used_overlay)) ==> !(decision is Allowed)",
+         "true", replay),
         ("reopened revocation", replay, "marker_in_snapshot(Marker::Revoked,target,rev_id,rev_read,crate::traversal::deref_option(rev_overlay)) ==> decision is Revoked",
          "true", replay),
     ]:
@@ -326,8 +328,8 @@ def marker_batch_consumers():
     for label, clause, weaker in [
         ("earlier namespace", "marker_batch::has(old(groups)@,target,m) ||", "false ||"),
         ("canonical row", "(kind == m && listed(rows@,target)) ==>", "false ==>"),
-        ("rejected row address", "0 <= i < rows.len() && #[trigger] rows@[i]@ == k@ &&",
-         "0 <= i < rows.len() && #[trigger] rows@[i]@.len() >= 0 &&"),
+        ("rejected row address", "exists|i:int,k:&[u8]| 0 <= i < rows.len() && #[trigger] rows@[i]@ == k@ &&",
+         "exists|i:int,k:&[u8]| 0 <= i < rows.len() && #[trigger] rows@[i]@.len() >= 0 &&"),
     ]:
         yield (
             f"mixed marker recovery loses {label}", mixed,

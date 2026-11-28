@@ -510,12 +510,12 @@ fn reopen_from_pages<I,T,V,E,R,C,F>(rev_id:Option<I>,used_id:Option<I>,rev_read:
 
 /// Instantiate the page evidence for an actual decoded leaf and recover its
 /// marker with the full walker, merger and store replay.
-fn checkpoint_revocation(target:Id) -> (out:Result<Admission,RecoveryError<()>>)
+fn checkpoint_marker_decision(target:Id,kind:Marker) -> (out:Result<Admission,RecoveryError<()>>)
     requires vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
         obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),
-    ensures out matches Ok(decision) && decision is Revoked,
+    ensures out matches Ok(decision) && !(decision is Allowed) && (kind is Revoked ==> decision is Revoked),
 {
-    let ns = Marker::Revoked.namespace().as_bytes();
+    let ns = kind.namespace().as_bytes();
     let text = marker_key::encode(&target);
     let address = crate::encoding::composite(ns,&text);
     let end = crate::encoding::prefix_end(ns,&[]);
@@ -539,9 +539,12 @@ fn checkpoint_revocation(target:Id) -> (out:Result<Admission,RecoveryError<()>>)
         }
         assert(page_membership(read,h,ns@,text@));
         assert(marker_visible(Some(1u64),h,None,address@));
-        assert(marker_in_snapshot(Marker::Revoked,target,Some(1u64),read,None));
+        assert(marker_in_snapshot(kind,target,Some(1u64),read,None));
     }
-    reopen_from_pages(Some(1u64),None,read,empty,None,None,target,true,legacy)
+    match kind {
+        Marker::Revoked => reopen_from_pages(Some(1u64),None,read,empty,None,None,target,true,legacy),
+        Marker::Consumed => reopen_from_pages(None,Some(1u64),empty,read,None,None,target,true,legacy),
+    }
 }
 
 /// If a canceled CAS installed its marker, the next attempt reads that entry
