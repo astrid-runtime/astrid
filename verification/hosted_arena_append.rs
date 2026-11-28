@@ -283,6 +283,41 @@ fn read_leaf<H:Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]
     record::confirmed(p,scheme,id,identify).ok()
 }
 
+/// The native preload loop exits on an empty batch. Every pending object
+/// must then already be resident. Every nonempty batch selects only the
+/// indexed locations for unresolved members of this exact frontier.
+fn preload_wave(frontier:&std::collections::BTreeSet<crate::ObjectId>,
+    loaded:&std::collections::BTreeMap<crate::ObjectId,crate::ObjectRecord>,
+    index:&std::collections::BTreeMap<crate::ObjectId,frame::ArenaLocation>)
+    requires vstd::std_specs::btree::btree_set_inv(frontier), vstd::std_specs::btree::btree_map_inv(loaded),
+        vstd::std_specs::btree::btree_map_inv(index), vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),
+        vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+{
+    match crate::journal_preload::requests(frontier,loaded,index) {
+        Ok(rows) => {
+            let ghost ids = rows@.map(|_,row:(crate::ObjectId,frame::ArenaLocation)| row.0);
+            proof {
+                ids.to_set_ensures();
+                assert(ids.to_set() =~= frontier@.difference(loaded@.dom()));
+                if rows.len() == 0 {
+                    assert(ids.len() == 0);
+                    assert forall|k:crate::ObjectId| frontier@.contains(k) implies loaded@.contains_key(k) by {
+                        if !loaded@.contains_key(k) {
+                            assert(ids.to_set().contains(k));
+                            assert(ids.contains(k));
+                        }
+                    }
+                }
+                assert forall|i:int| 0 <= i < rows.len() implies
+                    index@.contains_key(#[trigger] rows@[i].0) && index@[rows@[i].0] == rows@[i].1 by {};
+            }
+        },
+        Err(missing) => {
+            assert(frontier@.contains(missing) && !loaded@.contains_key(missing) && !index@.contains_key(missing));
+        },
+    }
+}
+
 /// Deliver an interior indexed frame to recovery and follow only owning
 /// references of the exact record whose digest was checked against the index.
 fn indexed_preload<H:FnOnce([u8;8],u64,&[u8])->[u8;32],I:FnOnce(&crate::ObjectRecord)->[u8;32]>(

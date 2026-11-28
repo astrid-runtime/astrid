@@ -114,17 +114,9 @@ pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
     let mut loaded = BTreeMap::new();
     let mut frontier = roots.into_iter().collect::<BTreeSet<_>>();
     while !frontier.is_empty() {
-        let mut requested = Vec::new();
-        for id in frontier {
-            if loaded.contains_key(&id) {
-                continue;
-            }
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
-            requested.push((id, location));
-        }
+        let requested = super::journal_preload::requests(&frontier, &loaded, index)
+            .map_err(ModelError::MissingObject)?;
+        drop(frontier);
         if requested.is_empty() {
             break;
         }

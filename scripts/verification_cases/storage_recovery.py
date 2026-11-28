@@ -36,6 +36,19 @@ def consumer_defects():
         )
     reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
+    for label, clause, weaker in [
+        ("frontier coverage", "frontier@.difference(loaded@.dom()) &&", "rows@.map(|_, row:(ObjectId,ArenaLocation)| row.0).to_set() &&"),
+        ("indexed membership", "index@.contains_key(#[trigger] rows@[i].0) &&", "#[trigger] rows@[i].0 == rows@[i].0 &&"),
+        ("physical location", "index@[rows@[i].0] == rows@[i].1", "true"),
+        ("missing frontier member", "Err(id) => frontier@.contains(id) &&", "Err(id) => true &&"),
+        ("unloaded missing object", "!loaded@.contains_key(id) && !index@.contains_key(id)", "!index@.contains_key(id)"),
+        ("absent index entry", "!loaded@.contains_key(id) && !index@.contains_key(id)", "!loaded@.contains_key(id)"),
+    ]:
+        yield (
+            f"preload wave loses {label}", preload,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs"),
+        )
     for label, source, clause, weaker in [
         ("physical bounds", reader, "(out matches Err(Error::Bounds)) == !fits", "(out matches Err(Error::Bounds)) ==> !fits"),
         ("returned bytes", reader, "p@ == body && loc.payload_len", "true && loc.payload_len"),
