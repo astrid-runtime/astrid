@@ -345,8 +345,9 @@ fn fold_token_group<A:crate::arena_frame::BatchFile,Identify,Encoder,Decoder,E,S
             &&& final(arena).image().take(old(arena).image().len() as int)==old(arena).image()
             &&& fold.location.offset>=old(arena).image().len() && at+fold.location.payload_len<=final(arena).image().len()
             &&& final(arena).image().subrange(at+8,at+40)==fold.id.digest()
+            &&& g.retained(state_refs@,commit_refs@)
             &&& principal@==owner.bytes() && g.component==fold.id
-            &&& (exists|v:crate::ObjectFormatVersion| v.number()==4 && #[trigger] g.links(principal,expected,record,v))
+            &&& (exists|v:crate::ObjectFormatVersion| v.number()==crate::header_graph::CURRENT_VERSION && #[trigger] g.links(principal,expected,record,v))
             &&& (if pending@.contains_key(principal) {Some(pending@[principal])} else {published@.get(principal)})==expected
             &&& forall|id:ObjectId| g.records@.contains_key(id) ==> #[trigger] identify.ensures((&g.records@[id],),id)
             &&& record.contents().2==crate::hosted_journal_history::component_bytes(final(arena).image(),fold.location)
@@ -375,7 +376,7 @@ fn fold_token_group<A:crate::arena_frame::BatchFile,Identify,Encoder,Decoder,E,S
     }
     let (record,_)=crate::hosted_delta_mutation::written_marker(key,previous,depth,used,totals);
     let graph=match crate::hosted_kv_root_publication::prepare(owner.encode(),expected,record,state_refs,commit_refs,
-        crate::ObjectFormatVersion::new(4).unwrap(),identify,pending,published) {
+        crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap(),identify,pending,published) {
         Ok(g)=>g,Err(e)=>return Err(FoldError::Publication(e)),
     };
     let replacement=graph.selected.replacement();

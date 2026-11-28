@@ -112,3 +112,16 @@ def consumer_defects():
             f"selected marker publication loses {label}", publication,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), group,
         )
+
+    # Removing a producer guarantee must fail in its consuming theorem.
+    yield (
+        "selected marker publication loses retained lineage", publication,
+        lambda s: replace_once(s, "&& g.retained(state_refs@,commit_refs@) &&", "&& true &&"),
+        group,
+    )
+    yield (
+        "selected marker publication loses recovered closure",
+        Path("crates/astrid-storage/src/engine/durable/closure_load.rs"),
+        lambda s: replace_once(s, "&&& walk::closed(root,Set::empty(),graph,ids)", "&&& true"),
+        publication,
+    )

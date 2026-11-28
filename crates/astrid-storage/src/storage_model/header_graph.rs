@@ -9,6 +9,8 @@ use std::sync::Arc;
 use vstd::prelude::*;
 
 verus! {
+
+pub(crate) const CURRENT_VERSION:u16=4;
 pub(crate) const STATE: &[u8;5] = b"state";
 pub(crate) const KV: &[u8;2] = b"kv";
 

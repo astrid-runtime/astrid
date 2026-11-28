@@ -139,7 +139,7 @@ fn mixed_batch(object:ObjectId,trailing:bool,deny_second:bool) -> (out:Result<Ve
     let header = crate::delta_header::Header {depth:1,delta_bytes:2055,entries:2,quota_bytes:2055,count:2};
     let rows=vec![first,second];
     let totals=crate::checkpoint_totals::NodeTotals{entries:2,logical_bytes:2049,quota_bytes:2055};
-    let version=crate::ObjectFormatVersion::new(4).unwrap();
+    let version=crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap();
     proof {
         reveal_with_fuel(batch::usage,3);
         reveal_with_fuel(crate::encoding::below,5);
@@ -323,7 +323,7 @@ pub(super) fn written_marker(key:Vec<u8>,previous:Option<ObjectId>,prior_depth:u
     let charge=(width as u64).saturating_add(1);
 
     let rows=vec![Mutation{key,value:Some(ValueSlot::Inline(vec![crate::token_authority::PRESENCE_MARKER[0]]))}];
-    let version=crate::ObjectFormatVersion::new(4).unwrap();
+    let version=crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap();
     proof {
         reveal_with_fuel(batch::usage,2);
         assert(batch::usage(rows@,1)==(charge as nat,0nat));
@@ -464,14 +464,14 @@ fn recover_tombstone(previous:Option<ObjectId>,logical:u64,entries:u64,quota:u64
     assert(ok.is_ok());
     let ghost wire = bytes@;
     let ghost links = refs@;
-    let record = ObjectRecord::from_fields(crate::ObjectKind::NamespaceMap,crate::ObjectFormatVersion::new(4).unwrap(),
+    let record = ObjectRecord::from_fields(crate::ObjectKind::NamespaceMap,crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap(),
         bytes,refs,logical,crate::ObjectClass::Metadata).unwrap();
     let validate = |_k:&[u8]| -> (e:Option<u8>) ensures e == if deny {Some(7u8)} else {None} {
         if deny {Some(7u8)} else {None}
     };
     let got = if via_envelope {
         use crate::{delta_chain::Head,projection_record};
-        match projection_record::decode(&record,crate::ObjectFormatVersion::new(4).unwrap(),&[],validate) {
+        match projection_record::decode(&record,crate::ObjectFormatVersion::new(crate::header_graph::CURRENT_VERSION).unwrap(),&[],validate) {
             Ok(Head::Delta {previous,depth,delta_bytes,mutations,totals}) =>
                 Ok(recovery::Recovered {previous,depth,delta_bytes,rows:mutations,totals}),
             Err(projection_record::Error::Delta(e)) => Err(e),

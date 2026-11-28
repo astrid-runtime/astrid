@@ -17,24 +17,20 @@ fn label(bytes:&[u8]) -> (out:ReferenceLabel)
     ReferenceLabel::new(owned)
 }
 
+fn sorted_metadata(refs:Vec<ObjectReference>,kind:ObjectKind,v:ObjectFormatVersion) -> (out:Option<ObjectRecord>)
+    ensures out.is_none()==!ObjectRecord::labels_ordered(refs@),
+        out matches Some(r) ==> header_graph::structural(r,kind,v) && r.contents().3==refs@,
+{
+    ObjectRecord::from_fields(kind,v,Vec::new(),refs,0,ObjectClass::Metadata)
+}
+
 fn metadata(mut refs:Vec<ObjectReference>,kind:ObjectKind,v:ObjectFormatVersion) -> (out:Option<ObjectRecord>)
     requires vstd::laws_cmp::obeys_cmp::<ObjectReference>(),
     ensures out matches Some(r) ==> header_graph::structural(r,kind,v) &&
         ObjectRecord::labels_ordered(r.contents().3) && r.contents().3.to_multiset()==refs@.to_multiset(),
-        out.is_none() ==> exists|sorted:Seq<ObjectReference>| sorted.to_multiset()==refs@.to_multiset() &&
-            !ObjectRecord::labels_ordered(sorted),
 {
-    let ghost original=refs@;
     refs.as_mut_slice().sort();
-    let ghost sorted=refs@;
-    let out=ObjectRecord::from_fields(kind,v,Vec::new(),refs,0,ObjectClass::Metadata);
-    proof {
-        if out.is_none() {
-            assert(exists|rows:Seq<ObjectReference>| rows.to_multiset()==original.to_multiset() &&
-                !ObjectRecord::labels_ordered(rows)) by {assert(!ObjectRecord::labels_ordered(sorted));}
-        }
-    }
-    out
+    sorted_metadata(refs,kind,v)
 }
 
 proof fn selected(refs:Seq<ObjectReference>,edge:ObjectReference)
