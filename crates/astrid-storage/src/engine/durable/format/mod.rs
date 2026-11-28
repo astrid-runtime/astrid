@@ -25,6 +25,8 @@ thread_local! {
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+mod duplicates;
+pub(in crate::engine::durable) use duplicates::duplicate_range;
 mod framed_append;
 mod indexed;
 mod location;

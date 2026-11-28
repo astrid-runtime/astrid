@@ -170,3 +170,132 @@ fn borrowed_snapshot_preserves_canonical_wire_and_complete_locations() {
     assert_eq!(recovered.arena_len, state.arena_len);
     validate_state(&recovered, 0).unwrap();
 }
+
+#[test]
+fn recovery_requires_the_cache_to_cover_every_physical_frame() {
+    use super::super::recover_arena;
+    use super::super::tests::{TEST_IDENTITY_SCHEME, TestIdentity, open, transaction};
+
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"checkpoint coverage");
+    engine.commit(transaction).unwrap();
+    engine.flush().unwrap();
+    drop(engine);
+
+    let mut arena = File::native(std::fs::File::open(directory.path().join(ARENA_FILE)).unwrap());
+    let length = arena.seek(SeekFrom::End(0)).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let (objects, arena_tail) = recover_arena(&mut arena, &TestIdentity, limits, length).unwrap();
+    assert_eq!(objects.len(), 2);
+
+    for delta in [false, true] {
+        for omitted in std::iter::once(None).chain(objects.keys().copied().map(Some)) {
+            let mut state = IndexState {
+                arena_len: length,
+                arena_tail,
+                objects: objects.clone(),
+            };
+            if let Some(id) = omitted {
+                state.objects.remove(&id);
+            }
+            let cache = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(directory.path().join(INDEX_FILE))
+                .unwrap();
+            let mut cache = File::native(cache);
+            if delta {
+                Snapshot::new(&empty(), TEST_IDENTITY_SCHEME)
+                    .unwrap()
+                    .append(&mut cache)
+                    .unwrap();
+                let additions = state
+                    .objects
+                    .iter()
+                    .map(|(id, at)| (*id, *at))
+                    .collect::<Vec<_>>();
+                append_index_delta(
+                    &mut cache,
+                    &IndexDelta {
+                        previous_arena_len: 0,
+                        arena_len: length,
+                        arena_tail: arena_tail.unwrap(),
+                        objects: &additions,
+                    },
+                    TEST_IDENTITY_SCHEME,
+                )
+                .unwrap();
+            } else {
+                Snapshot::new(&state, TEST_IDENTITY_SCHEME)
+                    .unwrap()
+                    .append(&mut cache)
+                    .unwrap();
+            }
+            let admitted =
+                recover_index(&mut cache, &mut arena, TEST_IDENTITY_SCHEME, limits, length);
+            assert_eq!(admitted.is_some(), omitted.is_none());
+            drop(cache);
+            super::super::format::reset_recovery_arena_scans();
+            let reopened = open(directory.path());
+            assert_eq!(
+                super::super::format::recovery_arena_scans(),
+                usize::from(omitted.is_some())
+            );
+            for id in objects.keys() {
+                assert!(reopened.object(*id).unwrap().is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_range_requires_an_earlier_byte_identical_frame() {
+    use super::super::{ARENA_MAGIC, format::duplicate_range};
+
+    let mut arena = File::native(tempfile::tempfile().unwrap());
+    let id = identity(1);
+    let mut payload = Vec::new();
+    encode_identity(&mut payload, scheme(), id);
+    payload.push(1);
+    let first = append_frame(&mut arena, ARENA_MAGIC, &payload).unwrap();
+    let copy = append_frame(&mut arena, ARENA_MAGIC, &payload).unwrap();
+    *payload.last_mut().unwrap() = 2;
+    let conflict = append_frame(&mut arena, ARENA_MAGIC, &payload).unwrap();
+    let end = arena.seek(SeekFrom::End(0)).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let index = BTreeMap::from([(id, first)]);
+    assert!(duplicate_range(
+        &mut arena,
+        &index,
+        scheme(),
+        limits,
+        copy.offset,
+        conflict.offset
+    ));
+    assert!(!duplicate_range(
+        &mut arena,
+        &index,
+        scheme(),
+        limits,
+        copy.offset,
+        conflict.offset - 1
+    ));
+    assert!(!duplicate_range(
+        &mut arena,
+        &index,
+        scheme(),
+        limits,
+        conflict.offset,
+        end
+    ));
+    assert!(!duplicate_range(
+        &mut arena,
+        &BTreeMap::from([(id, copy)]),
+        scheme(),
+        limits,
+        first.offset,
+        copy.offset
+    ));
+}

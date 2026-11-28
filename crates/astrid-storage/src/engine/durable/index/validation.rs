@@ -45,7 +45,7 @@ pub(super) fn validate_tail(
     }
 }
 
-fn location_end(location: &ArenaLocation) -> Result<u64, DurableError> {
+pub(super) fn location_end(location: &ArenaLocation) -> Result<u64, DurableError> {
     location
         .offset
         .checked_add(FRAME_HEADER_LEN)

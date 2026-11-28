@@ -324,3 +324,51 @@ fn live_empty_cache_root_publication_fault_preserves_acknowledged_state() {
         recovered.close().unwrap();
     }
 }
+
+#[test]
+fn rebuilt_checkpoint_reuses_identical_arena_copies_on_restart() {
+    use super::super::format::{recovery_arena_scans, reset_recovery_arena_scans};
+    use std::io::{Read, Seek, Write};
+
+    for volume_backed in [false, true] {
+        let fixture = Fixture::new(volume_backed);
+        let faults = Arc::new(TripPublication::default());
+        let engine = fixture.open(Arc::clone(&faults));
+        let (_, transaction) = transaction("alice", None, b"repeated physical records");
+        let root = engine.commit(transaction).unwrap().root();
+        engine.flush().unwrap();
+        drop(engine);
+
+        let mut file = match &fixture.volume {
+            Some(volume) => File::volume(volume.clone(), ARENA_FILE, false).unwrap(),
+            None => File::native(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(fixture.directory.path().join(ARENA_FILE))
+                    .unwrap(),
+            ),
+        };
+        let mut originals = Vec::new();
+        file.read_to_end(&mut originals).unwrap();
+        let first_len = u64::from_le_bytes(originals[12..20].try_into().unwrap());
+        let split = usize::try_from(FRAME_HEADER_LEN.checked_add(first_len).unwrap()).unwrap();
+        let (first, second) = originals.split_at(split);
+        // A duplicate between indexed rows and another after the last indexed row.
+        file.rewind().unwrap();
+        for frame in [first, first, second, second] {
+            file.write_all(frame).unwrap();
+        }
+        file.flush().unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        for scans in [1, 0, 0] {
+            reset_recovery_arena_scans();
+            let reopened = fixture.open(Arc::clone(&faults));
+            assert_eq!(recovery_arena_scans(), scans);
+            assert_eq!(reopened.object_count().unwrap(), 2);
+            assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(root));
+        }
+    }
+}
