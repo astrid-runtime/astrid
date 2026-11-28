@@ -306,6 +306,17 @@ def live_token_consumers():
 
 
 def marker_batch_consumers():
+    for label, path, clause, weaker in [
+        ("canonical encoding", "crates/astrid-capabilities/src/store/marker_key.rs", "ensures a == b,", "ensures true,"),
+        ("physical source", "verification/hosted_key_projection.rs",
+         "keys.deep_view().get(namespace@ + seq![0u8] + #[trigger] logical@[i]@) == Some(true)",
+         "#[trigger] logical@[i]@.len() >= 0"),
+    ]:
+        yield (
+            f"marker image recovery loses {label}", Path(path),
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_token_recovery.rs"),
+        )
     for label, clause, weaker in [
         ("complete enumeration", "Ok(()) => ids.len() == keys.len()", "Ok(()) => ids.len() <= keys.len()"),
         ("decoded identity", "&& decoded(keys@,ids,decode) && match out", "&& match out"),

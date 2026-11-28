@@ -274,19 +274,20 @@ fn hot_point(owner:u64,requester:u64,recorded:Option<crate::RootState>,published
 
 /// Combine both lifecycle observations with the lookup used by the live
 /// ArcSwap reader. A successful nonempty sample observes the selected slot.
-fn published_sample<P:Ord,S,F:Fn(&S)->crate::RootState>(slots:&std::collections::BTreeMap<P,S>,owner:&P,
+fn published_sample<P:Ord,S,F:Fn(&S)->crate::RootState>(snapshot:Option<&std::collections::BTreeMap<P,S>>,owner:&P,
     before:bool,after:bool,observe:F) -> (out:Option<crate::ready_root::ReadyKvRoot>)
-    requires vstd::std_specs::btree::btree_map_inv(slots),
+    requires snapshot matches Some(slots) ==> vstd::std_specs::btree::btree_map_inv(slots),
         vstd::laws_cmp::obeys_cmp::<P>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
         forall|s:&S| #[trigger] observe.requires((s,)),
-    ensures out.is_some() == (before && after),
-        out matches Some(sample) ==> sample.sampled().is_some() == slots@.contains_key(*owner) &&
-            (sample.sampled() matches Some(root) ==> observe.ensures((&slots@[*owner],),root)),
+    ensures out.is_some() == (before && after && snapshot.is_some()),
+        out matches Some(sample) ==> sample.sampled().is_some() == snapshot.unwrap()@.contains_key(*owner) &&
+            (sample.sampled() matches Some(root) ==> observe.ensures((&snapshot.unwrap()@[*owner],),root)),
 {
     let load = |p:&P| -> (r:Option<crate::ready_root::ReadyKvRoot>)
-        ensures r matches Some(sample) && sample.sampled().is_some() == slots@.contains_key(*p) &&
-            (sample.sampled() matches Some(root) ==> observe.ensures((&slots@[*p],),root)),
+        ensures r.is_some() == snapshot.is_some(), r matches Some(sample) ==> sample.sampled().is_some() == snapshot.unwrap()@.contains_key(*p) &&
+            (sample.sampled() matches Some(root) ==> observe.ensures((&snapshot.unwrap()@[*p],),root)),
     {
+        let slots = snapshot?;
         Some(crate::ready_root::ReadyKvRoot::new(crate::root_transition::sample(slots,p,|slot:&S| -> (root:crate::RootState)
             ensures observe.ensures((slot,),root), {observe(slot)})))
     };
@@ -333,7 +334,7 @@ fn installed_sample<P:Ord,S,F:Fn(&S)->crate::RootState+Copy>(roots:&std::collect
     let write = |candidate:std::collections::BTreeMap<P,S>| -> (selected:std::collections::BTreeMap<P,S>)
         ensures selected == candidate, {candidate};
     let Some(selected) = crate::journal_closure::install(roots,slots,read,write) else {return Err(());};
-    let sample = published_sample(&selected,owner,true,true,read).unwrap().get();
+    let sample = published_sample(Some(&selected),owner,true,true,read).unwrap().get();
     Ok(sample)
 }
 

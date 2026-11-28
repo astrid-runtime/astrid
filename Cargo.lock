@@ -441,6 +441,7 @@ dependencies = [
  "astrid-core",
  "astrid-crypto",
  "astrid-storage",
+ "async-trait",
  "chrono",
  "globset",
  "serde",

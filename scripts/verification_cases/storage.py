@@ -829,7 +829,7 @@ def hot_point_consumers():
         (root, "entry observation", "Some(root) => before.ensures((),true) &&", "Some(root) =>"),
         (root, "final observation", " && after.ensures((),true),", ","),
         (root, "published root", " && load.ensures((owner,),Some(root))", ""),
-        (root, "readiness refusal", "before.ensures((),false) || after.ensures((),false)", "true"),
+        (root, "readiness refusal", "before.ensures((),false) || after.ensures((),false) || load.ensures((owner,),None)", "true"),
         (cache, "stored bytes", "final(rows).deep_view() == old(rows).deep_view().insert(key@,value.bytes_view())", "final(rows).deep_view().dom() == old(rows).deep_view().dom().insert(key@)"),
         (cache, "other keys", "final(rows).deep_view() == old(rows).deep_view().insert(key@,value.bytes_view())", "final(rows).deep_view().get(key@) == Some(value.bytes_view())"),
         (cache, "selected key bytes", "rows.deep_view().get(key@) == Some(v.bytes_view())", "rows.deep_view().contains_key(key@)"),

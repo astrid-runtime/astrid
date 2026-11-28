@@ -51,6 +51,24 @@ pub(super) closed spec fn spells(id: Seq<u8>, text: Seq<u8>) -> bool {
         forall|i: int| 0 <= i < 16 ==> #[trigger] pair(id,text,i)
 }
 
+/// Every byte of a canonical marker is fixed by its token ID.
+pub(super) proof fn unique_text(id:Seq<u8>,a:Seq<u8>,b:Seq<u8>)
+    requires spells(id,a), spells(id,b),
+    ensures a == b,
+{
+    assert(a =~= b) by {
+        assert forall|j:int| 0 <= j < 36 implies #[trigger] a[j] == b[j] by {
+            if j != 8 && j != 13 && j != 18 && j != 23 {
+                let digits = j - (if j < 8 {0int} else if j < 13 {1} else if j < 18 {2} else if j < 23 {3} else {4});
+                let i = digits / 2;
+                assert(0 <= i < 16);
+                assert(pair(id,a,i) && pair(id,b,i));
+                assert(j == offset(i) || j == offset(i) + 1);
+            }
+        }
+    }
+}
+
 #[allow(clippy::arithmetic_side_effects, reason = "the verifier bounds every fixed-size array index")]
 pub(super) fn encode(id: &[u8; 16]) -> (text: [u8; 36])
     ensures spells(id@, text@),

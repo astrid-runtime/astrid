@@ -783,28 +783,8 @@ async fn revocation_fences_a_validated_token_before_consumption() {
     assert!(!store.is_used(&id).await);
 }
 
-#[tokio::test]
-async fn a_retry_cannot_win_after_a_durable_but_unobserved_consumption() {
-    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
-        .await
-        .unwrap();
-    let token = single_use_token();
-    let id = token.id.clone();
-    store.add(token).await.unwrap();
-
-    // Storage committed the marker, but this instance did not observe the
-    // result before the caller canceled. The live cache still has no entry.
-    kv.set(NS_USED, &id.0.to_string(), PRESENCE_MARKER.to_vec())
-        .await
-        .unwrap();
-    assert!(!store.is_used(&id).await);
-    assert!(matches!(
-        store.use_token(&id).await,
-        Err(CapabilityError::TokenAlreadyUsed { .. })
-    ));
-    assert!(store.is_used(&id).await);
-}
+#[path = "store/canceled_consume_tests.rs"]
+mod canceled_consume;
 
 #[tokio::test]
 async fn operation_binding_mismatch_does_not_consume_the_grant() {

@@ -23,6 +23,7 @@ uuid = { workspace = true }
 vstd = { workspace = true }
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

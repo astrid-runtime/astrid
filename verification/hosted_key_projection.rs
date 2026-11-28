@@ -57,12 +57,14 @@ fn overlay_wins(keys: &mut BTreeMap<Vec<u8>,bool>, original: Vec<u8>, replacemen
 
 /// For a single namespace the projected suffix identifies exactly one
 /// physical address. A false presence flag cannot return its logical key.
-fn namespace_keys(keys: &BTreeMap<Vec<u8>,bool>, namespace: &[u8], target: &[u8]) -> (logical: Vec<Vec<u8>>)
+pub(super) fn namespace_keys(keys: &BTreeMap<Vec<u8>,bool>, namespace: &[u8], target: &[u8]) -> (logical: Vec<Vec<u8>>)
     requires btree_map_inv(keys), obeys_cmp::<Vec<u8>>(), obeys_cmp_deep_eq::<Vec<u8>>(),
         forall|k:Vec<u8>| keys@.get(k) == Some(true) ==>
             #[trigger] encoding::matches_prefix(k@,namespace@ + seq![0u8]),
     ensures (exists|i:int| 0 <= i < logical.len() && #[trigger] logical@[i]@ == target@)
             == (keys.deep_view().get(namespace@ + seq![0u8] + target@) == Some(true)),
+        forall|i:int| 0 <= i < logical.len() ==>
+            keys.deep_view().get(namespace@ + seq![0u8] + #[trigger] logical@[i]@) == Some(true),
 {
     let start = encoding::composite(namespace,&[]);
     let address = encoding::composite(namespace,target);
@@ -87,6 +89,17 @@ fn namespace_keys(keys: &BTreeMap<Vec<u8>,bool>, namespace: &[u8], target: &[u8]
     let ghost seen = choose|seen:Seq<Vec<u8>>| seen.no_duplicates() && seen.len() == out.len()
         && (forall|k:Vec<u8>| #[trigger] seen.contains(k) == (keys@.get(k) == Some(true)))
         && (forall|i:int| 0 <= i < seen.len() ==> #[trigger] project.ensures((&seen[i],),Ok(out@[i])));
+    assert forall|i:int| 0 <= i < out.len() implies
+        keys.deep_view().get(start@ + #[trigger] out@[i]@) == Some(true) by {
+        let k = seen[i];
+        assert(seen.contains(k));
+        assert(keys@.get(k) == Some(true));
+        assert(project.ensures((&k,),Ok(out@[i])));
+        assert(encoding::matches_prefix(k@,start@));
+        assert(k@.take(start.len() as int) =~= start@);
+        assert(k@ =~= start@ + out@[i]@);
+        visible(keys,k@);
+    }
     proof { visible(keys,address@); }
     assert((exists|i:int| 0 <= i < out.len() && #[trigger] out@[i]@ == target@)
         == (keys.deep_view().get(address@) == Some(true))) by {
