@@ -406,7 +406,7 @@ def defects():
         ),
         (
             "byte order reverses strict-prefix ties",
-            KV_ENCODING,
+            Path("crates/astrid-storage/src/byte_order.rs"),
             lambda text: edit_function(text, "bytewise_cmp", "left.len().cmp(&right.len())", "right.len().cmp(&left.len())"),
         ),
         (
@@ -891,6 +891,18 @@ def hot_snapshot_consumers():
 def journal_snapshot_consumers():
     path = Path("crates/astrid-storage/src/engine/durable/journal_snapshot.rs")
     for label, clause, weaker in [
+        ("unknown header tag", "Err(HeaderError::UnknownRecord) => bytes.len() >= 9 && first == SENTINEL && bytes@[8] != RECORD", "Err(HeaderError::UnknownRecord) => true"),
+        ("transition length", "transition && length == first &&", "transition &&"),
+        ("transition cursor", "length == first && *final(cursor) == 8", "length == first"),
+        ("snapshot cursor", "snapshot && n == count && *final(cursor) == 17", "snapshot && n == count"),
+        ("header count", "snapshot && n == count &&", "snapshot &&"),
+        ("scan count", "result matches Ok(v) ==> v.len() == count && exists", "result matches Ok(v) ==> exists"),
+        ("contiguous spans", "ends[i+1] as int == ends[i] as int + row_bytes(rows[i],scheme).len()", "true"),
+        ("scan layout", "result matches Ok(v) && matches_rows(v@,expected)", "result matches Ok(v) ==> matches_rows(v@,expected)"),
+        ("scanned identities", "&& matches_rows(v@,expected) &&", "&&"),
+        ("scan end", "&& *final(cursor) == ends[count as int]),", "),"),
+        ("required order", "valid == ordered(rows@)", "valid ==> ordered(rows@)"),
+        ("invalid order", "valid == ordered(rows@)", "valid <== ordered(rows@)"),
         ("row acceptance", "(out matches Ok(r) && r.0@ == name && journal_history::represents(w,r.1))", "(out matches Ok(r) ==> r.0@ == name && journal_history::represents(w,r.1))"),
         ("parsed owner", "Ok(r) && r.0@ == name &&", "Ok(r) &&"),
         ("parsed root", "r.0@ == name && journal_history::represents(w,r.1)", "r.0@ == name"),

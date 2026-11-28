@@ -19,6 +19,61 @@ pub(super) open spec fn header(count:u64) -> Seq<u8> {
     vstd::bytes::spec_u64_to_le_bytes(SENTINEL) + seq![RECORD] + vstd::bytes::spec_u64_to_le_bytes(count)
 }
 
+pub(super) open spec fn ordered(rows:Seq<Row>) -> bool {
+    forall|i:int| 1 <= i < rows.len() ==> #[trigger] crate::byte_order::below(rows[i-1].0@, rows[i].0@)
+}
+
+/// Check the same strict owner ordering on both sides of the snapshot format.
+pub(super) fn strictly_ordered(rows:&[Row]) -> (valid:bool)
+    ensures valid == ordered(rows@),
+{
+    let mut i = 1usize;
+    while i < rows.len()
+        invariant 1 <= i, forall|j:int| 1 <= j < i ==> #[trigger] crate::byte_order::below(rows@[j-1].0@,rows@[j].0@),
+        decreases rows.len() - i,
+    {
+        if !crate::byte_order::bytewise_less(&rows[i.saturating_sub(1)].0,&rows[i].0) {return false;}
+        i = i.saturating_add(1);
+    }
+    true
+}
+
+pub(super) enum JournalHeader {
+    Transition(u64),
+    Snapshot(usize),
+}
+pub(super) enum HeaderError { Read(root_wire::ReadError), UnknownRecord, Length }
+
+/// Distinguish transition owner lengths from the reserved compaction header.
+pub(super) fn read_header(bytes:&[u8],cursor:&mut usize) -> (out:Result<JournalHeader,HeaderError>)
+    requires *old(cursor) == 0,
+    ensures ({
+        let first = vstd::bytes::spec_u64_from_le_bytes(bytes@.take(8));
+        let count = vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(9,17));
+        let transition = bytes.len() >= 8 && first != SENTINEL;
+        let snapshot = bytes.len() >= 17 && first == SENTINEL && bytes@[8] == RECORD && count <= usize::MAX;
+        match out {
+            Ok(JournalHeader::Transition(length)) => transition && length == first && *final(cursor) == 8,
+            Ok(JournalHeader::Snapshot(n)) => snapshot && n == count && *final(cursor) == 17
+                && bytes@.take(17) == header(n as u64),
+            Err(HeaderError::UnknownRecord) => bytes.len() >= 9 && first == SENTINEL && bytes@[8] != RECORD,
+            Err(HeaderError::Length) => bytes.len() >= 17 && first == SENTINEL && bytes@[8] == RECORD && count > usize::MAX,
+            Err(HeaderError::Read(_)) => bytes.len() < 8 || (first == SENTINEL && (bytes.len() < 9 ||
+                (bytes@[8] == RECORD && bytes.len() < 17))),
+        }
+    }),
+{
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    let first = match root_wire::fixed::<8>(bytes,cursor) {Ok(v) => u64::from_le_bytes(v),Err(e) => return Err(HeaderError::Read(e))};
+    if first != SENTINEL {return Ok(JournalHeader::Transition(first));}
+    let tag = match root_wire::fixed::<1>(bytes,cursor) {Ok(v) => v,Err(e) => return Err(HeaderError::Read(e))};
+    if tag[0] != RECORD {return Err(HeaderError::UnknownRecord);}
+    let count = match root_wire::fixed::<8>(bytes,cursor) {Ok(v) => u64::from_le_bytes(v),Err(e) => return Err(HeaderError::Read(e))};
+    let Ok(n) = usize::try_from(count) else {return Err(HeaderError::Length);};
+    assert(bytes@.take(17) =~= header(count));
+    Ok(JournalHeader::Snapshot(n))
+}
+
 pub(super) open spec fn row_bytes(row:Row, scheme:root_wire::Scheme) -> Seq<u8> {
     vstd::bytes::spec_u64_to_le_bytes(row.0.len() as u64) + row.0@ +
         vstd::bytes::spec_u64_to_le_bytes(row.1.generation.value()) + scheme.algorithm@ +
@@ -118,6 +173,103 @@ pub(super) fn read_row(bytes:&[u8], cursor:&mut usize, scheme:root_wire::Scheme)
         assert(w.commit@ =~= wire.commit@);
     }
     Ok(row)
+}
+
+pub(super) open spec fn spans(bytes:Seq<u8>,rows:Seq<Row>,ends:Seq<usize>,scheme:root_wire::Scheme) -> bool {
+    &&& ends.len() == rows.len() + 1
+    &&& forall|i:int| 0 <= i < rows.len() ==> {
+        &&& #[trigger] root_wire::at(bytes,ends[i] as int,row_bytes(rows[i],scheme))
+        &&& ends[i+1] as int == ends[i] as int + row_bytes(rows[i],scheme).len()
+    }
+}
+
+#[cfg(verus_keep_ghost)]
+pub(super) type WireRows = Seq<(Seq<u8>,root_wire::Root)>;
+pub(super) open spec fn layout(bytes:Seq<u8>,start:usize,count:usize,scheme:root_wire::Scheme,
+    expected:WireRows,ends:Seq<usize>) -> bool {
+    &&& expected.len() == count && ends.len() == count as int + 1 && ends[0] == start
+    &&& forall|i:int| 0 <= i < count ==> {
+        let frame = framed(expected[i].0,expected[i].1,scheme);
+        &&& expected[i].0.len() <= u64::MAX
+        &&& #[trigger] root_wire::at(bytes,ends[i] as int,framed(expected[i].0,expected[i].1,scheme))
+        &&& ends[i+1] as int == ends[i] as int + frame.len()
+    }
+}
+
+pub(super) open spec fn row_matches(row:Row, expected:(Seq<u8>,root_wire::Root)) -> bool {
+    row.0@ == expected.0 && journal_history::represents(expected.1,row.1)
+}
+
+pub(super) open spec fn matches_rows(rows:Seq<Row>,expected:WireRows) -> bool {
+    forall|i:int| 0 <= i < rows.len() ==> #[trigger] row_matches(rows[i],expected[i])
+}
+
+/// Consume exactly the declared number of contiguous rows using the caller's reserved storage.
+pub(super) fn read_rows(bytes:&[u8],cursor:&mut usize,count:usize,scheme:root_wire::Scheme,mut rows:Vec<Row>)
+    -> (result:Result<Vec<Row>,RowError>)
+    requires rows.len() == 0,
+    ensures result matches Ok(v) ==> v.len() == count && exists|ends:Seq<usize>|
+        ends[0] == *old(cursor) && ends[count as int] == *final(cursor) && #[trigger] spans(bytes@,v@,ends,scheme),
+        forall|expected:WireRows,ends:Seq<usize>| #[trigger] layout(bytes@,*old(cursor),count,scheme,expected,ends)
+            ==> (result matches Ok(v) && matches_rows(v@,expected) && *final(cursor) == ends[count as int]),
+{
+    let ghost start = *cursor;
+    let ghost mut positions = seq![start];
+    while rows.len() < count
+        invariant start == *old(cursor), rows.len() <= count, positions[0] == start,
+            positions[rows.len() as int] == *cursor, spans(bytes@,rows@,positions,scheme),
+            forall|expected:WireRows,ends:Seq<usize>| #[trigger] layout(bytes@,start,count,scheme,expected,ends)
+                ==> matches_rows(rows@,expected) && *cursor == ends[rows.len() as int],
+        decreases count - rows.len(),
+    {
+        let ghost n = rows.len() as int;
+        let ghost before = rows@;
+        let ghost pos = *cursor;
+        let next = read_row(bytes,cursor,scheme);
+        assert forall|expected:WireRows,ends:Seq<usize>| #[trigger] layout(bytes@,start,count,scheme,expected,ends)
+            implies (next matches Ok(row) && row.0@ == expected[n].0 && journal_history::represents(expected[n].1,row.1)
+                && *cursor == ends[n+1]) by {
+            let (name,w) = expected[n];
+            assert(root_wire::at(bytes@,pos as int,framed(name,w,scheme)));
+            if let Ok(row) = next {assert(row_bytes(row,scheme) =~= framed(name,w,scheme));}
+        }
+        let row = next?;
+        rows.push(row);
+        proof {
+            let old_positions = positions;
+            positions = positions.push(*cursor);
+            assert forall|i:int| 0 <= i < rows.len() implies
+                #[trigger] root_wire::at(bytes@,positions[i] as int,row_bytes(rows@[i],scheme)) &&
+                positions[i+1] as int == positions[i] as int + row_bytes(rows@[i],scheme).len() by {
+                if i < n {assert(root_wire::at(bytes@,old_positions[i] as int,row_bytes(before[i],scheme)));}
+            }
+            assert forall|expected:WireRows,ends:Seq<usize>| #[trigger] layout(bytes@,start,count,scheme,expected,ends)
+                implies matches_rows(rows@,expected) && *cursor == ends[rows.len() as int] by {
+                assert(*cursor == ends[n+1]);
+                assert(journal_history::represents(expected[n].1,row.1));
+                assert forall|i:int| 0 <= i < rows@.len() implies #[trigger] row_matches(rows@[i],expected[i]) by {
+                    if i < n {assert(row_matches(before[i],expected[i]));}
+                }
+                assert(matches_rows(rows@,expected));
+                assert(*cursor == ends[rows.len() as int]);
+            }
+        };
+    }
+    assert(positions[0] == *old(cursor) && positions[count as int] == *cursor);
+    assert(exists|ends:Seq<usize>| ends[0] == *old(cursor) && ends[count as int] == *cursor && #[trigger] spans(bytes@,rows@,ends,scheme));
+    Ok(rows)
+}
+
+pub(super) enum EndError { Order, Trailing }
+
+pub(super) fn finish(rows:&[Row],cursor:usize,payload_len:usize) -> (out:Result<(),EndError>)
+    ensures out.is_ok() == (ordered(rows@) && cursor == payload_len),
+        (out matches Err(EndError::Order)) == !ordered(rows@),
+        (out matches Err(EndError::Trailing)) == (ordered(rows@) && cursor != payload_len),
+{
+    if !strictly_ordered(rows) {return Err(EndError::Order);}
+    if cursor != payload_len {return Err(EndError::Trailing);}
+    Ok(())
 }
 
 pub(super) enum SnapshotError<E> { Position, Noncanonical, Duplicate, Codec(E) }

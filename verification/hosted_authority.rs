@@ -32,6 +32,8 @@ mod windows_append_confirmation;
 mod hosted_native_log;
 mod hosted_batch_slots;
 mod hosted_chunk_tree_range;
+#[path = "../crates/astrid-storage/src/byte_order.rs"]
+mod byte_order;
 #[path = "../crates/astrid-storage/src/storage_words.rs"]
 mod storage_words;
 #[path = "../crates/astrid-storage/src/storage_fields.rs"]

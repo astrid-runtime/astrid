@@ -67,6 +67,7 @@ INPUTS = [
     Path("verification/hosted_chunk_tree_range.rs"),
     Path("crates/astrid-storage/src/content_dag/child_range.rs"),
     Path("crates/astrid-storage/src/content_dag/chunk_range.rs"),
+    Path("crates/astrid-storage/src/byte_order.rs"),
     Path("crates/astrid-storage/src/storage_words.rs"),
     Path("crates/astrid-storage/src/storage_fields.rs"),
     Path("crates/astrid-storage/src/content_dag/file_wire.rs"),

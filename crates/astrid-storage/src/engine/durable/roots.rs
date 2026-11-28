@@ -13,7 +13,7 @@ use super::{
     preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
 };
 
-use journal_snapshot::{RECORD as SNAPSHOT_RECORD, SENTINEL as SNAPSHOT_SENTINEL};
+use journal_snapshot::{HeaderError, JournalHeader};
 impl From<IdentityScheme> for super::root_wire::Scheme {
     fn from(scheme: IdentityScheme) -> Self {
         Self {
@@ -251,10 +251,7 @@ pub(super) fn encode_root_snapshot(
     scheme: IdentityScheme,
     roots: &[(Vec<u8>, RootState)],
 ) -> Result<Vec<u8>, DurableError> {
-    if roots
-        .windows(2)
-        .any(|pair| pair[0].0.as_slice() >= pair[1].0.as_slice())
-    {
+    if !journal_snapshot::strictly_ordered(roots) {
         return Err(corrupt(
             ROOT_FILE,
             0,
@@ -280,36 +277,42 @@ fn decode_root_journal_record(
     scheme: IdentityScheme,
 ) -> Result<DecodedRootJournalRecord, &'static str> {
     let mut reader = RootReader::new(bytes);
-    let prefix = reader.u64()?;
-    if prefix == SNAPSHOT_SENTINEL {
-        if reader.u8()? != SNAPSHOT_RECORD {
-            return Err("unknown root-journal extension record");
-        }
-        let count = reader.usize_len()?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(count)
-            .map_err(|_| "root snapshot allocation failed")?;
-        for _ in 0..count {
-            let row = journal_snapshot::read_row(bytes, &mut reader.offset, scheme.into())
-                .map_err(|error| match error {
-                    journal_snapshot::RowError::Read(e) => read_error(e),
-                    journal_snapshot::RowError::Length => "length is not process-addressable",
-                    journal_snapshot::RowError::Root(e) => reader.root_error(e, scheme),
-                })?;
-            entries.push(row);
-        }
-        if entries
-            .windows(2)
-            .any(|pair| pair[0].0.as_slice() >= pair[1].0.as_slice())
-        {
-            return Err("root snapshot principals are not strictly ordered");
-        }
-        if reader.remaining() != 0 {
-            return Err("trailing root snapshot bytes");
-        }
-        return Ok(DecodedRootJournalRecord::Snapshot(entries));
-    }
+    let header =
+        journal_snapshot::read_header(bytes, &mut reader.offset).map_err(|error| match error {
+            HeaderError::Read(e) => read_error(e),
+            HeaderError::UnknownRecord => "unknown root-journal extension record",
+            HeaderError::Length => "length is not process-addressable",
+        })?;
+    let prefix = match header {
+        JournalHeader::Transition(length) => length,
+        JournalHeader::Snapshot(count) => {
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(count)
+                .map_err(|_| "root snapshot allocation failed")?;
+            let entries = journal_snapshot::read_rows(
+                bytes,
+                &mut reader.offset,
+                count,
+                scheme.into(),
+                entries,
+            )
+            .map_err(|error| match error {
+                journal_snapshot::RowError::Read(e) => read_error(e),
+                journal_snapshot::RowError::Length => "length is not process-addressable",
+                journal_snapshot::RowError::Root(e) => reader.root_error(e, scheme),
+            })?;
+            journal_snapshot::finish(&entries, reader.offset, bytes.len()).map_err(|error| {
+                match error {
+                    journal_snapshot::EndError::Order => {
+                        "root snapshot principals are not strictly ordered"
+                    },
+                    journal_snapshot::EndError::Trailing => "trailing root snapshot bytes",
+                }
+            })?;
+            return Ok(DecodedRootJournalRecord::Snapshot(entries));
+        },
+    };
 
     let principal_len =
         usize::try_from(prefix).map_err(|_| "principal length is not process-addressable")?;
@@ -345,28 +348,8 @@ impl<'a> RootReader<'a> {
         Self { bytes, offset: 0 }
     }
 
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.offset)
-    }
-
     fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
         super::root_wire::take(self.bytes, &mut self.offset, len).map_err(read_error)
-    }
-
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        self.take(1)?.first().copied().ok_or("truncated u8 field")
-    }
-
-    fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| "truncated u64 field")?,
-        ))
-    }
-
-    fn usize_len(&mut self) -> Result<usize, &'static str> {
-        usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
     }
 
     fn root_error(

@@ -123,6 +123,13 @@ fn compacted_transition(system:RootState, fleet:RootState, replacement:RootState
     };
     assert(rows@[0].0@ == seq![0u8]);
     assert(rows@[1].0.len() == 33 && rows@[1].0[0] == 2);
+    assert(crate::byte_order::below(rows@[0].0@,rows@[1].0@));
+    assert(snapshot::ordered(rows@)) by {
+        assert forall|i:int| 1 <= i < rows.len() implies
+            #[trigger] crate::byte_order::below(rows@[i-1].0@,rows@[i].0@) by {assert(i == 1);}
+    }
+    let writer_accepts = snapshot::strictly_ordered(&rows);
+    assert(writer_accepts);
     let payload = snapshot::serialize(&rows,scheme);
     assert(payload@ == snapshot::header(2) + snapshot::row_bytes(rows@[0],scheme) +
         snapshot::row_bytes(rows@[1],scheme)) by {
@@ -136,18 +143,53 @@ fn compacted_transition(system:RootState, fleet:RootState, replacement:RootState
         vstd::bytes::spec_u64_to_le_bytes(system.generation.value()) + scheme.algorithm@ +
         scheme.construction@ + seq![32u8,0,0,0] + system.commit.digest();
     assert(snapshot::row_bytes(rows@[0],scheme) =~= first);
-    let mut cursor = 17usize;
+    let mut cursor = 0usize;
+    assert(payload@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(u64::MAX));
+    assert(payload@[8] == 1);
+    assert(payload@.subrange(9,17) =~= vstd::bytes::spec_u64_to_le_bytes(2));
+    let count = match snapshot::read_header(&payload,&mut cursor) {
+        Ok(snapshot::JournalHeader::Snapshot(count)) => count,
+        _ => {assert(false);return history;},
+    };
+    assert(count == rows.len());
+    assert(cursor == 17);
     let ghost one = snapshot::row_bytes(rows@[0],scheme);
     let ghost two = snapshot::row_bytes(rows@[1],scheme);
     assert(payload@.subrange(17,17int+one.len()) =~= one);
-    let parsed_system = consume_snapshot_row(&payload,&mut cursor,&rows[0],scheme);
-    assert(payload@.subrange(cursor as int,cursor as int+two.len()) =~= two);
-    let parsed_fleet = consume_snapshot_row(&payload,&mut cursor,&rows[1],scheme);
-    assert(cursor == payload.len());
-    let parsed = vec![parsed_system,parsed_fleet];
+    let ghost middle = (17int + one.len()) as usize;
+    assert(payload@.subrange(middle as int,middle as int+two.len()) =~= two);
+    let w0 = crate::journal_history::to_wire(system);
+    let w1 = crate::journal_history::to_wire(fleet);
+    let ghost expected = seq![(rows@[0].0@,w0),(rows@[1].0@,w1)];
+    let ghost ends = seq![17usize,middle,payload.len()];
+    assert(one =~= snapshot::framed(rows@[0].0@,w0,scheme));
+    assert(two =~= snapshot::framed(rows@[1].0@,w1,scheme));
+    assert forall|i:int| 0 <= i < count implies {
+        let (name,w) = expected[i];
+        &&& name.len() <= u64::MAX
+        &&& #[trigger] root_wire::at(payload@,ends[i] as int,snapshot::framed(expected[i].0,expected[i].1,scheme))
+        &&& ends[i+1] as int == ends[i] as int + snapshot::framed(name,w,scheme).len()
+    } by {if i == 0 {} else {assert(i == 1);}}
+    assert(snapshot::layout(payload@,17,count,scheme,expected,ends));
+    let parsed = match snapshot::read_rows(&payload,&mut cursor,count,scheme,Vec::new()) {
+        Ok(v) => v,Err(_) => {assert(false);return history;},
+    };
+    assert(parsed.len() == count && cursor == payload.len());
+    assert(snapshot::row_matches(parsed@[0],expected[0]));
+    assert(snapshot::row_matches(parsed@[1],expected[1]));
+    proof {
+        crate::journal_history::unique(w0,parsed@[0].1,system);
+        crate::journal_history::unique(w1,parsed@[1].1,fleet);
+    }
     assert(snapshot::row_bytes(parsed@[0],scheme) =~= one);
     assert(snapshot::row_bytes(parsed@[1],scheme) =~= two);
     assert(snapshot::prefix(parsed@,2,scheme) == payload@) by {reveal_with_fuel(snapshot::prefix,3);}
+    assert(snapshot::ordered(parsed@)) by {
+        assert forall|i:int| 1 <= i < parsed.len() implies
+            #[trigger] crate::byte_order::below(parsed@[i-1].0@,parsed@[i].0@) by {assert(i == 1);}
+    }
+    let finished = snapshot::finish(&parsed,cursor,payload.len());
+    assert(finished.is_ok());
     let rows = parsed;
     let encode = |input:&Vec<(Vec<u8>,RootState)>| -> (r:Result<Vec<u8>,()>)
         ensures r matches Ok(w) && w@ == snapshot::prefix(input@,input.len() as nat,scheme),
@@ -180,6 +222,66 @@ fn compacted_transition(system:RootState, fleet:RootState, replacement:RootState
     history
 }
 
+
+/// Every row in a successful scan occupies a continuous, non-overlapping portion of the payload.
+fn scan_snapshot_extent(bytes:&[u8],cursor:&mut usize,count:usize,scheme:root_wire::Scheme)
+    -> (rows:Option<Vec<(Vec<u8>,RootState)>>)
+    ensures rows matches Some(v) ==> v.len() == count &&
+        exists|ends:Seq<usize>| ends.len() == v.len()+1 && ends[0] == *old(cursor) &&
+            ends[count as int] == *final(cursor) && forall|i:int| 0 <= i < count ==>
+                #[trigger] root_wire::at(bytes@,ends[i] as int,crate::journal_snapshot::row_bytes(v@[i],scheme)) &&
+                ends[i+1] as int == ends[i] as int + crate::journal_snapshot::row_bytes(v@[i],scheme).len(),
+{
+    use crate::journal_snapshot as snapshot;
+    let ghost start = *cursor;
+    match snapshot::read_rows(bytes,cursor,count,scheme,Vec::new()) {
+        Ok(v) => {
+            let ghost ends = choose|ends:Seq<usize>| ends[0] == start && ends[count as int] == *cursor &&
+                #[trigger] snapshot::spans(bytes@,v@,ends,scheme);
+            assert(snapshot::spans(bytes@,v@,ends,scheme));
+            Some(v)
+        },
+        Err(_) => None,
+    }
+}
+
+/// Preserve the ordering diagnostic even when the payload also has trailing bytes.
+fn finish_snapshot(rows:&[(Vec<u8>,RootState)],cursor:usize,len:usize) -> (result:u8)
+    ensures result == if !crate::journal_snapshot::ordered(rows@) {1u8}
+        else if cursor != len {2u8} else {0u8},
+{
+    use crate::journal_snapshot::{finish,EndError};
+    match finish(rows,cursor,len) {Ok(())=>0,Err(EndError::Order)=>1,Err(EndError::Trailing)=>2}
+}
+
+/// A repeated or descending adjacent owner invalidates a compacted snapshot.
+fn reject_unordered(rows:&[(Vec<u8>,RootState)],i:usize) -> (rejected:bool)
+    requires 0 < i < rows.len(),
+        !crate::byte_order::below(rows@[i as int-1].0@,rows@[i as int].0@),
+    ensures rejected,
+{
+    !crate::journal_snapshot::strictly_ordered(rows)
+}
+
+/// Normal transition lengths and malformed extension headers cannot select the snapshot path.
+fn dispatch_root_header(bytes:&[u8]) -> (selection:Option<(bool,u64,usize)>)
+    ensures selection == ({
+        let first = vstd::bytes::spec_u64_from_le_bytes(bytes@.take(8));
+        let count = vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(9,17));
+        if bytes.len() < 8 {None}
+        else if first != u64::MAX {Some((false,first,8usize))}
+        else if bytes.len() >= 17 && bytes@[8] == 1 && count <= usize::MAX {Some((true,count,17usize))}
+        else {None}
+    }),
+{
+    use crate::journal_snapshot::{read_header,JournalHeader};
+    let mut cursor = 0usize;
+    match read_header(bytes,&mut cursor) {
+        Ok(JournalHeader::Transition(n)) => Some((false,n,cursor)),
+        Ok(JournalHeader::Snapshot(n)) => Some((true,n as u64,cursor)),
+        Err(_) => None,
+    }
+}
 
 /// A rejected snapshot cannot overwrite any previously recovered owner, even if rejection is late.
 fn restore_or_keep<P:Ord,E,C,D>(history:&mut BTreeMap<P,(RootState,u64)>, offset:u64,
