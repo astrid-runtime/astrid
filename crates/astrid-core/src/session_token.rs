@@ -446,10 +446,15 @@ mod tests {
 
     #[test]
     fn challenge_message_binds_principal_and_nonce() {
-        let m = principal_auth_challenge_message("alice", "00ff");
-        assert_eq!(m, "astrid-principal-auth:v1:alice:00ff");
-        // Different principal or nonce ⇒ different message (no cross-replay).
-        assert_ne!(m, principal_auth_challenge_message("bob", "00ff"));
-        assert_ne!(m, principal_auth_challenge_message("alice", "ff00"));
+        let mut bytes = [0u8; PRINCIPAL_AUTH_NONCE_LEN];
+        SysRng.try_fill_bytes(&mut bytes).unwrap();
+        let nonce = hex::encode(bytes);
+        let message = principal_auth_challenge_message("alice", &nonce);
+        assert_eq!(message, format!("astrid-principal-auth:v1:alice:{nonce}"));
+
+        assert_ne!(message, principal_auth_challenge_message("bob", &nonce));
+        bytes[0] ^= 1;
+        let changed = hex::encode(bytes);
+        assert_ne!(message, principal_auth_challenge_message("alice", &changed));
     }
 }
