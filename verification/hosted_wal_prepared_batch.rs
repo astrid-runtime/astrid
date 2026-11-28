@@ -3,7 +3,7 @@ use super::*;
 use crate::wal_object_storage as storage;
 #[path = "hosted_wal_recovered_arena.rs"]
 mod recovered_arena;
-use recovered_arena::{append_fresh_arena,arena_contains,arena_entry,same_extent};
+use recovered_arena::{ArenaError,append_fresh_arena,arena_contains,arena_entry,same_extent};
 verus! {
 
 enum Payload<'a> { Plain(&'a [u8]), Lz4(Vec<u8>) }
@@ -323,7 +323,7 @@ fn publish_fresh<M:crate::positional_read::Media,S:crate::group_frontier::Buffer
     Ok(Publication{wal_target:Ghost(wal_target),group:r,journal,rows:Ghost(rows@)})
 }
 
-enum RecoveryError<E,A> { Arena(crate::arena_frame::BatchError<A>), Compression(usize,E), References(usize), Closure(crate::closure_walk::Failure<ObjectId,ObjectId>) }
+enum RecoveryError<E,A> { Arena(ArenaError<A>), Compression(usize,E), References(usize), Closure(crate::closure_walk::Failure<ObjectId,ObjectId>) }
 
 spec fn codec_failure<E,D:Fn(&[u8],usize)->Result<Vec<u8>,E>>(block:Seq<u8>,size:usize,decode:D,error:E) -> bool {
     exists|b:&[u8]| b@==block && #[trigger] decode.ensures((b,size),Err(error))
@@ -348,7 +348,7 @@ proof fn same_children(a:Seq<crate::ObjectReference>,b:Seq<crate::ObjectReferenc
 #[verifier::spinoff_prover]
 #[verifier::rlimit(35)]
 #[verifier::loop_isolation(false)]
-fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::BatchFile,F:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::ReplayArena,F:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
     p:&Publication<M>,Ghost(graph):Ghost<&crate::hosted_kv_root_publication::Graph<Vec<u8>>>,
     version:crate::ObjectFormatVersion,scheme:root_wire::Scheme,limit:u64,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,
     decode:D,hash:H,arena:&mut A,checksum:F)
@@ -372,6 +372,8 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::B
         forall|i:int,b:&[u8],v:Vec<u8>| 0<=i<p.rows@.len() && b@==(compression@)(p.rows@[i].1@) &&
             #[trigger] decode.ensures((b,p.rows@[i].1.len()),Ok(v)) ==> v@==p.rows@[i].1@,
     ensures final(arena).target()==old(arena).target(),
+        out matches Err(RecoveryError::Arena(ArenaError::Sync(e))) ==> A::sync_failed(old(arena).target(),e),
+        (out.is_ok() || (out matches Err(RecoveryError::Closure(_)))) && A::independent(old(arena).target()) ==> final(arena).stable()==final(arena).image(),
         out matches Ok((t,index)) ==> index@.dom()==t@.dom() &&
         (forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] arena_entry(index@[p.rows@[i].0],p.rows@[i].1@,final(arena).image(),old(arena).image().len())) &&
         final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
@@ -384,9 +386,9 @@ fn recover_closure<M:crate::positional_read::Media,E,D,H,A:crate::arena_frame::B
         ((out matches Err(RecoveryError::References(_))) || (out matches Err(RecoveryError::Compression(_,_)))) ==> final(arena).image()==old(arena).image(),
         out matches Err(RecoveryError::Closure(_)) ==> final(arena).image().take(old(arena).image().len() as int)==old(arena).image() &&
             forall|i:int| 0<=i<p.rows@.len() ==> #[trigger] arena_contains(p.rows@[i].1@,final(arena).image(),old(arena).image().len()),
-        out matches Err(RecoveryError::Arena(crate::arena_frame::BatchError::Write(e))) ==> A::write_failed(old(arena).target(),e),
-        out matches Err(RecoveryError::Arena(crate::arena_frame::BatchError::Seek(e))) ==> old(arena).seek_failed(e) && final(arena).image()==old(arena).image(),
-        out matches Err(RecoveryError::Arena(crate::arena_frame::BatchError::Overflow)) ==> final(arena).image()==old(arena).image() &&
+        out matches Err(RecoveryError::Arena(ArenaError::Append(crate::arena_frame::BatchError::Write(e)))) ==> A::write_failed(old(arena).target(),e),
+        out matches Err(RecoveryError::Arena(ArenaError::Append(crate::arena_frame::BatchError::Seek(e)))) ==> old(arena).seek_failed(e) && final(arena).image()==old(arena).image(),
+        out matches Err(RecoveryError::Arena(ArenaError::Append(crate::arena_frame::BatchError::Overflow))) ==> final(arena).image()==old(arena).image() &&
             (raw_extent(p.rows@,p.rows@.len())>isize::MAX || old(arena).image().len()+raw_extent(p.rows@,p.rows@.len())>u64::MAX),
         out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Source(k,e))) ==> k==e && !graph.records@.contains_key(k),
         out matches Err(RecoveryError::Closure(crate::closure_walk::Failure::Cycle(k))) ==> crate::closure_walk::reaches(

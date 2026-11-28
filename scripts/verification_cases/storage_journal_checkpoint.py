@@ -233,3 +233,18 @@ def consumer_defects():
             f"recovered arena batch loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
         )
+
+    sync_source = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
+    for label, source, clause, weakness, consumer in [
+        ("required flush", sync_source, "file.sync_replayed()?;", "/* skip arena flush */", sync_source),
+        ("stable image", sync_source,
+         "v@==locations@ && (S::independent(old(file).target()) ==> final(file).stable()==old(file).image())",
+         "v@==locations@", arena_batch),
+        ("release on success", arena_batch,
+         "Ok(locations)=>locations,Err(e)=>return Err(ArenaError::Sync(e)),",
+         "Ok(locations)=>locations,Err(_)=>Vec::new(),", arena_batch),
+    ]:
+        yield (
+            f"arena sync loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
+        )

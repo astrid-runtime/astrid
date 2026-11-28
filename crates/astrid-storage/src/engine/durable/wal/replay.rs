@@ -31,6 +31,12 @@ use crate::engine::durable::{
     RecoveryLimits, SharedIdentity, SharedPrincipalCodec,
 };
 
+impl crate::engine::durable::arena_frame::ReplayArena for File {
+    fn sync_replayed(&mut self) -> std::io::Result<()> {
+        self.sync_data()
+    }
+}
+
 type PendingTransaction = Batch<WalObjectDescriptor, WalRootDescriptor>;
 
 /// Both canonical replay and the protected-arena repair probe consume only
@@ -288,8 +294,7 @@ where
     // Even an idempotent object fold may publish a missing direct
     // representation for an already-indexed frame. Make the entire arena
     // source durable before any representation StateCas/flush is published.
-    arena
-        .sync_data()
+    let locations = crate::engine::durable::arena_frame::release_replayed(arena, locations)
         .map_err(|source| io_error("flush WAL-replayed object arena", source))?;
     for ((id, _payload), location) in new_objects.into_iter().zip(locations) {
         index.insert(id, location);
