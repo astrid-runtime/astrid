@@ -197,14 +197,17 @@ fn checkpoint_rows_reject_duplicate_reversed_and_foreign_names() {
             "index identity scheme does not match the store",
         ),
     ] {
-        let mut bytes = 2_u64.to_le_bytes().to_vec();
+        let mut bytes = vec![SNAPSHOT_RECORD];
+        encode_scheme(&mut bytes, scheme());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        encode_optional_location(&mut bytes, None);
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
         encode_identity(&mut bytes, scheme(), first);
         location(1).encode(&mut bytes);
         encode_identity(&mut bytes, second_scheme, second);
         location(2).encode(&mut bytes);
-        let mut reader = WireReader::new(&bytes);
         assert!(matches!(
-            decode_locations(&mut reader, scheme(), 17),
+            decode_record(None, &bytes, scheme(), 17),
             Err(DurableError::Corrupt { file: INDEX_FILE, offset: 17, detail: observed })
                 if observed == detail
         ));

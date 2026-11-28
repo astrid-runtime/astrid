@@ -151,6 +151,7 @@ INPUTS = [
     Path("verification/hosted_duplicate_recovery.rs"),
     Path("verification/hosted_record_roundtrip.rs"),
     Path("crates/astrid-storage/src/engine/durable/arena_index.rs"),
+    Path("crates/astrid-storage/src/engine/durable/index/wire.rs"),
     Path("crates/astrid-storage/src/engine/durable/index/key.rs"),
     Path("crates/astrid-storage/src/engine/durable/index/admission.rs"),
     Path("crates/astrid-storage/src/engine/durable/index/rebuild.rs"),

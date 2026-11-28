@@ -30,18 +30,20 @@ use super::{format::encode_identity, root_wire};
 
 use super::{IndexState, checkpoint_admission as admission};
 mod key;
+use super::arena_index;
+use key as checkpoint_key;
 mod snapshot;
 #[cfg(test)]
 mod tests;
 mod validation;
+mod wire;
 
 use snapshot::Snapshot;
 
 use validation::validate_state;
 
-const SNAPSHOT_RECORD: u8 = 1;
-const DELTA_RECORD: u8 = 2;
 use key::ROW_LEN as LOCATION_BYTES;
+use wire::{DELTA_RECORD, SNAPSHOT_RECORD};
 
 /// One successfully persisted object-arena change cached after publication.
 pub(super) struct IndexDelta<'a> {
@@ -278,25 +280,31 @@ fn decode_record(
     scheme: IdentityScheme,
     offset: u64,
 ) -> Result<IndexState, DurableError> {
-    let mut reader = WireReader::new(payload);
-    let record = reader.u8().map_err(|detail| corrupt(offset, detail))?;
-    let decoded = match (record, state) {
-        (SNAPSHOT_RECORD, None) => {
-            let snapshot = decode_snapshot(&mut reader, scheme, offset)?;
-            validate_state(&snapshot, offset)?;
-            snapshot
+    wire::record(payload, state, scheme.into(), |state| {
+        validate_state(state, offset)
+    })
+    .map_err(|error| match error {
+        wire::RecordError::Invalid(error) => error,
+        wire::RecordError::Discontinuous => corrupt(
+            offset,
+            "index delta does not continue the cached arena prefix",
+        ),
+        wire::RecordError::Backwards => corrupt(offset, "index delta arena length moves backwards"),
+        wire::RecordError::Remap => corrupt(offset, "index delta remaps an object identity"),
+        wire::RecordError::Wire(wire::Error::Field(error)) => corrupt(offset, key_error(error)),
+        wire::RecordError::Wire(wire::Error::TailTag) => {
+            corrupt(offset, "invalid optional arena-tail tag")
         },
-        (DELTA_RECORD, Some(current)) => apply_delta(current, &mut reader, scheme, offset)?,
-        (DELTA_RECORD, None) => return Err(corrupt(offset, "index delta precedes snapshot")),
-        (SNAPSHOT_RECORD, Some(_)) => {
-            return Err(corrupt(offset, "index contains more than one snapshot"));
+        wire::RecordError::Wire(wire::Error::Count) => {
+            corrupt(offset, "index length is not process-addressable")
         },
-        _ => return Err(corrupt(offset, "unknown index record kind")),
-    };
-    if reader.remaining() != 0 {
-        return Err(corrupt(offset, "trailing index-record bytes"));
-    }
-    Ok(decoded)
+        wire::RecordError::MissingSnapshot => corrupt(offset, "index delta precedes snapshot"),
+        wire::RecordError::RepeatedSnapshot => {
+            corrupt(offset, "index contains more than one snapshot")
+        },
+        wire::RecordError::Unknown => corrupt(offset, "unknown index record kind"),
+        wire::RecordError::Trailing => corrupt(offset, "trailing index-record bytes"),
+    })
 }
 
 /// Replace the disposable index with one complete, flushed checkpoint.
@@ -498,61 +506,6 @@ fn encode_locations(
     Ok(())
 }
 
-fn decode_snapshot(
-    reader: &mut WireReader<'_>,
-    scheme: IdentityScheme,
-    offset: u64,
-) -> Result<IndexState, DurableError> {
-    reader
-        .scheme(scheme)
-        .map_err(|detail| corrupt(offset, detail))?;
-    let arena_len = reader.u64().map_err(|detail| corrupt(offset, detail))?;
-    let arena_tail = decode_optional_location(reader, offset)?;
-    let objects = decode_locations(reader, scheme, offset)?;
-    Ok(IndexState {
-        arena_len,
-        arena_tail,
-        objects,
-    })
-}
-
-fn apply_delta(
-    mut state: IndexState,
-    reader: &mut WireReader<'_>,
-    scheme: IdentityScheme,
-    offset: u64,
-) -> Result<IndexState, DurableError> {
-    reader
-        .scheme(scheme)
-        .map_err(|detail| corrupt(offset, detail))?;
-    let previous_arena_len = reader.u64().map_err(|detail| corrupt(offset, detail))?;
-    let arena_len = reader.u64().map_err(|detail| corrupt(offset, detail))?;
-    if previous_arena_len != state.arena_len {
-        return Err(corrupt(
-            offset,
-            "index delta does not continue the cached arena prefix",
-        ));
-    }
-    if arena_len < previous_arena_len {
-        return Err(corrupt(offset, "index delta arena length moves backwards"));
-    }
-    let arena_tail = decode_location(reader, offset)?;
-    let additions = decode_locations(reader, scheme, offset)?;
-    // The prior prefix was validated and arena length cannot decrease. Old
-    // locations therefore remain bounded; only additions and the new tail
-    // need bounds checks. Authoritative arena verification still follows.
-    validation::validate_locations(additions.values(), arena_len, offset)?;
-    validation::validate_tail(Some(arena_tail), arena_len, offset)?;
-    for (id, location) in additions {
-        if !super::arena_index::restore_location(&mut state.objects, id, location) {
-            return Err(corrupt(offset, "index delta remaps an object identity"));
-        }
-    }
-    state.arena_len = arena_len;
-    state.arena_tail = Some(arena_tail);
-    Ok(state)
-}
-
 fn encode_optional_location(bytes: &mut Vec<u8>, location: Option<ArenaLocation>) {
     match location {
         None => bytes.push(0),
@@ -561,39 +514,6 @@ fn encode_optional_location(bytes: &mut Vec<u8>, location: Option<ArenaLocation>
             location.encode(bytes);
         },
     }
-}
-
-fn decode_optional_location(
-    reader: &mut WireReader<'_>,
-    offset: u64,
-) -> Result<Option<ArenaLocation>, DurableError> {
-    match reader.u8().map_err(|detail| corrupt(offset, detail))? {
-        0 => Ok(None),
-        1 => decode_location(reader, offset).map(Some),
-        _ => Err(corrupt(offset, "invalid optional arena-tail tag")),
-    }
-}
-
-fn decode_location(
-    reader: &mut WireReader<'_>,
-    offset: u64,
-) -> Result<ArenaLocation, DurableError> {
-    let bytes = reader
-        .take(ArenaLocation::ENCODED_LEN)
-        .map_err(|detail| corrupt(offset, detail))?;
-    ArenaLocation::decode(bytes).ok_or_else(|| corrupt(offset, "truncated index record"))
-}
-
-fn decode_locations(
-    reader: &mut WireReader<'_>,
-    scheme: IdentityScheme,
-    offset: u64,
-) -> Result<BTreeMap<ObjectId, ArenaLocation>, DurableError> {
-    let count = reader
-        .usize_len()
-        .map_err(|detail| corrupt(offset, detail))?;
-    key::rows(reader.bytes, &mut reader.offset, count, scheme.into())
-        .map_err(|error| corrupt(offset, key_error(error)))
 }
 
 fn encode_len(bytes: &mut Vec<u8>, len: usize) -> Result<(), DurableError> {
@@ -615,52 +535,6 @@ fn corrupt(offset: u64, detail: &'static str) -> DurableError {
         file: INDEX_FILE,
         offset,
         detail,
-    }
-}
-
-struct WireReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> WireReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.offset)
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or("index length overflow")?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or("truncated index record")?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        self.take(1)?.first().copied().ok_or("truncated u8")
-    }
-
-    fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().map_err(|_| "truncated u64")?,
-        ))
-    }
-
-    fn usize_len(&mut self) -> Result<usize, &'static str> {
-        usize::try_from(self.u64()?).map_err(|_| "index length is not process-addressable")
-    }
-
-    fn scheme(&mut self, expected: IdentityScheme) -> Result<(), &'static str> {
-        key::read_scheme(self.bytes, &mut self.offset, expected.into()).map_err(key_error)
     }
 }
 

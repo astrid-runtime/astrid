@@ -103,7 +103,12 @@ proof fn aligned_prefix(rows:Seq<(ObjectId,ArenaLocation)>,walk:Seq<(ObjectId,Ar
         if i>0 {assert(rows[i-1]==walk[i-1]);}
         assert(edge(rows,i)==edge(walk,i)) by {reveal(edge);}
         assert(walk[i].1.offset<end);
+        if i==rows.len() {
+            assert(edge(rows,i)==end && edge(walk,i)==walk[i].1.offset);
+            assert(false);
+        }
         assert(i<rows.len());
+        assert(rows[i].1.offset==walk[i].1.offset);
         assert(rows[i]==walk[i]);
     }
 }
@@ -131,8 +136,10 @@ proof fn physical_prefix(bytes:Seq<u8>, rows:Seq<(ObjectId,ArenaLocation)>,
         let (cached,at)=rows[i];
         assert(reader::matches(bytes,magic,version,loc,scheme,id,limit));
         assert(reader::matches(bytes,magic,version,at,scheme,cached,limit));
+        assert(at.offset==loc.offset && at.payload_len==loc.payload_len);
         assert(at.checksum =~= loc.checksum);
         ObjectId::same_digest(cached,id);
+        assert((cached,at)==(id,loc));
     }
     assert forall|i:int| 0<=i<walk.len() implies (#[trigger] walk[i]).1.offset==admission::frontier(walk,i) &&
         walk[i].1.offset<bytes.len() by {

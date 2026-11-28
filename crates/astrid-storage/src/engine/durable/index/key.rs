@@ -140,7 +140,7 @@ pub(super) fn rows(bytes:&[u8], cursor:&mut usize, count:usize, scheme:Scheme)
     -> (out:Result<BTreeMap<ObjectId,ArenaLocation>,Error>)
     requires *old(cursor) <= bytes.len(), obeys_cmp::<ObjectId>(), obeys_cmp_concrete_eq::<ObjectId>(),
     ensures
-        out matches Ok(map) ==> btree_map_inv(&map) &&
+        out matches Ok(map) ==> btree_map_inv(&map) && *final(cursor)<=bytes.len() &&
             *final(cursor) as int == *old(cursor) as int + count as int*ROW_LEN &&
             mapped(bytes@,*old(cursor) as int,count as nat,map@) &&
             (forall|i:int| 0 <= i < count ==> #[trigger] ordered_row(bytes@,*old(cursor) as int,i,scheme)),
@@ -164,7 +164,7 @@ pub(super) fn rows(bytes:&[u8], cursor:&mut usize, count:usize, scheme:Scheme)
     let mut i = 0usize;
     while i < count
         invariant
-            ROW_LEN == 88, i <= count, start == *old(cursor), start <= bytes.len(), *cursor as int == start as int + i as int*ROW_LEN,
+            ROW_LEN == 88, i <= count, *cursor<=bytes.len(), start == *old(cursor), start <= bytes.len(), *cursor as int == start as int + i as int*ROW_LEN,
             btree_map_inv(&map), obeys_cmp::<ObjectId>(), obeys_cmp_concrete_eq::<ObjectId>(),
             previous.is_some() == (i > 0),
             previous matches Some(id) ==> id.digest() == bytes@.subrange(*cursor as int-80,*cursor as int-48),

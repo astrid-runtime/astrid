@@ -268,6 +268,9 @@ mod indexed_frame;
 mod arena_index;
 #[path = "../crates/astrid-storage/src/engine/durable/index/key.rs"]
 mod checkpoint_key;
+use checkpoint_admission::IndexState;
+#[path = "../crates/astrid-storage/src/engine/durable/index/wire.rs"]
+mod checkpoint_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/format/checkpoint_reader.rs"]
 mod checkpoint_reader;
 #[path = "../crates/astrid-storage/src/engine/durable/format/duplicates.rs"]

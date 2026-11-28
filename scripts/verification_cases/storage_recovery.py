@@ -147,9 +147,25 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), observer,
         )
     media = Path("crates/astrid-storage/src/engine/durable/format/positional_read.rs")
+    wire = Path("crates/astrid-storage/src/engine/durable/index/wire.rs")
+    for label, before, after in [
+        ("declared length", "let state=IndexState{arena_len,arena_tail,objects};", "let state=IndexState{arena_len:0,arena_tail,objects};"),
+        ("optional tail", "let state=IndexState{arena_len,arena_tail,objects};", "let state=IndexState{arena_len,arena_tail:None,objects};"),
+        ("canonical snapshot", "let tag=root_wire::fixed::<1>(bytes,cursor).map_err(field)?;", "if true {return Err(Error::TailTag);}\n    let tag=root_wire::fixed::<1>(bytes,cursor).map_err(field)?;"),
+        ("delta predecessor", "if previous!=prior.arena_len", "if false && previous!=prior.arena_len"),
+        ("nondecreasing length", "if arena_len<previous", "if false && arena_len<previous"),
+        ("conflicting remap", "if !arena_index::restore_location", "if false && !arena_index::restore_location"),
+        ("whole record", "if cursor!=bytes.len()", "if false && cursor!=bytes.len()"),
+        ("unique snapshot", "(SNAPSHOT_RECORD,Some(_))=>return Err(RecordError::RepeatedSnapshot)", "(SNAPSHOT_RECORD,Some(old))=>return Ok(old)"),
+    ]:
+        yield (
+            f"checkpoint wire loses {label}", wire,
+            lambda s, a=before, b=after: replace_once(s, a, b), wire,
+        )
     duplicate_recovery = Path("verification/hosted_duplicate_recovery.rs")
     admission = Path("crates/astrid-storage/src/engine/durable/index/admission.rs")
     copies = Path("crates/astrid-storage/src/engine/durable/format/duplicates.rs")
+    # Mutate the implementation. Trait postcondition errors point to its interface.
     for label, before, after, expected in [
         ("bounded header", "let start=crate::positional_read::extent(at,52,end).ok()?;", "let start=at;", copies),
         ("bounded payload", "extent(start,d.payload_len,end)", "extent(start,d.payload_len,u64::MAX)", duplicate_recovery),
