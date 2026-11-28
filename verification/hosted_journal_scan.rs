@@ -2,6 +2,7 @@
 use crate::{RootState,arena_frame::{ROOT_MAGIC,FRAME_VERSION},frame_repair::FrameReader,
     frame_scan::{self,Call,Stop,Visitor},journal_apply::{self,VisitError},journal_visitor::RootHistory,root_wire};
 use std::collections::BTreeMap;
+use vstd::std_specs::btree::btree_map_inv;
 use vstd::{prelude::*,laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq}};
 
 verus! {
@@ -56,11 +57,11 @@ pub(crate) fn recover<R:FrameReader,P:Ord,D,C,H>(reader:&mut R,end:u64,limit:u64
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((ROOT_MAGIC,n,b)),
     ensures result matches Err(ScanError::Visitor(e)) ==> exists|calls,states,table|
             #[trigger] refused(calls,states,table,old(reader).image(),end,limit,scheme,decode,recode,hash,e),
-        result matches Err(ScanError::Frame(at,e,t)) ==> stopped(final(reader),at,end,e,limit,scheme,decode,recode,hash) &&
+        result matches Err(ScanError::Frame(at,e,t)) ==> btree_map_inv(&t) && stopped(final(reader),at,end,e,limit,scheme,decode,recode,hash) &&
             recovered(t@,old(reader).image(),at,limit,scheme,decode,recode,hash),
         final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),
         result.is_ok() ==> final(reader).position()==end,
-        result matches Ok(t) ==> recovered(t@,old(reader).image(),end,limit,scheme,decode,recode,hash),
+        result matches Ok(t) ==> btree_map_inv(&t) && recovered(t@,old(reader).image(),end,limit,scheme,decode,recode,hash),
 {
     let mut visitor=RootHistory::new(scheme,decode,recode);
     match frame_scan::scan_root(reader,&mut visitor,end,limit,hash) {
@@ -158,8 +159,8 @@ pub(crate) fn recover_live<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D,C
         forall|b:&[u8]| #[trigger] decode.requires((b,)),forall|p:&P| #[trigger] recode.requires((p,)),
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((ROOT_MAGIC,n,b)),
     ensures final(media).syncs_file()==old(media).syncs_file(),final(media).target()==old(reader).target(),
-        out matches Live::Complete(t) ==> *final(media)==*old(media) && recovered(t@,final(media).bytes(),end,limit,scheme,decode,recode,hash),
-        out matches Live::Repaired(at,e,t) ==> protected<=at<end && !crate::frame_repair::has_later::<M>(old(media).bytes(),at,end,ROOT_MAGIC,limit) &&
+        out matches Live::Complete(t) ==> btree_map_inv(&t) && *final(media)==*old(media) && recovered(t@,final(media).bytes(),end,limit,scheme,decode,recode,hash),
+        out matches Live::Repaired(at,e,t) ==> btree_map_inv(&t) && protected<=at<end && !crate::frame_repair::has_later::<M>(old(media).bytes(),at,end,ROOT_MAGIC,limit) &&
             stopped(final(reader),at,end,crate::frame_repair::FrameError::Tail(e),limit,scheme,decode,recode,hash) &&
             (match e.classification() {
                 crate::frame_repair::Damage::Incomplete=>final(media).calls()==old(media).calls().push(crate::frame_repair::Event::Resize(at)).push(crate::frame_repair::Event::Flush),

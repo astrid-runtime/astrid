@@ -376,6 +376,21 @@ def consumer_defects():
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )
 
+    loaded = Path("verification/hosted_recovered_roots.rs")
+    for label, source, clause, weakness in [
+        ("persisted end", loaded, "history:Ghost(history@),end:at", "history:Ghost(history@),end"),
+        ("root projection", loaded, "let v=Loaded{roots,records", "let v=Loaded{roots:BTreeMap::new(),records"),
+        ("restored object domain", loaded, "roots,records,known,history:Ghost", "roots,records,known:BTreeSet::new(),history:Ghost"),
+        ("separate physical targets", loaded, "arena.target()!=old(reader).target(),", "true,"),
+        ("journal protection", loaded, "recover_live(reader,media,end,protected,limit", "recover_live(reader,media,end,0,limit"),
+        ("arena scan extent", reopen, "rebuild(scan,0,arena_end,scheme", "rebuild(scan,0,0,scheme"),
+        ("arena read identity", reopen, "receipt.target@==arena.target(),", "true,"),
+    ]:
+        yield (
+            f"retained root recovery loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )
+
     transition = walker.with_name("journal_transition.rs")
     for label, source, clause, weakness, consumer in [
         ("diagnostic position", walker, "return Err(Stop::Visitor(offset,f.body,e))",

@@ -128,8 +128,8 @@ def defects():
         ("root generation and commit", journal, "roots@[p] == history@[p].0", "true"),
         ("owning closure", journal, "crate::journal_preload::closed_on(table@,table@.dom()) &&", "true &&"),
         ("physical record identity", journal,
-         "#[trigger] media_record(media.image(),(k,index@[k]),format.scheme,table@[k])) &&",
-         "index@.contains_key(k)) &&"),
+         "backed_by_arena(media.image(),index@,format.scheme,table@) &&",
+         "table@.dom().subset_of(index@.dom()) &&"),
         ("selected component row", source, "g.state.contents().3.contains(edge) &&", "true &&"),
     ]:
         yield (

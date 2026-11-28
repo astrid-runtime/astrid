@@ -136,6 +136,7 @@ INPUTS = [
     Path("verification/hosted_cold_journal.rs"),
     Path("verification/hosted_cold_snapshot.rs"),
     Path("verification/hosted_journal_scan.rs"),
+    Path("verification/hosted_recovered_roots.rs"),
     Path("verification/hosted_closure_model.rs"),
     Path("verification/hosted_record_model.rs"),
     Path("crates/astrid-storage/src/engine/durable_cache/resident.rs"),

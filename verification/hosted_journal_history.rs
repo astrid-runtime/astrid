@@ -820,6 +820,10 @@ fn install_buffer<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRec
     out
 }
 
+pub(super) open spec fn backed_by_arena(image:Seq<u8>,index:Map<crate::ObjectId,crate::ArenaLocation>,scheme:root_wire::Scheme,table:Map<crate::ObjectId,crate::ObjectRecord>) -> bool {
+    forall|k:crate::ObjectId| table.contains_key(k) ==> #[trigger] media_record(image,(k,index[k]),scheme,table[k])
+}
+
 #[verifier::rlimit(20)]
 pub(super) fn preload_closure<P:Ord,M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
     index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,history:&BTreeMap<P,(RootState,u64)>,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I,candidate:BTreeMap<P,RootState>) -> (out:Option<(BTreeMap<P,RootState>,WaveState)>)
@@ -829,8 +833,10 @@ pub(super) fn preload_closure<P:Ord,M:crate::positional_read::Media,H:Fn([u8;8],
         forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
     ensures out matches Some((roots,(table,known))) ==> btree_map_inv(&roots) && btree_map_inv(&table) && roots@.dom() == history@.dom() &&
         (forall|p:P| #[trigger] history@.contains_key(p) ==> roots@[p] == history@[p].0) && known@ == table@.dom() && known@.subset_of(index@.dom()) &&
+        (forall|k:crate::ObjectId| #[trigger] known@.contains(k) ==> exists|p:P,s:Set<crate::ObjectId>|
+            history@.contains_key(p) && #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,s) && s.contains(k)) &&
         crate::journal_preload::closed_on(table@,table@.dom()) &&
-        (forall|k:crate::ObjectId| table@.contains_key(k) ==> #[trigger] media_record(media.image(),(k,index@[k]),format.scheme,table@[k])) &&
+        backed_by_arena(media.image(),index@,format.scheme,table@) &&
         (forall|p:P| #[trigger] history@.contains_key(p) ==> exists|s:Set<crate::ObjectId>|
             #[trigger] crate::journal_closure::admitted(&table,history@[p].0.commit,s) && s.subset_of(known@)),
 {

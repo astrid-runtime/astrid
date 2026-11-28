@@ -238,46 +238,49 @@ fn callback_rejection_never_repairs_or_overwrites_the_stream() {
 #[test]
 fn incomplete_declared_payload_preserves_later_frames() {
     for hosted in [false, true] {
-        for has_later_frame in [false, true] {
-            let (_dir, mut stream) = self::stream(hosted);
-            append_frame(&mut stream, ARENA_MAGIC, b"retained prefix").unwrap();
-            let prefix_len = stream.stream_position().unwrap();
-            stream
-                .write_all(&frame_header(ARENA_MAGIC, 1024, [0; 32]))
-                .unwrap();
-            if has_later_frame {
-                append_frame(&mut stream, ARENA_MAGIC, b"later frame").unwrap();
-            }
-            let mut original = Vec::new();
-            stream.rewind().unwrap();
-            stream.read_to_end(&mut original).unwrap();
-            let mut visits = 0;
-            let result = scan_frames(
-                &mut stream,
-                "test frames",
-                ARENA_MAGIC,
-                RecoveryLimits::process_addressable(),
-                |at, body| {
-                    assert_eq!(at, 0);
-                    assert_eq!(body, b"retained prefix");
-                    visits = usize::strict_add(visits, 1);
-                    Ok(())
-                },
-            );
-            assert_eq!(visits, 1);
-            let expected = if has_later_frame {
-                assert!(
-                    matches!(result,Err(DurableError::Corrupt{offset,detail:"published frame payload is truncated",..}) if offset==prefix_len)
+        for short_reads in [false, true] {
+            for has_later_frame in [false, true] {
+                let (_dir, mut stream) = self::stream(hosted);
+                append_frame(&mut stream, ARENA_MAGIC, b"retained prefix").unwrap();
+                let prefix_len = stream.stream_position().unwrap();
+                stream
+                    .write_all(&frame_header(ARENA_MAGIC, 1024, [0; 32]))
+                    .unwrap();
+                if has_later_frame {
+                    append_frame(&mut stream, ARENA_MAGIC, b"later frame").unwrap();
+                }
+                let mut original = Vec::new();
+                stream.rewind().unwrap();
+                stream.read_to_end(&mut original).unwrap();
+                stream.short_reads = short_reads;
+                let mut visits = 0;
+                let result = scan_frames(
+                    &mut stream,
+                    "test frames",
+                    ARENA_MAGIC,
+                    RecoveryLimits::process_addressable(),
+                    |at, body| {
+                        assert_eq!(at, 0);
+                        assert_eq!(body, b"retained prefix");
+                        visits = usize::strict_add(visits, 1);
+                        Ok(())
+                    },
                 );
-                original.as_slice()
-            } else {
-                result.unwrap();
-                &original[..usize::try_from(prefix_len).unwrap()]
-            };
-            stream.rewind().unwrap();
-            let mut retained = Vec::new();
-            stream.read_to_end(&mut retained).unwrap();
-            assert_eq!(retained, expected);
+                assert_eq!(visits, 1);
+                let expected = if has_later_frame {
+                    assert!(
+                        matches!(result,Err(DurableError::Corrupt{offset,detail:"published frame payload is truncated",..}) if offset==prefix_len)
+                    );
+                    original.as_slice()
+                } else {
+                    result.unwrap();
+                    &original[..usize::try_from(prefix_len).unwrap()]
+                };
+                stream.rewind().unwrap();
+                let mut retained = Vec::new();
+                stream.read_to_end(&mut retained).unwrap();
+                assert_eq!(retained, expected);
+            }
         }
     }
 }

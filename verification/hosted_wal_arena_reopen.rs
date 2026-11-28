@@ -237,6 +237,50 @@ fn rebuild<R:crate::frame_repair::FrameReader,H,I>(reader:&mut R,start:u64,end:u
     Ok(index)
 }
 
+/// Scan a complete canonical arena from byte zero before loading the repaired
+/// root journal. Neither the index nor the set of restored objects is an input.
+#[verifier::spinoff_prover]
+fn reopen_retained<S:crate::frame_repair::FrameReader,R:crate::frame_repair::FrameReader,
+    M:crate::frame_repair::Medium,A:crate::positional_read::Media,P:Ord,D,C,H,I,F>(
+    scan:&mut S,reader:&mut R,media:&mut M,arena:&A,arena_end:u64,end:u64,
+    protected:u64,batch:u64,limit:u64,scheme:root_wire::Scheme,decode:D,recode:C,hash:H,identify:I,project:F,
+    Ghost(receipt):Ghost<ArenaReceipt>,Ghost(records):Ghost<Map<ObjectId,ObjectRecord>>)
+    -> (out:Result<Option<crate::hosted_recovered_roots::Loaded<P>>,RebuildError<S::Error>>)
+    where D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
+        I:Fn(&ObjectRecord)->[u8;32]+Copy,F:FnOnce(&BTreeMap<P,(RootState,u64)>)->BTreeMap<P,RootState>,
+    requires receipt.covers(records,scheme,limit,hash),receipt.start@==0,old(scan).position()==0,
+        old(scan).image()==receipt.image@,receipt.image@==arena.image(),
+        old(scan).target()==receipt.target@,receipt.target@==arena.target(),
+        arena_end==receipt.image@.len(),scheme.algorithm@!=seq![0u8,0u8],scheme.construction@!=seq![0u8,0u8],
+        old(reader).target()==old(media).target(),arena.target()!=old(reader).target(),
+        old(reader).image()==old(media).bytes(),old(media).syncs_file(),old(media).durable()==old(media).bytes(),
+        old(reader).position()==0,protected<=end==old(reader).image().len(),
+        obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|b:&[u8]| #[trigger] decode.requires((b,)),forall|p:&P| #[trigger] recode.requires((p,)),
+        forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),
+        forall|n:u64,a:&[u8],b:&[u8],d:[u8;32],e:[u8;32]| a@==b@ &&
+            #[trigger] hash.ensures((crate::arena_frame::ARENA_MAGIC,n,a),d) &&
+            #[trigger] hash.ensures((crate::arena_frame::ARENA_MAGIC,n,b),e) ==> d==e,
+        forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|k:ObjectId,r:&ObjectRecord,d:[u8;32]| #[trigger] records.contains_key(k) &&
+            crate::hosted_record_roundtrip::same_fields(*r,records[k]) && #[trigger] identify.ensures((r,),d) ==> d@==k.digest(),
+        forall|h:&BTreeMap<P,(RootState,u64)>| #[trigger] project.requires((h,)),
+        forall|h:&BTreeMap<P,(RootState,u64)>,t:BTreeMap<P,RootState>| #[trigger] project.ensures((h,),t) ==> btree_map_inv(&t),
+    ensures final(scan).target()==arena.target() && final(scan).image()==arena.image(),
+        match out {
+            Err(e)=>rebuild_failure::<S>(&receipt,records,e) && *final(media)==*old(media) && *final(reader)==*old(reader),
+            Ok(v)=>final(scan).position()==arena_end && (v matches Some(loaded) ==>
+                final(media).target()==old(reader).target() && protected<=loaded.end<=end &&
+                final(media).durable()==old(reader).image().take(loaded.end as int) &&
+                crate::hosted_journal_scan::recovered(loaded.history@,final(media).durable(),loaded.end,limit,scheme,decode,recode,hash) &&
+                crate::hosted_recovered_roots::retained(&loaded,arena.image(),receipt.index@,scheme)),
+        },
+{
+    let index=rebuild(scan,0,arena_end,scheme,limit,hash,identify,Ghost(receipt),Ghost(records))?;
+    Ok(crate::hosted_recovered_roots::recover_indexed(reader,media,arena,&index,end,protected,batch,limit,
+        scheme,decode,recode,hash,identify,project))
+}
+
 /// Rebuild the table solely by consuming the reopened media and the recovered
 /// index. A failed positional read identifies the exact key and location.
 #[verifier::spinoff_prover]

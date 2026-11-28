@@ -5,6 +5,7 @@ verus! {
 
 pub(super) trait Media {
     type Error;
+    spec fn target(&self) -> (int,Seq<u8>);
     spec fn image(&self) -> Seq<u8>;
     spec fn io_error(&self, offset:u64, error:Self::Error) -> bool;
 
