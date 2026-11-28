@@ -376,6 +376,27 @@ def consumer_defects():
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )
 
+    arena_fold = Path("crates/astrid-storage/src/engine/durable/format/arena_history.rs")
+    arena_scan = Path("verification/hosted_arena_scan.rs")
+    for label, source, clause, weakness in [
+        ("frame domain", walker, "let window=Window{start:0,end,magic:super::arena_frame::ARENA_MAGIC",
+         "let window=Window{start:0,end,magic:super::arena_frame::ROOT_MAGIC"),
+        ("frame payload", arena_fold, "self.index.accept(at,data,", "self.index.accept(at,&[],"),
+        ("physical offset", arena_fold, "self.index.accept(at,data,", "self.index.accept(0,data,"),
+        ("first placement", arena_fold, "    {self.index.finish()}", "    {(BTreeMap::new(),None)}"),
+        ("protected extent", arena_scan, "repair(media,at,end,protected,e.damage()", "repair(media,at,end,0,e.damage()"),
+        ("recovered extent", arena_scan, "Recovery::Loaded(at,(map,tail))\n", "Recovery::Loaded(end,(map,tail))\n"),
+        ("measured arena end", arena_scan, "recover(scan,backing,arena_end,arena_protected", "recover(scan,backing,0,arena_protected"),
+        ("positional identity", arena_scan, "a.target()==m.target() && a.image()==m.durable()", "a.image()==m.durable()"),
+        ("positional image", arena_scan, "a.target()==m.target() && a.image()==m.durable()", "a.target()==m.target()"),
+        ("refusal cause", arena_scan, "return Recovery::Record(at,b,e);", "return Recovery::Record(at,b,IndexError::Collision(ObjectId::new([0;32])));"),
+        ("restored index", arena_scan, "index:Ghost(index@),tail:Ghost(tail)", "index:Ghost(Map::empty()),tail:Ghost(tail)"),
+    ]:
+        yield (
+            f"arbitrary arena recovery loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )
+
     arena_index = Path("crates/astrid-storage/src/engine/durable/format/recovered_record.rs")
     for label, clause, weakness in [
         ("physical offset", "index(&mut self.entries,at,data", "index(&mut self.entries,0,data"),

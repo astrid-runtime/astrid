@@ -84,6 +84,18 @@ pub(super) fn scan_root<R:FrameReader,V:Visitor<R>,H:Fn([u8;8],u64,&[u8])->[u8;3
     scan(reader,visitor,window,hash)
 }
 
+/// The live native arena and its proof enter the same scan at zero.
+pub(super) fn scan_arena<R:FrameReader,V:Visitor<R>,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(reader:&mut R,visitor:&mut V,
+    end:u64,limit:u64,hash:H) -> (out:Result<(),Stop<R::Error,V::Error>>)
+    requires old(visitor).ready(),end<=old(reader).image().len(),old(reader).position()==0,
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((super::arena_frame::ARENA_MAGIC,n,b)),
+    ensures scanned(old(reader),final(reader),old(visitor),final(visitor),
+        Window{start:0,end,magic:super::arena_frame::ARENA_MAGIC,version:super::arena_frame::FRAME_VERSION,limit},hash,out),
+{
+    let window=Window{start:0,end,magic:super::arena_frame::ARENA_MAGIC,version:super::arena_frame::FRAME_VERSION,limit};
+    scan(reader,visitor,window,hash)
+}
+
 proof fn authenticated_frame<R:FrameReader,H:Fn([u8;8],u64,&[u8])->[u8;32]>(before:&R,after:&R,offset:u64,end:u64,
     magic:[u8;8],version:u16,limit:u64,hash:H,f:frame_repair::ScannedFrame)
     requires end<=before.image().len(), frame_repair::classified(before,after,offset,end,magic,version,limit,hash,Ok(f)),

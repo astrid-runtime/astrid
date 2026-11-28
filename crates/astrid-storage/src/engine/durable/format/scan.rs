@@ -128,6 +128,7 @@ pub(super) enum FrameScanBound {
     Committed(DurableFrameRange),
 }
 
+#[cfg(test)]
 pub(in crate::engine::durable) fn scan_frames_with_protected_prefix<F: DurableIo>(
     file: &mut F,
     file_name: &'static str,
@@ -293,10 +294,16 @@ fn scan_live<F: DurableIo>(
     Ok(())
 }
 
-/// Run the verified root-history visitor directly on the live journal reader.
-pub(in crate::engine::durable) fn scan_root_file<F: DurableIo, V, E>(
+#[derive(Clone, Copy)]
+pub(in crate::engine::durable) enum RecoveryFile {
+    Roots,
+    Arena { protected_len: u64 },
+}
+/// Scan the live file using its verified history visitor.
+pub(in crate::engine::durable) fn scan_recovery_file<F: DurableIo, V, E>(
     file: &mut F,
     limits: RecoveryLimits,
+    kind: RecoveryFile,
     visitor: &mut V,
     report: impl FnOnce(u64, &[u8], E) -> DurableError,
 ) -> Result<(), DurableError>
@@ -307,23 +314,45 @@ where
         .durable_metadata()
         .map_err(|source| io_error("read principal-store metadata", source))?
         .len();
+    let (file_name, magic, protected_len) = match kind {
+        RecoveryFile::Roots => (super::super::ROOT_FILE, super::super::ROOT_MAGIC, 0),
+        RecoveryFile::Arena { protected_len } => {
+            (super::ARENA_FILE, super::ARENA_MAGIC, protected_len)
+        },
+    };
+    if protected_len > file_len {
+        return Err(corrupt(
+            file_name,
+            file_len,
+            "published durable prefix is truncated",
+        ));
+    }
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_error("seek durable frame", source))?;
     let policy = FrameScanPolicy {
-        file_name: super::super::ROOT_FILE,
-        magic: super::super::ROOT_MAGIC,
+        file_name,
+        magic,
         limits,
-        protected_len: 0,
+        protected_len,
         file_len,
     };
     scan_live(file, |reader| {
-        let outcome = super::super::frame_scan::scan_root(
-            reader,
-            visitor,
-            file_len,
-            limits.max_frame_bytes,
-            frame_checksum,
-        );
+        let outcome = match kind {
+            RecoveryFile::Roots => super::super::frame_scan::scan_root(
+                reader,
+                visitor,
+                file_len,
+                limits.max_frame_bytes,
+                frame_checksum,
+            ),
+            RecoveryFile::Arena { .. } => super::super::frame_scan::scan_arena(
+                reader,
+                visitor,
+                file_len,
+                limits.max_frame_bytes,
+                frame_checksum,
+            ),
+        };
         complete_scan(outcome, policy, || &mut **reader.get_mut(), report)
     })
 }

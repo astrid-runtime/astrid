@@ -54,16 +54,20 @@ where
         |key: &[u8]| codec.decode(key),
         |p: &P| codec.encode(p),
     );
-    super::format::scan_root_file(roots, limits, &mut recovered, |offset, payload, error| {
-        match error {
+    super::format::scan_recovery_file(
+        roots,
+        limits,
+        super::format::RecoveryFile::Roots,
+        &mut recovered,
+        |offset, payload, error| match error {
             journal_apply::VisitError::Decode(cursor, error) => corrupt(
                 ROOT_FILE,
                 offset,
                 decode_error(payload, cursor, scheme, error),
             ),
             journal_apply::VisitError::Apply(error) => apply_error(offset, error),
-        }
-    })?;
+        },
+    )?;
     Ok(recovered.finish())
 }
 

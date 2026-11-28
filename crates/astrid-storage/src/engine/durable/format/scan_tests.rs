@@ -826,3 +826,40 @@ fn live_source_load_preserves_header_extent_overflow_with_max_bound() {
         assert!(matches!(error, DurableError::EncodingOverflow));
     }
 }
+
+#[test]
+fn arena_recovery_retains_first_location_and_last_duplicate_across_tail_repair() {
+    use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
+    use crate::storage_model::ObjectIdentity;
+
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        vec![7],
+        Vec::new(),
+        1,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let id = TestIdentity.identify(&record);
+    let bytes = encode_object_frame(TEST_IDENTITY_SCHEME, id, &record).unwrap();
+    for hosted in [false, true] {
+        let (_dir, mut stream) = stream(hosted);
+        let first = append_frame(&mut stream, ARENA_MAGIC, &bytes).unwrap();
+        let last = append_frame(&mut stream, ARENA_MAGIC, &bytes).unwrap();
+        let end = stream.stream_position().unwrap();
+        stream.write_all(&[0; 5]).unwrap();
+        stream.short_reads = true;
+        let limits = RecoveryLimits::process_addressable();
+        assert!(
+            matches!(recover_arena(&mut stream,&TestIdentity,limits,end+1),Err(DurableError::Corrupt{offset,..}) if offset==end)
+        );
+        assert_eq!(stream.durable_metadata().unwrap().len(), end + 5);
+        let (map, tail) = recover_arena(&mut stream, &TestIdentity, limits, end).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&id), Some(&first));
+        assert_eq!(tail, Some(last));
+        assert_eq!(stream.stream_position().unwrap(), end);
+        assert_eq!(stream.durable_metadata().unwrap().len(), end);
+    }
+}

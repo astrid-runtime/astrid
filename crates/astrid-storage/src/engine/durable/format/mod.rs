@@ -4,8 +4,8 @@ use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, DurableError, DurableIo, FRAME_HEADER_LEN,
     FRAME_HEADER_LEN_USIZE, FRAME_VERSION, IdentityScheme, ModelError, ObjectClass,
     ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    PersistentObjectIdentity, RecoveryLimits, ReferenceKind, ReferenceLabel, SeekFrom, io,
-    root_wire,
+    PersistentObjectIdentity, RecoveryLimits, ReferenceKind, ReferenceLabel, SeekFrom,
+    frame_repair, frame_scan, io, root_wire,
 };
 #[cfg(test)]
 use super::{CHECKSUM_START, File};
@@ -20,6 +20,7 @@ thread_local! {
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+mod arena_history;
 mod arena_span;
 mod checkpoint_reader;
 mod duplicates;
@@ -60,12 +61,10 @@ pub(super) use positioned::read_frame_at;
 pub(super) use prepared::append_prepared_frames;
 #[cfg(test)]
 use reader::SliceReader;
-#[cfg(test)]
-pub(super) use scan::scan_frames_prefix;
 use scan::{FrameScanBound, read_frame_preserving_cursor_within, scan_frames_with_bound};
-pub(super) use scan::{
-    scan_frames, scan_frames_range, scan_frames_with_protected_prefix, scan_root_file,
-};
+pub(super) use scan::{RecoveryFile, scan_frames, scan_frames_range, scan_recovery_file};
+#[cfg(test)]
+pub(super) use scan::{scan_frames_prefix, scan_frames_with_protected_prefix};
 
 struct CopyReader<'a, F>(&'a mut F, RecoveryLimits);
 
@@ -291,45 +290,38 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
 ) -> Result<(BTreeMap<ObjectId, ArenaLocation>, Option<ArenaLocation>), DurableError> {
     #[cfg(test)]
     RECOVERY_ARENA_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
-    let scheme = identity.scheme();
-    let mut index = recovered_record::ArenaIndex::new();
-    scan_frames_with_protected_prefix(
+    let mut history = arena_history::History::new(
+        identity.scheme().into(),
+        |r: &ObjectRecord| identity.identify(r),
+        |length, bytes: &[u8]| frame_checksum(ARENA_MAGIC, length, bytes),
+    );
+    scan_recovery_file(
         arena,
-        ARENA_FILE,
-        ARENA_MAGIC,
         limits,
-        protected_len,
-        |offset, payload, _source| {
+        RecoveryFile::Arena { protected_len },
+        &mut history,
+        |offset, _, error| {
             use recovered_record::{Error, IndexError};
-            index
-                .accept(
+            match error {
+                IndexError::Record(Error::Decode(e)) => {
+                    corrupt(ARENA_FILE, offset, body_error_detail(e))
+                },
+                IndexError::Record(Error::Identity) => {
+                    corrupt(ARENA_FILE, offset, "object identity mismatch")
+                },
+                IndexError::Record(Error::Overflow) => DurableError::EncodingOverflow,
+                IndexError::Record(Error::Canonical) => {
+                    corrupt(ARENA_FILE, offset, "object frame is not canonical")
+                },
+                IndexError::Collision(id) => DurableError::RecoveryModel {
+                    file: ARENA_FILE,
                     offset,
-                    payload,
-                    scheme.into(),
-                    |r| identity.identify(r),
-                    |length, bytes| frame_checksum(ARENA_MAGIC, length, bytes),
-                )
-                .map_err(|error| match error {
-                    IndexError::Record(Error::Decode(e)) => {
-                        corrupt(ARENA_FILE, offset, body_error_detail(e))
-                    },
-                    IndexError::Record(Error::Identity) => {
-                        corrupt(ARENA_FILE, offset, "object identity mismatch")
-                    },
-                    IndexError::Record(Error::Overflow) => DurableError::EncodingOverflow,
-                    IndexError::Record(Error::Canonical) => {
-                        corrupt(ARENA_FILE, offset, "object frame is not canonical")
-                    },
-                    IndexError::Collision(id) => DurableError::RecoveryModel {
-                        file: ARENA_FILE,
-                        offset,
-                        source: ModelError::ObjectCollision(id),
-                    },
-                })?;
-            Ok(())
+                    source: ModelError::ObjectCollision(id),
+                },
+            }
         },
     )?;
-    Ok(index.finish())
+    Ok(history.finish())
 }
 
 #[cfg(test)]

@@ -228,6 +228,7 @@ mod hosted_cold_journal;
 mod hosted_cold_snapshot;
 mod hosted_journal_scan;
 mod hosted_recovered_roots;
+mod hosted_arena_scan;
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/root_history.rs"]
@@ -296,6 +297,8 @@ mod direct_placement;
 mod positional_read;
 #[path = "../crates/astrid-storage/src/engine/durable/format/verified_record.rs"]
 mod verified_record;
+#[path = "../crates/astrid-storage/src/engine/durable/format/arena_history.rs"]
+mod arena_history;
 #[path = "../crates/astrid-storage/src/engine/durable/format/recovered_record.rs"]
 mod recovered_record;
 mod hosted_record_model;
