@@ -748,7 +748,14 @@ mod media;
 pub(in crate::engine::durable) use media::{DurableIo, File, StoreLock};
 
 #[derive(Debug)]
+enum CommitFrontier {
+    Wal,
+    Journal(frontier::JournalFlush<crate::volume::VolumeFile>),
+}
+
+#[derive(Debug)]
 struct Persisted {
+    frontier: CommitFrontier,
     locations: Vec<(ObjectId, ArenaLocation)>,
     arena_len: u64,
 }

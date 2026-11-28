@@ -100,6 +100,7 @@ where
             .map_err(|source| io_error("read WAL staged arena metadata", source))?
             .len();
         Ok(Persisted {
+            frontier: super::super::CommitFrontier::Wal,
             locations: Vec::new(),
             arena_len,
         })

@@ -47,14 +47,15 @@ spec fn stored(name:Seq<u8>,scheme:root_wire::Scheme,e:Option<RootState>,r:RootS
     arena_frame::header_bytes(magic,version,payload.len() as u64,digest(magic,payload.len() as u64,payload))+payload
 }
 
-enum JournalRecovery { AwaitingContainer, Replayed(RootState,bool) }
+use crate::group_frontier::{JournalContainer,JournalFlush};
+enum Failure<E> { Journal(E), Frontier(E) }
 
 /// The prior recovered history is independent of the live writer. A stale history must reject
 /// the otherwise intact frame and leave every owner unchanged.
-fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positional_read::Media,Open:FnOnce(&J)->M,P:Ord+Copy,K:FnOnce(Owner)->P,N:Fn(&P)->Owner+Copy,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(writer:&mut BTreeMap<P,RootState>,
+fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positional_read::Media,Open:FnOnce(&J)->M,V:FnOnce(&J::Container)->M,A:FnOnce()->Result<(),J::Error>,P:Ord+Copy,K:FnOnce(Owner)->P,N:Fn(&P)->Owner+Copy,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(writer:&mut BTreeMap<P,RootState>,
     recovered:&mut BTreeMap<P,(RootState,u64)>,owner:Owner,key:P,key_of:K,name_of:N,expected:Option<RootState>,next:RootState,
-    mut prefix:Vec<u8>,base:u64,magic:[u8;8],version:u16,scheme:root_wire::Scheme,hash:H,sink:&mut J,reopen:Open,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>)
-    -> (out:Result<JournalRecovery,J::Error>)
+    mut prefix:Vec<u8>,base:u64,magic:[u8;8],version:u16,scheme:root_wire::Scheme,hash:H,sink:&mut J,reopen:Open,reopen_volume:V,advance:A,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>)
+    -> (out:Result<(RootState,bool,M),Failure<J::Error>>)
     requires btree_map_inv(old(writer)),btree_map_inv(old(recovered)),obeys_cmp::<P>(),
         obeys_cmp_concrete_eq::<P>(),obeys_clone_eq::<P>(),
         name_of.requires((&key,)),forall|o:Owner| #[trigger] name_of.ensures((&key,),o) ==> o.bytes()==owner.bytes(),
@@ -62,21 +63,35 @@ fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positio
         forall|o:Owner,p:P| o.bytes()==owner.bytes() && #[trigger] key_of.ensures((o,),p) ==> p==key,
         base as int==old(sink).pending().len(),old(sink).position()==base,
         forall|s:&J| #[trigger] reopen.requires((s,)),
-        forall|s:&J,m:M| #[trigger] reopen.ensures((s,),m) ==> m.image()==s.durable() &&
+        forall|s:&J,m:M| #[trigger] reopen.ensures((s,),m) ==> (target@)(m)==s.journal_target() && m.image()==s.durable() &&
+            forall|at:u64,err:M::Error| base as int+prefix.len()<=at<base as int+prefix.len()+stored(owner.bytes(),scheme,expected,next,magic,version,digest@).len()
+                ==> !#[trigger] m.io_error(at,err),
+        advance.requires(()),
+        forall|c:&J::Container| #[trigger] reopen_volume.requires((c,)),
+        forall|c:&J::Container,m:M| #[trigger] reopen_volume.ensures((c,),m) ==> (target@)(m)==(c.container_id(),c.region_id()) && m.image()==c.durable_image() &&
             forall|at:u64,err:M::Error| base as int+prefix.len()<=at<base as int+prefix.len()+stored(owner.bytes(),scheme,expected,next,magic,version,digest@).len()
                 ==> !#[trigger] m.io_error(at,err),
         base as int+prefix.len()+stored(owner.bytes(),scheme,expected,next,magic,version,digest@).len()<=u64::MAX,
         forall|m:[u8;8],n:u64,b:&[u8],sum:[u8;32]| #[trigger] hash.ensures((m,n,b),sum) ==> sum==(digest@)(m,n,b@),
         base as int+prefix.len()<=u64::MAX,prefix.len()+200<=isize::MAX,
         forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),
-    ensures crate::group_frontier::journal_completed(old(sink).journal_calls(),final(sink).journal_calls(),
-            prefix@+stored(owner.bytes(),scheme,expected,next,magic,version,digest@),
-            match out {Ok(JournalRecovery::Replayed(_, _))=>Ok(crate::group_frontier::JournalFlush::StableFile),
-                Ok(JournalRecovery::AwaitingContainer)=>Ok(crate::group_frontier::JournalFlush::AwaitingContainer),Err(e)=>Err(e)}),
-        (out.is_err() || out matches Ok(JournalRecovery::AwaitingContainer)) ==> final(writer)@==old(writer)@ && final(recovered)@==old(recovered)@,
-        out matches Ok(JournalRecovery::Replayed(ack,applied)) ==> ({
+    ensures ({
+        let batch=prefix@+stored(owner.bytes(),scheme,expected,next,magic,version,digest@);
+        match out {
+            Err(Failure::Journal(e))=>crate::group_frontier::journal_completed(old(sink).journal_calls(),final(sink).journal_calls(),batch,Err(e)),
+            _=>exists|receipt:JournalFlush<J::Container>| #[trigger] crate::group_frontier::journal_completed(
+                old(sink).journal_calls(),final(sink).journal_calls(),batch,Ok(receipt)) &&
+                match out {Err(Failure::Frontier(e))=>advance.ensures((),Err(e)) || (advance.ensures((),Ok(())) &&
+                    (receipt matches JournalFlush::AwaitingContainer(c) && c.sync_failed(e))),_=>advance.ensures((),Ok(()))},
+        }
+    }),
+        out.is_err() ==> final(writer)@==old(writer)@ && final(recovered)@==old(recovered)@,
+        out matches Ok((ack,applied,media)) ==> ({
         let actual=if old(recovered)@.contains_key(key) {Some(old(recovered)@[key].0)} else {None};
         let generation=match actual {None=>0int,Some(r)=>r.generation.value() as int+1};
+        &&& (target@)(media)==old(sink).journal_target()
+        &&& crate::storage_fields::at(media.image(),base as int+prefix.len(),
+            stored(owner.bytes(),scheme,expected,next,magic,version,digest@))
         &&& ack==next
         &&& final(writer)@==old(writer)@.insert(key,ack)
         &&& applied==(actual==expected && next.generation.value()==generation)
@@ -106,12 +121,15 @@ fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positio
     assert(prefix@.skip(start as int) =~= bytes);
     assert(prefix@ =~= original+bytes);
     let ghost prior=sink.pending();
-    if let crate::group_frontier::JournalFlush::AwaitingContainer=crate::group_frontier::persist_journal(sink,&prefix)? {
-        return Ok(JournalRecovery::AwaitingContainer);
-    }
-    assert(sink.durable()==prior+prefix@);
+    let receipt=match crate::group_frontier::persist_journal(sink,&prefix) {
+        Ok(r)=>r, Err(e)=>return Err(Failure::Journal(e)),
+    };
+    let completion=match crate::group_frontier::finish_journal(receipt,advance) {
+        Ok(c)=>c, Err(e)=>return Err(Failure::Frontier(e)),
+    };
     let (ack,_)=prepared.publish(writer,|_,_,_|(),|_,_,_|());
-    let media=reopen(sink);
+    let media=match completion {None=>reopen(sink),Some(c)=>reopen_volume(&c)};
+    assert(media.image()==prior+prefix@);
     assert(media.image().subrange(frame.offset as int,frame.offset as int+size) =~= bytes);
     let mut observed=vec![0u8;size];
     match crate::positional_read::exact(&media,frame.offset,&mut observed) {
@@ -131,6 +149,6 @@ fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positio
     {Some(key_of(owner_codec::decode(n).unwrap()))};
     let recode=|p:&P| -> (r:Vec<u8>) requires *p==key, ensures r@==owner.bytes(), {name_of(p).encode()};
     let result=parsed.replay(recovered,scheme,frame.offset,body,decode,recode);
-    Ok(JournalRecovery::Replayed(ack,result.is_ok()))
+    Ok((ack,result.is_ok(),media))
 }
 }

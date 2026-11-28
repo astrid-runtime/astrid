@@ -526,7 +526,7 @@ where
                     live_files_mut(&mut inner.files)
                         .map_or(true, |files| files.arena_len >= previous_arena_len)
                 );
-                self.publish_commit_frontier(inner, persisted.arena_len)
+                self.publish_commit_frontier(inner, persisted.arena_len, persisted.frontier)
             }),
         };
         match published {
@@ -593,12 +593,16 @@ where
         &self,
         inner: &mut DurableInner<P>,
         arena_len: u64,
+        frontier: super::CommitFrontier,
     ) -> Result<(), DurableError> {
-        if self.transaction_wal.is_enabled() {
-            Self::advance_wal_arena_frontier(inner, arena_len)
-        } else {
-            self.advance_index_frontier(inner, arena_len)?;
-            self.sync_volume()
+        match frontier {
+            super::CommitFrontier::Wal => Self::advance_wal_arena_frontier(inner, arena_len),
+            super::CommitFrontier::Journal(receipt) => {
+                super::frontier::finish_journal(receipt, || {
+                    self.advance_index_frontier(inner, arena_len)
+                })
+                .map(|_| ())
+            },
         }
     }
 
@@ -706,7 +710,7 @@ where
         }
         self.fail_if(FaultPoint::BeforeRootCas)?;
 
-        self.publish_group_roots(files, accepted)?;
+        let receipt = self.publish_group_roots(files, accepted)?;
         let arena_len = files
             .arena
             .metadata()
@@ -714,6 +718,7 @@ where
             .len();
 
         Ok(Persisted {
+            frontier: super::CommitFrontier::Journal(receipt),
             locations: ids
                 .into_iter()
                 .zip(object_locations)
@@ -727,7 +732,7 @@ where
         &self,
         files: &mut DurableFiles,
         accepted: &[AcceptedCommit<P>],
-    ) -> Result<(), DurableError> {
+    ) -> Result<super::frontier::JournalFlush<crate::volume::VolumeFile>, DurableError> {
         let journals =
             super::frontier::journals(accepted, |entry| entry.prepared.root.journal().as_slice());
         let publication_started = Instant::now();
@@ -738,8 +743,9 @@ where
             accepted,
             publication_started,
         };
-        super::frontier::persist_journal(&mut journal, &encoded)?;
-        self.fail_if(FaultPoint::AfterRootCas)
+        let receipt = super::frontier::persist_journal(&mut journal, &encoded)?;
+        self.fail_if(FaultPoint::AfterRootCas)?;
+        Ok(receipt)
     }
 
     fn append_group_representations<'a>(
@@ -805,6 +811,7 @@ struct RootJournalBatch<'a, P: Ord> {
 
 impl<P: Ord> super::frontier::JournalSink for RootJournalBatch<'_, P> {
     type Error = DurableError;
+    type Container = crate::volume::VolumeFile;
 
     fn write_batch(&mut self, bytes: &[u8]) -> Result<(), DurableError> {
         use std::io::Write;
@@ -819,7 +826,9 @@ impl<P: Ord> super::frontier::JournalSink for RootJournalBatch<'_, P> {
         Ok(())
     }
 
-    fn flush_batch(&mut self) -> Result<super::frontier::JournalFlush, DurableError> {
+    fn flush_batch(
+        &mut self,
+    ) -> Result<super::frontier::JournalFlush<Self::Container>, DurableError> {
         let started = Instant::now();
         let scope = self
             .file

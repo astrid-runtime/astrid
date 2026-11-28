@@ -40,45 +40,85 @@ pub(super) fn wal_position<L: Copy>(current: u64, tail: Option<L>, observed: u64
     }
 }
 
-pub(super) enum JournalFlush { StableFile, AwaitingContainer }
+pub(super) trait JournalContainer {
+    type Error;
+    spec fn journal_image(&self) -> Seq<u8>;
+    spec fn durable_image(&self) -> Seq<u8>;
+    spec fn container_id(&self) -> int;
+    spec fn region_id(&self) -> Seq<u8>;
+    spec fn sync_failed(&self,error:Self::Error) -> bool;
+    fn sync_container(&mut self) -> (out:Result<(),Self::Error>)
+        ensures final(self).container_id()==old(self).container_id(), final(self).region_id()==old(self).region_id(),
+            out.is_ok() ==> final(self).durable_image()==old(self).journal_image(),
+            out matches Err(e) ==> old(self).sync_failed(e);
+}
+
+#[derive(Debug)]
+pub(super) enum JournalFlush<C> { StableFile, AwaitingContainer(C) }
 #[cfg(verus_keep_ghost)]
-pub(super) ghost enum JournalCall<E> { Write(Seq<u8>,Result<(),E>), Sync(Result<JournalFlush,E>) }
+pub(super) ghost enum JournalCall<C,E> { Write(Seq<u8>,Result<(),E>), Sync(Result<JournalFlush<C>,E>) }
 
 /// A journal handle positioned at the append offset. A failed host operation may
 /// leave partial bytes. Only a successful sync certifies the complete pending image.
 pub(super) trait JournalSink {
     type Error;
+    type Container: JournalContainer<Error=Self::Error>;
     spec fn pending(&self) -> Seq<u8>;
     spec fn durable(&self) -> Seq<u8>;
     spec fn position(&self) -> int;
-    spec fn journal_calls(&self) -> Seq<JournalCall<Self::Error>>;
+    spec fn journal_target(&self) -> (int,Seq<u8>);
+    spec fn journal_calls(&self) -> Seq<JournalCall<Self::Container,Self::Error>>;
     fn write_batch(&mut self,bytes:&[u8]) -> (out:Result<(),Self::Error>)
-        ensures final(self).journal_calls()==old(self).journal_calls().push(JournalCall::Write(bytes@,out)),
+        ensures final(self).journal_target()==old(self).journal_target(),
+            final(self).journal_calls()==old(self).journal_calls().push(JournalCall::Write(bytes@,out)),
             out.is_ok() && old(self).position()==old(self).pending().len()
             ==> final(self).pending()==old(self).pending()+bytes@;
-    fn flush_batch(&mut self) -> (out:Result<JournalFlush,Self::Error>)
-        ensures final(self).journal_calls()==old(self).journal_calls().push(JournalCall::Sync(out)),
+    fn flush_batch(&mut self) -> (out:Result<JournalFlush<Self::Container>,Self::Error>)
+        ensures final(self).journal_target()==old(self).journal_target(),
+            final(self).journal_calls()==old(self).journal_calls().push(JournalCall::Sync(out)),
             out matches Ok(JournalFlush::StableFile) ==> final(self).durable()==old(self).pending(),
-            out matches Ok(JournalFlush::AwaitingContainer) ==> final(self).pending()==old(self).pending();
+            out matches Ok(JournalFlush::AwaitingContainer(c)) ==> (c.container_id(),c.region_id())==old(self).journal_target() &&
+                c.journal_image()==old(self).pending() && final(self).pending()==old(self).pending();
 }
 
-pub(super) open spec fn journal_completed<E>(prior:Seq<JournalCall<E>>,after:Seq<JournalCall<E>>,batch:Seq<u8>,out:Result<JournalFlush,E>) -> bool {
+pub(super) open spec fn journal_completed<C,E>(prior:Seq<JournalCall<C,E>>,after:Seq<JournalCall<C,E>>,batch:Seq<u8>,out:Result<JournalFlush<C>,E>) -> bool {
     let submitted=prior.push(JournalCall::Write(batch,Ok(())));
     after==submitted.push(JournalCall::Sync(out)) ||
         (out matches Err(e) && after==prior.push(JournalCall::Write(batch,Err(e))))
 }
 
 /// Use the same journal handle for both operations and propagate its first error.
-pub(super) fn persist_journal<S:JournalSink>(sink:&mut S,bytes:&[u8]) -> (out:Result<JournalFlush,S::Error>)
+pub(super) fn persist_journal<S:JournalSink>(sink:&mut S,bytes:&[u8]) -> (out:Result<JournalFlush<S::Container>,S::Error>)
     ensures journal_completed(old(sink).journal_calls(),final(sink).journal_calls(),bytes@,out),
+        final(sink).journal_target()==old(sink).journal_target(),
+        out matches Ok(JournalFlush::AwaitingContainer(c)) ==> (c.container_id(),c.region_id())==old(sink).journal_target(),
         old(sink).position()==old(sink).pending().len() ==> match out {
             Ok(JournalFlush::StableFile)=>final(sink).durable()==old(sink).pending()+bytes@,
-            Ok(JournalFlush::AwaitingContainer)=>final(sink).pending()==old(sink).pending()+bytes@,
+            Ok(JournalFlush::AwaitingContainer(c))=>c.journal_image()==old(sink).pending()+bytes@,
             Err(_)=>true,
         },
 {
     sink.write_batch(bytes)?;
     sink.flush_batch()
+}
+
+/// Publish the index before flushing the exact container retained by the root journal.
+pub(super) fn finish_journal<C:JournalContainer,F:FnOnce()->Result<(),C::Error>>(receipt:JournalFlush<C>,advance:F)
+    -> (out:Result<Option<C>,C::Error>)
+    requires advance.requires(()),
+    ensures out.is_ok() ==> advance.ensures((),Ok(())),
+        out matches Ok(None) ==> receipt is StableFile,
+        out matches Ok(Some(stable)) ==> receipt matches JournalFlush::AwaitingContainer(submitted)
+            && stable.durable_image()==submitted.journal_image() && stable.container_id()==submitted.container_id()
+            && stable.region_id()==submitted.region_id(),
+        out matches Err(e) ==> advance.ensures((),Err(e)) || (advance.ensures((),Ok(())) &&
+            (receipt matches JournalFlush::AwaitingContainer(c) && c.sync_failed(e))),
+{
+    advance()?;
+    match receipt {
+        JournalFlush::StableFile=>Ok(None),
+        JournalFlush::AwaitingContainer(mut c)=>{c.sync_container()?;Ok(Some(c))}
+    }
 }
 
 pub(super) enum PublicationError<E> { Active, Empty, Sync(E) }

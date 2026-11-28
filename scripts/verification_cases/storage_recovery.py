@@ -8,6 +8,11 @@ from .common import replace_once
 def consumer_defects():
     frontier = Path("crates/astrid-storage/src/engine/durable/frontier.rs")
     for label, clause, weaker in [
+        ("container pending bytes", "Ok(JournalFlush::AwaitingContainer(c))=>c.journal_image()==old(sink).pending()+bytes@", "Ok(JournalFlush::AwaitingContainer(c))=>true"),
+        ("container stable bytes", "stable.durable_image()==submitted.journal_image() &&", "true &&"),
+        ("container identity", "stable.container_id()==submitted.container_id()\n            &&", "true &&"),
+        ("region identity", "&& stable.region_id()==submitted.region_id(),", "&& true,"),
+        ("index advancement", "ensures out.is_ok() ==> advance.ensures((),Ok(())),", "ensures true,"),
         ("native synced bytes", "Ok(JournalFlush::StableFile)=>final(sink).durable()==old(sink).pending()+bytes@", "Ok(JournalFlush::StableFile)=>true"),
         ("observed write and flush", "ensures journal_completed(old(sink).journal_calls(),final(sink).journal_calls(),bytes@,out),", "ensures true,"),
     ]:

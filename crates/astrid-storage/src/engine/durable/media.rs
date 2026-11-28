@@ -107,15 +107,18 @@ impl File {
     }
 
     pub(in crate::engine::durable) fn sync_data(&self) -> io::Result<()> {
-        self.flush_region().map(|_| ())
+        match self {
+            Self::Native(file) => file.sync_data(),
+            Self::Volume(_) => Ok(()),
+        }
     }
 
-    pub(super) fn flush_region(&self) -> io::Result<super::frontier::JournalFlush> {
+    pub(super) fn flush_region(&self) -> io::Result<super::frontier::JournalFlush<VolumeFile>> {
         use super::frontier::JournalFlush;
         match self {
             Self::Native(file) => file.sync_data().map(|()| JournalFlush::StableFile),
             // ASTVOL1 durability is one container fsync via AstridVolume::sync.
-            Self::Volume(_) => Ok(JournalFlush::AwaitingContainer),
+            Self::Volume(file) => Ok(JournalFlush::AwaitingContainer(file.clone())),
         }
     }
 
@@ -273,5 +276,14 @@ impl StoreMetadata {
             Self::Native(metadata) => metadata.len(),
             Self::Volume(metadata) => metadata.len(),
         }
+    }
+}
+
+impl super::frontier::JournalContainer for VolumeFile {
+    type Error = DurableError;
+
+    fn sync_container(&mut self) -> Result<(), DurableError> {
+        self.sync_data()
+            .map_err(|source| super::io_error("flush volume container", source))
     }
 }
