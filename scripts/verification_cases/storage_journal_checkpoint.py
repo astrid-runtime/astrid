@@ -147,3 +147,16 @@ def consumer_defects():
             f"prepared graph row loses {label}", placement,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), publication,
         )
+
+    batch_writer = Path("verification/hosted_wal_batch_writer.rs")
+    for label, clause, weakness in [
+        ("object ordinal", "o.encoding.flag(),sequence,count as u64,o.body.len()", "o.encoding.flag(),sequence,0,o.body.len()"),
+        ("submitted interval", "wal.append_record(&stream[start..end])", "wal.append_record(&stream[..end])"),
+        ("commit frame", "wal.append_record(&stream[start..])", "wal.append_record(&stream[start..start])"),
+        ("captured offset", "start:base+(row.next-72-row.body.len()) as u64", "start:base+row.next as u64"),
+        ("stable readback", "ensures out.1@==stream@ && out.0.image()", "ensures true && out.0.image()"),
+    ]:
+        yield (
+            f"acknowledged variable batch loses {label}", batch_writer,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), batch_writer,
+        )

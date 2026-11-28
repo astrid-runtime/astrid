@@ -9,6 +9,8 @@ use vstd::prelude::*;
 
 #[path = "hosted_wal_object_root.rs"]
 mod object_root;
+#[path = "hosted_wal_batch_writer.rs"]
+mod batch_writer;
 
 verus! {
 
