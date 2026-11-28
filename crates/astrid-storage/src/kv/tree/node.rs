@@ -10,12 +10,9 @@ use super::checkpoint_reference::{self, Rejection, Relation};
 use super::validation::validate_composite_key;
 use crate::error::{StorageError, StorageResult};
 
-pub(super) const INLINE_VALUE_MAX: usize = 1_024;
+pub(super) use super::checkpoint_value::{INLINE_VALUE_MAX, ValueSlot};
 pub(super) const NODE_MAX_RETAINED_BYTES: u64 = 4_096;
 pub(super) use super::checkpoint_branch::{MAX_TREE_LEVEL, NODE_MAX_ENTRIES};
-
-const INLINE_VALUE: u8 = 0;
-const SPILLED_VALUE: u8 = 1;
 
 pub(super) use super::checkpoint_totals::NodeTotals;
 
@@ -36,12 +33,6 @@ impl NodeTotals {
                 .ok_or_else(arithmetic_overflow)?,
         })
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ValueSlot {
-    Inline(Vec<u8>),
-    Spilled { object: ObjectId, length: u64 },
 }
 
 impl ValueSlot {
@@ -107,6 +98,8 @@ pub(super) fn value_record(bytes: Vec<u8>) -> StorageResult<ObjectRecord> {
 }
 
 pub(super) fn leaf_record(entries: &[LeafEntry]) -> StorageResult<ObjectRecord> {
+    use super::checkpoint_value::WriteError;
+
     if entries.is_empty() || entries.len() > NODE_MAX_ENTRIES {
         return Err(serialization("invalid KV leaf entry count"));
     }
@@ -128,27 +121,12 @@ pub(super) fn leaf_record(entries: &[LeafEntry]) -> StorageResult<ObjectRecord> 
         if !super::checkpoint_key_field::append(&mut canonical, &entry.key) {
             return Err(arithmetic_overflow());
         }
-        canonical.extend_from_slice(&entry.value.length()?.to_le_bytes());
-        match &entry.value {
-            ValueSlot::Inline(value) => {
-                if value.len() > INLINE_VALUE_MAX {
-                    return Err(serialization("oversized inline KV value"));
-                }
-                canonical.push(INLINE_VALUE);
-                canonical.extend_from_slice(value);
-            },
-            ValueSlot::Spilled { object, length } => {
-                if *length <= u64::try_from(INLINE_VALUE_MAX).unwrap_or(u64::MAX) {
-                    return Err(serialization("small KV value was not inlined"));
-                }
-                canonical.push(SPILLED_VALUE);
-                references.push(ObjectReference::owns(
-                    checkpoint_reference::label(Relation::Value, index)
-                        .ok_or_else(arithmetic_overflow)?,
-                    *object,
-                ));
-            },
-        }
+        super::checkpoint_value::append(&mut canonical, &mut references, index, &entry.value)
+            .map_err(|reason| match reason {
+                WriteError::Overflow => arithmetic_overflow(),
+                WriteError::Oversized => serialization("oversized inline KV value"),
+                WriteError::SmallSpill => serialization("small KV value was not inlined"),
+            })?;
     }
     ObjectRecord::new(
         ObjectKind::KvLeaf,
@@ -263,6 +241,8 @@ pub(super) fn spilled_opaque_payload(
 }
 
 fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
+    use super::checkpoint_value::Error as ValueError;
+
     let bytes = record.canonical_bytes();
     let (offset, Header { count, totals, .. }) =
         checkpoint_header::read(bytes, Kind::Leaf).map_err(|e| header_error(id, e))?;
@@ -275,39 +255,27 @@ fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
     for entry_index in 0..count {
         let key = cursor.key()?.to_vec();
         validate_composite_key(id, &key)?;
-        let value_length = cursor.u64()?;
-        let value = match cursor.u8()? {
-            INLINE_VALUE => {
-                let inline_length =
-                    usize::try_from(value_length).map_err(|_| invalid(id, "KV value too large"))?;
-                if inline_length > INLINE_VALUE_MAX {
-                    return Err(invalid(id, "oversized inline KV value"));
-                }
-                ValueSlot::Inline(cursor.take(inline_length)?.to_vec())
+        let value = super::checkpoint_value::read(
+            bytes,
+            &mut cursor.offset,
+            record.references(),
+            &mut reference_index,
+            entry_index,
+        )
+        .map_err(|reason| match reason {
+            ValueError::Field(e) => page_read_error(id, e),
+            ValueError::Length => invalid(id, "KV value too large"),
+            ValueError::Oversized => invalid(id, "oversized inline KV value"),
+            ValueError::SmallSpill => invalid(id, "small KV value was not inlined"),
+            ValueError::Tag => invalid(id, "invalid KV value storage tag"),
+            ValueError::Reference(Rejection::Missing) => {
+                invalid(id, "spilled KV value reference is missing")
             },
-            SPILLED_VALUE => {
-                if value_length <= u64::try_from(INLINE_VALUE_MAX).unwrap_or(u64::MAX) {
-                    return Err(invalid(id, "small KV value was not inlined"));
-                }
-                let object = checkpoint_reference::target(
-                    record.references(),
-                    reference_index,
-                    Relation::Value,
-                    entry_index,
-                )
-                .map_err(|reason| match reason {
-                    Rejection::Missing => invalid(id, "spilled KV value reference is missing"),
-                    Rejection::IndexOverflow => arithmetic_overflow(),
-                    Rejection::Mismatch => invalid(id, "invalid spilled KV value reference"),
-                })?;
-                reference_index = reference_index.saturating_add(1);
-                ValueSlot::Spilled {
-                    object,
-                    length: value_length,
-                }
+            ValueError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
+            ValueError::Reference(Rejection::Mismatch) => {
+                invalid(id, "invalid spilled KV value reference")
             },
-            _ => return Err(invalid(id, "invalid KV value storage tag")),
-        };
+        })?;
         entries.push(LeafEntry { key, value });
     }
     cursor.done()?;
@@ -409,20 +377,6 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn take(&mut self, length: usize) -> StorageResult<&'a [u8]> {
-        crate::storage_fields::take(self.bytes, &mut self.offset, length)
-            .map_err(|error| page_read_error(self.id, error))
-    }
-
-    fn array<const N: usize>(&mut self) -> StorageResult<[u8; N]> {
-        crate::storage_fields::fixed(self.bytes, &mut self.offset)
-            .map_err(|error| page_read_error(self.id, error))
-    }
-
-    fn u8(&mut self) -> StorageResult<u8> {
-        Ok(self.array::<1>()?[0])
-    }
-
     fn key(&mut self) -> StorageResult<&'a [u8]> {
         use super::checkpoint_key_field::{self, KeyError};
 
@@ -430,10 +384,6 @@ impl<'a> Cursor<'a> {
             KeyError::Field(error) => page_read_error(self.id, error),
             KeyError::Length => invalid(self.id, "persistent KV length is too large"),
         })
-    }
-
-    fn u64(&mut self) -> StorageResult<u64> {
-        Ok(u64::from_le_bytes(self.array()?))
     }
 
     fn done(self) -> StorageResult<()> {
@@ -466,8 +416,8 @@ mod tests {
             checkpoint_header::BRANCH_MAGIC,
             b"astrid-kv-bplus-branch-v1\0"
         );
-        assert_eq!(INLINE_VALUE, 0);
-        assert_eq!(SPILLED_VALUE, 1);
+        assert_eq!(super::super::checkpoint_value::INLINE_VALUE, 0);
+        assert_eq!(super::super::checkpoint_value::SPILLED_VALUE, 1);
     }
 
     #[test]

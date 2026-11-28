@@ -303,6 +303,9 @@ mod checkpoint_branch;
 mod checkpoint_summary;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_header.rs"]
 mod checkpoint_header;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_value.rs"]
+mod checkpoint_value;
+mod hosted_checkpoint_value;
 mod hosted_checkpoint_header;
 mod hosted_checkpoint_summary;
 mod hosted_checkpoint_branch;

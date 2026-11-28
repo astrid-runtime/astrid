@@ -698,6 +698,23 @@ def checkpoint_header_consumers():
         )
 
 
+def checkpoint_value_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_value.rs")
+    consumer = Path("verification/hosted_checkpoint_value.rs")
+    for label, clause, weaker in [
+        ("inline bytes", "data@ == bytes.subrange(start+9,end)", "true"),
+        ("spilled target", "refs[position as int].fields() == (edge::wire", "false ==> refs[position as int].fields() == (edge::wire"),
+        ("physical cursor", "next as int == position as int+1", "true"),
+        ("error cause", "&& failure(bytes@,*old(cursor)", "&& false ==> failure(bytes@,*old(cursor)"),
+        ("writer bytes", "out.is_ok() ==> final(bytes)@ == old(bytes)@ + wire(*value)", "true"),
+        ("writer owning edge", "final(refs)@.last().fields() == (edge::wire", "false ==> final(refs)@.last().fields() == (edge::wire"),
+    ]:
+        yield (
+            f"checkpoint value loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )
+
+
 def checkpoint_decode_consumers():
     yield from checkpoint_page_consumers()
     yield from checkpoint_reference_consumers()
@@ -707,3 +724,4 @@ def checkpoint_decode_consumers():
     yield from checkpoint_branch_consumers()
     yield from checkpoint_summary_consumers()
     yield from checkpoint_header_consumers()
+    yield from checkpoint_value_consumers()
