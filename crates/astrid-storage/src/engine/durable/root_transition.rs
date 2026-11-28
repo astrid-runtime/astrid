@@ -160,6 +160,22 @@ pub(super) fn sample<P:Ord,S,R,F:FnOnce(&S)->R>(roots:&BTreeMap<P,S>,owner:&P,re
     roots.get(owner).map(read)
 }
 
+/// Publish to the existing cell, or supply the complete current map to the
+/// new-principal builder. Both receive the writer's exact replacement root.
+pub(super) fn publish_slot<P:Ord,S,T,U,N>(slots:&BTreeMap<P,S>,owner:&P,root:RootState,update:U,new:N) -> (out:T)
+    where U:FnOnce(&S,RootState)->T, N:FnOnce(&BTreeMap<P,S>,&P,RootState)->T,
+    requires obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),btree_map_inv(slots),
+        if slots@.contains_key(*owner) { update.requires((&slots@[*owner],root)) }
+        else { new.requires((slots,owner,root)) },
+    ensures if slots@.contains_key(*owner) { update.ensures((&slots@[*owner],root),out) }
+        else { new.ensures((slots,owner,root),out) },
+{
+    match slots.get(owner) {
+        Some(slot) => update(slot,root),
+        None => new(slots,owner,root),
+    }
+}
+
 /// Read the entry for this principal from the published root map.
 pub(super) fn published<P:Ord,R:Copy>(roots:&BTreeMap<P,R>, owner:&P) -> (root:Option<R>)
     requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), btree_map_inv(roots),

@@ -193,6 +193,32 @@ fn guest_publication<R: Copy, E, U, T, W, A, F, V>(scope: &[u8], requested: &[u8
     }
 }
 
+/// The visibility callback installed after WAL success can address only the
+/// selected owner's current slot, or request a new slot for that owner.
+fn guest_slot_publication<S,U,N>(scope:&[u8],requested:&[u8],admitted:[u8;32],observed:[u8;32],
+    prior:Option<crate::RootState>,root:crate::RootState,writer:&mut BTreeMap<[u8;32],crate::RootState>,
+    slots:&BTreeMap<[u8;32],S>,update:U,new:N,append_ok:bool) -> (ok:bool)
+    where U:FnOnce(&S,crate::RootState),N:FnOnce(&BTreeMap<[u8;32],S>,&[u8;32],crate::RootState),
+    requires btree_map_inv(old(writer)),btree_map_inv(slots),obeys_cmp::<[u8;32]>(),obeys_cmp_concrete_eq::<[u8;32]>(),obeys_clone_eq::<[u8;32]>(),
+        if slots@.contains_key(admitted) { update.requires((&slots@[admitted],root)) }
+        else { new.requires((slots,&admitted,root)) },
+    ensures ok == (scope@ == requested@ && admitted@ == observed@ && append_ok),
+        final(writer)@ == if ok {old(writer)@.insert(admitted,root)} else {old(writer)@},
+        ok ==> if slots@.contains_key(admitted) {update.ensures((&slots@[admitted],root),())}
+            else {new.ensures((slots,&admitted,root),())},
+{
+    let encode = |_:&[u8;32],_:Option<crate::RootState>,_:crate::RootState| -> (r:Result<Vec<u8>,()>)
+        ensures r is Ok, {Ok(Vec::new())};
+    let append = |_:&[u8;32],_:Option<crate::RootState>,_:crate::RootState,_:&Vec<u8>| -> (r:Result<(),()>)
+        ensures r.is_ok() == append_ok, {if append_ok {Ok(())} else {Err(())}};
+    let memo = |_:&BTreeMap<[u8;32],crate::RootState>,_:&[u8;32],_:crate::RootState| {};
+    let visible = |p:&[u8;32],r:crate::RootState,_:&()| -> (out:())
+        requires *p == admitted,r == root,
+        ensures if slots@.contains_key(*p) {update.ensures((&slots@[*p],r),out)} else {new.ensures((slots,p,r),out)},
+    {crate::root_transition::publish_slot(slots,p,r,update,new)};
+    matches!(guest_publication(scope,requested,admitted,observed,prior,root,encode,append,writer,memo,visible),Some(Ok(_)))
+}
+
 /// Durable transition bytes for a guest-selected principal recover that
 /// principal and both prepared root fields, without a model decoder. The
 /// scanner represents a sequence as nonzero; an ordinal may start at zero.

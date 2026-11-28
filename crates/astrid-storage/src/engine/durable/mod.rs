@@ -619,14 +619,17 @@ where
     }
 
     fn publish(&self, principal: &P, root: RootState) {
-        let current = self.entries.load();
-        if let Some(published) = current.get(principal) {
-            published.value.store(Arc::new(root));
-            return;
-        }
-        let mut next = (**current).clone();
-        next.insert(principal.clone(), Arc::new(PublishedRoot::new(root)));
-        self.entries.store(Arc::new(next));
+        root_transition::publish_slot(
+            &self.entries.load(),
+            principal,
+            root,
+            |slot, replacement| slot.value.store(Arc::new(replacement)),
+            |current, owner, replacement| {
+                let mut next = current.clone();
+                next.insert(owner.clone(), Arc::new(PublishedRoot::new(replacement)));
+                self.entries.store(Arc::new(next));
+            },
+        );
     }
 
     fn replace(&self, roots: &BTreeMap<P, RootState>) -> Result<(), DurableError> {

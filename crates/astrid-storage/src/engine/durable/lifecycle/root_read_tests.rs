@@ -179,6 +179,37 @@ fn refused_slot_replacement_preserves_the_published_snapshot() {
     assert_eq!(published.get(&Key(3)), None);
 }
 
+#[test]
+fn retained_root_snapshot_shares_live_updates_until_replacement() {
+    use crate::engine::durable::PublishedRoots;
+    use crate::storage_model::{RootGeneration, RootState};
+    use std::collections::BTreeMap;
+
+    let (commit, _) = transaction("alice", None, b"old");
+    let first = RootState {
+        generation: RootGeneration::INITIAL,
+        commit,
+    };
+    let (commit, _) = transaction("alice", Some(first), b"updated");
+    let second = RootState {
+        generation: RootGeneration::new(1),
+        commit,
+    };
+    let published = PublishedRoots::new(&BTreeMap::from([(1u8, first)])).unwrap();
+    let held = published.entries.load_full();
+    published.publish(&2, first);
+    assert!(!held.contains_key(&2));
+    published.publish(&1, second);
+    assert_eq!(**held[&1].value.load(), second);
+    assert_eq!(published.get(&2), Some(first));
+
+    published.replace(&BTreeMap::from([(1, first)])).unwrap();
+    assert_eq!(published.get(&1), Some(first));
+    assert_eq!(published.get(&2), None);
+    assert!(!Arc::ptr_eq(&held[&1], &published.entries.load()[&1]));
+    assert_eq!(**held[&1].value.load(), second);
+}
+
 struct FailAfterRoot(AtomicBool);
 impl FaultInjector for FailAfterRoot {
     fn should_fail(&self, point: FaultPoint) -> bool {

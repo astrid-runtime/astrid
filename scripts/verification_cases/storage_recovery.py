@@ -168,6 +168,17 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b),
             Path("verification/hosted_batch_slots.rs"),
         )
+    for label, clause, weaker in [
+        ("existing owner slot", "update.ensures((&slots@[*owner],root),out)", "exists|s:&S| #[trigger] update.ensures((s,root),out)"),
+        ("existing slot root", "update.ensures((&slots@[*owner],root),out)", "exists|r:RootState| #[trigger] update.ensures((&slots@[*owner],r),out)"),
+        ("new owner", "new.ensures((slots,owner,root),out)", "exists|p:&P| #[trigger] new.ensures((slots,p,root),out)"),
+        ("new owner map", "new.ensures((slots,owner,root),out)", "exists|other:&BTreeMap<P,S>| #[trigger] new.ensures((other,owner,root),out)"),
+    ]:
+        yield (
+            f"live root write loses {label}", Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_kv_model.rs"),
+        )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
         ("installed record", "final(loaded)@ == old(loaded)@.insert(id,record)", "final(loaded)@.dom() == old(loaded)@.dom().insert(id)"),
