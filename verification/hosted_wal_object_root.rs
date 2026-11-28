@@ -1,5 +1,6 @@
 //! Bind a committed Object and Root descriptor to one writer-produced WAL stream.
 use super::*;
+use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},laws_eq::obeys_concrete_eq,std_specs::btree::btree_map_inv};
 verus! {
 
 pub(super) struct ObjectRoot<M> {
@@ -289,21 +290,25 @@ fn canonical_group<Encoder,Decoder,E,S:crate::group_frontier::BufferedWal,M:crat
 }
 
 struct MarkerFold<M> {
-    group:ObjectRoot<M>,id:ObjectId,location:crate::ArenaLocation,record:ObjectRecord,journal:crate::journal_transition::Record,
+    group:ObjectRoot<M>,id:ObjectId,location:crate::ArenaLocation,graph:crate::hosted_kv_root_publication::Graph<Vec<u8>>,journal:crate::journal_transition::Record,
 }
-enum FoldError<IO,E> { Capacity, Codec(CodecError<E>), Arena(crate::arena_frame::BatchError<IO>) }
+enum FoldError<IO,E> { Publication(crate::hosted_kv_root_publication::Error), Capacity, Codec(CodecError<E>), Arena(crate::arena_frame::BatchError<IO>) }
 
 /// Fold the stored object released by the acknowledged group. Return the root
 /// decoded from its companion descriptor for subsequent closure and CAS checks.
 fn fold_token_group<A:crate::arena_frame::BatchFile,Identify,Encoder,Decoder,E,S:crate::group_frontier::BufferedWal,M:crate::positional_read::Media,Open:FnOnce(&S)->M,H,F>(
-    sequence:u64,begin:&[u8],arena:&mut A,scheme:root_wire::Scheme,owner:Owner,expected:Option<RootState>,replacement:RootState,
+    sequence:u64,begin:&[u8],arena:&mut A,scheme:root_wire::Scheme,owner:Owner,expected:Option<RootState>,
+    state_refs:Vec<crate::ObjectReference>,commit_refs:Vec<crate::ObjectReference>,
+    pending:&std::collections::BTreeMap<Vec<u8>,RootState>,published:&std::collections::BTreeMap<Vec<u8>,RootState>,
     kind:crate::token_authority::Marker,token:[u8;16],previous:Option<ObjectId>,depth:u64,used:u64,totals:crate::checkpoint_totals::NodeTotals,
     identify:Identify,encode:Encoder,decode:Decoder,compression:Ghost<spec_fn(Seq<u8>)->Seq<u8>>,chunk:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
     finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,sink:S,base:u64,reopen:Open,target:Ghost<spec_fn(M)->(int,Seq<u8>)>)
     -> (out:Result<MarkerFold<M>,FoldError<A::Error,E>>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
-        Identify:FnOnce(&ObjectRecord)->ObjectId,Encoder:FnOnce(&[u8])->Vec<u8>,Decoder:FnOnce(&[u8],usize)->Result<Vec<u8>,E>,
-    requires sequence!=0,depth<u64::MAX,used as int+65<=u64::MAX,
+        Identify:Fn(&ObjectRecord)->ObjectId+Copy,Encoder:FnOnce(&[u8])->Vec<u8>,Decoder:FnOnce(&[u8],usize)->Result<Vec<u8>,E>,
+    requires obeys_cmp::<crate::ObjectReference>(),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        obeys_concrete_eq::<ObjectRecord>(),obeys_cmp::<Vec<u8>>(),obeys_cmp_concrete_eq::<Vec<u8>>(),
+        btree_map_inv(pending),btree_map_inv(published),sequence!=0,depth<u64::MAX,used as int+65<=u64::MAX,
         sink.at_end(),sink.buffered_image().len()==base,old(arena).image().len()<=u64::MAX,
         old(arena).target()!=sink.wal_target(),
         forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
@@ -327,6 +332,10 @@ fn fold_token_group<A:crate::arena_frame::BatchFile,Identify,Encoder,Decoder,E,S
         out matches Ok(fold) ==> {
             let at=fold.location.offset as int+crate::arena_frame::WIDTH;
             let ticket=fold.group;
+            let g=fold.graph;
+            let principal=g.selected.binding().0;
+            let replacement=g.selected.binding().2;
+            let record=g.records@[fold.id];
             let payload=final(arena).image().subrange(at,at+fold.location.payload_len);
             &&& (target@)(ticket.media)==sink.wal_target() && ticket.media.image().take(base as int)==sink.buffered_image()
             &&& ticket.stored(base,ticket.object_start as int,ticket.root_start as int)
@@ -336,10 +345,13 @@ fn fold_token_group<A:crate::arena_frame::BatchFile,Identify,Encoder,Decoder,E,S
             &&& final(arena).image().take(old(arena).image().len() as int)==old(arena).image()
             &&& fold.location.offset>=old(arena).image().len() && at+fold.location.payload_len<=final(arena).image().len()
             &&& final(arena).image().subrange(at+8,at+40)==fold.id.digest()
-            &&& identify.ensures((&fold.record,),fold.id)
-            &&& fold.record.contents().2==crate::hosted_journal_history::component_bytes(final(arena).image(),fold.location)
+            &&& principal@==owner.bytes() && g.component==fold.id
+            &&& (exists|v:crate::ObjectFormatVersion| v.number()==4 && #[trigger] g.links(principal,expected,record,v))
+            &&& (if pending@.contains_key(principal) {Some(pending@[principal])} else {published@.get(principal)})==expected
+            &&& forall|id:ObjectId| g.records@.contains_key(id) ==> #[trigger] identify.ensures((&g.records@[id],),id)
+            &&& record.contents().2==crate::hosted_journal_history::component_bytes(final(arena).image(),fold.location)
             &&& forall|text:Seq<u8>| #[trigger] crate::marker_key::spells(token@,text) ==>
-                crate::hosted_delta_mutation::marker_bytes(fold.record.contents().2,
+                crate::hosted_delta_mutation::marker_bytes(record.contents().2,
                     crate::hosted_token_recovery::ns_bytes(kind)+seq![0u8]+text)
             &&& fold.journal.principal@==owner.bytes() && fold.journal.expected==expected && fold.journal.replacement==replacement
             &&& ticket.object_start as int==base as int+72+begin.len() && ticket.root_start as int==ticket.object_start as int+72+ticket.object.len()
@@ -362,8 +374,14 @@ fn fold_token_group<A:crate::arena_frame::BatchFile,Identify,Encoder,Decoder,E,S
         assert(ns@==crate::hosted_token_recovery::ns_bytes(kind));
     }
     let (record,_)=crate::hosted_delta_mutation::written_marker(key,previous,depth,used,totals);
-    let id=identify(&record);
-    let canonical=crate::verified_record::encode(scheme,id,&record).unwrap();
+    let graph=match crate::hosted_kv_root_publication::prepare(owner.encode(),expected,record,state_refs,commit_refs,
+        crate::ObjectFormatVersion::new(4).unwrap(),identify,pending,published) {
+        Ok(g)=>g,Err(e)=>return Err(FoldError::Publication(e)),
+    };
+    let replacement=graph.selected.replacement();
+    let id=graph.component;
+    let record=graph.records.get(&id).unwrap();
+    let canonical=crate::verified_record::encode(scheme,id,record).unwrap();
     let name=owner.encode();
     let wire=crate::journal_transition::encode(&name,scheme,expected,replacement).unwrap();
     let Some(first)=begin.len().checked_add(360) else {return Err(FoldError::Capacity)};
@@ -375,11 +393,11 @@ fn fold_token_group<A:crate::arena_frame::BatchFile,Identify,Encoder,Decoder,E,S
     let journal=crate::hosted_acknowledged_root::parse_written(&group.root,&name,scheme,expected,replacement);
     let location=match marker_append::append_payload(arena,recovered,vec![Vec::new()],0,hash) {Ok(loc)=>loc,Err(e)=>return Err(FoldError::Arena(e))};
     proof {
-        marker_append::encoded_fields(arena.image(),location,canonical@,scheme,id,record);
+        marker_append::encoded_fields(arena.image(),location,canonical@,scheme,id,*record);
         assert forall|spelling:Seq<u8>| #[trigger] crate::marker_key::spells(token@,spelling) implies
             crate::hosted_delta_mutation::marker_bytes(record.contents().2,crate::hosted_token_recovery::ns_bytes(kind)+seq![0u8]+spelling)
             by {crate::marker_key::unique_text(token@,text@,spelling);}
     }
-    Ok(MarkerFold{group,id,location,record,journal})
+    Ok(MarkerFold{group,id,location,graph,journal})
 }
 }

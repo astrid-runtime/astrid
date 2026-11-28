@@ -4,10 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
 use crate::engine::{KvIdentitySession, KvProjectionEngine, RootTransaction};
-use crate::storage_model::{
-    ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
-};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord};
 
+use super::FORMAT_VERSION;
 use super::delta::{
     Head, Projection, checkpoint_record, decode_head, delta_record, mutation_payload_bytes,
 };
@@ -16,7 +15,6 @@ use super::node::{
     ChildPointer, INLINE_VALUE_MAX, LeafEntry, NODE_MAX_ENTRIES, NODE_MAX_RETAINED_BYTES, Node,
     NodeHandle, NodeTotals, ValueSlot, branch_record, leaf_record,
 };
-use super::{FORMAT_VERSION, KV_LABEL, PARENT_LABEL, STATE_LABEL};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
 
@@ -423,39 +421,20 @@ where
         header: TreeHeader<P>,
         head: ObjectId,
     ) -> StorageResult<RootTransaction<P>> {
-        let mut state_references = header.preserved_state;
-        state_references.push(ObjectReference::owns(KV_LABEL.to_vec().into(), head));
-        state_references.sort();
-        let state = ObjectRecord::new(
-            ObjectKind::PrincipalState,
+        let state = crate::storage_model::header_writer::kv_state(
+            header.preserved_state,
+            head,
             FORMAT_VERSION,
-            Vec::new(),
-            state_references,
-            0,
-            ObjectClass::Metadata,
         )
-        .map_err(|error| model_error(&error))?;
+        .ok_or_else(|| model_error(&ModelError::NonCanonicalReferences))?;
         let state = self.insert(state)?;
-
-        let mut commit_references = header.preserved_commit;
-        if let Some(previous) = header.root {
-            commit_references.push(ObjectReference::new(
-                PARENT_LABEL.to_vec().into(),
-                previous.commit,
-                ReferenceKind::Lineage,
-            ));
-        }
-        commit_references.push(ObjectReference::owns(STATE_LABEL.to_vec().into(), state));
-        commit_references.sort();
-        let commit = ObjectRecord::new(
-            ObjectKind::Commit,
+        let commit = crate::storage_model::header_writer::commit(
+            header.preserved_commit,
+            header.root,
+            state,
             FORMAT_VERSION,
-            Vec::new(),
-            commit_references,
-            0,
-            ObjectClass::Metadata,
         )
-        .map_err(|error| model_error(&error))?;
+        .ok_or_else(|| model_error(&ModelError::NonCanonicalReferences))?;
         let commit = self.insert(commit)?;
         self.retain_reachable(commit);
         let records = self.records.into_iter().collect();

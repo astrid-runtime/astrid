@@ -29,6 +29,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::num::NonZeroU32;
 pub(crate) mod header_graph;
+pub(crate) mod header_writer;
 mod object_reference;
 pub(crate) mod reference_lookup;
 mod root_state;

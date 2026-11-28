@@ -92,3 +92,23 @@ def consumer_defects():
             f"acknowledged object group loses {label}", source,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), group,
         )
+
+    publication = Path("verification/hosted_kv_root_publication.rs")
+    for label, clause, expected, substituted in [
+        ("commit state edge", "header_graph::state_edge(rows[bound.2.commit]) matches Some(e) && e.fields()==(header_graph::STATE@,self.state,ReferenceKind::Owns)", ",self.state,", ",self.component,"),
+        ("state component edge", "header_graph::kv_edge(rows[self.state]) matches Some(e) && e.fields()==(header_graph::KV@,self.component,ReferenceKind::Owns)", ",self.component,", ",self.state,"),
+    ]:
+        # Require a false edge destination in the graph predicate.
+        yield (
+            f"selected marker publication loses {label}", publication,
+            lambda s, a=clause, b=clause.replace(expected, substituted): replace_once(s, a, b),
+            publication,
+        )
+    for label, clause, weaker in [
+        ("authenticated declaration", "forall|id:ObjectId| g.records@.contains_key(id) ==> #[trigger] identify.ensures((&g.records@[id],),id)", "true"),
+        ("current owner root", "(if pending@.contains_key(owner) {Some(pending@[owner])} else {published@.get(owner)})==prior &&", "true &&"),
+    ]:
+        yield (
+            f"selected marker publication loses {label}", publication,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), group,
+        )

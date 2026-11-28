@@ -109,7 +109,7 @@ pub(super) use self::validation::TreeValidation;
 pub(super) const FORMAT_VERSION: crate::storage_model::ObjectFormatVersion =
     PRINCIPAL_GRAPH_VERSION;
 pub(super) const KV_LABEL: &[u8] = crate::storage_model::header_graph::KV;
-const PARENT_LABEL: &[u8] = b"parent";
+const PARENT_LABEL: &[u8] = crate::storage_model::header_writer::PARENT;
 pub(super) const ROOT_LABEL: &[u8] = projection_record::ROOT_LABEL;
 pub(super) const STATE_LABEL: &[u8] = crate::storage_model::header_graph::STATE;
 // Soft maintenance batch target. This is neither a quota nor a format limit.
