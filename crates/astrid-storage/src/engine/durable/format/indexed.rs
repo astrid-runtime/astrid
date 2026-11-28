@@ -127,11 +127,15 @@ pub(in crate::engine::durable) fn visit_indexed_objects<
         read_exact_at(arena, &mut span, span_start)
             .map_err(|source| io_error("read coalesced durable frames", source))?;
 
-        for (expected_id, location) in &ordered[first..end] {
-            let (record, payload) =
-                decode_indexed_frame(&span, span_start, *expected_id, *location, identity, limits)?;
-            accept(*expected_id, *location, record, payload)?;
-        }
+        super::indexed_frame::deliver(
+            &ordered[first..end],
+            &mut accept,
+            |id, location| decode_indexed_frame(&span, span_start, id, location, identity, limits),
+            |visitor, id, location, record, payload| {
+                visitor(id, location, record, payload)?;
+                Ok(visitor)
+            },
+        )?;
         first = end;
     }
     #[cfg(test)]

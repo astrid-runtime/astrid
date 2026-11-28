@@ -343,6 +343,64 @@ fn coalesced_read_checks_overflow_only_after_confirming_adjacency() {
 }
 
 #[test]
+fn coalesced_delivery_preserves_order_and_stops_at_the_first_failure() {
+    use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
+    use crate::storage_model::ObjectIdentity;
+
+    let mut source = ObservedSource::new();
+    let mut frames = Vec::new();
+    for byte in 0..3 {
+        let record = ObjectRecord::new(
+            ObjectKind::Chunk,
+            ObjectFormatVersion::V1,
+            vec![byte],
+            Vec::new(),
+            1,
+            ObjectClass::Data,
+        )
+        .unwrap();
+        let id = TestIdentity.identify(&record);
+        let payload = encode_object_frame(TEST_IDENTITY_SCHEME, id, &record).unwrap();
+        let location = append_frame(&mut source, ARENA_MAGIC, &payload).unwrap();
+        frames.push((id, location, record, payload));
+    }
+    let requests: Vec<_> = frames
+        .iter()
+        .rev()
+        .map(|(id, loc, _, _)| (*id, *loc))
+        .collect();
+    let visit = |rows: &[(ObjectId, ArenaLocation)], reject_at: Option<usize>| {
+        let mut seen = Vec::new();
+        let outcome = visit_indexed_objects(
+            &source,
+            rows,
+            u64::MAX,
+            &TestIdentity,
+            RecoveryLimits::process_addressable(),
+            |id, loc, record, payload| {
+                seen.push((id, loc, record, payload.to_vec()));
+                if reject_at == Some(seen.len()) {
+                    return Err(DurableError::EncodingOverflow);
+                }
+                Ok(())
+            },
+        );
+        (outcome, seen)
+    };
+    let (outcome, seen) = visit(&requests, None);
+    outcome.unwrap();
+    assert_eq!(seen, frames);
+    let (outcome, seen) = visit(&requests, Some(2));
+    assert!(matches!(outcome, Err(DurableError::EncodingOverflow)));
+    assert_eq!(seen, frames[..2]);
+    let mut wrong_identity = requests;
+    wrong_identity[1].0 = frames[0].0;
+    let (outcome, seen) = visit(&wrong_identity, None);
+    assert!(outcome.is_err());
+    assert_eq!(seen, frames[..1]);
+}
+
+#[test]
 fn indexed_object_hashes_frame_once_and_still_checks_index_and_object_identity() {
     use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
     use crate::storage_model::ObjectIdentity;

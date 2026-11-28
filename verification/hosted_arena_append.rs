@@ -283,6 +283,97 @@ fn read_leaf<H:Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]
     record::confirmed(p,scheme,id,identify).ok()
 }
 
+type Observation<'a> = (crate::ObjectId,frame::ArenaLocation,crate::ObjectRecord,&'a [u8]);
+
+/// Observe ordered delivery with the actual frame authenticator as decoder.
+/// All observations borrow payloads from the same physical span.
+#[verifier::loop_isolation(false)]
+fn observe_span<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+    rows:&[(crate::ObjectId,frame::ArenaLocation)],span:&'a [u8],base:u64,format:crate::indexed_frame::Format,
+    hash:H,identify:I,reject:Option<u64>)
+    requires forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+{
+    use crate::indexed_frame::{deliver,delivered,read};
+    let decode = |id:crate::ObjectId,loc:frame::ArenaLocation| -> (out:Result<(crate::ObjectRecord,&'a [u8]),bool>)
+        ensures match out {
+            Ok((r,p)) => p@ == span@.subrange(loc.offset as int-base+52,loc.offset as int-base+52+loc.payload_len) &&
+                record::record_at(p@,40,format.scheme,r) && id.digest()==p@.subrange(8,40),
+            Err(e) => !e,
+        },
+    {
+        match read(span,base,loc,id,format,hash,identify) {
+            Ok((r,p)) => {
+                assert(p@ =~= span@.subrange(loc.offset as int-base+52,loc.offset as int-base+52+loc.payload_len));
+                Ok((r,p))
+            },
+            Err(_) => Err(false),
+        }
+    };
+    let accept = |trace:Vec<Observation<'a>>,id:crate::ObjectId,loc:frame::ArenaLocation,r:crate::ObjectRecord,p:&'a [u8]| -> (out:Result<Vec<Observation<'a>>,bool>)
+        ensures if Some(loc.offset)==reject {out == Err(true)} else {
+            out matches Ok(t) && t@ == trace@.push((id,loc,r,p))
+        },
+    {
+        if Some(loc.offset)==reject {return Err(true);}
+        let mut trace = trace;
+        trace.push((id,loc,r,p));
+        Ok(trace)
+    };
+    let start = Vec::new();
+    let result = deliver(rows,start,decode,accept);
+    match result {
+        Ok(trace) => {
+            let ghost states = choose|x:Seq<Vec<Observation<'a>>>| #[trigger] delivered(rows@,x,decode,accept) &&
+                x.first()==start && x.last()==trace;
+            let mut i = 0usize;
+            while i < rows.len()
+                invariant 0 <= i <= rows.len(),states[i as int]@.len()==i,
+                    forall|j:int| 0 <= j < i ==> {
+                        let (id,loc,r,p) = #[trigger] states[i as int]@[j];
+                        let at = loc.offset as int-base+52;
+                        id == rows@[j].0 && loc == rows@[j].1 && Some(loc.offset)!=reject &&
+                        p@ == span@.subrange(at,at+loc.payload_len) && record::record_at(p@,40,format.scheme,r) &&
+                        id.digest()==p@.subrange(8,40)
+                    },
+                    delivered(rows@,states,decode,accept),
+                decreases rows.len()-i,
+            {
+                proof {
+                    let (id,loc) = rows@[i as int];
+                    assert(crate::indexed_frame::sent(rows@[i as int],states[i as int],states[i as int+1],decode,accept));
+                    let (r,p) = choose|r:crate::ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((id,loc),Ok((r,p))) &&
+                        accept.ensures((states[i as int],id,loc,r,p),Ok(states[i as int+1]));
+                    let at = loc.offset as int-base;
+                    assert(p@ =~= span@.subrange(at+52,at+52+loc.payload_len));
+                    assert(states[i as int+1]@ == states[i as int]@.push((id,loc,r,p)));
+                };
+                i = i.saturating_add(1);
+            }
+            assert(trace.len() == rows.len());
+            assert forall|j:int| 0 <= j < rows.len() implies {
+                let (id,loc,r,p) = #[trigger] trace@[j];
+                p@ == span@.subrange(loc.offset as int-base+52,loc.offset as int-base+52+loc.payload_len) &&
+                id == rows@[j].0 && loc == rows@[j].1 && Some(loc.offset)!=reject &&
+                record::record_at(p@,40,format.scheme,r) && id.digest()==p@.subrange(8,40)
+            } by {};
+        },
+        Err(e) => { proof {
+            assert(exists|i:int,states:Seq<Vec<Observation<'a>>>| 0 <= i < rows.len() &&
+                #[trigger] delivered(rows@.take(i),states,decode,accept) && states.first()==start &&
+                (decode.ensures((rows@[i].0,rows@[i].1),Err(e)) ||
+                    exists|r:crate::ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((rows@[i].0,rows@[i].1),Ok((r,p))) &&
+                        accept.ensures((states.last(),rows@[i].0,rows@[i].1,r,p),Err(e))));
+            let (i,states) = choose|i:int,states:Seq<Vec<Observation<'a>>>| 0 <= i < rows.len() &&
+                #[trigger] delivered(rows@.take(i),states,decode,accept) && states.first()==start &&
+                (decode.ensures((rows@[i].0,rows@[i].1),Err(e)) ||
+                    exists|r:crate::ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((rows@[i].0,rows@[i].1),Ok((r,p))) &&
+                        accept.ensures((states.last(),rows@[i].0,rows@[i].1,r,p),Err(e)));
+            if e {assert(Some(rows@[i].1.offset)==reject);}
+        }},
+    }
+}
+
 /// Each successful positional read can cover exactly the next range of
 /// frame indices. Induct across those ranges for any representable table.
 fn partition_reads(rows:&[(crate::ObjectId,frame::ArenaLocation)],target:u64)

@@ -36,6 +36,21 @@ def consumer_defects():
         )
     reader = Path("crates/astrid-storage/src/engine/durable/format/indexed_frame.rs")
     for label, clause, weaker in [
+        ("ordered rows", "sent(rows[i],states[i],states[i+1],decode,accept)", "exists|row:Row| #[trigger] sent(row,states[i],states[i+1],decode,accept)"),
+        ("decoded record", "accept.ensures((before,row.0,row.1,r,p),Ok(after))", "(exists|other:ObjectRecord| #[trigger] accept.ensures((before,row.0,row.1,other,p),Ok(after)))"),
+        ("borrowed payload", "accept.ensures((before,row.0,row.1,r,p),Ok(after))", "(exists|other:&'a [u8]| #[trigger] accept.ensures((before,row.0,row.1,r,other),Ok(after)))"),
+        ("initial visitor", "states.first()==initial && states.last()==s", "states.last()==s"),
+        ("final visitor", "states.first()==initial && states.last()==s", "states.first()==initial"),
+        ("failed prefix", "delivered(rows@.take(i),states,decode,accept) && states.first()==initial", "delivered(rows@.take(i),states,decode,accept)"),
+        ("decode error", "decode.ensures((rows@[i].0,rows@[i].1),Err(e)) ||", "true ||"),
+        ("visitor error", "accept.ensures((states.last(),rows@[i].0,rows@[i].1,r,p),Err(e))", "true"),
+    ]:
+        yield (
+            f"indexed row delivery loses {label}", reader,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs"),
+        )
+    for label, clause, weaker in [
         ("forward progress", "&&& first < end <= rows.len()", "&&& first <= end <= rows.len()"),
         ("table boundary", "&&& first < end <= rows.len()", "&&& first < end"),
         ("physical extent", "len as int == frame_end(rows@[end as int-1].1)-base &&", "true &&"),

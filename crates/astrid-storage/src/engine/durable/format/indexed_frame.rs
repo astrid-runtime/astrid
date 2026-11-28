@@ -91,6 +91,74 @@ pub(super) fn coalesced(rows:&[(ObjectId,ArenaLocation)],first:usize,target:u64)
     }
 }
 
+type Row = (ObjectId,ArenaLocation);
+
+pub(super) open spec fn sent<'a,S,E,D:Fn(ObjectId,ArenaLocation)->Result<(ObjectRecord,&'a [u8]),E>,
+    A:Fn(S,ObjectId,ArenaLocation,ObjectRecord,&'a [u8])->Result<S,E>>(
+    row:Row,before:S,after:S,decode:D,accept:A) -> bool {
+    exists|r:ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((row.0,row.1),Ok((r,p))) &&
+        accept.ensures((before,row.0,row.1,r,p),Ok(after))
+}
+
+pub(super) open spec fn delivered<'a,S,E,D:Fn(ObjectId,ArenaLocation)->Result<(ObjectRecord,&'a [u8]),E>,
+    A:Fn(S,ObjectId,ArenaLocation,ObjectRecord,&'a [u8])->Result<S,E>>(
+    rows:Seq<Row>,states:Seq<S>,decode:D,accept:A) -> bool {
+    &&& states.len() == rows.len()+1
+    &&& forall|i:int| #![trigger rows[i]] 0 <= i < rows.len() ==> sent(rows[i],states[i],states[i+1],decode,accept)
+}
+
+/// Thread the visitor through the decoded rows in order. Failure stops
+/// delivery at the first unsuccessful decode or visitor invocation.
+pub(super) fn deliver<'a,S,E,D:Fn(ObjectId,ArenaLocation)->Result<(ObjectRecord,&'a [u8]),E>,
+    A:Fn(S,ObjectId,ArenaLocation,ObjectRecord,&'a [u8])->Result<S,E>>(
+    rows:&[Row],initial:S,decode:D,accept:A) -> (out:Result<S,E>)
+    requires forall|id:ObjectId,loc:ArenaLocation| #[trigger] decode.requires((id,loc)),
+        forall|s:S,id:ObjectId,loc:ArenaLocation,r:ObjectRecord,p:&'a [u8]| #[trigger] accept.requires((s,id,loc,r,p)),
+    ensures match out {
+        Ok(s) => exists|states:Seq<S>| #[trigger] delivered(rows@,states,decode,accept) &&
+            states.first()==initial && states.last()==s,
+        Err(e) => exists|i:int,states:Seq<S>| 0 <= i < rows.len() &&
+            #[trigger] delivered(rows@.take(i),states,decode,accept) && states.first()==initial &&
+            (decode.ensures((rows@[i].0,rows@[i].1),Err(e)) ||
+                exists|r:ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((rows@[i].0,rows@[i].1),Ok((r,p))) &&
+                    accept.ensures((states.last(),rows@[i].0,rows@[i].1,r,p),Err(e))),
+    },
+{
+    let mut state = initial;
+    let mut i = 0;
+    let ghost mut states = seq![initial];
+    while i < rows.len()
+        invariant i <= rows.len(), delivered(rows@.take(i as int),states,decode,accept),
+            forall|id:ObjectId,loc:ArenaLocation| #[trigger] decode.requires((id,loc)),
+            forall|s:S,id:ObjectId,loc:ArenaLocation,r:ObjectRecord,p:&'a [u8]| #[trigger] accept.requires((s,id,loc,r,p)),
+            states.first()==initial, states.last()==state,
+        decreases rows.len()-i,
+    {
+        let (id,location) = rows[i];
+        let (r,p) = decode(id,location)?;
+        state = accept(state,id,location,r,p)?;
+        proof {
+            let next = states.push(state);
+            let prefix = rows@.take(i as int+1);
+            assert forall|j:int| #![trigger prefix[j]] 0 <= j < prefix.len() implies
+                sent(prefix[j],next[j],next[j+1],decode,accept) by {
+                if j < i {
+                    assert(rows@.take(i as int)[j] == prefix[j]);
+                    assert(next[j+1] == states[j+1]);
+                } else {
+                    assert(prefix[j] == (id,location));
+                    assert(next[j] == states.last() && next[j+1] == state);
+                }
+            }
+            assert(delivered(prefix,next,decode,accept));
+            states = next;
+        }
+        i = i.saturating_add(1);
+    }
+    assert(rows@.take(i as int) =~= rows@);
+    Ok(state)
+}
+
 pub(super) fn read<H:FnOnce([u8;8],u64,&[u8])->[u8;32],I:FnOnce(&ObjectRecord)->[u8;32]>(
     data:&[u8],base:u64,loc:ArenaLocation,id:ObjectId,format:Format,hash:H,identify:I) -> (out:Result<(ObjectRecord,&[u8]),Error>)
     requires forall|n:u64,p:&[u8]| #[trigger] hash.requires((format.magic,n,p)),
