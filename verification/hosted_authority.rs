@@ -343,6 +343,8 @@ mod checkpoint_value;
 mod delta_mutation;
 #[path = "../crates/astrid-storage/src/kv/tree/delta_batch.rs"]
 mod delta_batch;
+#[path = "../crates/astrid-storage/src/kv/tree/delta_header.rs"]
+mod delta_header;
 mod hosted_delta_mutation;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_entries.rs"]
 mod checkpoint_entries;

@@ -104,11 +104,14 @@ pub(super) fn delta_record(
     let count = u32::try_from(mutations.len()).map_err(|_| arithmetic_overflow())?;
     let mut canonical = Vec::new();
     canonical.push(DELTA);
-    canonical.extend_from_slice(&depth.to_le_bytes());
-    canonical.extend_from_slice(&delta_bytes.to_le_bytes());
-    canonical.extend_from_slice(&totals.entries.to_le_bytes());
-    canonical.extend_from_slice(&totals.quota_bytes.to_le_bytes());
-    canonical.extend_from_slice(&count.to_le_bytes());
+    super::delta_header::Header {
+        depth,
+        delta_bytes,
+        entries: totals.entries,
+        quota_bytes: totals.quota_bytes,
+        count,
+    }
+    .append(&mut canonical);
     let mut references = Vec::new();
     if let Some(previous) = previous {
         references.push(ObjectReference::owns(
@@ -147,7 +150,7 @@ pub(super) fn decode_head(id: ObjectId, record: &ObjectRecord) -> StorageResult<
     let mut cursor = Cursor::new(id, record.canonical_bytes());
     match cursor.u8()? {
         CHECKPOINT => decode_checkpoint(id, record, cursor),
-        DELTA => decode_delta(id, record, cursor),
+        DELTA => decode_delta(id, record),
         _ => Err(invalid(id, "invalid KV projection head tag")),
     }
 }
@@ -175,19 +178,19 @@ fn decode_checkpoint(
     Ok(Head::Checkpoint { tree, totals })
 }
 
-fn decode_delta(
-    id: ObjectId,
-    record: &ObjectRecord,
-    mut cursor: Cursor<'_>,
-) -> StorageResult<Head> {
-    let depth = cursor.u64()?;
-    let delta_bytes = cursor.u64()?;
+fn decode_delta(id: ObjectId, record: &ObjectRecord) -> StorageResult<Head> {
+    let bytes = record.canonical_bytes();
+    let (header, offset) = super::delta_header::Header::read(bytes)
+        .map_err(|_| invalid(id, "truncated KV projection head"))?;
+    let depth = header.depth;
+    let delta_bytes = header.delta_bytes;
     let totals = NodeTotals {
-        entries: cursor.u64()?,
+        entries: header.entries,
         logical_bytes: record.logical_bytes(),
-        quota_bytes: cursor.u64()?,
+        quota_bytes: header.quota_bytes,
     };
-    let count = cursor.u32_usize()?;
+    let count = usize::try_from(header.count)
+        .map_err(|_| invalid(id, "KV projection count is too large"))?;
     if depth == 0 || count == 0 {
         return Err(invalid(id, "empty KV delta head"));
     }
@@ -200,13 +203,9 @@ fn decode_delta(
             Ok(reference.target())
         })
         .transpose()?;
-    let mutations = super::delta_batch::read(
-        cursor.bytes,
-        record.references(),
-        cursor.offset,
-        count,
-        |key| validate_composite_key(id, key).err(),
-    )
+    let mutations = super::delta_batch::read(bytes, record.references(), offset, count, |key| {
+        validate_composite_key(id, key).err()
+    })
     .map_err(|error| match error {
         super::delta_batch::Error::Row(error) => decode_error(id, error),
         super::delta_batch::Error::Trailing => invalid(id, "trailing KV projection head bytes"),
@@ -319,11 +318,6 @@ impl<'a> Cursor<'a> {
 
     fn u8(&mut self) -> StorageResult<u8> {
         Ok(self.array::<1>()?[0])
-    }
-
-    fn u32_usize(&mut self) -> StorageResult<usize> {
-        usize::try_from(u32::from_le_bytes(self.array()?))
-            .map_err(|_| invalid(self.id, "KV projection count is too large"))
     }
 
     fn u64(&mut self) -> StorageResult<u64> {

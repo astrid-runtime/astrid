@@ -123,6 +123,18 @@ def consumer_defects():
             f"delta batch loses {label}", batch,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
         )
+    header = Path("crates/astrid-storage/src/kv/tree/delta_header.rs")
+    for label, clause, weaker in [
+        ("encoded fields", "final(bytes)@ == old(bytes)@ + self.wire()", "final(bytes).len() == old(bytes).len() + 36"),
+        ("decoded fields", "bytes@.subrange(1,37) == h.wire()", "true"),
+        ("row offset", "end == 37 && bytes@", "bytes@"),
+        ("acceptance", "out.is_ok() == (bytes.len() >= 37)", "out.is_ok() ==> (bytes.len() >= 37)"),
+        ("truncation", "out.is_err() ==> out == Err(ReadError::Truncated)", "true"),
+    ]:
+        yield (
+            f"delta header loses {label}", header,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

@@ -136,7 +136,9 @@ fn mixed_batch(object:ObjectId,trailing:bool,deny_second:bool) -> (out:Result<Ve
     let first = Mutation {key:vec![110u8,0,97],value:Some(ValueSlot::Inline(vec![42u8]))};
     let second = Mutation {key:vec![110u8,0,98],value:Some(ValueSlot::Spilled {object,length:2048})};
     let b = [110u8,0,98];
-    let mut bytes = Vec::new();
+    let mut bytes = vec![1u8];
+    let header = crate::delta_header::Header {depth:1,delta_bytes:2055,entries:2,quota_bytes:2055,count:2};
+    header.append(&mut bytes);
     let mut refs = Vec::new();
     let one = first.append(0,&mut bytes,&mut refs);
     let two = second.append(1,&mut bytes,&mut refs);
@@ -147,42 +149,52 @@ fn mixed_batch(object:ObjectId,trailing:bool,deny_second:bool) -> (out:Result<Ve
     };
     let raw = bytes.as_slice();
     let edges = refs.as_slice();
-    let out = batch::read(raw,edges,0,2,check);
+    let got = crate::delta_header::Header::read(raw);
+    assert(got.is_ok()) by {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    let Ok((decoded,start)) = got else {unreached() };
     proof {
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
-        assert(bytes@.subrange(0,4) =~= storage_words::word32(3));
-        assert(bytes@.subrange(17,21) =~= storage_words::word32(3));
-        key::encoded_length(bytes@,0,3); key::encoded_length(bytes@,17,3);
-        assert(bytes@.subrange(4,7) =~= first.key@);
-        assert(bytes@.subrange(21,24) =~= b@);
-        assert(bytes@[7] == 1 && bytes@[24] == 2);
-        assert(bytes@.subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(1));
-        assert(bytes@.subrange(16,17) =~= seq![42u8]);
-        assert(bytes@.subrange(25,33) =~= vstd::bytes::spec_u64_to_le_bytes(2048));
+        assert(raw@.subrange(1,37) =~= header.wire());
+        assert(decoded.wire().subrange(32,36) =~= storage_words::word32(decoded.count));
+        assert(header.wire().subrange(32,36) =~= storage_words::word32(header.count));
+        storage_words::unique_word32(decoded.count,header.count);
+    }
+    let out = batch::read(raw,edges,start,decoded.count as usize,check);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(bytes@.subrange(37,41) =~= storage_words::word32(3));
+        assert(bytes@.subrange(54,58) =~= storage_words::word32(3));
+        key::encoded_length(bytes@,37,3); key::encoded_length(bytes@,54,3);
+        assert(bytes@.subrange(41,44) =~= first.key@);
+        assert(bytes@.subrange(58,61) =~= b@);
+        assert(bytes@[44] == 1 && bytes@[61] == 2);
+        assert(bytes@.subrange(45,53) =~= vstd::bytes::spec_u64_to_le_bytes(1));
+        assert(bytes@.subrange(53,54) =~= seq![42u8]);
+        assert(bytes@.subrange(62,70) =~= vstd::bytes::spec_u64_to_le_bytes(2048));
         assert(refs.len() == 1 && refs@[0].fields() == (delta::label_bytes(1),object,ReferenceKind::Owns));
         assert(reference_lookup::selected(refs@,delta::label_bytes(1),0,1) == Some(refs@[0]));
         if out is Err {
             let e = out->Err_0;
             let (rows,p,end) = choose|rows:Seq<Mutation>,p:Seq<usize>,end:usize|
-                #[trigger] batch::stopped(raw,edges,0,2,check,rows,p,end,e);
+                #[trigger] batch::stopped(raw,edges,37,2,check,rows,p,end,e);
             if rows.len() > 0 {
                 assert(delta::decoded(raw,p[0] as int,p[1],edges,0,check,Ok(rows[0])));
-                assert(p[1] == 17);
+                assert(p[1] == 54);
             }
             if rows.len() == 2 {
                 assert(delta::decoded(raw,p[1] as int,p[2],edges,1,check,Ok(rows[1])));
-                assert(end == 33 && !deny_second && trailing && e is Trailing);
+                assert(end == 70 && !deny_second && trailing && e is Trailing);
             } else {
                 assert(rows.len() < 2 && e is Row);
                 let finish = choose|finish:usize| #[trigger] delta::decoded(raw,end as int,finish,edges,rows.len() as usize,check,Err(e->Row_0));
-                if rows.len() == 0 {assert(end == 0);} else {assert(end == 17);}
+                if rows.len() == 0 {assert(end == 37);} else {assert(end == 54);}
                 assert(rows.len() == 1 && deny_second && e == Error::Row(delta::DecodeError::InvalidKey(7u8)));
             }
         } else {
             let rows = out->Ok_0;
-            let p = choose|p:Seq<usize>| #[trigger] batch::layout(raw,edges,0,bytes.len(),rows@,p,check);
+            let p = choose|p:Seq<usize>| #[trigger] batch::layout(raw,edges,37,bytes.len(),rows@,p,check);
             assert(delta::decoded(raw,p[0] as int,p[1],edges,0,check,Ok(rows@[0])));
-            assert(p[1] == 17);
+            assert(p[1] == 54);
             assert(delta::decoded(raw,p[1] as int,p[2],edges,1,check,Ok(rows@[1])));
         }
     }
@@ -216,5 +228,40 @@ fn overflow_priority(object:ObjectId) {
     let verdict = batch::audit(&rows,u64::MAX,false,0);
     proof {reveal_with_fuel(batch::usage,2);}
     assert(verdict == Err(batch::AuditError::Overflow));
+}
+
+/// The same fixed header is used by the KV delta record writer and the replay reader.
+fn header_roundtrip(h:crate::delta_header::Header,tail:&[u8]) {
+    use crate::delta_header::Header;
+    let mut bytes = vec![1u8];
+    h.append(&mut bytes);
+    bytes.extend_from_slice(tail);
+    let result = Header::read(&bytes);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(bytes@.subrange(1,37) =~= h.wire());
+        assert(result.is_ok());
+        let (read,start) = result->Ok_0;
+        assert(read.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(read.depth));
+        assert(h.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(h.depth));
+        assert(read.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(read.delta_bytes));
+        assert(h.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(h.delta_bytes));
+        assert(read.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(read.entries));
+        assert(h.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(h.entries));
+        assert(read.wire().subrange(24,32) =~= vstd::bytes::spec_u64_to_le_bytes(read.quota_bytes));
+        assert(h.wire().subrange(24,32) =~= vstd::bytes::spec_u64_to_le_bytes(h.quota_bytes));
+        assert(read.wire().subrange(32,36) =~= storage_words::word32(read.count));
+        assert(h.wire().subrange(32,36) =~= storage_words::word32(h.count));
+        storage_words::unique_word32(h.count,read.count);
+        assert(read == h && start == 37);
+        assert(bytes@.skip(start as int) =~= tail@);
+    }
+}
+
+fn short_header(bytes:&[u8])
+    requires bytes.len() < 37,
+{
+    let result = crate::delta_header::Header::read(bytes);
+    assert(result == Err(storage_fields::ReadError::Truncated));
 }
 }
