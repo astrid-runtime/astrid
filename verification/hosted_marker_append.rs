@@ -19,6 +19,36 @@ closed spec fn appended_marker<I:FnOnce(&crate::ObjectRecord)->crate::ObjectId>(
         r.contents().2==crate::hosted_journal_history::component_bytes(image,loc)
 }
 
+/// Recover the stored ID, byte count and data directly from the object encoder's
+/// wire equation. References after the data may have any canonical length.
+proof fn encoded_fields(image:Seq<u8>,loc:frame::ArenaLocation,body:Seq<u8>,
+    scheme:Scheme,id:crate::ObjectId,r:crate::ObjectRecord)
+    requires {
+        let f=r.contents();
+        body==scheme.algorithm@+scheme.construction@+seq![32u8,0u8,0u8,0u8]+id.digest()+
+            record::header_wire(f.0,f.1,f.5)+record::payload_wire(f.4,f.2,f.3.len() as usize)+
+            record::reference_prefix(f.3,f.3.len(),scheme)
+    }, body.len()==loc.payload_len,loc.offset as int+frame::WIDTH+loc.payload_len<=image.len(),
+        image.subrange(loc.offset as int+frame::WIDTH,loc.offset as int+frame::WIDTH+loc.payload_len)==body,
+    ensures image.subrange(loc.offset as int+frame::WIDTH+8,loc.offset as int+frame::WIDTH+40)==id.digest(),
+        crate::hosted_journal_history::component_bytes(image,loc)==r.contents().2,
+{
+    let at=loc.offset as int+frame::WIDTH;
+    let fields=r.contents();
+    let identity=scheme.algorithm@+scheme.construction@+seq![32u8,0u8,0u8,0u8]+id.digest();
+    let prefix=identity+record::header_wire(fields.0,fields.1,fields.5);
+    let length=prefix.len() as int+8;
+    let start=prefix.len() as int+24;
+    vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+    assert(identity.len()==40 && prefix.len()==45);
+    assert(body.subrange(8,40) =~= id.digest());
+    assert(image.subrange(at+8,at+40) =~= image.subrange(at,at+loc.payload_len).subrange(8,40));
+    assert(body.subrange(length,length+8) =~= vstd::bytes::spec_u64_to_le_bytes(fields.2.len() as u64));
+    assert(body.subrange(start,start+fields.2.len()) =~= fields.2);
+    assert(fields.2.len()<=body.len());
+    assert(record::u64_field(body,length)==fields.2.len());
+}
+
 /// Follow a production marker record through canonical encoding and arena append.
 /// Neighbouring frames and the pre-existing file prefix have independent contents.
 #[verifier::rlimit(20)]
@@ -67,16 +97,9 @@ fn append_token_marker<S:frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
         assert(encoded.subrange(start+52,start+52+loc.payload_len) =~=
             encoded.subrange(start,start+52+loc.payload_len).skip(52));
         assert(file.image().subrange(at,at+loc.payload_len) =~= encoded.subrange(start+52,start+52+loc.payload_len));
-        assert(payload_bytes.subrange(8,40) =~= id.digest());
-        assert(file.image().subrange(at+8,at+40) =~= file.image().subrange(at,at+loc.payload_len).subrange(8,40));
-        assert(file.image().subrange(at+8,at+40) =~= id.digest());
-        let data=marker.contents().2;
-        assert(payload_bytes.subrange(53,61) =~= vstd::bytes::spec_u64_to_le_bytes(data.len() as u64));
-        assert(payload_bytes.subrange(69,69int+data.len()) =~= data);
         assert(file.image().subrange(at,at+loc.payload_len)==payload_bytes);
-        assert(record::u64_field(payload_bytes,53)==data.len() as u64);
-        assert(data.len()<=payload_bytes.len());
-        assert(crate::hosted_journal_history::component_bytes(file.image(),loc)==data);
+        encoded_fields(file.image(),loc,payload_bytes,scheme,id,marker);
+        let data=marker.contents().2;
         assert(identify.ensures((&marker,),id));
         assert(exists|r:&crate::ObjectRecord| #[trigger] identify.ensures((r,),id) &&
             r.contents().2==crate::hosted_journal_history::component_bytes(file.image(),loc));
@@ -88,12 +111,12 @@ fn append_token_marker<S:frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
     Ok((id,loc))
 }
 
-enum MarkerRestart<M> {
-    AlreadyIndexed(crate::ObjectId), Unavailable(crate::ObjectId,crate::ArenaLocation), DifferentComponent(crate::ObjectId,crate::ArenaLocation),
-    Decision(M,crate::RootState,crate::ObjectId,crate::ArenaLocation,Admission),
+enum MarkerRestart<M,P,E> {
+    AlreadyIndexed(crate::ArenaLocation),
+    Unavailable,
+    DifferentComponent,
+    Recovered(M,crate::hosted_recovered_header::RecoveredGraph<P>,Result<Admission,ReopenError<E>>),
 }
-
-enum MarkerRestartError<IO,E> { Append(crate::arena_frame::BatchError<IO>), Reopen(ReopenError<E>) }
 
 /// Write a fresh marker, install its returned location, read the recovered owner
 /// from that arena, and run admission if its KV edge selects the written object.
@@ -105,7 +128,7 @@ fn append_then_reopen_marker<File:crate::arena_frame::BatchFile,Hasher,Identity,
     wave:u64,limit:u64,scheme:crate::root_wire::Scheme,
     owner:P,kind:Marker,target:Id,single_use:bool,other:&(crate::memo_projection::Projection<B>,V),
     select:Select,fail:Fail,measure:M,start:I,values:(K,D),translate:A,rev_read:R,used_read:C,legacy:F)
-    -> (out:Result<MarkerRestart<Media>,MarkerRestartError<File::Error,E>>)
+    -> (out:Result<(crate::ObjectId,crate::ArenaLocation,MarkerRestart<Media,P,E>),frame::BatchError<File::Error>>)
     where Hasher:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,Identity:Fn(&crate::ObjectRecord)->[u8;32]+Copy,
         Open:FnOnce(&File)->Media,
         Check:Fn(&[u8])->Option<KE>+Copy,Select:Fn(crate::ObjectId)->Check,Fail:Fn(crate::ObjectId)->E,
@@ -135,17 +158,28 @@ fn append_then_reopen_marker<File:crate::arena_frame::BatchFile,Hasher,Identity,
         vstd::laws_cmp::obeys_cmp::<Vec<u8>>(),vstd::laws_cmp::obeys_cmp_deep_eq::<Vec<u8>>(),
         obeys_key_model::<Id>(),obeys_concrete_eq::<Id>(),forall|k:&[u8]| #[trigger] legacy.requires((k,)),
     ensures final(file).target()==old(file).target(), vstd::std_specs::btree::btree_map_inv(final(index)),
-        out matches Err(MarkerRestartError::Append(_)) ==> final(index)@==old(index)@,
-        out matches Ok(MarkerRestart::AlreadyIndexed(id)) ==> old(index)@.contains_key(id) && final(index)@==old(index)@,
-        out matches Ok(MarkerRestart::Unavailable(id,loc)) ==> !old(index)@.contains_key(id) && final(index)@==old(index)@.insert(id,loc),
-        out matches Ok(MarkerRestart::DifferentComponent(id,loc)) ==> !old(index)@.contains_key(id) && final(index)@==old(index)@.insert(id,loc),
-        out matches Ok(MarkerRestart::Decision(media,root,id,loc,decision)) ==> {
-            &&& (media_id@)(media)==old(file).target() && media.image()==final(file).image()
-            &&& history@.contains_key(owner) && root==history@[owner].0 && !old(index)@.contains_key(id) && final(index)@==old(index)@.insert(id,loc)
+        out.is_err() ==> final(index)@==old(index)@,
+        out matches Ok((id,loc,state)) ==> {
+            let image=final(file).image();
+            let at=loc.offset as int+frame::WIDTH;
+            &&& loc.offset>=old(file).image().len() && at+loc.payload_len<=image.len()
+            &&& image.take(old(file).image().len() as int)==old(file).image()
+            &&& image.subrange(at+8,at+40)==id.digest()
             &&& forall|spelling:Seq<u8>| #[trigger] marker_key::spells(target@,spelling) ==>
-                crate::hosted_delta_mutation::marker_bytes(crate::hosted_journal_history::component_bytes(media.image(),loc),
+                crate::hosted_delta_mutation::marker_bytes(crate::hosted_journal_history::component_bytes(image,loc),
                     ns_bytes(kind)+seq![0u8]+spelling)
-            &&& (kind is Revoked ==> decision is Revoked) && (single_use ==> !(decision is Allowed))
+            &&& match state {
+                MarkerRestart::AlreadyIndexed(earlier)=>old(index)@.get(id)==Some(earlier) && final(index)@==old(index)@,
+                _=>!old(index)@.contains_key(id) && final(index)@==old(index)@.insert(id,loc),
+            }
+            &&& state matches MarkerRestart::Recovered(media,graph,outcome) ==> {
+                &&& (media_id@)(media)==old(file).target() && media.image()==image
+                &&& graph.owner==owner && history@.contains_key(owner) && graph.root==history@[owner].0
+                &&& graph.from_arena(media.image(),final(index)@,scheme,version) && graph.component==Some(id)
+                &&& graph.records@.contains_key(id) &&
+                    graph.records@[id].contents().2==crate::hosted_journal_history::component_bytes(media.image(),loc)
+                &&& outcome matches Ok(decision) ==> (kind is Revoked ==> decision is Revoked) && (single_use ==> !(decision is Allowed))
+            }
         },
 {
     let (name,text)=kind.address(marker_key::encode(&target));
@@ -157,28 +191,26 @@ fn append_then_reopen_marker<File:crate::arena_frame::BatchFile,Hasher,Identity,
         assert(ns@==ns_bytes(kind));
     }
     let object_id=|r:&crate::ObjectRecord| crate::ObjectId::new(identify(r));
-    let (id,loc)=match append_token_marker(file,scheme,address,previous,depth,used,
-        totals,batch,selected,object_id,hash) {
-        Ok(pair)=>pair,Err(e)=>return Err(MarkerRestartError::Append(e)),
-    };
-    if index.contains_key(&id) {return Ok(MarkerRestart::AlreadyIndexed(id));}
-    index.insert(id,loc);
-    let media=open(file);
-    let format=crate::indexed_frame::Format{magic:crate::arena_frame::ARENA_MAGIC,
-        version:crate::arena_frame::FRAME_VERSION,limit,scheme};
-    let Some(graph)=crate::hosted_recovered_header::recovered_header(index,history,&media,wave,format,hash,
-        identify,candidate,&owner,version) else {return Ok(MarkerRestart::Unavailable(id,loc))};
-    let Some(component)=graph.component else {return Ok(MarkerRestart::DifferentComponent(id,loc))};
-    if !component.same(&id) {return Ok(MarkerRestart::DifferentComponent(id,loc));}
+    let (id,loc)=append_token_marker(file,scheme,address,previous,depth,used,
+        totals,batch,selected,object_id,hash)?;
     proof {
         assert forall|spelling:Seq<u8>| #[trigger] marker_key::spells(target@,spelling) implies
             crate::hosted_delta_mutation::marker_bytes(crate::hosted_journal_history::component_bytes(file.image(),loc),
                 ns_bytes(kind)+seq![0u8]+spelling) by {marker_key::unique_text(target@,text@,spelling);}
     }
-    match reopen_loaded_marker(&graph,version,Ghost(media.image()),Ghost(index@),scheme,kind,target,single_use,other,
-        select,fail,measure,start,values,translate,rev_read,used_read,legacy) {
-        Ok(a)=>Ok(MarkerRestart::Decision(media,graph.root,id,loc,a)),Err(e)=>Err(MarkerRestartError::Reopen(e)),
-    }
+    if let Some(earlier)=index.get(&id) {return Ok((id,loc,MarkerRestart::AlreadyIndexed(*earlier)));}
+    index.insert(id,loc);
+    let media=open(file);
+    let format=crate::indexed_frame::Format{magic:crate::arena_frame::ARENA_MAGIC,
+        version:crate::arena_frame::FRAME_VERSION,limit,scheme};
+    let Some(graph)=crate::hosted_recovered_header::recovered_header(index,history,&media,wave,format,hash,
+        identify,candidate,&owner,version) else {return Ok((id,loc,MarkerRestart::Unavailable))};
+    let Some(component)=graph.component else {return Ok((id,loc,MarkerRestart::DifferentComponent))};
+    if !component.same(&id) {return Ok((id,loc,MarkerRestart::DifferentComponent));}
+    proof {crate::hosted_journal_history::component_contents(media.image(),(id,loc),scheme,graph.records@[id]);}
+    let decision=reopen_loaded_marker(&graph,version,Ghost(media.image()),Ghost(index@),scheme,kind,target,single_use,other,
+        select,fail,measure,start,values,translate,rev_read,used_read,legacy);
+    Ok((id,loc,MarkerRestart::Recovered(media,graph,decision)))
 }
 
 }

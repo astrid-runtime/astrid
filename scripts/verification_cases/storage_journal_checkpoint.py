@@ -64,6 +64,9 @@ def consumer_defects():
         ("physical contents", append, "&&& crate::hosted_delta_mutation::marker_bytes(\n        crate::hosted_journal_history::component_bytes(image,loc),address)", "&&& true", append),
         ("reopened file image", append, "open.ensures((f,),m) ==> m.image()==f.image() &&", "open.ensures((f,),m) ==> true &&", append),
         ("indexed frame", append, "index.insert(id,loc);", "let _discarded_location = loc;", append),
+        ("existing location", append, "Ok((id,loc,MarkerRestart::AlreadyIndexed(*earlier)))", "Ok((id,*earlier,MarkerRestart::AlreadyIndexed(loc)))", append),
+        ("index after reopen error", append, "Ok((id,loc,MarkerRestart::Recovered(media,graph,decision)))", "if decision.is_err() {index.remove(&id);}\n    Ok((id,loc,MarkerRestart::Recovered(media,graph,decision)))", append),
+        ("admission decision", append, "MarkerRestart::Recovered(media,graph,decision)))", "MarkerRestart::Recovered(media,graph,Ok(Admission::Allowed))))", append),
     ]:
         yield (
             f"appended token marker loses {label}", source,
