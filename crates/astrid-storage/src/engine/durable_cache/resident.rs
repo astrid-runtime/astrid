@@ -132,6 +132,8 @@ pub(super) fn visit<P:Ord,M,V,F>(owner:&P,id:ObjectId,partitions:&mut BTreeMap<A
         out.is_none() ==> final(objects)@ == old(objects)@ &&
             *final(clock) == *old(clock) && final(global_lru)@ == old(global_lru)@,
         out.is_some() ==> *final(clock) == next(*old(clock)),
+        out.is_some() ==> final(objects)@[id].last_access == *final(clock),
+        out.is_some() ==> final(global_lru)@ == old(global_lru)@.remove((old(objects)@[id].last_access,id)).insert((*final(clock),id)),
         final(partitions)@.dom() == old(partitions)@.dom(),
         forall|peer:Arc<P>| #[trigger] old(partitions)@.contains_key(peer) ==> (
             if *peer != *owner { final(partitions)@[peer] == old(partitions)@[peer] }

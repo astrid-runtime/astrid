@@ -145,13 +145,33 @@ fn resident_lookup(owner:u64,requester:u64,stored:ObjectId,request:ObjectId,reco
     global.insert((tick,stored)); local.insert((tick,stored));
     let key = Arc::new(owner);
     partitions.insert(Arc::clone(&key),Partition {entries,lru:local,charged_bytes:17});
+    let peer = Arc::new(if owner == 0 {1u64} else {0u64});
+    let other = Partition {entries:BTreeMap::new(),lru:BTreeSet::new(),charged_bytes:0};
+    let ghost peer_before = other;
+    partitions.insert(Arc::clone(&peer),other);
+    assert(*peer != owner);
+    assert(partitions@.contains_key(peer) && partitions@[peer] == peer_before);
+    let ghost original_global = global@;
+    let ghost original_local = partitions@[key].lru@;
     let check = |p:&u64| requires *p == requester, { };
     assert(partitions@.contains_key(key) && *key == owner && partitions@[key].entries@.contains_key(stored));
     if requester == owner && stored.same(&request) {assert(resident::member(partitions@,requester,request));}
     let out = resident::visit(&requester,request,&mut partitions,&mut objects,&mut clock,&mut global,check);
     assert(objects@[stored].record == record);
+    if requester != *peer {
+        assert(partitions@[peer] == peer_before);
+    } else {
+        assert(partitions@[peer].entries@ == peer_before.entries@);
+    }
     let partition = partitions.get(&key).unwrap();
     assert(partition.charged_bytes == 17 && partition.entries@[stored].projections == projection);
+    if requester == owner && stored.same(&request) {
+        assert(global@ == original_global.remove((tick,stored)).insert((clock,stored)));
+        assert(partition.lru@ == original_local.remove((tick,stored)).insert((clock,stored)));
+        assert(objects@[stored].last_access == clock);
+    } else {
+        assert(global@ == original_global && partition.lru@ == original_local);
+    }
     assert(clock == if requester == owner && request == stored {resident::next(tick)} else {tick});
     out
 }

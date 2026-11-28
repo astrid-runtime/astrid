@@ -832,6 +832,9 @@ def resident_cache_consumers():
         ("access clock", "out.is_some() ==> *final(clock) == next(*old(clock))", "true"),
         ("principal charge", "&&& after.charged_bytes == before.charged_bytes", "&&& true"),
         ("projection custody", "&&& after.entries@ == before.entries@.insert(id,PrincipalEntry {last_access:t,..old})", "&&& true"),
+        ("physical recency", "out.is_some() ==> final(objects)@[id].last_access == *final(clock)", "true"),
+        ("global eviction index", "out.is_some() ==> final(global_lru)@ == old(global_lru)@.remove((old(objects)@[id].last_access,id)).insert((*final(clock),id))", "true"),
+        ("owner eviction index", "&&& after.lru@ == before.lru@.remove((old.last_access,id)).insert((t,id))", "&&& true"),
         ("unrelated partitions", "if *peer != *owner { final(partitions)@[peer] == old(partitions)@[peer] }", "if *peer != *owner { true }"),
     ]:
         yield (
