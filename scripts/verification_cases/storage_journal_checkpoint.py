@@ -301,3 +301,18 @@ def consumer_defects():
             f"cold root history loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )
+
+    for label, source, clause, weakness in [
+        ("appended principal", journal_scan, "let row=Row {name:name@,key,prior:expected,root:next",
+         "let row=Row {name:Seq::empty(),key,prior:expected,root:next"),
+        ("physical append address", journal_scan, "let loc=ArenaLocation {offset:prior_image.len() as u64",
+         "let loc=ArenaLocation {offset:0"),
+        ("reopened history", journal_scan, "let out=recover(reader,end,scheme,limit,hash,decode,recode,Ghost(full));",
+         "let out:Result<BTreeMap<P,(RootState,u64)>,(u64,Failure<R::Error>)>=Ok(BTreeMap::new());"),
+        ("reserved header precedence", repair, "if !frame::magic_matches(&h,magic)",
+         "if h[10]!=0 || !frame::magic_matches(&h,magic)"),
+    ]:
+        yield (
+            f"certified journal append loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )

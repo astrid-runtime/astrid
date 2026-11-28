@@ -112,27 +112,35 @@ pub(super) fn next_frame<R:FrameReader,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
     requires old(reader).position()==offset,offset<end<=old(reader).image().len(),
         forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
     ensures final(reader).target()==old(reader).target(),final(reader).image()==old(reader).image(),{
-        let at=offset as int;let image=old(reader).image();let h=header_at(image,offset);
-        let n=vstd::bytes::spec_u64_from_le_bytes(h.subrange(12,20));
-        let next=at+52+n;let body=image.subrange(at+52,next);
-        let matches=h.take(8)==magic@;
-        let current=h[8]==version as u8 && h[9]==(version >> 8) as u8;
-        let clear=h[10]==0 && h[11]==0;
-        match out {
-            Ok(f)=>at+52<=end && matches && current && clear && n<=limit && at<f.end==next<=end &&
-                final(reader).position()==f.end && f.body@==body && f.body.len()==n &&
-                exists|b:&[u8],sum:[u8;32]| b@==body && sum@==h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
-            Err(FrameError::Tail(TailError::HeaderShort))=>end<at+52,
-            Err(FrameError::Tail(TailError::Magic))=>at+52<=end && !matches,
-            Err(FrameError::Header(super::arena_frame::HeaderError::Version))=>matches && !current,
-            Err(FrameError::Header(super::arena_frame::HeaderError::Reserved))=>matches && current && !clear,
-            Err(FrameError::Tail(TailError::Oversize{size,interior}))=>size==n && n>limit && interior==(next<=end),
-            Err(FrameError::Overflow)=>n<=limit && next>u64::MAX,
-            Err(FrameError::Tail(TailError::PayloadShort))=>n<=limit && end<next<=u64::MAX,
-            Err(FrameError::Tail(TailError::Checksum))=>next<=end && exists|b:&[u8],sum:[u8;32]| b@==body &&
-                sum@!=h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
-            Err(FrameError::Io(e))=>old(reader).failed(at,52,e) || exists|r:R| r.image()==image &&
-                r.target()==old(reader).target() && r.position()==at+52 && #[trigger] r.failed(at+52,n,e),
+        let at=offset as int;
+        if end<at+52 {
+            out matches Err(FrameError::Tail(TailError::HeaderShort))
+        } else {
+            let image=old(reader).image();let h=header_at(image,offset);
+            let n=vstd::bytes::spec_u64_from_le_bytes(h.subrange(12,20));
+            let next=at+52+n;
+            let matches=h.take(8)==magic@;
+            let current=h[8]==version as u8 && h[9]==(version >> 8) as u8;
+            let clear=h[10]==0 && h[11]==0;
+            let valid=matches && current && clear;
+            match out {
+                Ok(f)=>valid && n<=limit && at<f.end==next<=end &&
+                    super::arena_frame::WIDTH==52 && final(reader).position()==f.end &&
+                    f.body.len()==n && f.body@==image.subrange(at+52,next) &&
+                    exists|b:&[u8],sum:[u8;32]| b@==f.body@ && sum@==h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
+                Err(FrameError::Tail(TailError::HeaderShort))=>false,
+                Err(FrameError::Tail(TailError::Magic))=>!matches,
+                Err(FrameError::Header(super::arena_frame::HeaderError::Version))=>matches && !current,
+                Err(FrameError::Header(super::arena_frame::HeaderError::Reserved))=>matches && current && !clear,
+                Err(FrameError::Tail(TailError::Oversize{size,interior}))=>valid && size==n && n>limit && interior==(next<=end),
+                Err(FrameError::Overflow)=>valid && n<=limit && next>u64::MAX,
+                Err(FrameError::Tail(TailError::PayloadShort))=>valid && n<=limit && end<next<=u64::MAX,
+                Err(FrameError::Tail(TailError::Checksum))=>valid && n<=limit && next<=end &&
+                    exists|b:&[u8],sum:[u8;32]| b@==image.subrange(at+52,next) &&
+                        sum@!=h.subrange(20,52) && #[trigger] hash.ensures((magic,n,b),sum),
+                Err(FrameError::Io(e))=>old(reader).failed(at,52,e) || valid && n<=limit && next<=end &&
+                    exists|r:R| r.image()==image && r.target()==old(reader).target() && r.position()==at+52 && #[trigger] r.failed(at+52,n,e),
+            }
         }
     },
 {

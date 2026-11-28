@@ -200,6 +200,8 @@ pub(super) fn index_fresh<H:Fn(&ObjectRecord)->[u8;32],C:FnOnce(u64,&[u8])->[u8;
                     if old(index)@.contains_key(key) {scan::agrees(old(index)@[key],*loc) && index@==old(index)@}
                     else {index@==old(index)@.insert(key,*loc)};
                 ObjectId::same_digest(key,id);
+                assert(key==id);
+                assert(index@==old(index)@.insert(id,*loc));
             },
             Err(IndexError::Collision(key))=>{ObjectId::same_digest(*key,id);},
             Err(IndexError::Record(Error::Identity))=>{

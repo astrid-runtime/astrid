@@ -403,6 +403,7 @@ fn append_replayed_payload<J:crate::arena_frame::BatchFile,H:Fn([u8;8],u64,&[u8]
     ensures final(file).target()==old(file).target() && final(file).image()==old(file).image()+
         crate::arena_frame::header_bytes(crate::arena_frame::ROOT_MAGIC,crate::arena_frame::FRAME_VERSION,
             payload.len() as u64,(digest@)(payload@))+payload@,
+        crate::arena_frame::hashed(hash,crate::arena_frame::ROOT_MAGIC,payload@,(digest@)(payload@)),
 {
     use crate::arena_frame::{self as frame,ROOT_MAGIC,FRAME_VERSION,BatchError};
     let batch=[payload];
@@ -483,6 +484,7 @@ fn durable_journal_fold<J:crate::arena_frame::BatchFile,S:crate::group_frontier:
             Some(Decision::AlreadyPublished)=>already,
             Some(Decision::Conflict(r))=>!already && actual!=expected && r==actual,
             Some(Decision::Applied(bytes))=>!already && actual==expected &&
+                crate::hosted_cold_journal::appended(old(file).image(),final(file).image(),scheme,hash,key,owner.bytes(),expected,replacement) &&
                 bytes@==crate::journal_transition::wire(owner.bytes(),scheme,expected,replacement),
             None=>true,
         }
@@ -508,7 +510,9 @@ fn durable_journal_fold<J:crate::arena_frame::BatchFile,S:crate::group_frontier:
     let decision=bound.fold(history,scheme)?;
     if let Decision::Applied(ref bytes)=decision {
         assert(bytes@==encoded@);
+        let ghost prior_image=file.image();
         append_replayed_payload(file,bytes,hash,journal_digest);
+        crate::hosted_cold_journal::attest_append(Ghost(prior_image),Ghost(file.image()),scheme,hash,key,&name,expected,replacement,bytes,Ghost((journal_digest@)(bytes@)));
     }
     Some(decision)
 }
@@ -614,7 +618,9 @@ fn retire_applied_wal<J:crate::arena_frame::BatchFile,S:crate::group_frontier::B
         }
         &&& out matches Some(Ok(Ok((c,state)))) ==> (!(state is Conflict))==(cold==expected) &&
             c.arena_target()==arena_id@ && c.canonical_stable().get(crate::recovery_barrier::Target::Arena)==Some(arena_bytes@) && c.roots_target()==initial_journal.target() && c.wal_target()==sink.wal_target() && c.stable_image()==Seq::<u8>::empty() &&
-            c.canonical_stable().get(crate::recovery_barrier::Target::Roots)==Some(initial_journal.image()+header+wire)
+            c.canonical_stable().get(crate::recovery_barrier::Target::Roots)==Some(initial_journal.image()+header+wire) &&
+            crate::hosted_cold_journal::appended(initial_journal.image(),c.canonical_stable()[crate::recovery_barrier::Target::Roots],
+                scheme,hash,key,owner.bytes(),expected,replacement)
     }),
 {
     let mut file=initial_journal;

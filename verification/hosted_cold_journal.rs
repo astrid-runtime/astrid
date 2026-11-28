@@ -92,12 +92,60 @@ spec fn refused_at<R:scan::FrameReader,P>(image:Seq<u8>,target:(int,Seq<u8>),r:R
     }
 }
 
+pub(crate) closed spec fn describes<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(rows:Seq<Row<P>>,image:Seq<u8>,scheme:root_wire::Scheme,limit:u64,hash:H) -> bool {
+        &&& extent(rows,rows.len())==image.len()
+        &&& forall|i:int| 0<=i<rows.len() ==> (#[trigger] rows[i]).frames(image,scheme,limit,hash) &&
+            rows[i].loc.offset==extent(rows,i as nat)
+}
+
+pub(crate) closed spec fn appended<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(
+    prior_image:Seq<u8>,image:Seq<u8>,scheme:root_wire::Scheme,hash:H,
+    key:P,name:Seq<u8>,expected:Option<RootState>,next:RootState) -> bool {
+    exists|r:Row<P>| r.key==key && r.name==name && r.prior==expected && r.root==next &&
+        r.loc.offset==prior_image.len() && r.loc.payload_len==r.payload(scheme).len() &&
+        forall|rows:Seq<Row<P>>,limit:u64| #[trigger] describes(rows,prior_image,scheme,limit,hash) && r.loc.payload_len<=limit ==>
+            describes(rows.push(r),image,scheme,limit,hash)
+}
+
+pub(crate) fn attest_append<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(Ghost(prior_image):Ghost<Seq<u8>>,Ghost(image):Ghost<Seq<u8>>,
+    scheme:root_wire::Scheme,hash:H,key:P,name:&[u8],expected:Option<RootState>,next:RootState,body:&[u8],Ghost(sum):Ghost<[u8;32]>)
+    requires prior_image.len()<=u64::MAX,name.len()<u64::MAX,body@==journal::wire(name@,scheme,expected,next),
+        image==prior_image+frame::header_bytes(frame::ROOT_MAGIC,frame::FRAME_VERSION,body.len() as u64,sum)+body@,
+        frame::hashed(hash,frame::ROOT_MAGIC,body@,sum),
+    ensures appended(prior_image,image,scheme,hash,key,name@,expected,next),
+{
+    let prior=match expected {Some(r)=>Some(history::to_wire(r)),None=>None};
+    let root=history::to_wire(next);
+    proof {
+        let loc=ArenaLocation {offset:prior_image.len() as u64,payload_len:body.len() as u64,checksum:sum};
+        let row=Row {name:name@,key,prior:expected,root:next,prior_wire:prior,root_wire:root,loc};
+        let hdr=frame::header_bytes(frame::ROOT_MAGIC,frame::FRAME_VERSION,loc.payload_len,sum);
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(hdr.len()==52);
+        assert(image.subrange(prior_image.len() as int,image.len() as int) =~= hdr+body@);
+        assert forall|rows:Seq<Row<P>>,limit:u64| #[trigger] describes(rows,prior_image,scheme,limit,hash) && row.loc.payload_len<=limit implies
+            describes(rows.push(row),image,scheme,limit,hash) by {
+            let result=rows.push(row);
+            assert(row.frames(image,scheme,limit,hash));
+            assert forall|i:int| 0<=i<result.len() implies (#[trigger] result[i]).frames(image,scheme,limit,hash) &&
+                result[i].loc.offset==extent(result,i as nat) by {
+                if i<rows.len() {
+                    let old=rows[i];
+                    assert(old.frames(prior_image,scheme,limit,hash));
+                    let at=old.loc.offset as int;let end=at+52+old.loc.payload_len;
+                    assert(image.subrange(at,end) =~= prior_image.subrange(at,end));
+                }
+                if i>0 {assert(result[i-1]==rows[i-1]);}
+            }
+        }
+    }
+}
+
 pub(crate) closed spec fn readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,image:Seq<u8>,end:u64,scheme:root_wire::Scheme,limit:u64,hash:H,decode:D,recode:C) -> bool
     where H:Fn([u8;8],u64,&[u8])->[u8;32],D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>,
 {
-        &&& extent(rows,rows.len())==end
-        &&& forall|i:int| 0<=i<rows.len() ==> (#[trigger] rows[i]).frames(image,scheme,limit,hash) &&
-            rows[i].loc.offset==extent(rows,i as nat)
+        &&& describes(rows,image,scheme,limit,hash)
+        &&& end==image.len()
         &&& obeys_cmp::<P>() && obeys_cmp_concrete_eq::<P>()
         &&& forall|n:u64,b:&[u8]| #[trigger] hash.requires((frame::ROOT_MAGIC,n,b))
         &&& forall|n:u64,a:&[u8],b:&[u8],d:[u8;32],e:[u8;32]| a@==b@ && #[trigger] hash.ensures((frame::ROOT_MAGIC,n,a),d) &&
@@ -106,6 +154,54 @@ pub(crate) closed spec fn readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,image:Seq<u8>,e
         &&& forall|i:int,n:&[u8],p:Option<P>| 0<=i<rows.len() && n@==(#[trigger] rows[i]).name && #[trigger] decode.ensures((n,),p) ==> p==Some(rows[i].key)
         &&& forall|p:&P| #[trigger] recode.requires((p,))
         &&& forall|i:int,v:Vec<u8>| 0<=i<rows.len() && #[trigger] recode.ensures((&rows[i].key,),v) ==> v@==rows[i].name
+}
+
+proof fn prefix_push<P>(rows:Seq<Row<P>>,row:Row<P>,n:nat)
+    requires n<=rows.len(),
+    ensures prefix(rows.push(row),n)==prefix(rows,n),
+    decreases n,
+{
+    if n>0 {
+        prefix_push(rows,row,(n-1) as nat);
+        assert(rows.push(row)[n-1]==rows[n-1]);
+    }
+}
+
+/// A WAL-applied transition extends the scan contract for every certified
+/// prefix, including a journal containing other owners and earlier generations.
+pub(crate) proof fn extend_readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,old_image:Seq<u8>,image:Seq<u8>,
+    scheme:root_wire::Scheme,limit:u64,hash:H,decode:D,recode:C,
+    key:P,name:Seq<u8>,expected:Option<RootState>,next:RootState)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32],D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>,
+    requires readable(rows,old_image,old_image.len() as u64,scheme,limit,hash,decode,recode),
+        consecutive(rows,rows.len()),image.len()<=u64::MAX,journal::wire(name,scheme,expected,next).len()<=limit,
+        appended(old_image,image,scheme,hash,key,name,expected,next),
+        expected==(if prefix(rows,rows.len()).contains_key(key) {Some(prefix(rows,rows.len())[key].0)} else {None}),
+        next.generation.value()==match expected {None=>0int,Some(r)=>r.generation.value() as int+1},
+        forall|n:&[u8],p:Option<P>| n@==name && #[trigger] decode.ensures((n,),p) ==> p==Some(key),
+        forall|v:Vec<u8>| #[trigger] recode.ensures((&key,),v) ==> v@==name,
+    ensures exists|extended:Seq<Row<P>>| #[trigger] readable(extended,image,image.len() as u64,scheme,limit,hash,decode,recode) &&
+        consecutive(extended,extended.len()) && prefix(extended,extended.len())==prefix(rows,rows.len()).insert(key,(next,old_image.len() as u64)),
+{
+    let row=choose|r:Row<P>| r.key==key && r.name==name && r.prior==expected && r.root==next &&
+        r.loc.offset==old_image.len() && r.loc.payload_len==r.payload(scheme).len() &&
+        forall|rs:Seq<Row<P>>,lim:u64| #[trigger] describes(rs,old_image,scheme,lim,hash) && r.loc.payload_len<=lim ==>
+            describes(rs.push(r),image,scheme,lim,hash);
+    let extended=rows.push(row);
+    assert(describes(extended,image,scheme,limit,hash));
+    assert forall|i:int,n:&[u8],p:Option<P>| 0<=i<extended.len() && n@==(#[trigger] extended[i]).name && #[trigger] decode.ensures((n,),p) implies p==Some(extended[i].key) by {
+        if i<rows.len() {assert(extended[i]==rows[i]);}
+    }
+    assert forall|i:int,v:Vec<u8>| 0<=i<extended.len() && #[trigger] recode.ensures((&extended[i].key,),v) implies v@==extended[i].name by {
+        if i<rows.len() {assert(extended[i]==rows[i]);}
+    }
+    assert(readable(extended,image,image.len() as u64,scheme,limit,hash,decode,recode));
+    assert forall|i:int| 0<=i<extended.len() implies (#[trigger] extended[i]).admitted(prefix(extended,i as nat)) by {
+        prefix_push(rows,row,i as nat);
+        if i<rows.len() {assert(rows[i].admitted(prefix(rows,i as nat)));}
+    }
+    prefix_push(rows,row,rows.len());
+    assert(prefix(extended,extended.len())==prefix(rows,rows.len()).insert(key,(next,old_image.len() as u64)));
 }
 
 pub(crate) closed spec fn failed<R:scan::FrameReader,P>(rows:Seq<Row<P>>,image:Seq<u8>,target:(int,Seq<u8>),at:u64,f:Failure<R::Error>) -> bool {
@@ -126,6 +222,9 @@ pub(crate) fn recover<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,end:u64,sch
             Err((at,f))=>failed::<R,P>(rows,old(reader).image(),old(reader).target(),at,f),
         },
 {
+    assert(extent(rows,rows.len())==end);
+    assert forall|i:int| 0<=i<rows.len() implies (#[trigger] rows[i]).frames(reader.image(),scheme,limit,hash) &&
+        rows[i].loc.offset==extent(rows,i as nat) by {}
     let mut history=BTreeMap::new();
     let mut at=0u64;
     let ghost mut n:nat=0;
@@ -168,5 +267,58 @@ pub(crate) fn recover<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,end:u64,sch
         assert(n==rows.len());
     }
     Ok(history)
+}
+
+/// Reopen the complete file after one accepted publication on a certified
+/// prefix. Key and root witnesses are erased; decoding starts at physical zero.
+#[verifier::spinoff_prover]
+fn recover_appended<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,end:u64,scheme:root_wire::Scheme,limit:u64,hash:H,decode:D,recode:C,
+    Ghost(rows):Ghost<Seq<Row<P>>>,Ghost(before):Ghost<Seq<u8>>,Ghost(key):Ghost<P>,Ghost(name):Ghost<Seq<u8>>,
+    Ghost(expected):Ghost<Option<RootState>>,Ghost(next):Ghost<RootState>)
+    -> (out:Result<BTreeMap<P,(RootState,u64)>,(u64,Failure<R::Error>)>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy,
+    requires old(reader).position()==0,end==old(reader).image().len(),
+        readable(rows,before,before.len() as u64,scheme,limit,hash,decode,recode),consecutive(rows,rows.len()),
+        appended(before,old(reader).image(),scheme,hash,key,name,expected,next),
+        journal::wire(name,scheme,expected,next).len()<=limit,
+        expected==(if prefix(rows,rows.len()).contains_key(key) {Some(prefix(rows,rows.len())[key].0)} else {None}),
+        next.generation.value()==match expected {None=>0int,Some(r)=>r.generation.value() as int+1},
+        forall|n:&[u8],p:Option<P>| n@==name && #[trigger] decode.ensures((n,),p) ==> p==Some(key),
+        forall|v:Vec<u8>| #[trigger] recode.ensures((&key,),v) ==> v@==name,
+    ensures final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),
+        match out {
+            Ok(table)=>btree_map_inv(&table) && final(reader).position()==end &&
+                table@==prefix(rows,rows.len()).insert(key,(next,before.len() as u64)),
+            Err((at,Failure::Frame(scan::FrameError::Io(e))))=>at<end &&
+                exists|r:R,n:u64| r.image()==old(reader).image() && r.target()==old(reader).target() &&
+                    (r.position()==at && n==52 || r.position()==at as int+52 && r.position()+n<=end) &&
+                    #[trigger] r.failed(r.position(),n,e),
+            _=>false,
+        },
+{
+    let ghost image=reader.image();
+    proof {extend_readable(rows,before,image,scheme,limit,hash,decode,recode,key,name,expected,next);}
+    let ghost full=choose|rs:Seq<Row<P>>| #[trigger] readable(rs,image,end,scheme,limit,hash,decode,recode) && consecutive(rs,rs.len()) &&
+        prefix(rs,rs.len())==prefix(rows,rows.len()).insert(key,(next,before.len() as u64));
+    let out=recover(reader,end,scheme,limit,hash,decode,recode,Ghost(full));
+    proof {
+        if let Err((at,e))=&out {
+            let i=choose|i:int| 0<=i<full.len() && (#[trigger] full[i]).loc.offset==*at && consecutive(full,i as nat) &&
+                refused_at::<R,P>(image,reader.target(),full[i],prefix(full,i as nat),*e);
+            let row=full[i];
+            assert(row.admitted(prefix(full,i as nat)));
+            assert(row.frames(image,scheme,limit,hash));
+            if let Failure::Frame(scan::FrameError::Io(io))=e {
+                if exists|r:R| r.image()==image && r.target()==reader.target() && r.position()==*at && #[trigger] r.failed(*at as int,52,*io) {
+                    let r=choose|r:R| r.image()==image && r.target()==reader.target() && r.position()==*at && #[trigger] r.failed(*at as int,52,*io);
+                    assert(r.failed(r.position(),52,*io));
+                } else {
+                    let r=choose|r:R| r.image()==image && r.target()==reader.target() && r.position()==*at as int+52 && #[trigger] r.failed(*at as int+52,row.loc.payload_len,*io);
+                    assert(r.failed(r.position(),row.loc.payload_len,*io));
+                }
+            }
+        }
+    }
+    out
 }
 }
