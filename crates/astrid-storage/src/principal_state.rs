@@ -470,6 +470,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    principal_scratch_root: Arc<std::path::Path>,
     quota: Arc<dyn crate::KvQuotaResolver<StateOwner>>,
     volume_binding: std::sync::Weak<crate::volume::HostedFileVolume>,
     engine: Arc<RuntimeEngine>,
@@ -482,6 +483,14 @@ pub struct RuntimePrincipalStore {
 }
 
 impl RuntimePrincipalStore {
+    /// Native scratch directory for a durable principal in this opened runtime.
+    #[must_use]
+    pub fn principal_tmp_dir(&self, uid: PrincipalUid) -> std::path::PathBuf {
+        self.principal_scratch_root
+            .join(uid.to_string())
+            .join("tmp")
+    }
+
     /// Write the current live container bytes for a quiescent replay fixture.
     ///
     /// Uses the lock-owning handle without flushing, closing, or releasing

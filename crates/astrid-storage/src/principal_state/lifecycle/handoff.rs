@@ -103,6 +103,7 @@ impl RuntimePrincipalStore {
             "Rebound finalization validation memos"
         );
         let store = Self {
+            principal_scratch_root: Arc::clone(&self.principal_scratch_root),
             quota: Arc::clone(&quota),
             volume_binding: self.volume_binding.clone(),
             engine,
