@@ -859,6 +859,8 @@ mod faults;
 mod format;
 mod frontier;
 mod group;
+#[path = "wal/group_publication.rs"]
+mod group_publication;
 mod index;
 mod journal_apply;
 mod journal_closure;

@@ -199,6 +199,19 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b), publication,
         )
 
+    group_publication = Path("crates/astrid-storage/src/engine/durable/wal/group_publication.rs")
+    for label, before, after in [
+        ("installed group", "install(entries,staged,receipt)", "install(&[],staged,receipt)"),
+        ("paired frame source", "let frames=collect(t)?;", "let frames=collect(&transactions[0])?;"),
+        ("first transaction", "Action::Objects{first:i==0,frames:&e.frames}", "Action::Objects{first:true,frames:&e.frames}"),
+        ("root event", "state,Action::Root(e.transaction),Ghost(initial)", "state,Action::Commit,Ghost(initial)"),
+        ("final commit", "state=step(&write,state,Action::Commit,Ghost(initial),Ghost(all),Ghost(n+3))?;", ""),
+    ]:
+        yield (
+            f"WAL group publication loses {label}", group_publication,
+            lambda s, a=before, b=after: replace_once(s, a, b), group_publication,
+        )
+
     merge_rows = Path("crates/astrid-storage/src/engine/durable/wal/merge_rows.rs")
     for label, before, after in [
         ("lower prepared identity", "Ordering::Greater=>Row::Prepared(*j,frame)", "Ordering::Greater=>Row::Prepared(*i,frame)"),
