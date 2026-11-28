@@ -67,18 +67,30 @@ fn replay<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,offset:u64,end:u64,hist
     }
 }
 
-spec fn extent<P>(rows:Seq<Row<P>>,n:nat) -> int {
-    if n==0 {0} else {let loc=rows[n-1].loc;loc.offset as int+52+loc.payload_len}
+pub(crate) closed spec fn boundary<P>(start:u64,rows:Seq<Row<P>>,n:nat) -> int {
+    if n==0 {start as int} else {let loc=rows[n-1].loc;loc.offset as int+52+loc.payload_len}
 }
 
-pub(crate) closed spec fn prefix<P>(rows:Seq<Row<P>>,n:nat) -> Map<P,(RootState,u64)>
+spec fn extent<P>(rows:Seq<Row<P>>,n:nat) -> int {
+    boundary(0,rows,n)
+}
+
+pub(crate) closed spec fn applied<P>(base:Map<P,(RootState,u64)>,rows:Seq<Row<P>>,n:nat) -> Map<P,(RootState,u64)>
     decreases n,
 {
-    if n==0 {Map::empty()} else {let r=rows[n-1];prefix(rows,(n-1) as nat).insert(r.key,(r.root,r.loc.offset))}
+    if n==0 {base} else {let r=rows[n-1];applied(base,rows,(n-1) as nat).insert(r.key,(r.root,r.loc.offset))}
+}
+
+pub(crate) closed spec fn prefix<P>(rows:Seq<Row<P>>,n:nat) -> Map<P,(RootState,u64)> {
+    applied(Map::empty(),rows,n)
+}
+
+pub(crate) closed spec fn accepted<P>(base:Map<P,(RootState,u64)>,rows:Seq<Row<P>>,n:nat) -> bool {
+    forall|i:int| 0<=i<n ==> (#[trigger] rows[i]).admitted(applied(base,rows,i as nat))
 }
 
 pub(crate) closed spec fn consecutive<P>(rows:Seq<Row<P>>,n:nat) -> bool {
-    forall|i:int| 0<=i<n ==> (#[trigger] rows[i]).admitted(prefix(rows,i as nat))
+    accepted(Map::empty(),rows,n)
 }
 
 spec fn refused_at<R:scan::FrameReader,P>(image:Seq<u8>,target:(int,Seq<u8>),r:Row<P>,prior:Map<P,(RootState,u64)>,f:Failure<R::Error>) -> bool {
@@ -92,10 +104,14 @@ spec fn refused_at<R:scan::FrameReader,P>(image:Seq<u8>,target:(int,Seq<u8>),r:R
     }
 }
 
-pub(crate) closed spec fn describes<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(rows:Seq<Row<P>>,image:Seq<u8>,scheme:root_wire::Scheme,limit:u64,hash:H) -> bool {
-        &&& extent(rows,rows.len())==image.len()
+pub(crate) closed spec fn describes_suffix<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(start:u64,rows:Seq<Row<P>>,image:Seq<u8>,scheme:root_wire::Scheme,limit:u64,hash:H) -> bool {
+        &&& boundary(start,rows,rows.len())==image.len()
         &&& forall|i:int| 0<=i<rows.len() ==> (#[trigger] rows[i]).frames(image,scheme,limit,hash) &&
-            rows[i].loc.offset==extent(rows,i as nat)
+            rows[i].loc.offset==boundary(start,rows,i as nat)
+}
+
+pub(crate) closed spec fn describes<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(rows:Seq<Row<P>>,image:Seq<u8>,scheme:root_wire::Scheme,limit:u64,hash:H) -> bool {
+    describes_suffix(0,rows,image,scheme,limit,hash)
 }
 
 pub(crate) closed spec fn appended<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(
@@ -141,10 +157,10 @@ pub(crate) fn attest_append<P,H:Fn([u8;8],u64,&[u8])->[u8;32]>(Ghost(prior_image
     }
 }
 
-pub(crate) closed spec fn readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,image:Seq<u8>,end:u64,scheme:root_wire::Scheme,limit:u64,hash:H,decode:D,recode:C) -> bool
+pub(crate) closed spec fn readable_suffix<P:Ord,H,D,C>(start:u64,rows:Seq<Row<P>>,image:Seq<u8>,end:u64,scheme:root_wire::Scheme,limit:u64,hash:H,decode:D,recode:C) -> bool
     where H:Fn([u8;8],u64,&[u8])->[u8;32],D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>,
 {
-        &&& describes(rows,image,scheme,limit,hash)
+        &&& describes_suffix(start,rows,image,scheme,limit,hash)
         &&& end==image.len()
         &&& obeys_cmp::<P>() && obeys_cmp_concrete_eq::<P>()
         &&& forall|n:u64,b:&[u8]| #[trigger] hash.requires((frame::ROOT_MAGIC,n,b))
@@ -154,6 +170,12 @@ pub(crate) closed spec fn readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,image:Seq<u8>,e
         &&& forall|i:int,n:&[u8],p:Option<P>| 0<=i<rows.len() && n@==(#[trigger] rows[i]).name && #[trigger] decode.ensures((n,),p) ==> p==Some(rows[i].key)
         &&& forall|p:&P| #[trigger] recode.requires((p,))
         &&& forall|i:int,v:Vec<u8>| 0<=i<rows.len() && #[trigger] recode.ensures((&rows[i].key,),v) ==> v@==rows[i].name
+}
+
+pub(crate) closed spec fn readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,image:Seq<u8>,end:u64,scheme:root_wire::Scheme,limit:u64,hash:H,decode:D,recode:C) -> bool
+    where H:Fn([u8;8],u64,&[u8])->[u8;32],D:Fn(&[u8])->Option<P>,C:Fn(&P)->Vec<u8>,
+{
+    readable_suffix(0,rows,image,end,scheme,limit,hash,decode,recode)
 }
 
 proof fn prefix_push<P>(rows:Seq<Row<P>>,row:Row<P>,n:nat)
@@ -188,6 +210,8 @@ pub(crate) proof fn extend_readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,old_image:Seq<
         forall|rs:Seq<Row<P>>,lim:u64| #[trigger] describes(rs,old_image,scheme,lim,hash) && r.loc.payload_len<=lim ==>
             describes(rs.push(r),image,scheme,lim,hash);
     let extended=rows.push(row);
+    assert(describes(rows,old_image,scheme,limit,hash));
+    assert(row.loc.payload_len<=limit);
     assert(describes(extended,image,scheme,limit,hash));
     assert forall|i:int,n:&[u8],p:Option<P>| 0<=i<extended.len() && n@==(#[trigger] extended[i]).name && #[trigger] decode.ensures((n,),p) implies p==Some(extended[i].key) by {
         if i<rows.len() {assert(extended[i]==rows[i]);}
@@ -204,43 +228,49 @@ pub(crate) proof fn extend_readable<P:Ord,H,D,C>(rows:Seq<Row<P>>,old_image:Seq<
     assert(prefix(extended,extended.len())==prefix(rows,rows.len()).insert(key,(next,old_image.len() as u64)));
 }
 
+pub(crate) closed spec fn failed_suffix<R:scan::FrameReader,P>(base:Map<P,(RootState,u64)>,rows:Seq<Row<P>>,image:Seq<u8>,target:(int,Seq<u8>),at:u64,f:Failure<R::Error>) -> bool {
+    exists|i:int| 0<=i<rows.len() && (#[trigger] rows[i]).loc.offset==at && accepted(base,rows,i as nat) &&
+                refused_at::<R,P>(image,target,rows[i],applied(base,rows,i as nat),f)
+}
+
 pub(crate) closed spec fn failed<R:scan::FrameReader,P>(rows:Seq<Row<P>>,image:Seq<u8>,target:(int,Seq<u8>),at:u64,f:Failure<R::Error>) -> bool {
-    exists|i:int| 0<=i<rows.len() && (#[trigger] rows[i]).loc.offset==at && consecutive(rows,i as nat) &&
-                refused_at::<R,P>(image,target,rows[i],prefix(rows,i as nat),f)
+    failed_suffix::<R,P>(Map::empty(),rows,image,target,at,f)
 }
 
 #[verifier::spinoff_prover]
 #[verifier::loop_isolation(false)]
-#[verifier::rlimit(30)]
-pub(crate) fn recover<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,end:u64,scheme:root_wire::Scheme,limit:u64,
+#[verifier::rlimit(70)]
+pub(crate) fn scan_suffix<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,start:u64,end:u64,mut history:BTreeMap<P,(RootState,u64)>,scheme:root_wire::Scheme,limit:u64,
     hash:H,decode:D,recode:C,Ghost(rows):Ghost<Seq<Row<P>>>) -> (out:Result<BTreeMap<P,(RootState,u64)>,(u64,Failure<R::Error>)>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy,
-    requires old(reader).position()==0,end==old(reader).image().len(),readable(rows,old(reader).image(),end,scheme,limit,hash,decode,recode),
+    requires btree_map_inv(&history),start<=end,old(reader).position()==start,end==old(reader).image().len(),readable_suffix(start,rows,old(reader).image(),end,scheme,limit,hash,decode,recode),
     ensures final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),
         match out {
-            Ok(history)=>btree_map_inv(&history) && history@==prefix(rows,rows.len()) && consecutive(rows,rows.len()) && final(reader).position()==end,
-            Err((at,f))=>failed::<R,P>(rows,old(reader).image(),old(reader).target(),at,f),
+            Ok(table)=>btree_map_inv(&table) && table@==applied(history@,rows,rows.len()) && accepted(history@,rows,rows.len()) && final(reader).position()==end,
+            Err((at,f))=>failed_suffix::<R,P>(history@,rows,old(reader).image(),old(reader).target(),at,f),
         },
 {
-    assert(extent(rows,rows.len())==end);
+    assert(boundary(start,rows,rows.len())==end);
     assert forall|i:int| 0<=i<rows.len() implies (#[trigger] rows[i]).frames(reader.image(),scheme,limit,hash) &&
-        rows[i].loc.offset==extent(rows,i as nat) by {}
-    let mut history=BTreeMap::new();
-    let mut at=0u64;
+        rows[i].loc.offset==boundary(start,rows,i as nat) by {}
+    let ghost base=history@;
+    let mut at=start;
     let ghost mut n:nat=0;
     while at<end
-        invariant at<=end,n<=rows.len(),at==extent(rows,n),reader.position()==at,reader.image()==old(reader).image(),
-            reader.target()==old(reader).target(),btree_map_inv(&history),history@==prefix(rows,n),consecutive(rows,n),
+        invariant at<=end,n<=rows.len(),at==boundary(start,rows,n),reader.position()==at,reader.image()==old(reader).image(),
+            reader.target()==old(reader).target(),btree_map_inv(&history),history@==applied(base,rows,n),accepted(base,rows,n),
         decreases end-at,
     {
         assert(n<rows.len());
         let ghost row=rows[n as int];
+        assert(row.frames(reader.image(),scheme,limit,hash));
+        assert(row.loc.offset==at);
         let ghost cursor=*reader;
         match replay(reader,at,end,&mut history,scheme,limit,hash,decode,recode,Ghost(row)) {
             Ok(next)=>{
-                assert(history@==prefix(rows,n+1));
-                assert forall|i:int| 0<=i<n+1 implies (#[trigger] rows[i]).admitted(prefix(rows,i as nat)) by {
-                    if i<n {assert(rows[i].admitted(prefix(rows,i as nat)));}
+                assert(history@==applied(base,rows,n+1));
+                assert forall|i:int| 0<=i<n+1 implies (#[trigger] rows[i]).admitted(applied(base,rows,i as nat)) by {
+                    if i<n {assert(rows[i].admitted(applied(base,rows,i as nat)));}
                 }
                 at=next;
                 proof {n=n+1;}
@@ -255,9 +285,9 @@ pub(crate) fn recover<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,end:u64,sch
                         assert(witness.image()==old(reader).image());
                     }
                 }
-                assert(refused_at::<R,P>(cursor.image(),cursor.target(),row,prefix(rows,n),e));
-                assert(exists|i:int| 0<=i<rows.len() && (#[trigger] rows[i]).loc.offset==at && consecutive(rows,i as nat) &&
-                    refused_at::<R,P>(cursor.image(),cursor.target(),rows[i],prefix(rows,i as nat),e));
+                assert(refused_at::<R,P>(cursor.image(),cursor.target(),row,applied(base,rows,n),e));
+                assert(exists|i:int| 0<=i<rows.len() && (#[trigger] rows[i]).loc.offset==at && accepted(base,rows,i as nat) &&
+                    refused_at::<R,P>(cursor.image(),cursor.target(),rows[i],applied(base,rows,i as nat),e));
                 return Err((at,e));
             }
         }
@@ -267,6 +297,19 @@ pub(crate) fn recover<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,end:u64,sch
         assert(n==rows.len());
     }
     Ok(history)
+}
+
+pub(crate) fn recover<R:scan::FrameReader,P:Ord,H,D,C>(reader:&mut R,end:u64,scheme:root_wire::Scheme,limit:u64,
+    hash:H,decode:D,recode:C,Ghost(rows):Ghost<Seq<Row<P>>>) -> (out:Result<BTreeMap<P,(RootState,u64)>,(u64,Failure<R::Error>)>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,D:Fn(&[u8])->Option<P>+Copy,C:Fn(&P)->Vec<u8>+Copy,
+    requires old(reader).position()==0,end==old(reader).image().len(),readable(rows,old(reader).image(),end,scheme,limit,hash,decode,recode),
+    ensures final(reader).image()==old(reader).image(),final(reader).target()==old(reader).target(),
+        match out {
+            Ok(history)=>btree_map_inv(&history) && history@==prefix(rows,rows.len()) && consecutive(rows,rows.len()) && final(reader).position()==end,
+            Err((at,f))=>failed::<R,P>(rows,old(reader).image(),old(reader).target(),at,f),
+        },
+{
+    scan_suffix(reader,0,end,BTreeMap::new(),scheme,limit,hash,decode,recode,Ghost(rows))
 }
 
 /// Reopen the complete file after one accepted publication on a certified

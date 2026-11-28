@@ -1,5 +1,5 @@
 //! Compare a published root with restart replay of the same framed journal payload.
-use crate::{RootState, arena_frame, journal_history as history, journal_snapshot, journal_transition as journal,
+use crate::{RootState, arena_frame, journal_history as history, journal_transition as journal,
     owner_codec::{self,Owner},root_transition::PreparedRoot,root_wire};
 use std::collections::BTreeMap;
 use vstd::{prelude::*,laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},pervasive::obeys_clone_eq,std_specs::btree::btree_map_inv};
@@ -20,14 +20,21 @@ pub(super) fn parse_transition(body:&[u8],scheme:root_wire::Scheme,
         vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         assert(body@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(name.len() as u64));
     }
-    let length=match journal_snapshot::read_header(body,&mut cursor) {
-        Ok(journal_snapshot::JournalHeader::Transition(n))=>n,_=>{assert(false);unreached()}
-    };
     let ghost pos=8+name.len() as int;
     assert(body@.subrange(8,pos) =~= name);
     assert(body@.skip(pos) =~= root_wire::prior(prior,scheme)+replacement.wire(scheme));
     assert(root_wire::tail(body@,pos,scheme,prior,replacement));
-    let out=match journal::decode(body,&mut cursor,length,scheme) {Ok(r)=>r,Err(_)=>{assert(false);unreached()}};
+    assert(body.len()>=8);
+    assert(vstd::bytes::spec_u64_from_le_bytes(body@.take(8))==name.len());
+    let decoded=crate::journal_payload::decode(body,&mut cursor,scheme);
+    assert(root_wire::tail(body@,8+vstd::bytes::spec_u64_from_le_bytes(body@.take(8)) as int,scheme,prior,replacement));
+    let ghost tag=crate::journal_payload::tag(body@);
+    assert(tag==name.len() && tag<=usize::MAX && tag!=crate::journal_snapshot::SENTINEL);
+    assert(root_wire::tail(body@,8+tag as int,scheme,prior,replacement));
+    assert(decoded matches Ok(crate::journal_payload::Record::Transition(_)));
+    let out=match decoded {
+        Ok(crate::journal_payload::Record::Transition(r))=>r,_=>{assert(false);unreached()}
+    };
     proof {
         let (e,r)=choose|e:Option<root_wire::Root>,r:root_wire::Root|
             #[trigger] root_wire::tail(body@,pos,scheme,e,r) && history::represents(r,out.replacement) &&

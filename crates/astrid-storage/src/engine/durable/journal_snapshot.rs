@@ -87,18 +87,56 @@ pub(super) open spec fn prefix(rows:Seq<Row>,n:nat,scheme:root_wire::Scheme) -> 
     else {prefix(rows,(n-1) as nat,scheme) + row_bytes(rows[n-1],scheme)}
 }
 
+pub(super) open spec fn serialized(bytes:Seq<u8>,rows:Seq<Row>,scheme:root_wire::Scheme) -> bool {
+    &&& bytes.take(17)==header(rows.len() as u64)
+    &&& exists|wire:WireRows,ends:Seq<usize>| #[trigger] layout(bytes,17,rows.len() as usize,scheme,wire,ends) &&
+        matches_rows(rows,wire) && ends.last()==bytes.len()
+}
+
+proof fn extend_layout(before:Seq<u8>,after:Seq<u8>,scheme:root_wire::Scheme,wire:WireRows,ends:Seq<usize>,
+    row:(Seq<u8>,root_wire::Root))
+    requires wire.len()<usize::MAX,after.len()<=usize::MAX,row.0.len()<=u64::MAX,
+        layout(before,17,wire.len() as usize,scheme,wire,ends),ends.last()==before.len(),
+        after==before+framed(row.0,row.1,scheme),
+    ensures layout(after,17,(wire.len()+1) as usize,scheme,wire.push(row),ends.push(after.len() as usize)),
+{
+    let next=wire.push(row);let positions=ends.push(after.len() as usize);
+    assert(ends.len()==wire.len()+1 && ends[0]==17);
+    assert(positions[0]==17 && positions.len()==next.len()+1 && next.len()<=usize::MAX);
+    let count=next.len() as usize;
+    assert(count==next.len());
+    assert forall|i:int| 0<=i<count implies #[trigger] placed(after,scheme,next,positions,i) by {
+        let start=positions[i] as int;
+        let size=framed(next[i].0,next[i].1,scheme);
+        if i<wire.len() {
+            assert(placed(before,scheme,wire,ends,i));
+            assert(root_wire::at(before,ends[i] as int,framed(wire[i].0,wire[i].1,scheme)));
+            assert(after.subrange(start,start+size.len()) =~= before.subrange(start,start+size.len()));
+        } else {
+            assert(start==before.len());
+            assert(after.subrange(start,after.len() as int) =~= size);
+        }
+    }
+    assert(layout(after,17,count,scheme,next,positions));
+}
+
 /// The caller checks strict owner ordering before serializing.
 pub(super) fn serialize(rows:&[Row],scheme:root_wire::Scheme) -> (bytes:Vec<u8>)
-    ensures bytes@ == prefix(rows@,rows.len() as nat,scheme),
+    ensures bytes@ == prefix(rows@,rows.len() as nat,scheme),serialized(bytes@,rows@,scheme),
 {
     let count = rows.len() as u64;
     let mut bytes = vstd::bytes::u64_to_le_bytes(SENTINEL);
     bytes.push(RECORD);
     bytes.extend_from_slice(&root_wire::little_endian(count));
     assert(bytes@ =~= header(count));
+    let ghost mut written:WireRows=Seq::empty();
+    let ghost mut positions=seq![17usize];
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
     let mut i = 0usize;
     while i < rows.len()
-        invariant i <= rows.len(), bytes@ == prefix(rows@,i as nat,scheme),
+        invariant i <= rows.len(), bytes@ == prefix(rows@,i as nat,scheme),bytes@.take(17)==header(count),
+            written.len()==i,layout(bytes@,17,i,scheme,written,positions),positions.last()==bytes.len(),
+            forall|j:int| 0<=j<i ==> #[trigger] row_matches(rows@[j],written[j]),
         decreases rows.len() - i,
     {
         let (principal,root) = &rows[i];
@@ -109,9 +147,30 @@ pub(super) fn serialize(rows:&[Row],scheme:root_wire::Scheme) -> (bytes:Vec<u8>)
         let wire = journal_history::to_wire(*root);
         wire.append(&mut bytes,scheme);
         assert(bytes@ =~= before + row_bytes(rows@[i as int],scheme));
+        let _physical_end=bytes.len();
+        proof {
+            assert(bytes@.len()==_physical_end);
+            let item=(principal@,wire);
+            assert(row_matches(rows@[i as int],item));
+            assert(bytes@==before+framed(item.0,item.1,scheme));
+            extend_layout(before,bytes@,scheme,written,positions,item);
+            assert(bytes@.take(17) =~= before.take(17));
+            written=written.push(item);
+            positions=positions.push(_physical_end);
+        }
         i = i.saturating_add(1);
     }
+    assert(matches_rows(rows@,written));
+    assert(layout(bytes@,17,rows@.len() as usize,scheme,written,positions));
+    assert(positions.last()==bytes@.len());
+    assert(serialized(bytes@,rows@,scheme));
     bytes
+}
+
+pub(super) fn encode_ordered(rows:&[Row],scheme:root_wire::Scheme) -> (out:Option<Vec<u8>>)
+    ensures out.is_some()==ordered(rows@),out matches Some(bytes) ==> bytes@==prefix(rows@,rows.len() as nat,scheme) && serialized(bytes@,rows@,scheme),
+{
+    if strictly_ordered(rows) {Some(serialize(rows,scheme))} else {None}
 }
 
 pub(super) enum RowError { Read(root_wire::ReadError), Length, Root(root_wire::RootError) }
@@ -188,12 +247,14 @@ pub(super) type WireRows = Seq<(Seq<u8>,root_wire::Root)>;
 pub(super) open spec fn layout(bytes:Seq<u8>,start:usize,count:usize,scheme:root_wire::Scheme,
     expected:WireRows,ends:Seq<usize>) -> bool {
     &&& expected.len() == count && ends.len() == count as int + 1 && ends[0] == start
-    &&& forall|i:int| 0 <= i < count ==> {
-        let frame = framed(expected[i].0,expected[i].1,scheme);
-        &&& expected[i].0.len() <= u64::MAX
-        &&& #[trigger] root_wire::at(bytes,ends[i] as int,framed(expected[i].0,expected[i].1,scheme))
-        &&& ends[i+1] as int == ends[i] as int + frame.len()
-    }
+    &&& forall|i:int| 0<=i<count ==> #[trigger] placed(bytes,scheme,expected,ends,i)
+}
+
+pub(super) open spec fn placed(bytes:Seq<u8>,scheme:root_wire::Scheme,expected:WireRows,ends:Seq<usize>,i:int) -> bool {
+    let f=framed(expected[i].0,expected[i].1,scheme);
+    &&& expected[i].0.len()<=u64::MAX
+    &&& root_wire::at(bytes,ends[i] as int,f)
+    &&& ends[i+1] as int==ends[i] as int+f.len()
 }
 
 pub(super) open spec fn row_matches(row:Row, expected:(Seq<u8>,root_wire::Root)) -> bool {
@@ -229,6 +290,7 @@ pub(super) fn read_rows(bytes:&[u8],cursor:&mut usize,count:usize,scheme:root_wi
         assert forall|expected:WireRows,ends:Seq<usize>| #[trigger] layout(bytes@,start,count,scheme,expected,ends)
             implies (next matches Ok(row) && row.0@ == expected[n].0 && journal_history::represents(expected[n].1,row.1)
                 && *cursor == ends[n+1]) by {
+            assert(placed(bytes@,scheme,expected,ends,n));
             let (name,w) = expected[n];
             assert(root_wire::at(bytes@,pos as int,framed(name,w,scheme)));
             if let Ok(row) = next {assert(row_bytes(row,scheme) =~= framed(name,w,scheme));}
@@ -270,6 +332,30 @@ pub(super) fn finish(rows:&[Row],cursor:usize,payload_len:usize) -> (out:Result<
     if !strictly_ordered(rows) {return Err(EndError::Order);}
     if cursor != payload_len {return Err(EndError::Trailing);}
     Ok(())
+}
+
+pub(super) enum CompleteError { Capacity, Row(RowError), End(EndError) }
+
+/// Read the declared snapshot rows and require strict owner order and exact EOF.
+pub(super) fn read_complete(bytes:&[u8],cursor:&mut usize,count:usize,scheme:root_wire::Scheme)
+    -> (out:Result<Vec<Row>,CompleteError>)
+    ensures out matches Ok(v) ==> v.len()==count && ordered(v@) && *final(cursor)==bytes.len() &&
+            exists|ends:Seq<usize>| ends[0]==*old(cursor) && ends[count as int]==*final(cursor) && #[trigger] spans(bytes@,v@,ends,scheme),
+        out matches Err(CompleteError::Capacity) ==> count>0 && *final(cursor)==*old(cursor),
+        forall|expected:WireRows,ends:Seq<usize>| #[trigger] layout(bytes@,*old(cursor),count,scheme,expected,ends) ==>
+            match out {
+                Ok(v)=>matches_rows(v@,expected),
+                Err(CompleteError::Capacity)=>count>0,
+                Err(CompleteError::Row(_))=>false,
+                Err(CompleteError::End(e))=>*final(cursor)==ends[count as int] &&
+                    exists|v:Seq<Row>| v.len()==count && #[trigger] matches_rows(v,expected) &&
+                    match e {EndError::Order=>!ordered(v),EndError::Trailing=>ordered(v) && *final(cursor)!=bytes.len()},
+            },
+{
+    let mut rows=Vec::new();
+    if count>0 && rows.try_reserve_exact(count).is_err() {return Err(CompleteError::Capacity);}
+    let rows=match read_rows(bytes,cursor,count,scheme,rows) {Ok(v)=>v,Err(e)=>return Err(CompleteError::Row(e))};
+    match finish(&rows,*cursor,bytes.len()) {Ok(())=>Ok(rows),Err(e)=>Err(CompleteError::End(e))}
 }
 
 pub(super) enum SnapshotError<E> { Position, Noncanonical, Duplicate, Codec(E) }

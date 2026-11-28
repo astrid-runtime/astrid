@@ -400,7 +400,7 @@ def consumer_defects():
         ("refused prefix", frame, "out.is_none() ==> final(encoded)@ == old(encoded)@", "true"),
         ("address", frame, "loc.offset == base as int + old(encoded).len()", "true"),
         ("extent", frame, "&& loc.payload_len == payload.len()", "&& true"),
-        ("hash inputs", frame, "hash.ensures((magic,loc.payload_len,payload),loc.checksum)", "true"),
+        ("hash inputs", frame, "&& hash.ensures((magic,loc.payload_len,payload),loc.checksum)", "&& true"),
         ("batch bytes", frame, "final(encoded)@ == old(encoded)@ + header_bytes(magic,version,loc.payload_len,loc.checksum) + payload@", "true"),
     ]:
         yield (

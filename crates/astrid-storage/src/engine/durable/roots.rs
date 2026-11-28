@@ -15,7 +15,8 @@ use super::{
     recovery_closure_error, scan_frames,
 };
 
-use journal_snapshot::{HeaderError, JournalHeader};
+use super::journal_payload::{self, Record as DecodedRootJournalRecord};
+use journal_snapshot::{CompleteError, EndError, HeaderError, RowError};
 impl From<IdentityScheme> for super::root_wire::Scheme {
     fn from(scheme: IdentityScheme) -> Self {
         Self {
@@ -249,19 +250,13 @@ pub(super) fn encode_root_snapshot(
     scheme: IdentityScheme,
     roots: &[(Vec<u8>, RootState)],
 ) -> Result<Vec<u8>, DurableError> {
-    if !journal_snapshot::strictly_ordered(roots) {
-        return Err(corrupt(
+    journal_snapshot::encode_ordered(roots, scheme.into()).ok_or_else(|| {
+        corrupt(
             ROOT_FILE,
             0,
             "root snapshot principals are not strictly ordered",
-        ));
-    }
-    Ok(journal_snapshot::serialize(roots, scheme.into()))
-}
-
-enum DecodedRootJournalRecord {
-    Transition(DecodedRootRecord),
-    Snapshot(Vec<(Vec<u8>, RootState)>),
+        )
+    })
 }
 
 fn decode_root_journal_record(
@@ -269,52 +264,30 @@ fn decode_root_journal_record(
     scheme: IdentityScheme,
 ) -> Result<DecodedRootJournalRecord, &'static str> {
     let mut reader = RootReader::new(bytes);
-    let header =
-        journal_snapshot::read_header(bytes, &mut reader.offset).map_err(|error| match error {
+    journal_payload::decode(bytes, &mut reader.offset, scheme.into()).map_err(|error| match error {
+        journal_payload::Error::Header(error) => match error {
             HeaderError::Read(e) => read_error(e),
             HeaderError::UnknownRecord => "unknown root-journal extension record",
             HeaderError::Length => "length is not process-addressable",
-        })?;
-    let prefix = match header {
-        JournalHeader::Transition(length) => length,
-        JournalHeader::Snapshot(count) => {
-            let mut entries = Vec::new();
-            entries
-                .try_reserve_exact(count)
-                .map_err(|_| "root snapshot allocation failed")?;
-            let entries = journal_snapshot::read_rows(
-                bytes,
-                &mut reader.offset,
-                count,
-                scheme.into(),
-                entries,
-            )
-            .map_err(|error| match error {
-                journal_snapshot::RowError::Read(e) => read_error(e),
-                journal_snapshot::RowError::Length => "length is not process-addressable",
-                journal_snapshot::RowError::Root(e) => reader.root_error(e, scheme),
-            })?;
-            journal_snapshot::finish(&entries, reader.offset, bytes.len()).map_err(|error| {
-                match error {
-                    journal_snapshot::EndError::Order => {
-                        "root snapshot principals are not strictly ordered"
-                    },
-                    journal_snapshot::EndError::Trailing => "trailing root snapshot bytes",
-                }
-            })?;
-            return Ok(DecodedRootJournalRecord::Snapshot(entries));
         },
-    };
-
-    journal_transition::decode(bytes, &mut reader.offset, prefix, scheme.into())
-        .map(DecodedRootJournalRecord::Transition)
-        .map_err(|error| match error {
+        journal_payload::Error::Snapshot(error) => match error {
+            CompleteError::Capacity => "root snapshot allocation failed",
+            CompleteError::Row(RowError::Read(e)) => read_error(e),
+            CompleteError::Row(RowError::Length) => "length is not process-addressable",
+            CompleteError::Row(RowError::Root(e)) => reader.root_error(e, scheme),
+            CompleteError::End(EndError::Order) => {
+                "root snapshot principals are not strictly ordered"
+            },
+            CompleteError::End(EndError::Trailing) => "trailing root snapshot bytes",
+        },
+        journal_payload::Error::Transition(error) => match error {
             DecodeError::Length => "principal length is not process-addressable",
             DecodeError::Principal(e) | DecodeError::Tail(TailError::Read(e)) => read_error(e),
             DecodeError::Tail(TailError::Root(e)) => reader.root_error(e, scheme),
             DecodeError::Tail(TailError::ExpectedTag) => "invalid expected-root tag",
             DecodeError::Tail(TailError::Trailing) => "trailing root-journal bytes",
-        })
+        },
+    })
 }
 
 fn read_error(error: super::root_wire::ReadError) -> &'static str {

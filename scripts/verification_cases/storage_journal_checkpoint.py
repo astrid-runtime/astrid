@@ -316,3 +316,28 @@ def consumer_defects():
             f"certified journal append loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )
+
+    snapshot = Path("verification/hosted_cold_snapshot.rs")
+    dispatch = Path("crates/astrid-storage/src/engine/durable/journal_payload.rs")
+    for label, source, clause, weakness in [
+        ("snapshot write limit", dispatch, "if size>limit {return Err(WriteError::Size(size));}",
+         "if false {return Err(WriteError::Size(size));}"),
+        ("written frame payload", frames, "if let Err(e)=file.write_bytes(payload)",
+         "if let Err(e)=file.write_bytes(&[])"),
+        ("reopened snapshot", snapshot, "RoundTrip::Loaded(table)\n", "RoundTrip::Loaded(BTreeMap::new())\n"),
+        ("payload kind", dispatch, "Ok(r)=>Ok(Record::Transition(r))",
+         "Ok(_)=>Ok(Record::Snapshot(Vec::new()))"),
+        ("snapshot count", dispatch, "snapshot::read_complete(bytes,cursor,n,scheme)",
+         "snapshot::read_complete(bytes,cursor,0,scheme)"),
+        ("restore position", snapshot, "snapshot::restore(&mut table,0,&f.body",
+         "snapshot::restore(&mut table,f.end,&f.body"),
+        ("restored owners", snapshot, "Ok((table,f.end))", "Ok((BTreeMap::new(),f.end))"),
+        ("suffix map", snapshot, "scan_suffix(reader,start,end,base,scheme",
+         "scan_suffix(reader,start,end,BTreeMap::new(),scheme"),
+        ("suffix cursor", snapshot, "scan_suffix(reader,start,end,base,scheme",
+         "scan_suffix(reader,0,end,base,scheme"),
+    ]:
+        yield (
+            f"compacted journal loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
+        )

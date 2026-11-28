@@ -258,6 +258,32 @@ pub(super) trait BatchFile {
                 final(self).cursor()==final(self).image().len();
 }
 
+pub(super) enum SingleError<E> { Length, Seek(E), Header(E), Payload(E) }
+
+/// Append one physical frame with separate header and payload writes.
+pub(super) fn append_one<S:BatchFile,H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(file:&mut S,magic:[u8;8],version:u16,
+    payload:&[u8],hash:H) -> (out:Result<ArenaLocation,SingleError<S::Error>>)
+    requires hash.requires((magic,payload.len() as u64,payload)),
+    ensures final(file).target()==old(file).target(),
+        match out {
+            Ok(loc)=>loc.offset==old(file).image().len() && loc.payload_len==payload.len() &&
+                hash.ensures((magic,loc.payload_len,payload),loc.checksum) &&
+                final(file).image()==old(file).image()+header_bytes(magic,version,loc.payload_len,loc.checksum)+payload@ &&
+                final(file).cursor()==final(file).image().len(),
+            Err(SingleError::Length)=>payload.len()>u64::MAX && final(file).image()==old(file).image(),
+            Err(SingleError::Seek(e))=>old(file).seek_failed(e) && final(file).image()==old(file).image(),
+            Err(SingleError::Header(e))|Err(SingleError::Payload(e))=>S::write_failed(old(file).target(),e),
+        },
+{
+    let Ok(len)=u64::try_from(payload.len()) else {return Err(SingleError::Length)};
+    let checksum=hash(magic,len,payload);
+    let offset=match file.seek_end() {Ok(at)=>at,Err(e)=>return Err(SingleError::Seek(e))};
+    let head=header(magic,version,len,checksum);
+    if let Err(e)=file.write_bytes(&head) {return Err(SingleError::Header(e));}
+    if let Err(e)=file.write_bytes(payload) {return Err(SingleError::Payload(e));}
+    Ok(ArenaLocation {offset,payload_len:len,checksum})
+}
+
 /// Native files synchronize independently. A region of a shared volume
 /// reaches stable media when its container is synchronized.
 pub(super) trait ReplayArena:BatchFile {

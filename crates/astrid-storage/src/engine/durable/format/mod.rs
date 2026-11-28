@@ -373,21 +373,18 @@ pub(super) fn append_frame<F: DurableIo>(
     magic: [u8; 8],
     payload: &[u8],
 ) -> Result<ArenaLocation, DurableError> {
-    let payload_len = u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    let checksum = frame_checksum(magic, payload_len, payload);
-    let offset = file
-        .seek(SeekFrom::End(0))
-        .map_err(|source| io_error("seek durable append", source))?;
-    let header = frame_header(magic, payload_len, checksum);
-    file.write_all(&header)
-        .map_err(|source| io_error("append durable frame header", source))?;
-    file.write_all(payload)
-        .map_err(|source| io_error("append durable frame payload", source))?;
-    Ok(ArenaLocation {
-        offset,
-        payload_len,
-        checksum,
-    })
+    arena_frame::append_one(file, magic, FRAME_VERSION, payload, frame_checksum)
+        .map_err(single_frame_error)
+}
+
+pub(super) fn single_frame_error(error: arena_frame::SingleError<io::Error>) -> DurableError {
+    use arena_frame::SingleError;
+    match error {
+        SingleError::Length => DurableError::EncodingOverflow,
+        SingleError::Seek(source) => io_error("seek durable append", source),
+        SingleError::Header(source) => io_error("append durable frame header", source),
+        SingleError::Payload(source) => io_error("append durable frame payload", source),
+    }
 }
 
 pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(

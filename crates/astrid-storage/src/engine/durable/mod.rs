@@ -861,6 +861,7 @@ mod index;
 mod journal_closure;
 mod journal_history;
 mod journal_preload;
+mod journal_payload;
 mod journal_snapshot;
 mod journal_transition;
 mod lifecycle;
