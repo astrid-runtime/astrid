@@ -222,7 +222,8 @@ fn decode_delta(
             Ok(reference.target())
         })
         .transpose()?;
-    let mut mutations = Vec::with_capacity(count);
+    // The header alone cannot establish how many complete rows are present.
+    let mut mutations = Vec::new();
     for index in 0..count {
         let key_length = cursor.u32_usize()?;
         let key = cursor.take(key_length)?.to_vec();
