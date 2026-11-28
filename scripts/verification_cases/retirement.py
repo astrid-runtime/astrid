@@ -47,6 +47,18 @@ def defects():
         )
     cursor = Path("crates/astrid-storage/src/ownership/pending.rs")
     for name, original, changed in [
+        ("candidate identity", "final(rows)@ == old(rows)@.insert(uid,match before", "final(rows)@.contains_key(uid) || final(rows)@ == old(rows)@.insert(uid,match before"),
+        ("alias compatibility", "&&& before matches Some(r) ==> !(r.alias matches Some(a) && (alias matches Some(b) && a != b))", "&&& true"),
+        ("fresh admission", "before.is_none() ==> exists|r:Result<(),E>|", "false ==> exists|r:Result<(),E>|"),
+        ("error atomicity", "out.is_err() ==> final(rows)@ == old(rows)@", "true"),
+        ("conflict identity", "old(rows)@[uid].alias == Some(a) && (requested matches", "(requested matches"),
+        ("admission error", "!old(rows)@.contains_key(uid) && admit.ensures((&*old(rows),),Err(e))", "true"),
+    ]:
+        yield (
+            f"retirement candidate loses {name}", cursor,
+            lambda s, a=original, b=changed: replace_once(s, a, b), consumer,
+        )
+    for name, original, changed in [
         ("loses a reservation", "cursor.remaining().contains((&k,&v)) == (map@.get(k) == Some(v)),", "cursor.remaining().contains((&k,&v)) ==> (map@.get(k) == Some(v)),"),
         ("may skip the rest", "(*final(cursor)).remaining() == before.drop_first()", "(*final(cursor)).remaining().len() <= before.drop_first().len()"),
         ("loses a visited UID", "key == *before[0].0 &&", "true &&"),

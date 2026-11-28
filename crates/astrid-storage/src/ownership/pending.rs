@@ -16,6 +16,63 @@ pub(super) struct Reservation<A,F> {
     pub(super) fleet: Option<F>,
 }
 
+pub(super) enum ReserveError<A,E> { Conflict(A), Admission(E) }
+
+/// Stage a reservation in the candidate graph submitted to ownership CAS.
+/// An existing reservation keeps its original fleet and any retained alias.
+pub(super) fn reserve<K:Ord+Copy,A:Eq+Clone,F:Copy,E,C>(
+    rows:&mut BTreeMap<K,Reservation<A,F>>,uid:K,requested:Option<&A>,fleet:Option<F>,admit:C,
+) -> (out:Result<(),ReserveError<A,E>>)
+    where C:FnOnce(&BTreeMap<K,Reservation<A,F>>)->Result<(),E>,
+    requires vstd::std_specs::btree::btree_map_inv(old(rows)),
+        vstd::laws_cmp::obeys_cmp::<K>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<K>(),
+        vstd::laws_eq::obeys_concrete_eq::<A>(),vstd::pervasive::obeys_clone_eq::<A>(),
+        !old(rows)@.contains_key(uid) ==> admit.requires((&*old(rows),)),
+    ensures vstd::std_specs::btree::btree_map_inv(final(rows)),
+        out.is_err() ==> final(rows)@ == old(rows)@,
+        match out {
+            Ok(()) => {
+                let alias = match requested {Some(a) => Some(*a),None => None};
+                let before = old(rows)@.get(uid);
+                &&& final(rows)@ == old(rows)@.insert(uid,match before {
+                    Some(r) => Reservation {alias:if r.alias.is_some() {r.alias} else {alias},fleet:r.fleet},
+                    None => Reservation {alias,fleet},
+                })
+                &&& before matches Some(r) ==> !(r.alias matches Some(a) && (alias matches Some(b) && a != b))
+                &&& before.is_none() ==> exists|r:Result<(),E>| #[trigger] admit.ensures((&*old(rows),),r) && r.is_ok()
+            },
+            Err(ReserveError::Conflict(a)) => old(rows)@.contains_key(uid) &&
+                old(rows)@[uid].alias == Some(a) && (requested matches Some(b) && a != *b),
+            Err(ReserveError::Admission(e)) => !old(rows)@.contains_key(uid) && admit.ensures((&*old(rows),),Err(e)),
+        },
+{
+    proof {reveal(vstd::pervasive::obeys_clone_eq); reveal(vstd::laws_eq::obeys_concrete_eq);}
+    if let Some(reservation) = rows.get(&uid) {
+        match (&reservation.alias, requested) {
+            (Some(existing),Some(alias)) if *existing != *alias => {
+                let conflict = existing.clone();
+                assert(vstd::pervasive::cloned(*existing,conflict));
+                assert(*existing != *alias);
+                return Err(ReserveError::Conflict(conflict));
+            },
+            (None,Some(alias)) => {
+                let retained = alias.clone();
+                assert(vstd::pervasive::cloned(*alias,retained));
+                rows.insert(uid,Reservation {alias:Some(retained),fleet:reservation.fleet});
+            },
+            _ => {assert(rows@ =~= old(rows)@.insert(uid,*reservation));},
+        }
+    } else {
+        let approval = admit(rows);
+        if let Err(e) = approval {return Err(ReserveError::Admission(e));}
+        assert(approval.is_ok());
+        assert(admit.ensures((&*old(rows),),approval));
+        let alias = match requested {Some(a) => {let retained = a.clone();assert(vstd::pervasive::cloned(*a,retained));Some(retained)},None => None};
+        rows.insert(uid,Reservation {alias,fleet});
+    }
+    Ok(())
+}
+
 pub(super) fn scan<K: Ord,V>(map: &BTreeMap<K,V>) -> (cursor: Iter<'_,K,V>)
     requires key_obeys_cmp_spec::<K>(), btree_map_wf(map),
     ensures cursor.decrease().is_some(), cursor.remaining().len() == map@.dom().len(),

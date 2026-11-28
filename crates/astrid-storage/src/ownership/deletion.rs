@@ -278,40 +278,38 @@ impl OwnershipStore {
                         alias: live_alias,
                     });
                 }
-                if let Some(reservation) = graph.principal_deletions.get_mut(&principal_uid) {
-                    match (&reservation.alias, &alias) {
-                        (Some(existing), Some(requested)) if existing != requested => {
-                            return Err(OwnershipError::DeletionReservationConflict {
-                                principal: principal_uid,
-                                alias: existing.clone(),
+                super::pending::reserve(
+                    &mut graph.principal_deletions,
+                    principal_uid,
+                    alias.as_ref(),
+                    fleet,
+                    |reservations| {
+                        if !self.principals.contains_uid(principal_uid) {
+                            return Err(OwnershipError::PrincipalNotFound(principal_uid));
+                        }
+                        if let Some(requested) = &alias
+                            && let Some((reserved_uid, _)) =
+                                reservations.iter().find(|(_, reservation)| {
+                                    reservation.alias.as_ref() == Some(requested)
+                                })
+                        {
+                            return Err(OwnershipError::DeletionAliasReserved {
+                                alias: requested.clone(),
+                                principal: *reserved_uid,
                             });
-                        },
-                        (None, Some(requested)) => reservation.alias = Some(requested.clone()),
-                        _ => {},
-                    }
-                } else {
-                    if !self.principals.contains_uid(principal_uid) {
-                        return Err(OwnershipError::PrincipalNotFound(principal_uid));
-                    }
-                    if let Some(requested) = &alias
-                        && let Some((reserved_uid, _)) = graph
-                            .principal_deletions
-                            .iter()
-                            .find(|(_, reservation)| reservation.alias.as_ref() == Some(requested))
-                    {
-                        return Err(OwnershipError::DeletionAliasReserved {
-                            alias: requested.clone(),
-                            principal: *reserved_uid,
-                        });
-                    }
-                    graph.principal_deletions.insert(
-                        principal_uid,
-                        PrincipalDeletionReservation {
-                            alias: alias.clone(),
-                            fleet,
-                        },
-                    );
-                }
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|error| match error {
+                    super::pending::ReserveError::Conflict(alias) => {
+                        OwnershipError::DeletionReservationConflict {
+                            principal: principal_uid,
+                            alias,
+                        }
+                    },
+                    super::pending::ReserveError::Admission(error) => error,
+                })?;
                 // Ownership removal and retirement commit together. Retaining the
                 // fleet on the reservation protects retries after identity removal.
                 graph.principal_ownership.remove(&principal_uid);

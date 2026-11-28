@@ -50,6 +50,39 @@ fn recover(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64
     crate::recovery::replay(reservations,directory,stores)
 }
 
+// Stage the same reservation consumed by startup. Persistence must still
+// establish that the acknowledged candidate is the recovered graph.
+fn reserve_then_recover(rows:&mut BTreeMap<u64,Reservation>,uid:u64,requested:u64,fleet:Option<u64>,
+    permitted:bool,directory:&HashMap<u64,u64>,stores:&mut Stores)
+    requires vstd::std_specs::btree::btree_map_inv(old(rows)),hash_map_inv(directory),old(stores).valid(),
+{
+    use crate::pending_deletions::{reserve,ReserveError};
+    let ghost before = rows@;
+    let result = reserve(rows,uid,Some(&requested),fleet,
+        |_:&BTreeMap<u64,Reservation>| -> (out:Result<(),()>) ensures out.is_ok() == permitted,
+            {if permitted {Ok(())} else {Err(())}});
+    match result {
+        Ok(()) => {
+            assert(before.contains_key(uid) || permitted);
+            assert(rows@.contains_key(uid));
+            assert(rows@[uid].alias == Some(requested));
+            assert(rows@[uid].fleet == if before.contains_key(uid) {before[uid].fleet} else {fleet});
+            assert(rows@.remove(uid) =~= before.remove(uid));
+            let _ = recover(rows,directory,stores);
+            assert(stores.authority(requested) == (true,true,None));
+            assert forall|live:u64| directory@.get(uid) == Some(live) implies #[trigger] stores.authority(live) == (true,true,None) by {};
+        },
+        Err(ReserveError::Conflict(retained)) => {
+            assert(before.contains_key(uid) && before[uid].alias == Some(retained) && retained != requested);
+            assert(rows@ == before);
+        },
+        Err(ReserveError::Admission(())) => {
+            assert(!permitted && !before.contains_key(uid));
+            assert(rows@ == before);
+        },
+    }
+}
+
 // Both observations describe the same final state of one invocation.
 fn recover_renamed(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64>,
     stores: &mut Stores, uid: u64, retained: u64, live: u64)
