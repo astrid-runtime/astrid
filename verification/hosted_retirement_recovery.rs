@@ -86,7 +86,7 @@ fn reserve_then_recover(rows:&mut BTreeMap<u64,Reservation>,uid:u64,requested:u6
 // Exercise the real KV adapter's read/compare/stage step with an immutable
 // header observation. A matching empty value differs from an absent entry.
 fn graph_compare(namespace:&[u8],key:&[u8],header:u64,observed_at:u64,prior:Option<Vec<u8>>,
-    expected:Option<&[u8]>,candidate:&[u8]) {
+    expected:Option<&[u8]>,candidate:&[u8],object:crate::ObjectId) {
     use crate::kv_replacement::{bytes,Replacement};
     let address = crate::encoding::composite(namespace,key);
     let ghost image = bytes(prior);
@@ -100,7 +100,7 @@ fn graph_compare(namespace:&[u8],key:&[u8],header:u64,observed_at:u64,prior:Opti
     };
     let result = Replacement::compare_at(&header,&address,expected,candidate,read);
     match result {
-        Ok((accepted,rows,changed)) => {
+        Ok((accepted,mut rows,changed)) => {
             assert(header == observed_at);
             let ghost compare = match expected {Some(v) => Some(v@),None => None};
             assert(accepted == (image == compare));
@@ -109,10 +109,53 @@ fn graph_compare(namespace:&[u8],key:&[u8],header:u64,observed_at:u64,prior:Opti
             if changed {
                 assert(rows@[0].fields() == (location,Some(candidate@),
                     Some((match image {Some(old) => Some(old.len() as usize),None => None},false))));
+                let Some(row) = rows.pop() else {assert(false);return;};
+                let (key,_,value) = row.into_parts();
+                let mut overlay = None;
+                let stored = crate::overlay_update::stage(&mut overlay,key,value,
+                    |data:&Vec<u8>| -> (r:Result<crate::checkpoint_value::ValueSlot,()>)
+                        requires data@ == candidate@,
+                        ensures r.is_ok() && match r {
+                            Ok(crate::checkpoint_value::ValueSlot::Inline(v)) => data.len() <= crate::checkpoint_value::INLINE_VALUE_MAX && v@ == data@,
+                            Ok(crate::checkpoint_value::ValueSlot::Spilled {object:id,length}) =>
+                                data.len() > crate::checkpoint_value::INLINE_VALUE_MAX && id == object && length == data.len(),
+                            Err(_) => false,
+                        },
+                    {
+                        crate::delta_mutation::encode(data,|payload:&[u8],length:u64| -> (v:Result<crate::ObjectId,()>)
+                            requires payload@ == candidate@ && length == candidate.len(),
+                            ensures v == Ok(object), {Ok(object)})
+                    });
+                let Ok(mutation) = stored else {assert(false);return;};
+                assert(mutation.key@ == location);
+                if candidate.len() <= crate::checkpoint_value::INLINE_VALUE_MAX {
+                    assert(mutation.value matches Some(crate::checkpoint_value::ValueSlot::Inline(v)) && v@ == candidate@);
+                } else {
+                    assert(mutation.value == Some(crate::checkpoint_value::ValueSlot::Spilled {object,length:candidate.len() as u64}));
+                }
+                assert(crate::traversal::lookup_spec(overlay,location) matches Some(Some(v)) && v@ == candidate@);
             }
         },
         Err(e) => {assert(e == header && observed_at != header);},
     }
+}
+
+/// Encoding failure leaves an arbitrary existing overlay intact. A delete
+/// writes a tombstone, leaving all other keys as they were.
+fn stage_refusal_and_delete(root:&mut Option<std::sync::Arc<crate::traversal::Node>>,
+    key:Vec<u8>,value:Vec<u8>,error:u64,other:&[u8])
+    requires crate::traversal::ordered(*old(root)), other@ != key@,
+{
+    let ghost before = *root;
+    let rejected = crate::overlay_update::stage(root,key.clone(),Some(value),
+        |_:&Vec<u8>| -> (r:Result<crate::checkpoint_value::ValueSlot,u64>) ensures r == Err(error), {Err(error)});
+    assert(rejected == Err(error) && *root == before);
+    let deleted = crate::overlay_update::stage(root,key,None,
+        |_:&Vec<u8>| -> (r:Result<crate::checkpoint_value::ValueSlot,u64>) requires false, {Err(error)});
+    let Ok(row) = deleted else {assert(false);return;};
+    assert(row.key@ == key@ && row.value.is_none());
+    assert(crate::traversal::lookup_spec(*root,key@) == Some(None));
+    assert(crate::traversal::lookup_spec(*root,other@) == crate::traversal::lookup_spec(before,other@));
 }
 
 // Both observations describe the same final state of one invocation.

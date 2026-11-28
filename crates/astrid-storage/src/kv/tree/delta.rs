@@ -19,11 +19,7 @@ const SPILLED: u8 = 2;
 const PREVIOUS_LABEL: &[u8] = b"previous";
 const VALUE_LABEL_PREFIX: &[u8] = b"value/";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Mutation {
-    pub(super) key: Vec<u8>,
-    pub(super) value: Option<ValueSlot>,
-}
+pub(super) use super::delta_mutation::Mutation;
 
 #[derive(Clone, Debug)]
 pub(super) struct Projection {

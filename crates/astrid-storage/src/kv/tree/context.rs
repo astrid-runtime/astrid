@@ -9,8 +9,7 @@ use crate::storage_model::{
 };
 
 use super::delta::{
-    Head, Mutation, Projection, checkpoint_record, decode_head, delta_record,
-    mutation_payload_bytes,
+    Head, Projection, checkpoint_record, decode_head, delta_record, mutation_payload_bytes,
 };
 use super::header::TreeHeader;
 use super::node::{
@@ -288,12 +287,8 @@ where
         };
         let mut current = header.overlay.clone();
         let mut mutations = Vec::with_capacity(replacements.len());
-        for Replacement {
-            key,
-            previous,
-            value: replacement,
-        } in replacements
-        {
+        for row in replacements {
+            let (key, previous, replacement) = row.into_parts();
             let (previous_len, unchanged) = if let Some(value) = current.get(&key) {
                 (value.as_ref().map(Vec::len), value == &replacement)
             } else {
@@ -314,16 +309,11 @@ where
                 ));
             }
             update_totals(&mut totals, &key, previous_len, replacement.as_deref())?;
-            let value = replacement
-                .as_ref()
-                .map(|value| self.make_value(value.as_slice()))
-                .transpose()?;
-            // Chunk construction borrows these bytes; retain them for the
-            // overlay instead of reconstructing the just-staged value.
-            // Admission retains all structural and publication checks; locally
-            // bound identities do not need a second computation.
-            current.insert(key.clone(), replacement);
-            mutations.push(Mutation { key, value });
+            mutations.push(current.stage(key, replacement, |data| {
+                super::delta_mutation::encode(data, |bytes, length| {
+                    self.spill_value(bytes.into(), length)
+                })
+            })?);
         }
         let record = delta_record(
             header.head,

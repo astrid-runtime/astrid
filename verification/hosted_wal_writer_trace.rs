@@ -75,25 +75,32 @@ fn admit_sealed<P,C,H:Fn(&ObjectRecord)->ObjectId>(update:root_declaration::Upda
 
 /// The same identity session may consume exactly the hint constructed from
 /// the sealed declaration's own principal and commit. A peer never gets it.
-fn checkpoint_recipient<H:Fn(&ObjectRecord)->ObjectId>(update:root_declaration::Update<u64>,issuer:u64,receiver:u64,hash:H)
+fn checkpoint_recipient<H:Fn(&ObjectRecord)->ObjectId>(update:root_declaration::Update<u64>,issuer:u64,
+    receiver:u64,root:RootState,hash:H)
+    -> (out:(Result<(root_declaration::Update<u64>,Option<(u64,ObjectId)>),(ObjectId,ObjectId)>,Option<(u64,RootState)>))
     requires forall|r:&ObjectRecord| #[trigger] hash.requires((r,)),
+    ensures issuer == receiver ==> out.0.is_ok(),
+        out.0 matches Ok((accepted,hint)) ==> accepted == update &&
+            hint == if issuer == receiver {Some((update.principal,update.commit))} else {None},
+        out.1 == if root.commit == update.commit {Some((update.principal,root))} else {None},
 {
-    let commit = update.commit;
     let declaration = root_declaration::Declaration::sealed(update,issuer);
+    let target = declaration.checkpoint_target();
     let mut slot = None;
     declaration.attach_checkpoint(&mut slot,|owner:&u64,id:ObjectId| -> (v:(u64,ObjectId))
         ensures v == (*owner,id), {(*owner,id)});
     let same = |a:&u64,b:&u64| -> (v:bool) ensures v == (*a == *b) {*a == *b};
     let result = declaration.admit_with_checkpoint(&receiver,same,hash,&mut slot);
-    assert(issuer == receiver ==> result.is_ok());
-    if let Ok((accepted,hint)) = result {
-        assert(accepted == update);
-        assert(hint == if issuer == receiver {Some((update.principal,update.commit))} else {None});
-    }
-    let raw = root_declaration::Declaration::<u64,u64>::untrusted(issuer,None,commit,Vec::new());
-    let mut empty = None;
-    raw.attach_checkpoint(&mut empty,|_:&u64,_:ObjectId| 42u64);
-    assert(empty.is_none());
+    let fallback = target.publish(root,|owner:u64,r:RootState| -> (v:(u64,RootState))
+        ensures v == (owner,r), {(owner,r)});
+    (result,fallback)
+}
+
+fn untrusted_hint<C>(owner:u64,commit:ObjectId,slot:&mut Option<C>,make:impl FnOnce(&u64,ObjectId)->C)
+    ensures *final(slot) == *old(slot),
+{
+    let raw = root_declaration::Declaration::<u64,u64>::untrusted(owner,None,commit,Vec::new());
+    raw.attach_checkpoint(slot,make);
 }
 
 /// The journal callback receives the root retained across closure validation.

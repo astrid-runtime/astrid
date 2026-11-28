@@ -39,6 +39,16 @@ impl Replacement {
         })
     }
 
+    pub(super) fn into_parts(self) -> (out:(Vec<u8>,PreviousValue,Option<Vec<u8>>))
+        ensures out.0@ == self.fields().0, bytes(out.2) == self.fields().1,
+            self.fields().2 == match out.1 {
+                PreviousValue::Unread => None,
+                PreviousValue::Loaded {previous_len,unchanged} => Some((previous_len,unchanged)),
+            },
+    {
+        (self.key,self.previous,self.value)
+    }
+
     #[cfg(any(test, all(feature = "legacy-surrealkv", not(target_family = "wasm"))))]
     pub(crate) fn new(key:Vec<u8>,value:Option<Vec<u8>>) -> Self {
         Self {key,previous:PreviousValue::Unread,value}

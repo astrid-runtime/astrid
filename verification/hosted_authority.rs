@@ -337,6 +337,8 @@ mod checkpoint_summary;
 mod checkpoint_header;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_value.rs"]
 mod checkpoint_value;
+#[path = "../crates/astrid-storage/src/kv/tree/delta_mutation.rs"]
+mod delta_mutation;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_entries.rs"]
 mod checkpoint_entries;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_leaf_summary.rs"]

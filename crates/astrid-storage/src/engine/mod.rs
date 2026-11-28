@@ -110,6 +110,13 @@ impl<P> RootTransaction<P> {
         }
     }
 
+    pub(crate) fn checkpoint_target(&self) -> root_declaration::CheckpointTarget<P>
+    where
+        P: Clone,
+    {
+        self.declaration.checkpoint_target()
+    }
+
     pub(crate) fn with_kv_checkpoint_publication(
         mut self,
         publication: impl FnOnce(&P, ObjectId) -> crate::kv::KvCheckpointPublication,

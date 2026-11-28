@@ -1,5 +1,7 @@
 //! Persistent insertion and balancing for the hosted KV overlay.
 
+use super::checkpoint_value::ValueSlot;
+use super::delta_mutation::Mutation;
 use super::encoding;
 use super::traversal::{Entry, Node};
 #[cfg(verus_keep_ghost)]
@@ -11,6 +13,37 @@ use std::sync::Arc;
 use vstd::prelude::*;
 
 verus! {
+
+/// Stage the resolved bytes and return the corresponding durable mutation.
+pub(super) fn stage<E,F:FnOnce(&Vec<u8>)->Result<ValueSlot,E>>(
+    root:&mut Option<Arc<Node>>, key:Vec<u8>, replacement:Option<Vec<u8>>, encode:F,
+) -> (out:Result<Mutation,E>)
+    requires ordered(*old(root)), replacement matches Some(data) ==> encode.requires((&data,)),
+    ensures ordered(*final(root)),
+        match out {
+            Err(e) => *final(root) == *old(root) && (replacement matches Some(data) &&
+                encode.ensures((&data,),Err(e))),
+            Ok(row) => {
+                &&& row.key@ == key@
+                &&& match replacement {
+                    None => row.value.is_none(),
+                    Some(data) => row.value matches Some(slot) && encode.ensures((&data,),Ok(slot)),
+                }
+                &&& forall|q:Seq<u8>| #[trigger] lookup_spec(*final(root),q) ==
+                    if q == key@ {Some(replacement)} else {lookup_spec(*old(root),q)}
+            },
+        },
+{
+    let value = match &replacement {
+        None => None,
+        Some(data) => Some(encode(data)?),
+    };
+    let mut address = Vec::with_capacity(key.len());
+    address.extend_from_slice(&key);
+    assert(address@ =~= key@);
+    put(root,address,replacement);
+    Ok(Mutation {key,value})
+}
 
 spec fn same_entries(a: Arc<Node>, b: Arc<Node>) -> bool {
     forall|k: Seq<u8>, v: Option<Vec<u8>>| #[trigger] contains_entry(Some(a), k, v) == contains_entry(Some(b), k, v)

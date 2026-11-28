@@ -44,12 +44,20 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             return Ok(ValueSlot::Inline(bytes.into_owned()));
         }
         let length = u64::try_from(bytes.len()).map_err(|_| arithmetic_overflow())?;
-        let object = if length > u64::from(PROFILE.maximum_bytes()) {
-            self.make_chunked_value(&bytes, length)?
-        } else {
-            self.insert(value_record(bytes.into_owned())?)?
-        };
+        let object = self.spill_value(bytes, length)?;
         Ok(ValueSlot::Spilled { object, length })
+    }
+
+    pub(super) fn spill_value(
+        &mut self,
+        bytes: Cow<'_, [u8]>,
+        length: u64,
+    ) -> StorageResult<ObjectId> {
+        if length > u64::from(PROFILE.maximum_bytes()) {
+            self.make_chunked_value(&bytes, length)
+        } else {
+            self.insert(value_record(bytes.into_owned())?)
+        }
     }
 
     fn make_chunked_value(&mut self, bytes: &[u8], length: u64) -> StorageResult<ObjectId> {

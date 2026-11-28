@@ -60,6 +60,26 @@ def consumer_defects():
             label, declaration, lambda s, a=clause, b=weaker: replace_once(s, a, b),
             Path("verification/hosted_wal_writer_trace.rs"),
         )
+    recovery = Path("verification/hosted_retirement_recovery.rs")
+    stage = Path("crates/astrid-storage/src/kv/tree/overlay/update.rs")
+    delta = Path("crates/astrid-storage/src/kv/tree/delta_mutation.rs")
+    for label, path, clause, weaker, consumer in [
+        ("fallback binding", declaration, "target.binding() == (self.payload().principal,self.payload().commit)", "true", Path("verification/hosted_wal_writer_trace.rs")),
+        ("fallback eligibility", declaration, "out.is_some() == (root.commit == self.binding().1)", "true", Path("verification/hosted_wal_writer_trace.rs")),
+        ("fallback recipient", declaration, "publish.ensures((self.binding().0,root),result)", "true", Path("verification/hosted_wal_writer_trace.rs")),
+        ("delta key", stage, "row.key@ == key@", "true", recovery),
+        ("delta value", stage, "encode.ensures((&data,),Ok(slot))", "true", recovery),
+        ("delta deletion", stage, "None => row.value.is_none()", "None => true", recovery),
+        ("delta overlay", stage, "if q == key@ {Some(replacement)} else {lookup_spec(*old(root),q)}", "lookup_spec(*final(root),q)", recovery),
+        ("delta error preservation", stage, "*final(root) == *old(root) && (replacement", "true && (replacement", recovery),
+        ("delta inline bytes", delta, "&& v@ == data@", "", recovery),
+        ("delta spill length", delta, "length == data.len() && spill.ensures", "spill.ensures", recovery),
+        ("delta spill identity", delta, "spill.ensures((data,length),Ok(object))", "true", recovery),
+    ]:
+        yield (
+            f"retirement storage loses {label}", path,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), consumer,
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

@@ -20,6 +20,24 @@ pub(super) struct Declaration<P,A> {
     identity:IdentityProof<A>,
 }
 
+/// The cache fallback must address the transaction that supplied the hint.
+pub(crate) struct CheckpointTarget<P> {
+    owner:P,
+    commit:ObjectId,
+}
+
+impl<P> CheckpointTarget<P> {
+    pub(crate) closed spec fn binding(&self) -> (P,ObjectId) {(self.owner,self.commit)}
+
+    pub(crate) fn publish<T,F:FnOnce(P,RootState)->T>(self,root:RootState,publish:F) -> (out:Option<T>)
+        requires root.commit == self.binding().1 ==> publish.requires((self.binding().0,root)),
+        ensures out.is_some() == (root.commit == self.binding().1),
+            out matches Some(result) ==> publish.ensures((self.binding().0,root),result),
+    {
+        if self.commit.same(&root.commit) {Some(publish(self.owner,root))} else {None}
+    }
+}
+
 impl<P,A> Declaration<P,A> {
     pub(super) closed spec fn payload(&self) -> Update<P> { self.update }
     pub(super) closed spec fn proof_source(&self) -> IdentityProof<A> { self.identity }
@@ -27,6 +45,16 @@ impl<P,A> Declaration<P,A> {
     pub(super) const fn update(&self) -> (u:&Update<P>)
         ensures *u == self.payload(),
     { &self.update }
+
+    pub(super) fn checkpoint_target(&self) -> (target:CheckpointTarget<P>) where P:Clone,
+        requires vstd::pervasive::obeys_clone_eq::<P>(),
+        ensures target.binding() == (self.payload().principal,self.payload().commit),
+    {
+        proof {reveal(vstd::pervasive::obeys_clone_eq);}
+        let owner = P::clone(&self.update.principal);
+        assert(vstd::pervasive::cloned(self.update.principal,owner));
+        CheckpointTarget {owner,commit:self.update.commit}
+    }
 
     /// Only an engine-sealed declaration can attach a cache publication. Its
     /// factory receives the owner and commit from this declaration.

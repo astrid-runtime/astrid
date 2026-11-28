@@ -53,6 +53,7 @@ mod checkpoint_value;
 mod checkpoint_walk;
 mod context;
 mod delta;
+mod delta_mutation;
 mod handoff;
 mod header;
 mod hot_cache;
@@ -488,7 +489,7 @@ where
         let (tree, validation) = context.build_validated_checkpoint(&base)?;
         let checkpoint_totals = base_projection.totals;
         interleave()?;
-        let current = self.header_at_epoch(owner.clone(), epoch)?;
+        let current = self.header_at_epoch(owner, epoch)?;
         let current_projection = projection_from_header(&current);
         if !force && !should_checkpoint(&current_projection) {
             return Ok(false);
@@ -513,16 +514,19 @@ where
                 epoch,
             )
         });
+        let target = transaction.checkpoint_target();
         match self.engine.commit_kv_root(transaction) {
             Ok(outcome) => {
-                self.validation.publish_if_current(
-                    self.engine.as_ref(),
-                    owner,
-                    outcome.root(),
-                    rebased,
-                    Some(validation),
-                    epoch,
-                );
+                target.publish(outcome.root(), |owner, root| {
+                    self.validation.publish_if_current(
+                        self.engine.as_ref(),
+                        owner,
+                        root,
+                        rebased,
+                        Some(validation),
+                        epoch,
+                    );
+                });
                 Ok(true)
             },
             Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),
