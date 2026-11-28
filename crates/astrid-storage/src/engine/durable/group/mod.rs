@@ -728,10 +728,8 @@ where
         files: &mut DurableFiles,
         accepted: &[AcceptedCommit<P>],
     ) -> Result<(), DurableError> {
-        let journals: Vec<_> = accepted
-            .iter()
-            .map(|accepted| accepted.prepared.root.journal().as_slice())
-            .collect();
+        let journals =
+            super::frontier::journals(accepted, |entry| entry.prepared.root.journal().as_slice());
         let publication_started = Instant::now();
         append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
         record_group(

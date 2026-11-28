@@ -3,6 +3,27 @@ use vstd::prelude::*;
 
 verus! {
 
+/// Preserve submission order when gathering the legacy root journal frames.
+pub(super) fn journals<'a,T,F:Fn(&'a T)->&'a [u8]>(group:&'a [T],select:F)
+    -> (out:Vec<&'a [u8]>)
+    requires forall|i:int| 0 <= i < group.len() ==> #[trigger] select.requires((&group@[i],)),
+    ensures out.len() == group.len(), forall|i:int| 0 <= i < group.len() ==>
+        #[trigger] select.ensures((&group@[i],),out@[i]),
+{
+    let mut frames = Vec::with_capacity(group.len());
+    let mut i = 0;
+    while i < group.len()
+        invariant i <= group.len(), frames.len() == i,
+            forall|j:int| 0 <= j < group.len() ==> #[trigger] select.requires((&group@[j],)),
+            forall|j:int| 0 <= j < i ==> #[trigger] select.ensures((&group@[j],),frames@[j]),
+        decreases group.len()-i,
+    {
+        frames.push(select(&group[i]));
+        i = i.saturating_add(1);
+    }
+    frames
+}
+
 /// Select the new cached WAL arena position after the filesystem length is read.
 /// Equal lengths preserve the existing tail even when pending locations exist.
 pub(super) fn wal_position<L: Copy>(current: u64, tail: Option<L>, observed: u64, pending: Option<L>)

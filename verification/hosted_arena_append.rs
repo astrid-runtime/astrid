@@ -59,6 +59,64 @@ fn physical_frame<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(header:&[u8;52],magic:[u8
     }
 }
 
+/// Every accepted root contributes its own complete journal at the same index.
+fn legacy_group_journals<'a,P,R:Copy>(group:&'a [crate::root_transition::PreparedRoot<P,R>],index:usize)
+    requires index < group.len(),
+{
+    use crate::root_transition::PreparedRoot;
+    let select = |root:&'a PreparedRoot<P,R>| -> (bytes:&'a [u8])
+            ensures bytes@ == root.binding().3@, {root.journal().as_slice()};
+    let frames = crate::group_frontier::journals(group,select);
+    assert(select.ensures((&group@[index as int],),frames@[index as int]));
+    assert(frames.len() == group.len());
+    assert(frames@[index as int]@ == group@[index as int].binding().3@);
+}
+
+/// Locate a root journal entry after an arbitrary coalesced prefix, validate its
+/// physical header and checksum, and recover the owner and both root fields.
+fn legacy_journal_readback<H:Copy+Fn([u8;8],u64,&[u8])->[u8;32]>(
+    mut batch:Vec<u8>,base:u64,magic:[u8;8],version:u16,owner:&[u8],scheme:Scheme,
+    expected:Option<crate::root_wire::Root>,replacement:crate::root_wire::Root,
+    hash:H,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>,
+)
+    requires owner.len() < u64::MAX,
+        forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),
+        forall|m:[u8;8],n:u64,b:&[u8],sum:[u8;32]| #[trigger] hash.ensures((m,n,b),sum) ==> sum == (digest@)(m,n,b@),
+{
+    use crate::root_wire as wire;
+    let payload = wire::encode(owner,scheme,expected,replacement).unwrap();
+    let prefix = batch.len();
+    let ghost original = batch@;
+    let Some(location) = frame::extend_batch(&mut batch,base,magic,version,&payload,hash) else {
+        assert(base as int + prefix > u64::MAX && batch@ == original);
+        return;
+    };
+    assert(location.offset == base as int + prefix && location.payload_len == payload.len());
+    assert(location.checksum == (digest@)(magic,payload.len() as u64,payload@));
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    assert(frame::header_bytes(magic,version,location.payload_len,location.checksum).len() == 52);
+    let start = (location.offset - base) as usize;
+    assert(start == prefix && batch.len() == start + 52 + payload.len());
+    let mut header = [0u8;52];
+    header.copy_from_slice(&batch[start..start+52]);
+    let body = &batch[start+52..];
+    assert(batch@.take(start as int) =~= original);
+    assert(header@ =~= frame::header_bytes(magic,version,location.payload_len,location.checksum));
+    assert(body@ =~= payload@);
+    let valid = physical_frame(&header,magic,version,body,hash,digest);
+    assert(valid);
+    proof {vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();}
+    assert(body@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(owner.len() as u64));
+    let Ok((name,mut cursor)) = wire::read_owner(body) else {assert(false);return;};
+    assert(name@ =~= owner@);
+    let ghost at = cursor as int;
+    assert(body@.skip(at) =~= wire::prior(expected,scheme) + replacement.wire(scheme));
+    assert(wire::tail(body@,at,scheme,expected,replacement));
+    let Ok((prior,next)) = wire::read_tail(body,&mut cursor,scheme) else {assert(false);return;};
+    proof {wire::unique_tail(body@,at,scheme,prior,next,expected,replacement);}
+    assert(wire::same_expected(prior,expected) && wire::same(next,replacement));
+}
+
 /// Normal frames advance the cursor to their full end; oversize frames retain their interior classification.
 fn frame_extent(at:u64,end:u64,len:u64,limit:u64) -> (result:(u8,u64))
     ensures ({

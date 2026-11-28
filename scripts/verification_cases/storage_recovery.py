@@ -6,6 +6,24 @@ from .common import replace_once
 
 
 def consumer_defects():
+    frame = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
+    frontier = Path("crates/astrid-storage/src/engine/durable/frontier.rs")
+    for label, source, clause, weaker in [
+        ("batch length", frontier, "out.len() == group.len(), forall", "true, forall"),
+        ("batch order", frontier, "forall|i:int| 0 <= i < group.len() ==>\n        #[trigger] select.ensures((&group@[i],),out@[i])", "true"),
+        ("append refusal", frame, "out.is_some() == (base as int + old(encoded).len() <=", "out.is_some() ==> (base as int + old(encoded).len() <="),
+        ("refused prefix", frame, "out.is_none() ==> final(encoded)@ == old(encoded)@", "true"),
+        ("address", frame, "loc.offset == base as int + old(encoded).len()", "true"),
+        ("extent", frame, "&& loc.payload_len == payload.len()", "&& true"),
+        ("hash inputs", frame, "hash.ensures((magic,loc.payload_len,payload),loc.checksum)", "true"),
+        ("batch bytes", frame, "final(encoded)@ == old(encoded)@ + header_bytes(magic,version,loc.payload_len,loc.checksum) + payload@", "true"),
+    ]:
+        yield (
+            f"legacy journal readback loses {label}", source,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_arena_append.rs"),
+        )
+
     ack = Path("crates/astrid-storage/src/kv/tree/mutation_ack.rs")
     for label, clause, weaker in [
         ("unchanged result", "!changed ==> out == Ok(Some(output))", "true"),

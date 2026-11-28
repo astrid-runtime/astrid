@@ -149,6 +149,28 @@ pub(super) open spec fn hashed<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
     exists|p:&[u8]| p@ == data && #[trigger] hash.ensures((magic,data.len() as u64,p),sum)
 }
 
+/// Append one borrowed payload to the coalesced batch and return its physical extent.
+pub(super) fn extend_batch<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
+    encoded:&mut Vec<u8>, base:u64, magic:[u8;8], version:u16, payload:&[u8], hash:H,
+) -> (out:Option<ArenaLocation>)
+    requires hash.requires((magic,payload.len() as u64,payload)),
+    ensures out.is_some() == (base as int + old(encoded).len() <= u64::MAX && payload.len() <= u64::MAX),
+        out matches Some(loc) ==> loc.offset == base as int + old(encoded).len()
+            && loc.payload_len == payload.len()
+            && hash.ensures((magic,loc.payload_len,payload),loc.checksum)
+            && final(encoded)@ == old(encoded)@ + header_bytes(magic,version,loc.payload_len,loc.checksum) + payload@,
+        out.is_none() ==> final(encoded)@ == old(encoded)@,
+{
+    let payload_len = u64::try_from(payload.len()).ok()?;
+    let checksum = hash(magic,payload_len,payload);
+    let relative = u64::try_from(encoded.len()).ok()?;
+    let offset = base.checked_add(relative)?;
+    encoded.extend_from_slice(&header(magic,version,payload_len,checksum));
+    encoded.extend_from_slice(payload);
+    assert(encoded@ =~= old(encoded)@ + header_bytes(magic,version,payload_len,checksum) + payload@);
+    Some(ArenaLocation {offset,payload_len,checksum})
+}
+
 impl PreparedFrame {
     pub(super) closed spec fn body(self) -> Seq<u8> { self.payload@ }
     pub(super) closed spec fn sum(self) -> [u8;32] { self.checksum }

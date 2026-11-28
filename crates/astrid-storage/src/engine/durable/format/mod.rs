@@ -404,22 +404,16 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
         .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable batch append", source))?;
     for payload in payloads {
-        let payload = payload.as_ref();
-        let payload_len =
-            u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let checksum = frame_checksum(magic, payload_len, payload);
-        let relative = u64::try_from(encoded.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let offset = base
-            .checked_add(relative)
-            .ok_or(DurableError::EncodingOverflow)?;
-        let header = frame_header(magic, payload_len, checksum);
-        encoded.extend_from_slice(&header);
-        encoded.extend_from_slice(payload);
-        locations.push(ArenaLocation {
-            offset,
-            payload_len,
-            checksum,
-        });
+        let location = super::arena_frame::extend_batch(
+            &mut encoded,
+            base,
+            magic,
+            FRAME_VERSION,
+            payload.as_ref(),
+            frame_checksum,
+        )
+        .ok_or(DurableError::EncodingOverflow)?;
+        locations.push(location);
     }
     file.write_all(&encoded)
         .map_err(|source| io_error("append durable frame batch", source))?;
