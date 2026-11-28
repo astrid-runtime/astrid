@@ -65,6 +65,18 @@ fn roundtrip(row:Mutation,index:usize,bytes:&mut Vec<u8>,refs:&mut Vec<ObjectRef
         },
     }
     assert(cursor as int == start as int+row.payload().len());
+    let mut consumed = start;
+    let parsed = Mutation::decode(bytes,&mut consumed,refs,index,|_:&[u8]| -> (error:Option<()>)
+        ensures error == None, {None});
+    let Ok(actual) = parsed else {assert(false);return;};
+    assert(actual.key@ == row.key@);
+    match &row.value {
+        None => assert(actual.value.is_none()),
+        Some(ValueSlot::Inline(data)) => assert(actual.value matches Some(ValueSlot::Inline(got)) && got@ == data@),
+        Some(ValueSlot::Spilled {object,length}) => assert(actual.value == Some(ValueSlot::Spilled {object:*object,length:*length})),
+    }
+    assert(consumed == cursor);
+
 }
 
 fn malformed_operation(bytes:&[u8],start:usize)
@@ -73,6 +85,16 @@ fn malformed_operation(bytes:&[u8],start:usize)
     let mut cursor = start;
     let decoded = delta::read(bytes,&mut cursor);
     assert(decoded.is_err());
+}
+
+/// A rejected key cannot produce a recovered mutation.
+fn refused_key(bytes:&[u8],start:usize,refs:&[ObjectReference],index:usize,error:u64)
+    requires start as int+4 <= bytes.len() && start as int+4+key::length(bytes@,start as int) <= bytes.len(),
+{
+    let mut cursor = start;
+    let out = Mutation::decode(bytes,&mut cursor,refs,index,|_:&[u8]| -> (decision:Option<u64>)
+        ensures decision == Some(error), {Some(error)});
+    assert(out matches Err(delta::DecodeError::InvalidKey(e)) && e == error);
 }
 
 fn wrong_relation(refs:&[ObjectReference],index:usize)

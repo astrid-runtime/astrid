@@ -15,7 +15,7 @@ const CHECKPOINT: u8 = 0;
 const DELTA: u8 = 1;
 #[cfg(test)]
 use super::delta_mutation::{DELETE, INLINE, SPILLED};
-use super::delta_mutation::{Operation, ReadError, WriteError};
+use super::delta_mutation::{DecodeError, EdgeError, ReadError, WriteError};
 const PREVIOUS_LABEL: &[u8] = b"previous";
 
 pub(super) use super::delta_mutation::Mutation;
@@ -200,43 +200,15 @@ fn decode_delta(
         .transpose()?;
     let mut mutations = Vec::with_capacity(count);
     for index in 0..count {
-        let key = super::checkpoint_key_field::read(cursor.bytes, &mut cursor.offset)
-            .map_err(|error| match error {
-                super::checkpoint_key_field::KeyError::Field(error) => field_error(id, error),
-                super::checkpoint_key_field::KeyError::Length => {
-                    invalid(id, "KV projection count is too large")
-                },
-            })?
-            .to_vec();
-        validate_composite_key(id, &key)?;
-        let operation =
-            super::delta_mutation::read(cursor.bytes, &mut cursor.offset).map_err(|error| {
-                match error {
-                    ReadError::Field(error) => field_error(id, error),
-                    ReadError::Length => invalid(id, "KV projection length is too large"),
-                    ReadError::Oversized => invalid(id, "oversized inline KV delta value"),
-                    ReadError::SmallSpill => invalid(id, "small KV delta value was not inlined"),
-                    ReadError::Tag => invalid(id, "invalid KV delta operation tag"),
-                }
-            })?;
-        let value = match operation {
-            Operation::Delete => None,
-            Operation::Inline(data) => Some(ValueSlot::Inline(data.to_vec())),
-            Operation::Spill(length) => {
-                let object = super::delta_mutation::spill_object(record.references(), index)
-                    .map_err(|error| match error {
-                        super::delta_mutation::EdgeError::Index => arithmetic_overflow(),
-                        super::delta_mutation::EdgeError::Missing => {
-                            invalid(id, "spilled KV delta value is missing")
-                        },
-                        super::delta_mutation::EdgeError::NonOwning => {
-                            invalid(id, "spilled KV delta value is not owning")
-                        },
-                    })?;
-                Some(ValueSlot::Spilled { object, length })
-            },
-        };
-        mutations.push(Mutation { key, value });
+        let row = Mutation::decode(
+            cursor.bytes,
+            &mut cursor.offset,
+            record.references(),
+            index,
+            |key| validate_composite_key(id, key).err(),
+        )
+        .map_err(|error| decode_error(id, error))?;
+        mutations.push(row);
     }
     cursor.done()?;
     if mutations.windows(2).any(|pair| pair[0].key >= pair[1].key)
@@ -278,6 +250,31 @@ pub(super) fn mutation_payload_bytes(mutations: &[Mutation]) -> StorageResult<u6
             .and_then(|total| total.checked_add(value))
             .ok_or_else(arithmetic_overflow)
     })
+}
+
+fn decode_error(id: ObjectId, error: DecodeError<StorageError>) -> StorageError {
+    use super::checkpoint_key_field::KeyError;
+    match error {
+        DecodeError::Key(KeyError::Field(error))
+        | DecodeError::Operation(ReadError::Field(error)) => field_error(id, error),
+        DecodeError::Key(KeyError::Length) => invalid(id, "KV projection count is too large"),
+        DecodeError::InvalidKey(error) => error,
+        DecodeError::Operation(ReadError::Length) => {
+            invalid(id, "KV projection length is too large")
+        },
+        DecodeError::Operation(ReadError::Oversized) => {
+            invalid(id, "oversized inline KV delta value")
+        },
+        DecodeError::Operation(ReadError::SmallSpill) => {
+            invalid(id, "small KV delta value was not inlined")
+        },
+        DecodeError::Operation(ReadError::Tag) => invalid(id, "invalid KV delta operation tag"),
+        DecodeError::Edge(EdgeError::Index) => arithmetic_overflow(),
+        DecodeError::Edge(EdgeError::Missing) => invalid(id, "spilled KV delta value is missing"),
+        DecodeError::Edge(EdgeError::NonOwning) => {
+            invalid(id, "spilled KV delta value is not owning")
+        },
+    }
 }
 
 fn field_error(id: ObjectId, error: crate::storage_fields::ReadError) -> StorageError {

@@ -95,6 +95,20 @@ def consumer_defects():
             f"delta wire loses {label}", delta,
             lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
         )
+    for label, clause, weaker in [
+        ("assembled key", "has_key && row.key@ == key && valid", "has_key && valid"),
+        ("validator refusal", "has_key && validated(validate,key,Some(e))", "has_key"),
+        ("validation before operation", "validated(validate,key,None) && !valid(bytes@,key_end)", "!valid(bytes@,key_end)"),
+        ("validation before edge", "validated(validate,key,None) && valid(bytes@,key_end) && bytes@", "valid(bytes@,key_end) && bytes@"),
+        ("accepted key", "&&& validated(validate,key,None)", "&&& true"),
+        ("assembled inline data", "data@ == bytes@.subrange(key_end+9,*final(cursor) as int)", "true"),
+        ("assembled spill identity", "r.fields() == (label,object,super::ReferenceKind::Owns)", "r.fields().0 == label"),
+        ("assembled spill length", "n == length && index <= u32::MAX", "index <= u32::MAX"),
+    ]:
+        yield (
+            f"delta decoder loses {label}", delta,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), Path("verification/hosted_delta_mutation.rs"),
+        )
     materializer = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
     for label, clause, weaker in [
         ("commit admission", "rows@[i].1.contents().0 is Commit,", "true,"),

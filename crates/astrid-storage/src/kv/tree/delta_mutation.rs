@@ -148,6 +148,8 @@ pub(super) fn spill_object(refs:&[ObjectReference],index:usize) -> (out:Result<O
             Some(edge) => out == if edge.fields().2 == super::ReferenceKind::Owns {Ok(edge.fields().1)} else {Err(EdgeError::NonOwning)},
         }}
     }),
+        out matches Ok(id) ==> (super::reference_lookup::selected(refs@,label_bytes(index as u32),0,refs.len() as int)
+            matches Some(edge) && edge.fields() == (label_bytes(index as u32),id,super::ReferenceKind::Owns)),
         out matches Ok(id) ==> exists|r:ObjectReference| refs@.contains(r) &&
             #[trigger] r.fields() == (label_bytes(index as u32),id,super::ReferenceKind::Owns),
         forall|i:int| index <= u32::MAX && #[trigger] super::reference_lookup::positioned(refs@,label_bytes(index as u32),i) &&
@@ -157,6 +159,83 @@ pub(super) fn spill_object(refs:&[ObjectReference],index:usize) -> (out:Result<O
     let bytes = label.into_inner();
     let Some(r) = super::reference_lookup::find(refs,bytes.as_slice()) else {return Err(EdgeError::Missing);};
     r.owning_target().ok_or(EdgeError::NonOwning)
+}
+
+pub(super) enum DecodeError<E> {
+    Key(super::checkpoint_key_field::KeyError),
+    InvalidKey(E),
+    Operation(ReadError),
+    Edge(EdgeError),
+}
+
+pub(super) open spec fn validated<E,F:FnOnce(&[u8])->Option<E>>(validate:F,key:Seq<u8>,decision:Option<E>) -> bool {
+    exists|field:&[u8]| field@ == key && #[trigger] validate.ensures((field,),decision)
+}
+
+impl Mutation {
+    /// Recover one complete mutation, preserving validation and error order.
+    pub(super) fn decode<E,F:FnOnce(&[u8])->Option<E>>(bytes:&[u8],cursor:&mut usize,
+        refs:&[ObjectReference],index:usize,validate:F) -> (out:Result<Self,DecodeError<E>>)
+        requires forall|k:&[u8]| #[trigger] validate.requires((k,)),
+        ensures ({
+            let start = *old(cursor) as int;
+            let key_end = start + 4 + super::checkpoint_key_field::length(bytes@,start);
+            let has_key = start+4 <= bytes.len() && key_end <= bytes.len();
+            let key = if has_key {bytes@.subrange(start+4,key_end)} else {Seq::empty()};
+            let length = super::checkpoint_value::value_length(bytes@,key_end+1);
+            let label = if index <= u32::MAX {label_bytes(index as u32)} else {Seq::empty()};
+            let edge = super::reference_lookup::selected(refs@,label,0,refs.len() as int);
+            match out {
+                Err(DecodeError::Key(_)) => !has_key,
+                Err(DecodeError::InvalidKey(e)) => has_key && validated(validate,key,Some(e)),
+                Err(DecodeError::Operation(_)) => has_key && validated(validate,key,None) && !valid(bytes@,key_end),
+                Err(DecodeError::Edge(_)) => has_key && validated(validate,key,None) && valid(bytes@,key_end) && bytes@[key_end] == SPILLED &&
+                    (index > u32::MAX || edge.is_none() || edge.unwrap().fields().2 != super::ReferenceKind::Owns),
+                Ok(row) => {
+                    &&& has_key && row.key@ == key && valid(bytes@,key_end)
+                    &&& validated(validate,key,None)
+                    &&& match row.value {
+                        None => bytes@[key_end] == DELETE && *final(cursor) as int == key_end+1,
+                        Some(ValueSlot::Inline(data)) => bytes@[key_end] == INLINE && *final(cursor) as int == key_end+9+length &&
+                            data@ == bytes@.subrange(key_end+9,*final(cursor) as int),
+                        Some(ValueSlot::Spilled {object,length:n}) => bytes@[key_end] == SPILLED && *final(cursor) as int == key_end+9 &&
+                            n == length && index <= u32::MAX && (edge matches Some(r) && r.fields() == (label,object,super::ReferenceKind::Owns)),
+                    }
+                },
+            }
+        }),
+    {
+        let ghost start = *cursor as int;
+        let k = match super::checkpoint_key_field::read(bytes,cursor) {
+            Ok(k) => k, Err(e) => return Err(DecodeError::Key(e)),
+        };
+        let ghost key_end = start + 4 + super::checkpoint_key_field::length(bytes@,start);
+        assert(k@ == bytes@.subrange(start+4,key_end));
+        let decision = validate(k);
+        assert(validated(validate,k@,decision)) by {assert(validate.ensures((k,),decision));}
+        if let Some(e) = decision {return Err(DecodeError::InvalidKey(e));}
+        assert(decision.is_none());
+        assert(*cursor as int == key_end);
+        let op = match read(bytes,cursor) {Ok(o) => o, Err(e) => return Err(DecodeError::Operation(e))};
+        let value = match op {
+            Operation::Delete => None,
+            Operation::Inline(data) => {
+                let mut value = Vec::with_capacity(data.len());
+                value.extend_from_slice(data);
+                assert(value@ =~= data@);
+                Some(ValueSlot::Inline(value))
+            },
+            Operation::Spill(length) => {
+                let object = match spill_object(refs,index) {Ok(id) => id, Err(e) => return Err(DecodeError::Edge(e))};
+                Some(ValueSlot::Spilled {object,length})
+            },
+        };
+        let mut key = Vec::with_capacity(k.len());
+        key.extend_from_slice(k);
+        assert(key@ =~= k@);
+        assert(validated(validate,key@,None));
+        Ok(Self {key,value})
+    }
 }
 
 /// Resolve borrowed mutation bytes without duplicating a spilled payload.
