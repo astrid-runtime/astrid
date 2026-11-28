@@ -21,7 +21,7 @@ mod types;
 mod writer;
 
 #[allow(unused_imports)]
-pub(super) use overlay::{PendingWalOverlay, PendingWalRoot, read_snapshot};
+pub(super) use overlay::{PendingWalOverlay, read_snapshot};
 pub(super) use replay::recover_wal;
 #[allow(unused_imports)]
 pub(super) use scan::{ScannedWal, WalScanner};

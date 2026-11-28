@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 
 use super::super::representations::DirectArenaObject;
+use super::super::root_transition::PreparedRoot;
 use super::super::{ArenaLocation, DurableError, ModelError};
 
 #[path = "overlay_object.rs"]
@@ -48,54 +49,11 @@ impl PendingWalObject {
     }
 }
 
-/// One root transition retained until the canonical root journal is folded.
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(in crate::engine::durable) struct PendingWalRoot<P> {
-    principal: P,
-    expected: Option<RootState>,
-    replacement: RootState,
-    journal: Vec<u8>,
-}
-
-#[allow(dead_code)]
-impl<P> PendingWalRoot<P> {
-    pub(in crate::engine::durable) fn new(
-        principal: P,
-        expected: Option<RootState>,
-        replacement: RootState,
-        journal: Vec<u8>,
-    ) -> Self {
-        Self {
-            principal,
-            expected,
-            replacement,
-            journal,
-        }
-    }
-
-    pub(in crate::engine::durable) fn principal(&self) -> &P {
-        &self.principal
-    }
-
-    pub(in crate::engine::durable) const fn expected(&self) -> Option<RootState> {
-        self.expected
-    }
-
-    pub(in crate::engine::durable) const fn replacement(&self) -> RootState {
-        self.replacement
-    }
-
-    pub(in crate::engine::durable) fn journal(&self) -> &[u8] {
-        &self.journal
-    }
-}
-
 /// Committed WAL state that has not yet been folded into canonical files.
 #[derive(Debug)]
 pub(in crate::engine::durable) struct PendingWalOverlay<P: Ord> {
     objects: BTreeMap<ObjectId, PendingWalObject>,
-    roots: Vec<PendingWalRoot<P>>,
+    roots: Vec<PreparedRoot<P, RootState>>,
 }
 
 impl<P: Ord> Default for PendingWalOverlay<P> {
@@ -172,24 +130,16 @@ impl<P: Ord> PendingWalOverlay<P> {
     }
 
     /// Retain one root transition in publication order.
-    pub(in crate::engine::durable) fn push_root(
-        &mut self,
-        principal: P,
-        expected: Option<RootState>,
-        replacement: RootState,
-        journal: Vec<u8>,
-    ) {
-        self.roots.push(PendingWalRoot::new(
-            principal,
-            expected,
-            replacement,
-            journal,
-        ));
+    pub(in crate::engine::durable) fn retain_root(&mut self, root: &PreparedRoot<P, RootState>)
+    where
+        P: Clone,
+    {
+        root.retain(&mut self.roots);
     }
 
-    /// Return root transitions in the order they were WAL-published.
-    pub(in crate::engine::durable) fn roots(&self) -> &[PendingWalRoot<P>] {
-        &self.roots
+    /// Borrow the journal payloads in the order retained by publication.
+    pub(in crate::engine::durable) fn journals(&self) -> Vec<&[u8]> {
+        super::super::frontier::journals(&self.roots, PreparedRoot::journal_bytes)
     }
 
     /// Remove all pending state for one checkpoint fold.

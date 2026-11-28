@@ -527,6 +527,15 @@ def consumer_defects():
         )
     transition = Path("crates/astrid-storage/src/engine/durable/root_transition.rs")
     for label, clause in [
+        ("earlier roots", "final(pending)@.drop_last()==old(pending)@"),
+        ("accepted journal bytes", "kept.3@==submitted.3@"),
+        ("folded payload", "bytes@==self.binding().3@"),
+    ]:
+        yield (
+            f"retained WAL fold loses {label}", transition,
+            lambda s, a=clause: replace_once(s, a, "true"), Path("verification/hosted_kv_model.rs"),
+        )
+    for label, clause in [
         ("writer map", "final(writer)@ == old(writer)@.insert(self.binding().0,self.binding().2),"),
         ("visible receipt", "visible.ensures((&self.binding().0,self.binding().2,&result.1),()),"),
         ("writer invariant", "result.0 == self.binding().2, btree_map_inv(final(writer)),"),

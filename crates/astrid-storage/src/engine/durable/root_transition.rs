@@ -291,6 +291,29 @@ impl<P,R: Copy> PreparedRoot<P,R> {
     pub(super) fn owner(&self) -> (p: &P) ensures *p == self.binding().0 { &self.owner }
     pub(super) fn journal(&self) -> (j: &Vec<u8>) ensures *j == self.binding().3 { &self.journal }
 
+    /// Retain the accepted root and its encoded journal together until checkpoint folding.
+    pub(super) fn retain(&self,pending:&mut Vec<Self>) where P:Clone,
+        requires obeys_clone_eq::<P>(),
+        ensures final(pending)@.drop_last()==old(pending)@,final(pending).len()==old(pending).len()+1,
+            ({
+                let kept=final(pending)@.last().binding();
+                let submitted=self.binding();
+                (kept.0,kept.1,kept.2)==(submitted.0,submitted.1,submitted.2) && kept.3@==submitted.3@
+            }),
+    {
+        proof { reveal(obeys_clone_eq); }
+        let owner=self.owner.clone();
+        assert(vstd::pervasive::cloned(self.owner,owner));
+        let journal=self.journal.clone();
+        assert(journal@ =~= self.journal@);
+        pending.push(Self {owner,expected:self.expected,replacement:self.replacement,journal});
+        assert(pending@.drop_last() =~= old(pending)@);
+    }
+
+    pub(super) fn journal_bytes(&self) -> (bytes:&[u8])
+        ensures bytes@==self.binding().3@,
+    { self.journal.as_slice() }
+
     /// Make this accepted replacement visible to subsequent preparations in the batch.
     pub(super) fn stage(&self, pending:&mut BTreeMap<P,R>) where P:Ord+Clone,
         requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), obeys_clone_eq::<P>(), btree_map_inv(old(pending)),

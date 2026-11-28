@@ -367,11 +367,7 @@ where
                     });
                 }
             }
-            let journals = pending
-                .roots()
-                .iter()
-                .map(super::wal::PendingWalRoot::journal)
-                .collect::<Vec<_>>();
+            let journals = pending.journals();
             if !journals.is_empty() {
                 append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
             }

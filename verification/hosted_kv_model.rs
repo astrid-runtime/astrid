@@ -376,6 +376,89 @@ type WriterRoots=BTreeMap<u64,crate::RootState>;
 type AcceptedRoot=crate::group_receipt::Accepted<PreparedRoot<u64,crate::RootState>,u64,()>;
 type RootReplies=Vec<(u64,Result<crate::RootState,u64>)>;
 
+fn journal_bytes<'a>(row:&'a &[u8]) -> (bytes:&'a [u8])
+    ensures bytes@==(*row)@,
+{ *row }
+
+spec fn folded_journal<H:Fn([u8;8],u64,&[u8])->[u8;32]>(
+    image:Seq<u8>,base:int,rows:Seq<crate::arena_frame::ArenaLocation>,i:int,
+    bytes:Seq<u8>,hash:H,magic:[u8;8],version:u16) -> bool {
+    let loc=rows[i];
+    let start=loc.offset as int;
+    let end=start+crate::arena_frame::WIDTH+bytes.len();
+    &&& start==if i==0 {base} else {rows[i-1].offset as int+crate::arena_frame::WIDTH+rows[i-1].payload_len}
+    &&& end<=image.len() && loc.payload_len==bytes.len()
+    &&& crate::arena_frame::hashed(hash,magic,bytes,loc.checksum)
+    &&& image.subrange(start,end)==crate::arena_frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+bytes
+}
+
+/// Fold an accepted root after an arbitrary pending prefix. The last physical frame
+/// contains that transition's journal; the receipt names its replacement at the same owner.
+fn retained_root_frame<S:crate::arena_frame::BatchFile,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+    root:PreparedRoot<u64,crate::RootState>,mut pending:Vec<PreparedRoot<u64,crate::RootState>>,
+    mut writer:WriterRoots,file:&mut S,hash:H,magic:[u8;8],version:u16)
+    -> (out:Result<(WriterRoots,crate::RootState,Vec<crate::arena_frame::ArenaLocation>),crate::arena_frame::BatchError<S::Error>>)
+    requires btree_map_inv(&writer),obeys_cmp::<u64>(),obeys_cmp_concrete_eq::<u64>(),obeys_clone_eq::<u64>(),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+        old(file).image().len()<=u64::MAX,
+    ensures final(file).target()==old(file).target(),
+        out matches Ok((roots,ack,rows)) ==> {
+            let desc=root.binding();
+            &&& ack==desc.2 && roots@==writer@.insert(desc.0,ack)
+            &&& rows.len()==pending.len()+1
+            &&& forall|i:int| 0<=i<rows.len() ==> #[trigger] folded_journal(final(file).image(),old(file).image().len() as int,
+                rows@,i,pending@.push(root)[i].binding().3@,hash,magic,version)
+            &&& final(file).image().len()>=old(file).image().len()+crate::arena_frame::WIDTH+desc.3.len()
+            &&& final(file).image().skip(final(file).image().len()-desc.3.len())==desc.3@
+        },
+{
+    use crate::arena_frame as frame;
+    let ghost prior=pending@;
+    root.retain(&mut pending);
+    let (ack,())=root.publish(&mut writer,|_,_,_| (),|_,_,_| ());
+    let project=PreparedRoot::<u64,crate::RootState>::journal_bytes;
+    let retained=pending.as_slice();
+    let payloads=crate::group_frontier::journals(retained,project);
+    let select=journal_bytes;
+    let input=payloads.as_slice();
+    let rows=frame::append_batch(file,input,select,hash,magic,version,(Vec::new(),Vec::new()))?;
+    proof {
+        let base=old(file).image().len() as u64;
+        let bytes=choose|b:Seq<u8>| file.image()==old(file).image()+b &&
+            #[trigger] frame::packed(input,select,hash,base,magic,version,Seq::empty(),b,rows@);
+        assert forall|j:int| 0<=j<rows.len() implies #[trigger] folded_journal(file.image(),base as int,rows@,j,
+            prior.push(root)[j].binding().3@,hash,magic,version) by {
+            crate::hosted_acknowledged_root::packed_row(input,select,hash,base,magic,version,Seq::empty(),bytes,rows@,j);
+            assert(project.ensures((&retained@[j],),payloads@[j]));
+            if j<prior.len() {assert(pending@.drop_last()[j]==pending@[j]);}
+            let loc=rows@[j];
+            let at=loc.offset as int-base;
+            let end=at+frame::WIDTH+loc.payload_len;
+            let selected=choose|b:&[u8]| #[trigger] select.ensures((&input@[j],),b) && b.len()==loc.payload_len &&
+                hash.ensures((magic,loc.payload_len,b),loc.checksum) &&
+                bytes.subrange(at,end)==frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+b@;
+            assert(frame::hashed(hash,magic,selected@,loc.checksum));
+            assert(file.image().subrange(loc.offset as int,end+base) =~= bytes.subrange(at,end));
+        }
+        reveal_with_fuel(frame::packed,2);
+        let i=rows.len() as int-1;
+        let loc=rows@[i];
+        let start=loc.offset as int-base;
+        assert(project.ensures((&retained@[i],),payloads@[i]));
+        assert(input@[i]@==root.binding().3@);
+        let body=choose|b:&[u8]| #[trigger] select.ensures((&input@[i],),b) &&
+            b.len()==loc.payload_len && hash.ensures((magic,loc.payload_len,b),loc.checksum) &&
+            bytes==bytes.take(start)+frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+b@;
+        assert(frame::hashed(hash,magic,root.binding().3@,loc.checksum));
+        let prefix=bytes.take(start);
+        assert(file.image() =~= old(file).image()+prefix+frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+body@);
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(frame::header_bytes(magic,version,loc.payload_len,loc.checksum).len()==frame::WIDTH);
+        assert(file.image().skip(file.image().len()-root.binding().3.len()) =~= root.binding().3@);
+    };
+    Ok((writer,ack,rows))
+}
+
 /// Publish each accepted root into one owner map and correlate its result with the original receipt.
 /// A persistence or frontier refusal returns every receipt with an error before publishing roots.
 fn group_root_receipts<D,P,F>(batch:Vec<AcceptedRoot>,writer:WriterRoots,persist:P,advance:F,unavailable:u64)

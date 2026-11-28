@@ -149,18 +149,9 @@ where
             }
         }
         for entry in prepared {
-            entry
-                .transaction
-                .prepared
-                .root
-                .write_wal(|owner, expected, replacement, journal| {
-                    inner.pending_wal.push_root(
-                        owner.clone(),
-                        expected,
-                        replacement,
-                        journal.clone(),
-                    );
-                });
+            inner
+                .pending_wal
+                .retain_root(&entry.transaction.prepared.root);
         }
         Ok(())
     }
