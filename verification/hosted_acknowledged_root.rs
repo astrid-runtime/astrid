@@ -50,11 +50,111 @@ spec fn stored(name:Seq<u8>,scheme:root_wire::Scheme,e:Option<RootState>,r:RootS
 use crate::group_frontier::{JournalContainer,JournalFlush};
 enum Failure<E> { Journal(E), Frontier(E) }
 
+/// An arbitrary selected row occupies its own recorded interval in the completed batch.
+proof fn packed_row<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]>(
+    input:&'a [T],select:F,hash:H,base:u64,magic:[u8;8],version:u16,initial:Seq<u8>,encoded:Seq<u8>,
+    rows:Seq<arena_frame::ArenaLocation>,i:int)
+    requires 0<=i<rows.len(), arena_frame::packed(input,select,hash,base,magic,version,initial,encoded,rows),
+    ensures ({
+        let loc=rows[i];
+        let start=loc.offset as int-base;
+        &&& start==if i==0 {initial.len() as int} else {rows[i-1].offset as int-base+52+rows[i-1].payload_len}
+        &&& 0<=start && start+52+loc.payload_len<=encoded.len()
+        &&& exists|b:&[u8]| #[trigger] select.ensures((&input@[i],),b) && b.len()==loc.payload_len &&
+            hash.ensures((magic,loc.payload_len,b),loc.checksum) &&
+            encoded.subrange(start,start+52+loc.payload_len)==arena_frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+b@
+    }),
+    decreases rows.len(),
+{
+    reveal_with_fuel(arena_frame::packed,3);
+    let last=rows.last();
+    let begin=last.offset as int-base;
+    let earlier=encoded.take(begin);
+    let rest=rows.drop_last();
+    let body=choose|b:&[u8]| #[trigger] select.ensures((&input@[rows.len()-1],),b) &&
+        b.len()==last.payload_len && hash.ensures((magic,last.payload_len,b),last.checksum) &&
+        encoded==earlier+arena_frame::header_bytes(magic,version,last.payload_len,last.checksum)+b@;
+    vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+    assert(arena_frame::header_bytes(magic,version,last.payload_len,last.checksum).len()==52);
+    if i==rows.len()-1 {
+        if rest.len()>0 {
+            let prev=rest.last();
+            let at=prev.offset as int-base;
+            let prior=choose|b:&[u8]| #[trigger] select.ensures((&input@[rest.len()-1],),b) &&
+                b.len()==prev.payload_len && hash.ensures((magic,prev.payload_len,b),prev.checksum) &&
+                earlier==earlier.take(at)+arena_frame::header_bytes(magic,version,prev.payload_len,prev.checksum)+b@;
+            assert(arena_frame::header_bytes(magic,version,prev.payload_len,prev.checksum).len()==52);
+            assert(begin==at+52+prior.len());
+        }
+        assert(encoded.subrange(begin,begin+52+last.payload_len) =~= arena_frame::header_bytes(magic,version,last.payload_len,last.checksum)+body@);
+    } else {
+        packed_row(input,select,hash,base,magic,version,initial,earlier,rest,i);
+        let lo=rows[i].offset as int-base;
+        let hi=lo+52+rows[i].payload_len;
+        assert(rest[i]==rows[i]);
+        if i>0 {assert(rest[i-1]==rows[i-1]);}
+        let loc=rows[i];
+        let earlier_body=choose|b:&[u8]| #[trigger] select.ensures((&input@[i],),b) && b.len()==loc.payload_len &&
+            hash.ensures((magic,loc.payload_len,b),loc.checksum) &&
+            earlier.subrange(lo,hi)==arena_frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+b@;
+        assert(encoded.subrange(lo,hi) =~= earlier.subrange(lo,hi));
+        assert(encoded.subrange(lo,hi)==arena_frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+earlier_body@);
+    }
+}
+
+/// Read one selected transition from an arbitrary completed coalesced write.
+fn read_group_transition<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,M:crate::positional_read::Media>(
+    input:&'a [T],select:F,hash:H,base:u64,magic:[u8;8],version:u16,initial:Ghost<Seq<u8>>,encoded:&[u8],
+    rows:&[arena_frame::ArenaLocation],index:usize,media:&M,name:&[u8],scheme:root_wire::Scheme,
+    expected:Option<RootState>,next:RootState,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>)
+    -> (out:(journal::Record,Vec<u8>))
+    requires index<rows.len(),rows.len()==input.len(),name.len()<u64::MAX,
+        arena_frame::packed(input,select,hash,base,magic,version,initial@,encoded@,rows@),
+        crate::storage_fields::at(media.image(),base as int,encoded@),
+        forall|b:&[u8]| #[trigger] select.ensures((&input@[index as int],),b) ==> b@==journal::wire(name@,scheme,expected,next),
+        rows@[index as int].offset as int+52+rows@[index as int].payload_len<=u64::MAX,
+        forall|at:u64,err:M::Error| rows@[index as int].offset<=at<rows@[index as int].offset as int+52+rows@[index as int].payload_len
+            ==> !#[trigger] media.io_error(at,err),
+        forall|m:[u8;8],n:u64,b:&[u8]| #[trigger] hash.requires((m,n,b)),
+        forall|m:[u8;8],n:u64,b:&[u8],sum:[u8;32]| #[trigger] hash.ensures((m,n,b),sum) ==> sum==(digest@)(m,n,b@),
+    ensures out.0.principal@==name@ && out.0.expected==expected && out.0.replacement==next,
+        out.1.len()>=52 && out.1@.skip(52)==journal::wire(name@,scheme,expected,next),
+        crate::storage_fields::at(media.image(),rows@[index as int].offset as int,stored(name@,scheme,expected,next,magic,version,digest@)),
+{
+    let loc=rows[index];
+    let ghost wire=journal::wire(name@,scheme,expected,next);
+    proof {
+        packed_row(input,select,hash,base,magic,version,initial@,encoded@,rows@,index as int);
+        let start=loc.offset as int-base;
+        let body=choose|b:&[u8]| #[trigger] select.ensures((&input@[index as int],),b) && b.len()==loc.payload_len &&
+            hash.ensures((magic,loc.payload_len,b),loc.checksum) &&
+            encoded@.subrange(start,start+52+loc.payload_len)==arena_frame::header_bytes(magic,version,loc.payload_len,loc.checksum)+b@;
+        assert(body@==wire);
+        assert(media.image().subrange(loc.offset as int,loc.offset as int+52+loc.payload_len) =~= encoded@.subrange(start,start+52+loc.payload_len));
+    }
+    assert(52int+loc.payload_len<=encoded.len());
+    assert(52int+loc.payload_len<=usize::MAX);
+    let length=usize::try_from(loc.payload_len).unwrap();
+    let mut bytes=vec![0u8;52+length];
+    match crate::positional_read::exact(media,loc.offset,&mut bytes) {Ok(())=>{},Err(_)=>{assert(false);unreached()}}
+    let mut header=[0u8;52];
+    header.copy_from_slice(&bytes[..52]);
+    let body=&bytes[52..];
+    assert(header@ =~= arena_frame::header_bytes(magic,version,loc.payload_len,loc.checksum));
+    assert(body@ =~= wire);
+    let valid=crate::hosted_arena_append::physical_frame(&header,magic,version,body,hash,digest);
+    assert(valid);
+    let record=parse_written(body,name,scheme,expected,next);
+    (record,bytes)
+}
+
+fn select_body<'a>(body:&'a &'a [u8]) -> (out:&'a [u8]) ensures out@==(*body)@ { *body }
+
 /// The prior recovered history is independent of the live writer. A stale history must reject
 /// the otherwise intact frame and leave every owner unchanged.
 fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positional_read::Media,Open:FnOnce(&J)->M,V:FnOnce(&J::Container)->M,A:FnOnce()->Result<(),J::Error>,P:Ord+Copy,K:FnOnce(Owner)->P,N:Fn(&P)->Owner+Copy,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(writer:&mut BTreeMap<P,RootState>,
     recovered:&mut BTreeMap<P,(RootState,u64)>,owner:Owner,key:P,key_of:K,name_of:N,expected:Option<RootState>,next:RootState,
-    mut prefix:Vec<u8>,base:u64,magic:[u8;8],version:u16,scheme:root_wire::Scheme,hash:H,sink:&mut J,reopen:Open,reopen_volume:V,advance:A,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>)
+    prefix:Vec<u8>,base:u64,magic:[u8;8],version:u16,scheme:root_wire::Scheme,hash:H,sink:&mut J,reopen:Open,reopen_volume:V,advance:A,target:Ghost<spec_fn(M)->(int,Seq<u8>)>,digest:Ghost<spec_fn([u8;8],u64,Seq<u8>)->[u8;32]>)
     -> (out:Result<(RootState,bool,M),Failure<J::Error>>)
     requires btree_map_inv(old(writer)),btree_map_inv(old(recovered)),obeys_cmp::<P>(),
         obeys_cmp_concrete_eq::<P>(),obeys_clone_eq::<P>(),
@@ -114,9 +214,30 @@ fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positio
         if let Some(prior)=expected {assert(journal::root(prior,scheme).len()==48);}
         assert(name.len()<=33 && payload.len()<=138);
     }
-    let frame=arena_frame::extend_batch(&mut prefix,base,magic,version,&payload,hash).unwrap();
+    let batch=[payload.as_slice()];
+    let pick=select_body;
+    let (prefix,locations)=match arena_frame::encode_batch(&batch,pick,hash,base,magic,version,(prefix,Vec::new())) {
+        Some(out)=>out,None=>{
+            proof {
+                let (prior,rows,body)=choose|prior:Seq<u8>,rows:Seq<arena_frame::ArenaLocation>,body:&[u8]|
+                    #[trigger] arena_frame::refused_at(&batch,pick,hash,base,magic,version,original,prior,rows,body);
+                assert(rows.len()==0 && prior==original && body@==payload@);
+                assert(false);
+            }
+            unreached()
+        }
+    };
+    let frame=locations[0];
+    proof {
+        assert(locations.len()==1);
+        packed_row(&batch,pick,hash,base,magic,version,original,prefix@,locations@,0);
+        let begin=frame.offset as int-base;
+        assert(locations@.drop_last().len()==0);
+        assert(arena_frame::packed(&batch,pick,hash,base,magic,version,original,prefix@.take(begin),locations@.drop_last()));
+        assert(prefix@.take(begin)==original);
+        assert(frame.offset==base as int+start);
+    }
     assert(arena_frame::header_bytes(magic,version,frame.payload_len,frame.checksum).len()==52);
-    let size=52+payload.len();
     let ghost bytes=stored(owner.bytes(),scheme,expected,next,magic,version,digest@);
     assert(prefix@.skip(start as int) =~= bytes);
     assert(prefix@ =~= original+bytes);
@@ -130,25 +251,13 @@ fn legacy_replay_published<J:crate::group_frontier::JournalSink,M:crate::positio
     let (ack,_)=prepared.publish(writer,|_,_,_|(),|_,_,_|());
     let media=match completion {None=>reopen(sink),Some(c)=>reopen_volume(&c)};
     assert(media.image()==prior+prefix@);
-    assert(media.image().subrange(frame.offset as int,frame.offset as int+size) =~= bytes);
-    let mut observed=vec![0u8;size];
-    match crate::positional_read::exact(&media,frame.offset,&mut observed) {
-        Ok(())=>{},Err(_)=>{assert(false);unreached()}
-    }
-    assert(observed@==bytes);
-    let mut header=[0u8;52];
-    header.copy_from_slice(&observed[..52]);
-    let body=&observed[52..];
-    assert(header@ =~= arena_frame::header_bytes(magic,version,frame.payload_len,frame.checksum));
-    assert(body@ =~= payload@);
-    let valid=crate::hosted_arena_append::physical_frame(&header,magic,version,body,hash,digest);
-    assert(valid);
-    let parsed=parse_written(body,&name,scheme,expected,ack);
+    assert(media.image().subrange(base as int,base as int+prefix.len()) =~= prefix@);
+    let (parsed,observed)=read_group_transition(&batch,pick,hash,base,magic,version,Ghost(original),&prefix,&locations,0,&media,&name,scheme,expected,ack,digest);
     let decode=|n:&[u8]| -> (r:Option<P>)
         requires n@==name@, ensures r==Some(key),
     {Some(key_of(owner_codec::decode(n).unwrap()))};
     let recode=|p:&P| -> (r:Vec<u8>) requires *p==key, ensures r@==owner.bytes(), {name_of(p).encode()};
-    let result=parsed.replay(recovered,scheme,frame.offset,body,decode,recode);
+    let result=parsed.replay(recovered,scheme,frame.offset,&observed[52..],decode,recode);
     Ok((ack,result.is_ok(),media))
 }
 }

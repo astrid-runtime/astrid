@@ -174,6 +174,66 @@ pub(super) fn extend_batch<H:FnOnce([u8;8],u64,&[u8])->[u8;32]>(
     Some(ArenaLocation {offset,payload_len,checksum})
 }
 
+/// The locations and bytes describe the first rows of the caller's batch in order.
+pub(super) open spec fn packed<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]>(
+    input:&'a [T],select:F,hash:H,base:u64,magic:[u8;8],version:u16,initial:Seq<u8>,encoded:Seq<u8>,rows:Seq<ArenaLocation>) -> bool
+    decreases rows.len(),
+{
+    if rows.len()==0 {encoded==initial} else {
+        let i=rows.len()-1;
+        let loc=rows[i];
+        let start=loc.offset as int-base;
+        &&& i<input.len() && 0<=start<=encoded.len()
+        &&& packed(input,select,hash,base,magic,version,initial,encoded.take(start),rows.drop_last())
+        &&& exists|body:&[u8]| #[trigger] select.ensures((&input@[i],),body) &&
+            body.len()==loc.payload_len && hash.ensures((magic,loc.payload_len,body),loc.checksum) &&
+            encoded==encoded.take(start)+header_bytes(magic,version,loc.payload_len,loc.checksum)+body@
+    }
+}
+
+pub(super) open spec fn refused_at<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]>(
+    input:&'a [T],select:F,hash:H,base:u64,magic:[u8;8],version:u16,initial:Seq<u8>,prior:Seq<u8>,r:Seq<ArenaLocation>,b:&[u8]) -> bool {
+    &&& r.len()<input.len()
+    &&& packed(input,select,hash,base,magic,version,initial,prior,r)
+    &&& select.ensures((&input@[r.len() as int],),b)
+    &&& base as int+prior.len()>u64::MAX || b.len()>u64::MAX || prior.len()+WIDTH+b.len()>isize::MAX
+}
+
+#[verifier::loop_isolation(false)]
+pub(super) fn encode_batch<'a,T:'a,F:Fn(&'a T)->&'a [u8],H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy>(
+    input:&'a [T],select:F,hash:H,base:u64,magic:[u8;8],version:u16,buffers:(Vec<u8>,Vec<ArenaLocation>))
+    -> (out:Option<(Vec<u8>,Vec<ArenaLocation>)>)
+    requires buffers.1.len()==0,forall|i:int| 0<=i<input.len() ==> #[trigger] select.requires((&input@[i],)),
+        forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+    ensures out matches Some((v,r)) ==> r.len()==input.len() && packed(input,select,hash,base,magic,version,buffers.0@,v@,r@),
+        out.is_none() ==> exists|prior:Seq<u8>,r:Seq<ArenaLocation>,b:&[u8]|
+            #[trigger] refused_at(input,select,hash,base,magic,version,buffers.0@,prior,r,b),
+{
+    let ghost initial=buffers.0@;
+    let (mut encoded,mut rows)=buffers;
+    let mut i=0usize;
+    while i<input.len()
+        invariant i<=input.len(),rows.len()==i,packed(input,select,hash,base,magic,version,initial,encoded@,rows@),
+            forall|j:int| 0<=j<input.len() ==> #[trigger] select.requires((&input@[j],)),
+            forall|n:u64,b:&[u8]| #[trigger] hash.requires((magic,n,b)),
+        decreases input.len()-i,
+    {
+        let body=select(&input[i]);
+        let ghost prior=encoded@;
+        let Some(loc)=extend_batch(&mut encoded,base,magic,version,body,hash) else {
+            assert(refused_at(input,select,hash,base,magic,version,initial,prior,rows@,body));
+            return None;
+        };
+        let ghost previous=rows@;
+        rows.push(loc);
+        assert(rows@.drop_last() =~= previous);
+        assert(encoded@.take(prior.len() as int) =~= prior);
+        assert(packed(input,select,hash,base,magic,version,initial,encoded@,rows@));
+        i=i.saturating_add(1);
+    }
+    Some((encoded,rows))
+}
+
 impl PreparedFrame {
     pub(super) closed spec fn body(self) -> Seq<u8> { self.payload@ }
     pub(super) closed spec fn sum(self) -> [u8;32] { self.checksum }

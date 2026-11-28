@@ -22,6 +22,18 @@ def consumer_defects():
             Path("verification/hosted_acknowledged_root.rs"),
         )
 
+    arena = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
+    for label, clause, weaker in [
+        ("complete row count", "r.len()==input.len() && packed(input", "r.len()<=input.len() && packed(input"),
+        ("successful packing", "r.len()==input.len() && packed(input,select,hash,base,magic,version,buffers.0@,v@,r@)", "r.len()==input.len()"),
+        ("overflow cause", "&&& base as int+prior.len()>u64::MAX || b.len()>u64::MAX || prior.len()+WIDTH+b.len()>isize::MAX", "&&& true"),
+    ]:
+        yield (
+            f"group frame readback loses {label}", arena,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_acknowledged_root.rs"),
+        )
+
     transition = Path("crates/astrid-storage/src/engine/durable/journal_transition.rs")
     for label, clause, weaker in [
         ("owner bytes", "r.principal@==bytes@.subrange(at,at+length)", "true"),

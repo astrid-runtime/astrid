@@ -419,19 +419,16 @@ pub(super) fn prepare_frame_batch<T: AsRef<[u8]>, F: DurableIo>(
     let base = file
         .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable batch append", source))?;
-    for payload in payloads {
-        let location = super::arena_frame::extend_batch(
-            &mut encoded,
-            base,
-            magic,
-            FRAME_VERSION,
-            payload.as_ref(),
-            frame_checksum,
-        )
-        .ok_or(DurableError::EncodingOverflow)?;
-        locations.push(location);
-    }
-    Ok((encoded, locations))
+    super::arena_frame::encode_batch(
+        payloads,
+        AsRef::as_ref,
+        frame_checksum,
+        base,
+        magic,
+        FRAME_VERSION,
+        (encoded, locations),
+    )
+    .ok_or(DurableError::EncodingOverflow)
 }
 
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
