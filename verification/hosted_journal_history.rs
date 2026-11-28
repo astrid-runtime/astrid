@@ -485,6 +485,64 @@ spec fn installed(s:WaveState,id:crate::ObjectId,r:crate::ObjectRecord,t:WaveSta
     &&& t.1@ == s.1@.union(crate::closure_walk::children(r.contents().3).difference(s.0@.dom()))
 }
 
+spec fn decoded_at<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>>(
+    row:ReadRow,state:WaveState,decode:D) -> bool {
+    state.0@.contains_key(row.0) && exists|p:&'a [u8]| #[trigger] decode.ensures((row.0,row.1),Ok((state.0@[row.0],p)))
+}
+
+/// A delivered record remains at its requested ID after later rows in the
+/// same span. The decoder relation also retains the original location.
+proof fn delivery_record<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>,
+    A:Fn(WaveState,crate::ObjectId,crate::ArenaLocation,crate::ObjectRecord,&'a [u8])->Result<WaveState,()>>(
+    rows:Seq<ReadRow>,states:Seq<WaveState>,decode:D,accept:A,j:int,end:int)
+    requires 0 <= j < end <= rows.len(), crate::indexed_frame::delivered(rows,states,decode,accept),
+        rows.map(|_,r:ReadRow|r.0).no_duplicates(),
+        forall|s:WaveState,id,loc,r,p,t| #[trigger] accept.ensures((s,id,loc,r,p),Ok(t)) ==> installed(s,id,r,t),
+    ensures decoded_at(rows[j],states[end],decode),
+    decreases end,
+{
+    let i = end-1;
+    let (id,loc) = rows[i];
+    assert(crate::indexed_frame::sent(rows[i],states[i],states[end],decode,accept));
+    let (record,payload) = choose|r:crate::ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((id,loc),Ok((r,p))) &&
+        accept.ensures((states[i],id,loc,r,p),Ok(states[end]));
+    assert(installed(states[i],id,record,states[end]));
+    if j < i {
+        delivery_record(rows,states,decode,accept,j,i);
+        let ids = rows.map(|_,r:ReadRow|r.0);
+        assert(ids[j]!=ids[i]);
+        assert(id!=rows[j].0);
+        let previous = choose|p:&'a [u8]| #[trigger] decode.ensures((rows[j].0,rows[j].1),Ok((states[i].0@[rows[j].0],p)));
+        assert(states[end].0@[rows[j].0] == states[i].0@[rows[j].0]);
+        assert(decode.ensures((rows[j].0,rows[j].1),Ok((states[end].0@[rows[j].0],previous))));
+    } else {
+        assert(states[end].0@[id]==record && rows[j]==(id,loc));
+        assert(decode.ensures((rows[j].0,rows[j].1),Ok((states[end].0@[rows[j].0],payload))));
+    }
+}
+
+proof fn delivery_preserves<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>,
+    A:Fn(WaveState,crate::ObjectId,crate::ArenaLocation,crate::ObjectRecord,&'a [u8])->Result<WaveState,()>>(
+    rows:Seq<ReadRow>,states:Seq<WaveState>,decode:D,accept:A,end:int)
+    requires 0 <= end <= rows.len(),crate::indexed_frame::delivered(rows,states,decode,accept),
+        states.first().0@.dom().disjoint(crate::journal_preload::selected(rows)),
+        forall|s:WaveState,id,loc,r,p,t| #[trigger] accept.ensures((s,id,loc,r,p),Ok(t)) ==> installed(s,id,r,t),
+    ensures states.first().0@.submap_of(states[end].0@),
+    decreases end,
+{
+    if end == 0 { return; }
+    let i = end-1;
+    delivery_preserves(rows,states,decode,accept,i);
+    let (id,loc) = rows[i];
+    let ids = rows.map(|_,row:ReadRow|row.0);
+    ids.to_set_ensures();
+    assert(ids[i]==id && ids.contains(id));
+    assert(crate::indexed_frame::sent(rows[i],states[i],states[end],decode,accept));
+    let (r,p) = choose|r:crate::ObjectRecord,p:&'a [u8]| #[trigger] decode.ensures((id,loc),Ok((r,p))) &&
+        accept.ensures((states[i],id,loc,r,p),Ok(states[end]));
+    assert(installed(states[i],id,r,states[end]));
+}
+
 /// Interpret the successful prefix exposed by the production delivery loop.
 proof fn delivery_wave<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>,
     A:Fn(WaveState,crate::ObjectId,crate::ArenaLocation,crate::ObjectRecord,&'a [u8])->Result<WaveState,()>>(
@@ -540,6 +598,11 @@ proof fn delivery_wave<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a
 
 }
 
+spec fn decoded_rows<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>>(
+    rows:Seq<ReadRow>,state:WaveState,decode:D) -> bool {
+    forall|j:int| 0 <= j < rows.len() ==> decoded_at(#[trigger] rows[j],state,decode)
+}
+
 fn read_wave<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>>(
     start:WaveState,rows:&[ReadRow],decode:D,
     Ghost(initial):Ghost<Map<crate::ObjectId,crate::ObjectRecord>>,Ghost(seen):Ghost<Set<crate::ObjectId>>) -> (out:Result<WaveState,()>)
@@ -549,6 +612,7 @@ fn read_wave<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>>(
         forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
     ensures out matches Ok((t,n)) ==> btree_map_inv(&t) && vstd::std_specs::btree::btree_set_inv(&n) &&
         crate::journal_preload::wave(initial,seen.union(crate::journal_preload::selected(rows@)),t@,n@),
+        out matches Ok(v) ==> decoded_rows(rows@,v,decode) && start.0@.submap_of(v.0@),
 {
     let accept = |s:WaveState,id:crate::ObjectId,_loc:crate::ArenaLocation,r:crate::ObjectRecord,_p:&'a [u8]| -> (out:Result<WaveState,()>)
         requires btree_map_inv(&s.0),vstd::std_specs::btree::btree_set_inv(&s.1),
@@ -579,6 +643,9 @@ fn read_wave<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>>(
         let states = choose|states:Seq<WaveState>| #[trigger] crate::indexed_frame::delivered(rows@,states,decode,accept) &&
             states.first()==start && states.last()==*t;
         delivery_wave(rows@,states,decode,accept,rows.len() as int,initial,seen);
+        assert forall|j:int| 0 <= j < rows.len() implies decoded_at(#[trigger] rows@[j],*t,decode) by { delivery_record(rows@,states,decode,accept,j,rows.len() as int); }
+        assert(decoded_rows(rows@,*t,decode));
+        delivery_preserves(rows@,states,decode,accept,rows.len() as int);
         assert(rows@.take(rows.len() as int) =~= rows@);
     }}
     out
@@ -656,17 +723,91 @@ proof fn dispatched_wave<V:Fn(WaveState,&[ReadRow],u64,u64)->Result<WaveState,()
     assert(prior.0@.dom().difference(start.0@.dom()) =~= selected(rows.take(lo)));
 }
 
-fn preload_closure<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>+Copy>(
-    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,roots:PendingIds,decode:D,target:u64,limit:u64)
+spec fn media_record(image:Seq<u8>,row:ReadRow,scheme:root_wire::Scheme,r:crate::ObjectRecord) -> bool {
+    let at = row.1.offset as int + 52;
+    let body = image.subrange(at,at+row.1.payload_len);
+    &&& at+row.1.payload_len <= image.len()
+    &&& crate::verified_record::record_at(body,40,scheme,r)
+    &&& row.0.digest()==body.subrange(8,40)
+}
+
+/// Later spans preserve earlier installations, so the media relation established
+/// in the selected span still holds after the last positional read.
+proof fn dispatched_record<V:Fn(WaveState,&[ReadRow],u64,u64)->Result<WaveState,()>>(
+    rows:Seq<ReadRow>,j:int,end:int,start:WaveState,state:WaveState,limit:u64,visit:V,image:Seq<u8>,scheme:root_wire::Scheme)
+    requires 0 <= j < end <= rows.len(),crate::indexed_frame::dispatched(rows,end,start,state,limit,visit),
+        forall|s:WaveState,p:&[ReadRow],base:u64,n:u64,t:WaveState| #[trigger] visit.ensures((s,p,base,n),Ok(t)) ==>
+            s.0@.submap_of(t.0@) && forall|i:int| 0 <= i < p.len() ==> {
+                let row = #[trigger] p@[i];
+                t.0@.contains_key(row.0) && media_record(image,row,scheme,t.0@[row.0])
+            },
+    ensures state.0@.contains_key(rows[j].0) && media_record(image,rows[j],scheme,state.0@[rows[j].0]),
+    decreases end,
+{
+    use crate::indexed_frame::{batch,frame_end,dispatched};
+    let (lo,prior,part,size) = choose|lo:int,prior:WaveState,part:&[ReadRow],size:u64|
+        batch(rows,lo,end,limit) && part@ == rows.subrange(lo,end) &&
+        size as int == frame_end(rows[end-1].1)-rows[lo].1.offset &&
+        #[trigger] visit.ensures((prior,part,rows[lo].1.offset,size),Ok(state)) &&
+        dispatched(rows,lo,start,prior,limit,visit);
+    if j < lo {
+        dispatched_record(rows,j,lo,start,prior,limit,visit,image,scheme);
+    } else {
+        assert(part@[j-lo]==rows[j]);
+    }
+}
+
+/// Interpret the buffer while its borrow is live. Only owned records escape.
+fn install_buffer<'a,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+    s:WaveState,rows:&[ReadRow],span:&'a [u8],base:u64,format:crate::indexed_frame::Format,
+    hash:H,identify:I,origin:Ghost<Map<crate::ObjectId,crate::ObjectRecord>>,image:Ghost<Seq<u8>>)
+    -> (out:Result<WaveState,()>)
+    requires span_state(origin@,s.0@.dom().difference(origin@.dom()),s),
+        s.0@.dom().disjoint(crate::journal_preload::selected(rows@)),rows@.map(|_,r:ReadRow|r.0).no_duplicates(),
+        span.len()>0 ==> base as int + span.len() <= image@.len() && span@ == image@.subrange(base as int,base as int+span.len()),
+        obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures out matches Ok(v) ==> span_state(origin@,s.0@.dom().difference(origin@.dom()).union(crate::journal_preload::selected(rows@)),v) && s.0@.submap_of(v.0@) &&
+        forall|j:int| 0 <= j < rows.len() ==> { let row = #[trigger] rows@[j]; v.0@.contains_key(row.0) && media_record(image@,row,format.scheme,v.0@[row.0]) },
+{
+    let decode = |id:crate::ObjectId,loc:crate::ArenaLocation| -> (out:Decoded<'a>)
+        ensures out matches Ok((r,_)) ==> media_record(image@,(id,loc),format.scheme,r),
+    {
+        match crate::indexed_frame::read(span,base,loc,id,format,hash,identify) {
+            Ok((r,p)) => {
+                let ghost at = loc.offset as int + 52;
+                assert(crate::indexed_frame::fits(span@,base,loc));
+                assert(p@ =~= image@.subrange(at,at+loc.payload_len));
+                Ok((r,p))
+            },
+            Err(_) => Err(()),
+        }
+    };
+    let out = read_wave(s,rows,decode,origin,Ghost(s.0@.dom().difference(origin@.dom())));
+    if let Ok(v) = &out { proof {
+        assert forall|j:int| 0 <= j < rows.len() implies media_record(image@,#[trigger] rows@[j],format.scheme,v.0@[rows@[j].0]) by {
+            let (id,loc) = rows@[j];
+            let p = choose|p:&'a [u8]| #[trigger] decode.ensures((id,loc),Ok((v.0@[id],p)));
+        }
+    }}
+    out
+}
+
+fn preload_closure<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,I:Fn(&crate::ObjectRecord)->[u8;32]+Copy>(
+    index:&BTreeMap<crate::ObjectId,crate::ArenaLocation>,roots:PendingIds,media:&M,target:u64,format:crate::indexed_frame::Format,hash:H,identify:I)
     requires btree_map_inv(index),vstd::std_specs::btree::btree_set_inv(&roots),
         obeys_cmp::<crate::ObjectId>(),obeys_cmp_concrete_eq::<crate::ObjectId>(),
-        forall|id:crate::ObjectId,loc:crate::ArenaLocation| #[trigger] decode.requires((id,loc)),
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
 {
     use crate::journal_preload::{preload,closed_on,selected,wave,outgoing,Error};
+    let limit = format.limit;
     let read = |t:PreloadTable,r:&[ReadRow]| -> (out:Result<(PreloadTable,PendingIds),()>)
         requires btree_map_inv(&t), t@.dom().disjoint(selected(r@)),r@.map(|_,row:ReadRow|row.0).no_duplicates(),
         ensures out matches Ok((u,n)) ==> btree_map_inv(&u) && vstd::std_specs::btree::btree_set_inv(&n) &&
-            wave(t@,selected(r@),u@,n@),
+            wave(t@,selected(r@),u@,n@) &&
+            forall|j:int| 0 <= j < r.len() ==> media_record(media.image(),#[trigger] r@[j],format.scheme,u@[r@[j].0]),
     {
         let ordered = crate::indexed_frame::ordered(r);
         proof { permute_frontier(r@,ordered@); }
@@ -678,12 +819,27 @@ fn preload_closure<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>+Co
         let origin = Ghost(t@);
         let start = (t,next);
         assert(span_state(origin@,Set::empty(),start));
-        let visit = |s:WaveState,p:&[ReadRow],_base:u64,_len:u64| -> (out:Result<WaveState,()>)
+        let visit = |s:WaveState,p:&[ReadRow],base:u64,len:u64| -> (out:Result<WaveState,()>)
             requires span_state(origin@,s.0@.dom().difference(origin@.dom()),s),
                 s.0@.dom().disjoint(selected(p@)),p@.map(|_,r:ReadRow|r.0).no_duplicates(),
-            ensures out matches Ok(v) ==> span_state(origin@,s.0@.dom().difference(origin@.dom()).union(selected(p@)),v),
+            ensures out matches Ok(v) ==> span_state(origin@,s.0@.dom().difference(origin@.dom()).union(selected(p@)),v) && s.0@.submap_of(v.0@) &&
+                forall|j:int| 0 <= j < p.len() ==> { let row = #[trigger] p@[j]; v.0@.contains_key(row.0) && media_record(media.image(),row,format.scheme,v.0@[row.0]) },
         {
-            read_wave(s,p,decode,origin,Ghost(s.0@.dom().difference(origin@.dom())))
+            let consume = |span:&[u8],at:u64| -> (out:Result<WaveState,()>)
+                requires at == base,crate::positional_read::interval(media,base,len,span),
+                ensures out matches Ok(v) ==> span_state(origin@,s.0@.dom().difference(origin@.dom()).union(selected(p@)),v) && s.0@.submap_of(v.0@) &&
+                    forall|j:int| 0 <= j < p.len() ==> { let row = #[trigger] p@[j]; v.0@.contains_key(row.0) && media_record(media.image(),row,format.scheme,v.0@[row.0]) },
+            { install_buffer(s,p,span,at,format,hash,identify,origin,Ghost(media.image())) };
+            match crate::positional_read::with_span(media,base,len,consume) {
+                Ok(v) => {
+                    proof {
+                        let bytes = choose|bytes:&[u8]| crate::positional_read::interval(media,base,len,bytes) &&
+                            #[trigger] consume.ensures((bytes,base),Ok(v));
+                    }
+                    Ok(v)
+                },
+                Err(_) => Err(()),
+            }
         };
         assert forall|lo:int,hi:int,s:WaveState,p:&[ReadRow],n:u64| #[trigger] crate::indexed_frame::batch(ordered@,lo,hi,limit) &&
             #[trigger] crate::indexed_frame::dispatched(ordered@,lo,start,s,limit,visit) && p@ == ordered@.subrange(lo,hi) &&
@@ -697,6 +853,18 @@ fn preload_closure<'a,D:Fn(crate::ObjectId,crate::ArenaLocation)->Decoded<'a>+Co
             Ok(v) => {
                 proof { dispatched_wave(ordered@,ordered.len() as int,start,v,limit,visit); }
                 assert(ordered@.take(ordered.len() as int) =~= ordered@);
+                proof {
+                    r@.to_multiset_ensures();
+                    ordered@.to_multiset_ensures();
+                    assert forall|j:int| 0 <= j < r.len() implies media_record(media.image(),#[trigger] r@[j],format.scheme,v.0@[r@[j].0]) by {
+                        let row = r@[j];
+                        assert(r@.contains(row));
+                        assert(ordered@.to_multiset().count(row)>0);
+                        assert(ordered@.contains(row));
+                        let i = choose|i:int| 0 <= i < ordered.len() && ordered@[i]==row;
+                        dispatched_record(ordered@,i,ordered.len() as int,start,v,limit,visit,media.image(),format.scheme);
+                    }
+                }
                 Ok(v)
             },
             Err(_) => Err(()),

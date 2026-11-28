@@ -116,6 +116,15 @@ def consumer_defects():
             lambda s, a=clause, b=weaker: replace_once(s, a, b),
             Path("verification/hosted_arena_append.rs"),
         )
+    for label, clause, weaker in [
+        ("requested digest", "id.digest()==body.subrange(8,40) && record::record_at(body,40,scheme,r)", "record::record_at(body,40,scheme,r)"),
+        ("installed body", "id.digest()==body.subrange(8,40) && record::record_at(body,40,scheme,r)", "id.digest()==body.subrange(8,40)"),
+    ]:
+        yield (
+            f"indexed media installation loses {label}", reader,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_journal_history.rs"),
+        )
     preload = Path("crates/astrid-storage/src/engine/durable/journal_preload.rs")
     for label, clause, weaker in [
         ("installed record", "final(loaded)@ == old(loaded)@.insert(id,record)", "final(loaded)@.dom() == old(loaded)@.dom().insert(id)"),
