@@ -362,9 +362,9 @@ def consumer_defects():
         )
 
     for label, source, clause, weakness in [
-        ("protected boundary", integrated, "repair(media,at,end,protected,e.damage())", "repair(media,at,end,0,e.damage())"),
-        ("actual failed cursor", integrated, "repair(media,at,end,protected,e.damage())", "repair(media,protected,end,protected,e.damage())"),
-        ("classified tail", integrated, "protected,e.damage())", "protected,crate::frame_repair::Damage::Incomplete)"),
+        ("protected boundary", integrated, "repair(media,at,end,protected,e.damage(),ROOT_MAGIC,limit)", "repair(media,at,end,0,e.damage(),ROOT_MAGIC,limit)"),
+        ("actual failed cursor", integrated, "repair(media,at,end,protected,e.damage(),ROOT_MAGIC,limit)", "repair(media,protected,end,protected,e.damage(),ROOT_MAGIC,limit)"),
+        ("classified tail", integrated, "protected,e.damage(),ROOT_MAGIC,limit)", "protected,crate::frame_repair::Damage::Incomplete,ROOT_MAGIC,limit)"),
         ("repaired history", integrated, "Live::Repaired(at,e,table)", "Live::Repaired(at,e,BTreeMap::new())"),
         ("refused suffix", integrated, "Ok(Outcome::Reject)=>Live::Frame(at,FrameError::Tail(e))", "Ok(Outcome::Reject)=>Live::Repaired(at,e,table)"),
         ("container persistence", integrated, "match region.sync_container()", "match Ok::<(),V::Error>(())"),
@@ -394,4 +394,23 @@ def consumer_defects():
         yield (
             f"root refusal loses {label}", source,
             lambda s, a=clause, b=weakness: replace_once(s, a, b), consumer,
+        )
+
+    probe = walker.with_name("frame_probe.rs")
+    for label, source, clause, weakness in [
+        ("search start", repair, "let start=offset.saturating_add(1);", "let start=offset.saturating_add(2);"),
+        ("candidate address", probe, "candidate(media,at,end,magic,limit)?", "candidate(media,offset,end,magic,limit)?"),
+        ("window overlap", probe, "offset=offset.saturating_add(i as u64);", "offset=offset.saturating_add(count as u64);"),
+        ("read refusal", probe, "if let Err(e)=media.read_window(offset,window) {return Err(Error::Io(e));}",
+         "if let Err(_e)=media.read_window(offset,window) {return Ok(false);}"),
+        ("oversize protection", probe, "if n>limit {return Ok(true);}", "if n>limit {return Ok(false);}"),
+        ("hash domain", probe, "M::prepare_hash(magic,length)", "M::prepare_hash([0u8;8],length)"),
+        ("hash chunk", probe, "hash.absorb(part);", "hash.absorb(&[]);"),
+        ("payload cursor", probe, "left=left.saturating_sub(count as u64);", "left=0;"),
+        ("candidate checksum", probe, "let matches=sum.as_slice()==decoded.checksum.as_slice();", "let matches=true;"),
+        ("later-frame truncation guard", repair, "return Ok(Outcome::Reject)\n", "return Ok(Outcome::Repaired)\n"),
+    ]:
+        yield (
+            f"physical repair probe loses {label}", source,
+            lambda s, a=clause, b=weakness: replace_once(s, a, b), source,
         )

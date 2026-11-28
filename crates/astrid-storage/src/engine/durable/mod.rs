@@ -840,6 +840,7 @@ mod batch_slots;
 #[path = "index/admission.rs"]
 mod checkpoint_admission;
 mod direct_placement;
+mod frame_probe;
 mod frame_repair;
 mod frame_scan;
 mod read_admission;

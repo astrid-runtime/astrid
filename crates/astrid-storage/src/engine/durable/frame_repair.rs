@@ -208,20 +208,13 @@ impl TailError {
 #[cfg(verus_keep_ghost)]
 pub(super) enum Event { Probe(u64), Resize(u64), Flush }
 
-pub(super) trait Medium {
-    type Error;
-    spec fn target(&self) -> (int,Seq<u8>);
-    /// Set only for backings whose file flush synchronizes the physical medium.
-    spec fn syncs_file(&self) -> bool;
-    spec fn calls(&self) -> Seq<Event>;
-    spec fn bytes(&self) -> Seq<u8>;
-    spec fn durable(&self) -> Seq<u8>;
-    spec fn probe_result(&self, offset:u64, result:Result<bool,Self::Error>) -> bool;
-
-    fn later_frame(&mut self,offset:u64) -> (out:Result<bool,Self::Error>)
-        ensures final(self).syncs_file()==old(self).syncs_file(),final(self).target()==old(self).target(),final(self).calls() == old(self).calls().push(Event::Probe(offset)),
-            final(self).bytes() == old(self).bytes(), final(self).durable() == old(self).durable(),
-            old(self).probe_result(offset,out);
+pub(super) trait Medium: super::frame_probe::Media {
+    /// Prepare a single search buffer before touching the physical suffix.
+    fn begin_probe(&mut self,offset:u64) -> (out:Result<Vec<u8>,Self::Error>)
+        ensures final(self).syncs_file()==old(self).syncs_file(),final(self).target()==old(self).target(),
+            final(self).calls()==old(self).calls().push(Event::Probe(offset)),
+            final(self).bytes()==old(self).bytes(),final(self).durable()==old(self).durable(),
+            out matches Ok(buf) ==> 8<=buf.len()<=u64::MAX;
 
     fn resize(&mut self,offset:u64) -> (out:Result<(),Self::Error>)
         ensures final(self).syncs_file()==old(self).syncs_file(),final(self).target()==old(self).target(),final(self).calls() == old(self).calls().push(Event::Resize(offset)),
@@ -234,23 +227,29 @@ pub(super) trait Medium {
 }
 
 pub(super) enum Outcome { Reject, Repaired }
-pub(super) enum Error<E> { Probe(E), Resize(E), Flush(E) }
+pub(super) enum ProbeError<E> { Prepare(E), Search(super::frame_probe::Error<E>) }
+pub(super) enum Error<E> { Probe(ProbeError<E>), Resize(E), Flush(E) }
 
-pub(super) fn repair<M:Medium>(media:&mut M,offset:u64,end:u64,protected:u64,damage:Damage)
+pub(super) open spec fn has_later<M:Medium>(image:Seq<u8>,at:u64,end:u64,magic:[u8;8],limit:u64) -> bool {
+    exists|next:u64| at<next && #[trigger] super::frame_probe::protects::<M>(image,magic,end,limit,next)
+}
+
+pub(super) fn repair<M:Medium>(media:&mut M,offset:u64,end:u64,protected:u64,damage:Damage,magic:[u8;8],limit:u64)
     -> (out:Result<Outcome,Error<M::Error>>)
+    requires offset>=protected && offset<end && (damage matches Damage::Suspect {known_interior:false}) ==> end<=old(media).bytes().len(),
     ensures final(media).syncs_file()==old(media).syncs_file(),final(media).target()==old(media).target(), ({
         let before = old(media).calls();
         let blocked = offset < protected || offset >= end || (damage matches Damage::Suspect {known_interior:true});
         let probe = !blocked && (damage matches Damage::Suspect {known_interior:false});
         let prefix = if probe {before.push(Event::Probe(offset))} else {before};
         &&& match out {
-            Ok(Outcome::Reject) => (blocked || (probe && old(media).probe_result(offset,Ok(true)))) &&
+            Ok(Outcome::Reject) => (blocked || (probe && has_later::<M>(old(media).bytes(),offset,end,magic,limit))) &&
                 final(media).calls() == prefix && final(media).bytes() == old(media).bytes() &&
                 final(media).durable() == old(media).durable(),
-            Err(Error::Probe(e)) => probe && old(media).probe_result(offset,Err(e)) &&
+            Err(Error::Probe(_)) => probe &&
                 final(media).calls() == prefix && final(media).bytes() == old(media).bytes() &&
                 final(media).durable() == old(media).durable(),
-            _ => !blocked && (probe ==> old(media).probe_result(offset,Ok(false))) &&
+            _ => !blocked && (probe ==> !has_later::<M>(old(media).bytes(),offset,end,magic,limit)) &&
                 match out {
                     Err(Error::Resize(_)) => final(media).calls() == prefix.push(Event::Resize(offset)),
                     _ => final(media).calls() == prefix.push(Event::Resize(offset)).push(Event::Flush),
@@ -263,11 +262,20 @@ pub(super) fn repair<M:Medium>(media:&mut M,offset:u64,end:u64,protected:u64,dam
     if offset < protected || offset >= end {return Ok(Outcome::Reject);}
     if let Damage::Suspect {known_interior} = damage {
         if known_interior {return Ok(Outcome::Reject);}
-        match media.later_frame(offset) {
-            Ok(false) => {},
-            Ok(true) => return Ok(Outcome::Reject),
-            Err(e) => return Err(Error::Probe(e)),
+        let mut buffer=match media.begin_probe(offset) {
+            Ok(buffer)=>buffer,Err(e)=>return Err(Error::Probe(ProbeError::Prepare(e))),
+        };
+        let start=offset.saturating_add(1);
+        match super::frame_probe::search(media,start,end,magic,limit,&mut buffer) {
+            Ok(false)=>{},
+            Ok(true)=>{
+                let ghost next=choose|next:u64| start<=next && #[trigger] super::frame_probe::protects::<M>(media.bytes(),magic,end,limit,next);
+                assert(has_later::<M>(media.bytes(),offset,end,magic,limit));
+                return Ok(Outcome::Reject)
+            },
+            Err(e)=>return Err(Error::Probe(ProbeError::Search(e))),
         }
+
     }
     if let Err(e) = media.resize(offset) {return Err(Error::Resize(e));}
     if let Err(e) = media.flush() {return Err(Error::Flush(e));}

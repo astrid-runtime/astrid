@@ -146,7 +146,7 @@ fn preserve_committed<M:crate::frame_repair::Medium>(media:&mut M,start:u64,end:
 {
     use crate::frame_repair as r;
     let w = r::window(physical,r::Bound::Committed {start,end}).unwrap();
-    matches!(r::repair(media,at,w.end,w.protected,damage),Ok(r::Outcome::Reject))
+    matches!(r::repair(media,at,w.end,w.protected,damage,frame::ARENA_MAGIC,u64::MAX),Ok(r::Outcome::Reject))
 }
 
 /// A live scan may discard an incomplete payload only beyond the protected prefix.
@@ -174,7 +174,7 @@ fn incomplete_payload<M:crate::frame_repair::Medium>(media:&mut M,physical:u64,p
         r::Extent::Incomplete => {},
         _ => {assert(false);return Ok(false);},
     }
-    match r::repair(media,at,w.end,w.protected,r::Damage::Incomplete) {
+    match r::repair(media,at,w.end,w.protected,r::Damage::Incomplete,frame::ARENA_MAGIC,limit) {
         Ok(r::Outcome::Reject) => Ok(false),Ok(r::Outcome::Repaired) => Ok(true),Err(e) => Err(e),
     }
 }
@@ -182,12 +182,12 @@ fn incomplete_payload<M:crate::frame_repair::Medium>(media:&mut M,physical:u64,p
 /// If the later-frame probe finds a frame or fails, recovery leaves the media unchanged.
 fn preserve_later_frame<M:crate::frame_repair::Medium>(media:&mut M,at:u64,end:u64,protected:u64,known_interior:bool)
     -> (refused:bool)
-    requires protected <= at < end, !old(media).probe_result(at,Ok(false)),
+    requires protected <= at < end, end<=old(media).bytes().len(),crate::frame_repair::has_later::<M>(old(media).bytes(),at,end,frame::ARENA_MAGIC,u64::MAX),
     ensures refused, final(media).calls() == if known_interior {old(media).calls()} else {old(media).calls().push(crate::frame_repair::Event::Probe(at))},
         final(media).bytes() == old(media).bytes(), final(media).durable() == old(media).durable(),
 {
     use crate::frame_repair as r;
-    match r::repair(media,at,end,protected,r::Damage::Suspect {known_interior}) {
+    match r::repair(media,at,end,protected,r::Damage::Suspect {known_interior},frame::ARENA_MAGIC,u64::MAX) {
         Ok(r::Outcome::Reject) | Err(r::Error::Probe(_)) => true,_ => false,
     }
 }

@@ -163,7 +163,7 @@ pub(crate) fn recover_live<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D,C
             stopped(final(reader),at,end,crate::frame_repair::FrameError::Tail(e),limit,scheme,decode,recode,hash) &&
             (match e.classification() {
                 crate::frame_repair::Damage::Incomplete=>final(media).calls()==old(media).calls().push(crate::frame_repair::Event::Resize(at)).push(crate::frame_repair::Event::Flush),
-                crate::frame_repair::Damage::Suspect {known_interior}=>!known_interior && old(media).probe_result(at,Ok(false)) &&
+                crate::frame_repair::Damage::Suspect {known_interior}=>!known_interior && !crate::frame_repair::has_later::<M>(old(media).bytes(),at,end,ROOT_MAGIC,limit) &&
                     final(media).calls()==old(media).calls().push(crate::frame_repair::Event::Probe(at)).push(crate::frame_repair::Event::Resize(at)).push(crate::frame_repair::Event::Flush),
             }) && final(media).bytes()==old(reader).image().take(at as int) &&
             (final(media).syncs_file() ==> final(media).durable()==final(media).bytes()) &&
@@ -180,7 +180,7 @@ pub(crate) fn recover_live<R:FrameReader,M:crate::frame_repair::Medium,P:Ord,D,C
         Ok(table)=>Live::Complete(table),
         Err(ScanError::Visitor(e))=>Live::Visitor(e),
         Err(ScanError::Frame(at,FrameError::Tail(e),table))=>{
-            match crate::frame_repair::repair(media,at,end,protected,e.damage()) {
+            match crate::frame_repair::repair(media,at,end,protected,e.damage(),ROOT_MAGIC,limit) {
                 Ok(Outcome::Repaired)=>{
                     proof {retain_prefix(table@,reader.image(),at,limit,scheme,decode,recode,hash);}
                     Live::Repaired(at,e,table)

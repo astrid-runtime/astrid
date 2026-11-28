@@ -278,6 +278,8 @@ mod checkpoint_admission;
 mod arena_frame;
 #[path = "../crates/astrid-storage/src/engine/durable/frame_repair.rs"]
 mod frame_repair;
+#[path = "../crates/astrid-storage/src/engine/durable/frame_probe.rs"]
+mod frame_probe;
 #[path = "../crates/astrid-storage/src/engine/durable/frame_scan.rs"]
 mod frame_scan;
 #[path = "../crates/astrid-storage/src/engine/durable/recovery_barrier.rs"]

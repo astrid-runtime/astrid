@@ -12,6 +12,7 @@ struct ObservedStream {
     seeks: usize,
     short_reads: bool,
     fail_after_reads: Option<usize>,
+    eof_after_reads: Option<usize>,
     move_cursor_on_read_at: bool,
     positional_reads: std::cell::RefCell<Vec<(u64, usize)>>,
 }
@@ -20,6 +21,9 @@ impl Read for ObservedStream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         if self.fail_after_reads == Some(self.reads) {
             return Err(io::Error::other("injected scan read failure"));
+        }
+        if self.eof_after_reads == Some(self.reads) {
+            return Ok(0);
         }
         self.reads = self.reads.strict_add(1);
         let length = if self.short_reads {
@@ -94,6 +98,7 @@ fn stream(hosted: bool) -> (tempfile::TempDir, ObservedStream) {
             seeks: 0,
             short_reads: false,
             fail_after_reads: None,
+            eof_after_reads: None,
             move_cursor_on_read_at: false,
             positional_reads: std::cell::RefCell::new(Vec::new()),
         },
@@ -124,6 +129,73 @@ fn short_probe_reads_preserve_valid_frames_after_damage() {
         let mut preserved = Vec::new();
         stream.read_to_end(&mut preserved).unwrap();
         assert_eq!(preserved, original);
+    }
+}
+
+#[test]
+fn a_later_frame_crossing_probe_windows_prevents_truncation() {
+    // The first window starts at 1 and ends at 65,544. Only three bytes
+    // of the later frame's magic fit before that boundary.
+    for hosted in [false, true] {
+        let (_dir, mut stream) = self::stream(hosted);
+        stream.write_all(&vec![0; 65_541]).unwrap();
+        // The payload also crosses the independent 64 KiB checksum buffer.
+        let mut payload = vec![0u8; 65_537];
+        *payload.last_mut().unwrap() = 1;
+        append_frame(&mut stream, ARENA_MAGIC, &payload).unwrap();
+        let length = stream.file.metadata().unwrap().len();
+        let error = scan_frames(
+            &mut stream,
+            "test frames",
+            ARENA_MAGIC,
+            RecoveryLimits::process_addressable(),
+            |_, _| panic!("interior damage must stop the scan"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DurableError::Corrupt {
+                offset: 0,
+                detail: "frame magic mismatch",
+                ..
+            }
+        ));
+        assert_eq!(stream.file.metadata().unwrap().len(), length);
+
+        // Change only the final chunk. No complete protective frame now follows.
+        stream.seek(SeekFrom::End(-1)).unwrap();
+        stream.write_all(&[0]).unwrap();
+        scan_frames(
+            &mut stream,
+            "test frames",
+            ARENA_MAGIC,
+            RecoveryLimits::process_addressable(),
+            |_, _| panic!("invalid frame must not be visited"),
+        )
+        .unwrap();
+        assert_eq!(stream.file.metadata().unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn probe_eof_before_the_measured_end_preserves_the_file() {
+    for hosted in [false, true] {
+        let (_dir, mut stream) = self::stream(hosted);
+        stream.write_all(&[0; FRAME_HEADER_LEN_USIZE]).unwrap();
+        // Header fetch succeeds, then the independent probe reads zero bytes.
+        stream.eof_after_reads = Some(1);
+        let error = scan_frames(
+            &mut stream,
+            "test frames",
+            ARENA_MAGIC,
+            RecoveryLimits::process_addressable(),
+            |_, _| panic!("unreadable tail must stop the scan"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error,DurableError::Io{operation:"read durable tail recovery scan",source} if source.kind()==io::ErrorKind::UnexpectedEof)
+        );
+        assert_eq!(stream.file.metadata().unwrap().len(), FRAME_HEADER_LEN);
     }
 }
 
