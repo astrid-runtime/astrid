@@ -739,6 +739,27 @@ def checkpoint_entries_consumers():
         )
 
 
+def checkpoint_record_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_record.rs")
+    for label, clause, weaker in [
+        ("metadata checks", "out == Err(EnvelopeError::Header)", "true"),
+        ("leaf dispatch", "out == Ok(PageKind::Leaf)", "true"),
+        ("branch dispatch", "out == Ok(PageKind::Branch)", "true"),
+        ("kind rejection", "out == Err(EnvelopeError::Kind)", "true"),
+        ("charge overflow", "out == Err(SizeError::Overflow)", "true"),
+        ("oversize rejection", "out == Err(SizeError::Oversize)", "true"),
+        ("scheduled identity", "out matches Ok(handle) && handle.object == id", "out matches Ok(handle)"),
+        ("decoded page", "handle.node == node", "true"),
+        ("admitted payload", "parsed(record,handle.node,validate)", "true"),
+        ("admitted identity", "handle.object == id && parsed(record", "parsed(record"),
+    ]:
+        yield (
+            f"checkpoint envelope loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path("verification/hosted_checkpoint_record.rs"),
+        )
+
+
 def checkpoint_decode_consumers():
     yield from checkpoint_page_consumers()
     yield from checkpoint_reference_consumers()
@@ -750,3 +771,4 @@ def checkpoint_decode_consumers():
     yield from checkpoint_header_consumers()
     yield from checkpoint_value_consumers()
     yield from checkpoint_entries_consumers()
+    yield from checkpoint_record_consumers()

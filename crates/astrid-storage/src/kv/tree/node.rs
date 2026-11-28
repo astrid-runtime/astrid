@@ -10,9 +10,9 @@ use super::checkpoint_reference::{self, Rejection, Relation};
 use super::validation::validate_composite_key;
 use crate::error::{StorageError, StorageResult};
 
-pub(super) use super::checkpoint_value::{INLINE_VALUE_MAX, ValueSlot};
-pub(super) const NODE_MAX_RETAINED_BYTES: u64 = 4_096;
 pub(super) use super::checkpoint_branch::{MAX_TREE_LEVEL, NODE_MAX_ENTRIES};
+pub(super) use super::checkpoint_record::NODE_MAX_RETAINED_BYTES;
+pub(super) use super::checkpoint_value::{INLINE_VALUE_MAX, ValueSlot};
 
 pub(super) use super::checkpoint_totals::NodeTotals;
 
@@ -52,15 +52,6 @@ impl LeafEntry {
 pub(super) type ChildPointer = super::checkpoint_range::Child<ObjectId, NodeTotals>;
 
 pub(super) type Node = super::checkpoint_page::Node<ObjectId, NodeTotals, ValueSlot>;
-
-impl Node {
-    pub(super) fn entry_slots(&self) -> usize {
-        match self {
-            Self::Leaf(leaf) => leaf.entries.len(),
-            Self::Branch(branch) => branch.children.len(),
-        }
-    }
-}
 
 pub(super) type NodeHandle = super::checkpoint_page::Handle<ObjectId, NodeTotals, ValueSlot>;
 
@@ -180,28 +171,22 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
 }
 
 pub(super) fn decode_node(id: ObjectId, record: &ObjectRecord) -> StorageResult<NodeHandle> {
-    if record.format_version() != FORMAT_VERSION
-        || record.logical_bytes() != 0
-        || record.class() != ObjectClass::Metadata
-    {
-        return Err(invalid(id, "invalid persistent KV page header"));
-    }
-    let node = match record.kind() {
-        ObjectKind::KvLeaf => decode_leaf(id, record)?,
-        ObjectKind::KvBranch => decode_branch(id, record)?,
-        _ => return Err(invalid(id, "invalid persistent KV page kind")),
-    };
-    let retained_bytes = record
-        .retained_bytes()
-        .map_err(|error| model_error(&error))?;
-    let unsplittable_slots = match &node {
-        Node::Leaf(_) => 1,
-        Node::Branch(_) => 3,
-    };
-    if retained_bytes > NODE_MAX_RETAINED_BYTES && node.entry_slots() > unsplittable_slots {
-        return Err(invalid(id, "oversized persistent KV page"));
-    }
-    Ok(NodeHandle { object: id, node })
+    use super::checkpoint_record::{self, EnvelopeError, ReadError, SizeError};
+    checkpoint_record::read(id, record, FORMAT_VERSION, |k| {
+        validate_composite_key(id, k)
+    })
+    .map_err(|error| match error {
+        ReadError::Envelope(EnvelopeError::Header) => {
+            invalid(id, "invalid persistent KV page header")
+        },
+        ReadError::Envelope(EnvelopeError::Kind) => invalid(id, "invalid persistent KV page kind"),
+        ReadError::Leaf(e) => leaf_error(id, e),
+        ReadError::Branch(e) => branch_error(id, e),
+        ReadError::Size(SizeError::Overflow) => {
+            model_error(&crate::storage_model::ModelError::ArithmeticOverflow)
+        },
+        ReadError::Size(SizeError::Oversize) => invalid(id, "oversized persistent KV page"),
+    })
 }
 
 pub(super) fn decode_value(
@@ -230,17 +215,17 @@ pub(super) fn spilled_opaque_payload(
     Ok(record.canonical_bytes())
 }
 
-fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
+fn leaf_error(
+    id: ObjectId,
+    reason: super::checkpoint_leaf_record::Error<StorageError>,
+) -> StorageError {
     use super::checkpoint_entries::Error;
     use super::checkpoint_key_field::KeyError;
     use super::checkpoint_value::Error as ValueError;
 
-    use super::checkpoint_leaf_record::{self, Error as RecordError};
+    use super::checkpoint_leaf_record::Error as RecordError;
     use super::checkpoint_leaf_summary::Error as SummaryError;
-    let leaf = checkpoint_leaf_record::read(record.canonical_bytes(), record.references(), |k| {
-        validate_composite_key(id, k)
-    })
-    .map_err(|reason| match reason {
+    match reason {
         RecordError::Prefix(e) => header_error(id, e),
         RecordError::Count => invalid(id, "invalid KV leaf entry count"),
         RecordError::Summary(SummaryError::Overflow) => arithmetic_overflow(),
@@ -268,49 +253,46 @@ fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
                 },
             },
         },
-    })?;
-    Ok(Node::Leaf(leaf))
+    }
 }
 
-fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
+fn branch_error(
+    id: ObjectId,
+    reason: checkpoint_header::RecordError<StorageError>,
+) -> StorageError {
     use super::checkpoint_branch::{DecodeError, RowsError};
     use super::checkpoint_child::ChildError;
     use super::checkpoint_key_field::KeyError;
     use super::checkpoint_summary::FinishError;
 
-    let branch =
-        checkpoint_header::branch(record.canonical_bytes(), record.references(), |field| {
-            validate_composite_key(id, field)
-        })
-        .map_err(|reason| match reason {
-            checkpoint_header::RecordError::Prefix(e) => header_error(id, e),
-            checkpoint_header::RecordError::Body(reason) => match reason {
-                DecodeError::Header => invalid(id, "invalid KV branch header"),
-                DecodeError::Rows(RowsError::Level) => invalid(id, "invalid KV branch level"),
-                DecodeError::Rows(RowsError::Child(reason)) => match reason {
-                    ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => {
-                        page_read_error(id, e)
-                    },
-                    ChildError::Key(KeyError::Length) => {
-                        invalid(id, "persistent KV length is too large")
-                    },
-                    ChildError::InvalidKey(e) => e,
-                    ChildError::Empty => invalid(id, "empty KV branch child"),
-                    ChildError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
-                    ChildError::Reference(Rejection::Missing | Rejection::Mismatch) => {
-                        invalid(id, "invalid KV branch child reference")
-                    },
+    match reason {
+        checkpoint_header::RecordError::Prefix(e) => header_error(id, e),
+        checkpoint_header::RecordError::Body(reason) => match reason {
+            DecodeError::Header => invalid(id, "invalid KV branch header"),
+            DecodeError::Rows(RowsError::Level) => invalid(id, "invalid KV branch level"),
+            DecodeError::Rows(RowsError::Child(reason)) => match reason {
+                ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => {
+                    page_read_error(id, e)
                 },
-                DecodeError::Finish(FinishError::Trailing) => {
-                    invalid(id, "trailing persistent KV page bytes")
+                ChildError::Key(KeyError::Length) => {
+                    invalid(id, "persistent KV length is too large")
                 },
-                DecodeError::Finish(FinishError::NonCanonical) => {
-                    invalid(id, "non-canonical persistent KV branch")
+                ChildError::InvalidKey(e) => e,
+                ChildError::Empty => invalid(id, "empty KV branch child"),
+                ChildError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
+                ChildError::Reference(Rejection::Missing | Rejection::Mismatch) => {
+                    invalid(id, "invalid KV branch child reference")
                 },
-                DecodeError::Finish(FinishError::Overflow) => arithmetic_overflow(),
             },
-        })?;
-    Ok(Node::Branch(branch))
+            DecodeError::Finish(FinishError::Trailing) => {
+                invalid(id, "trailing persistent KV page bytes")
+            },
+            DecodeError::Finish(FinishError::NonCanonical) => {
+                invalid(id, "non-canonical persistent KV branch")
+            },
+            DecodeError::Finish(FinishError::Overflow) => arithmetic_overflow(),
+        },
+    }
 }
 
 fn leaf_totals(entries: &[LeafEntry]) -> StorageResult<NodeTotals> {

@@ -117,19 +117,6 @@ mod object_record;
 pub use object_record::{ObjectFormatVersion, ObjectRecord};
 
 impl ObjectRecord {
-    // Stable widths in the logical canonical record encoding. Durable engines
-    // may add framing, checksums, algorithm tags, and indexes; those belong to
-    // physical-store accounting rather than a principal's retained quota.
-    const FIXED_RETAINED_BYTES: u64 = 2 // object kind
-        + 2 // format version
-        + 1 // accounting class
-        + 8 // logical byte contribution
-        + 8 // canonical payload length
-        + 8; // reference count
-    const FIXED_REFERENCE_BYTES: u64 = 8 // label length
-        + 32 // target ObjectId
-        + 1; // reference kind
-
     /// Construct a canonical object record.
     ///
     /// References must be strictly increasing by relation label. Requiring one
@@ -180,20 +167,7 @@ impl ObjectRecord {
     /// Returns [`ModelError::ArithmeticOverflow`] when a length or the total
     /// cannot be represented as `u64`.
     pub fn retained_bytes(&self) -> Result<u64, ModelError> {
-        let canonical_bytes = u64::try_from(self.canonical_bytes.len())
-            .map_err(|_| ModelError::ArithmeticOverflow)?;
-        let mut retained = Self::FIXED_RETAINED_BYTES
-            .checked_add(canonical_bytes)
-            .ok_or(ModelError::ArithmeticOverflow)?;
-        for reference in &self.references {
-            let label_bytes = u64::try_from(reference.label.as_bytes().len())
-                .map_err(|_| ModelError::ArithmeticOverflow)?;
-            retained = retained
-                .checked_add(Self::FIXED_REFERENCE_BYTES)
-                .and_then(|total| total.checked_add(label_bytes))
-                .ok_or(ModelError::ArithmeticOverflow)?;
-        }
-        Ok(retained)
+        self.retained_usage().ok_or(ModelError::ArithmeticOverflow)
     }
 
     /// Find a reference by its canonical relation label.

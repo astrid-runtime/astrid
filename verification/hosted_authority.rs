@@ -289,6 +289,8 @@ mod hosted_checkpoint_range;
 mod checkpoint_leaf;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_page.rs"]
 mod checkpoint_page;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_record.rs"]
+mod checkpoint_record;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_reference.rs"]
 mod checkpoint_reference;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_totals.rs"]
@@ -312,6 +314,7 @@ mod checkpoint_leaf_summary;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_leaf_record.rs"]
 mod checkpoint_leaf_record;
 mod hosted_checkpoint_leaf_record;
+mod hosted_checkpoint_record;
 mod hosted_checkpoint_entries;
 mod hosted_checkpoint_value;
 mod hosted_checkpoint_header;

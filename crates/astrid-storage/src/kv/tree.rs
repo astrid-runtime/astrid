@@ -10,7 +10,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, KvProjectionError};
-use crate::storage_model::{ModelError, ObjectId, ObjectReference, ReferenceLabel, RootState};
+use crate::storage_model::{
+    ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
+    ObjectReference, ReferenceLabel, RootState,
+};
 use parking_lot::Mutex;
 
 use self::context::{Replacement, TreeContext};
@@ -42,6 +45,7 @@ mod checkpoint_leaf_summary;
 mod checkpoint_page;
 mod checkpoint_progress;
 mod checkpoint_range;
+mod checkpoint_record;
 mod checkpoint_reference;
 mod checkpoint_summary;
 mod checkpoint_totals;

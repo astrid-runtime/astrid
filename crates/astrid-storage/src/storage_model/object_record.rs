@@ -51,6 +51,63 @@ pub struct ObjectRecord {
 
 
 impl ObjectRecord {
+    // Stable widths in the logical canonical record encoding. Durable engines
+    // may add framing, checksums, algorithm tags, and indexes; those belong to
+    // physical-store accounting rather than a principal's retained quota.
+    pub(crate) const FIXED_RETAINED_BYTES: u64 = 2 // object kind
+        + 2 // format version
+        + 1 // accounting class
+        + 8 // logical byte contribution
+        + 8 // canonical payload length
+        + 8; // reference count
+    pub(crate) const FIXED_REFERENCE_BYTES: u64 = 8 // label length
+        + 32 // target ObjectId
+        + 1; // reference kind
+
+    pub(crate) open spec fn reference_charge(refs: Seq<ObjectReference>, count: nat) -> nat
+        decreases count,
+    {
+        if count == 0 { 0 } else {
+            Self::reference_charge(refs, (count - 1) as nat)
+                + Self::FIXED_REFERENCE_BYTES as nat + refs[count - 1].fields().0.len()
+        }
+    }
+
+    proof fn prefix_charge_le(refs: Seq<ObjectReference>, prefix: nat, count: nat)
+        requires prefix <= count <= refs.len(),
+        ensures Self::reference_charge(refs, prefix) <= Self::reference_charge(refs, count),
+        decreases count - prefix,
+    {
+        if prefix < count { Self::prefix_charge_le(refs, prefix, (count - 1) as nat); }
+    }
+
+    pub(crate) open spec fn retained_cost(&self) -> nat {
+        Self::FIXED_RETAINED_BYTES as nat + self.contents().2.len()
+            + Self::reference_charge(self.contents().3, self.contents().3.len())
+    }
+
+    pub(crate) fn retained_usage(&self) -> (out: Option<u64>)
+        ensures out.is_some() == (self.retained_cost() <= u64::MAX),
+            out matches Some(n) ==> n == self.retained_cost(),
+    {
+        let bytes = u64::try_from(self.canonical_bytes.len()).ok()?;
+        let mut retained = Self::FIXED_RETAINED_BYTES.checked_add(bytes)?;
+        let refs = self.references.as_slice();
+        let mut i = 0usize;
+        while i < refs.len()
+            invariant i <= refs.len(), refs@ == self.contents().3,
+                retained == Self::FIXED_RETAINED_BYTES as nat + self.contents().2.len()
+                    + Self::reference_charge(refs@, i as nat),
+            decreases refs.len() - i,
+        {
+            proof { Self::prefix_charge_le(refs@, i as nat + 1, refs@.len()); }
+            let label = u64::try_from(refs[i].label_bytes().len()).ok()?;
+            retained = retained.checked_add(Self::FIXED_REFERENCE_BYTES)?.checked_add(label)?;
+            i = i.saturating_add(1);
+        }
+        Some(retained)
+    }
+
 pub(crate) open spec fn label_before(a:Seq<u8>,b:Seq<u8>) -> bool {super::object_reference::before(a,b)}
 
 pub(crate) open spec fn labels_ordered(refs:Seq<ObjectReference>) -> bool {
